@@ -49,7 +49,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       const res = await api.post<{ reply: string }>('/ai/chat', { messages: updatedMessages })
       const assistantMessage: Message = {
         role: 'assistant',
-        content: res.data.reply,
+        content: res.data?.reply ?? '',
       }
       setMessages((prev) => [...prev, assistantMessage])
     } catch {
