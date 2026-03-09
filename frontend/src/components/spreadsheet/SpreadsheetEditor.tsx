@@ -549,6 +549,29 @@ export default function SpreadsheetEditor({ sheetId, sheet: initialSheet }: Prop
     [displayRowIndices, rowMap, rows, parsedColumns]
   )
 
+  const persistStructure = useCallback(
+    async (nextColumns: ColumnDef[], nextConfig: SheetConfig) => {
+      if (!sheet) return
+
+      const nextSheet: Sheet = {
+        ...sheet,
+        columns: nextColumns,
+        config: nextConfig,
+      }
+
+      await api.put(`/sheets/${sheetId}`, {
+        name: nextSheet.name,
+        sort_order: nextSheet.sort_order,
+        columns: nextColumns,
+        frozen: nextSheet.frozen || { row: 0, col: 0 },
+        config: nextConfig,
+      })
+
+      setSheet(nextSheet)
+    },
+    [setSheet, sheet, sheetId]
+  )
+
   const handleColumnFilterApply = useCallback(
     async (columnKey: string, selectedValues: Set<string>) => {
       const nextColumnFilters = {
@@ -712,29 +735,6 @@ export default function SpreadsheetEditor({ sheetId, sheet: initialSheet }: Prop
       setContextMenu(null)
     },
     [parsedColumns]
-  )
-
-  const persistStructure = useCallback(
-    async (nextColumns: ColumnDef[], nextConfig: SheetConfig) => {
-      if (!sheet) return
-
-      const nextSheet: Sheet = {
-        ...sheet,
-        columns: nextColumns,
-        config: nextConfig,
-      }
-
-      await api.put(`/sheets/${sheetId}`, {
-        name: nextSheet.name,
-        sort_order: nextSheet.sort_order,
-        columns: nextColumns,
-        frozen: nextSheet.frozen || { row: 0, col: 0 },
-        config: nextConfig,
-      })
-
-      setSheet(nextSheet)
-    },
-    [setSheet, sheet, sheetId]
   )
 
   useEffect(() => {
