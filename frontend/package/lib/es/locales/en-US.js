@@ -1,0 +1,23 @@
+import { Tools as r } from "@univerjs/core";
+import e from "@univerjs/design/locale/en-US";
+import o from "@univerjs/docs-ui/locale/en-US";
+import i from "@univerjs/sheets/locale/en-US";
+import s from "@univerjs/sheets-formula/locale/en-US";
+import m from "@univerjs/sheets-formula-ui/locale/en-US";
+import t from "@univerjs/sheets-numfmt-ui/locale/en-US";
+import u from "@univerjs/sheets-ui/locale/en-US";
+import f from "@univerjs/ui/locale/en-US";
+const g = r.deepMerge(
+  {},
+  e,
+  o,
+  i,
+  s,
+  m,
+  t,
+  u,
+  f
+);
+export {
+  g as default
+};

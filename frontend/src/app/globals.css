@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #ffffff;
+  --color-foreground: #0a0a0a;
+  --color-primary: #2563eb;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #f1f5f9;
+  --color-secondary-foreground: #0f172a;
+  --color-muted: #f1f5f9;
+  --color-muted-foreground: #64748b;
+  --color-accent: #f1f5f9;
+  --color-accent-foreground: #0f172a;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+  --color-border: #e2e8f0;
+  --color-input: #e2e8f0;
+  --color-ring: #2563eb;
+  --color-card: #ffffff;
+  --color-card-foreground: #0a0a0a;
+  --radius: 0.5rem;
+}
+
+/* Univer CSS — imported AFTER tailwind so Univer's own styles win */
+@import "@univerjs/preset-sheets-core/lib/index.css";
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+}
+
+/*
+ * Univer renders a canvas + absolutely-positioned overlays inside its
+ * container div. Tailwind's preflight resets (border-box, margin: 0, etc.)
+ * don't cause problems, but two things CAN break rendering:
+ *
+ *  a) The container having 0 height — Univer reads offsetHeight at mount.
+ *  b) An ancestor with `overflow: hidden` + `border-radius` — this clips
+ *     Univer's dropdowns and context-menu which are portalled INTO the
+ *     container, not into document.body.
+ *
+ * The rules below are safety nets.
+ */
+
+/* Make sure Univer's own root wrapper fills its container */
+.univer-app-layout {
+  width: 100% !important;
+  height: 100% !important;
+}

@@ -1,0 +1,77 @@
+package model
+
+import (
+	"encoding/json"
+	"time"
+)
+
+type Workbook struct {
+	ID          int64           `json:"id" db:"id"`
+	Name        string          `json:"name" db:"name"`
+	Description *string         `json:"description" db:"description"`
+	OwnerID     int64           `json:"owner_id" db:"owner_id"`
+	Metadata    json.RawMessage `json:"metadata" db:"metadata"`
+	IsTemplate  bool            `json:"is_template" db:"is_template"`
+	Status      int             `json:"status" db:"status"`
+	CreatedAt   time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time       `json:"updated_at" db:"updated_at"`
+	Sheets      []Sheet         `json:"sheets,omitempty"`
+}
+
+type Sheet struct {
+	ID         int64           `json:"id" db:"id"`
+	WorkbookID int64           `json:"workbook_id" db:"workbook_id"`
+	Name       string          `json:"name" db:"name"`
+	SortOrder  int             `json:"sort_order" db:"sort_order"`
+	Columns    json.RawMessage `json:"columns" db:"columns"`
+	Frozen     json.RawMessage `json:"frozen" db:"frozen"`
+	Config     json.RawMessage `json:"config" db:"config"`
+	CreatedAt  time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt  time.Time       `json:"updated_at" db:"updated_at"`
+}
+
+type Row struct {
+	ID        int64           `json:"id" db:"id"`
+	SheetID   int64           `json:"sheet_id" db:"sheet_id"`
+	RowIndex  int             `json:"row_index" db:"row_index"`
+	Data      json.RawMessage `json:"data" db:"data"`
+	CreatedBy *int64          `json:"created_by" db:"created_by"`
+	UpdatedBy *int64          `json:"updated_by" db:"updated_by"`
+	CreatedAt time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at" db:"updated_at"`
+}
+
+type CreateWorkbookRequest struct {
+	Name        string `json:"name" binding:"required"`
+	Description string `json:"description"`
+	IsTemplate  bool   `json:"is_template"`
+}
+
+type UpdateWorkbookRequest struct {
+	Name        *string `json:"name"`
+	Description *string `json:"description"`
+}
+
+type CreateSheetRequest struct {
+	Name    string          `json:"name" binding:"required"`
+	Columns json.RawMessage `json:"columns"`
+}
+
+type UpdateSheetRequest struct {
+	Name      *string          `json:"name"`
+	Columns   *json.RawMessage `json:"columns"`
+	SortOrder *int             `json:"sort_order"`
+	Frozen    *json.RawMessage `json:"frozen"`
+	Config    *json.RawMessage `json:"config"`
+}
+
+type CellUpdate struct {
+	SheetID int64           `json:"sheet_id"`
+	Row     int             `json:"row"`
+	Col     string          `json:"col"`
+	Value   json.RawMessage `json:"value"`
+}
+
+type BatchUpdateRequest struct {
+	Changes []CellUpdate `json:"changes"`
+}

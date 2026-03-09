@@ -1,0 +1,64 @@
+const t = {
+  ribbon: {
+    start: "开始",
+    insert: "插入",
+    formulas: "公式",
+    data: "数据",
+    view: "视图",
+    others: "其他",
+    more: "更多"
+  },
+  fontFamily: {
+    TimesNewRoman: "Times New Roman",
+    Arial: "Arial",
+    Tahoma: "Tahoma",
+    Verdana: "Verdana",
+    MicrosoftYaHei: "微软雅黑",
+    SimSun: "宋体",
+    SimHei: "黑体",
+    Kaiti: "楷体",
+    FangSong: "仿宋",
+    NSimSun: "新宋体",
+    STXinwei: "华文新魏",
+    STXingkai: "华文行楷",
+    STLiti: "华文隶书",
+    HanaleiFill: "HanaleiFill",
+    Anton: "Anton",
+    Pacifico: "Pacifico"
+  },
+  "shortcut-panel": {
+    title: "快捷键面板"
+  },
+  shortcut: {
+    undo: "撤销",
+    redo: "重做",
+    cut: "剪切",
+    copy: "复制",
+    paste: "粘贴",
+    "shortcut-panel": "打开收起快捷键面板"
+  },
+  "common-edit": "常用编辑",
+  "toggle-shortcut-panel": "打开收起快捷键面板",
+  clipboard: {
+    authentication: {
+      title: "无法访问剪贴板",
+      content: "请允许 Univer 访问您的剪贴板。"
+    }
+  },
+  textEditor: {
+    formulaError: "请输入合法的公式，例如=SUM(A1)",
+    rangeError: "请输入合法的范围，例如 A1:B10"
+  },
+  rangeSelector: {
+    title: "选择一个数据范围",
+    addAnotherRange: "添加范围",
+    buttonTooltip: "选择数据范围",
+    placeHolder: "框选范围或输入",
+    confirm: "确认",
+    cancel: "取消"
+  },
+  "global-shortcut": "全局快捷键"
+};
+export {
+  t as default
+};

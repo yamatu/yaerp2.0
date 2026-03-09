@@ -1,0 +1,64 @@
+const i = {
+  ribbon: {
+    start: "شروع",
+    insert: "درج",
+    formulas: "فرمول‌ها",
+    data: "داده‌ها",
+    view: "نمایش",
+    others: "دیگر",
+    more: "بیشتر"
+  },
+  fontFamily: {
+    TimesNewRoman: "Times New Roman",
+    Arial: "Arial",
+    Tahoma: "Tahoma",
+    Verdana: "Verdana",
+    MicrosoftYaHei: "Microsoft YaHei",
+    SimSun: "SimSun",
+    SimHei: "SimHei",
+    Kaiti: "Kaiti",
+    FangSong: "FangSong",
+    NSimSun: "NSimSun",
+    STXinwei: "STXinwei",
+    STXingkai: "STXingkai",
+    STLiti: "STLiti",
+    HanaleiFill: "HanaleiFill",
+    Anton: "Anton",
+    Pacifico: "Pacifico"
+  },
+  "shortcut-panel": {
+    title: "کلیدهای میانبر"
+  },
+  shortcut: {
+    undo: "بازگرداندن",
+    redo: "تکرار",
+    cut: "بریدن",
+    copy: "کپی کردن",
+    paste: "چسباندن",
+    "shortcut-panel": "نمایش/مخفی کردن پنل کلیدهای میانبر"
+  },
+  "common-edit": "کلیدهای میانبر ویرایش عمومی",
+  "toggle-shortcut-panel": "نمایش/مخفی کردن پنل کلیدهای میانبر",
+  clipboard: {
+    authentication: {
+      title: "اجازه دسترسی داده نشده است",
+      content: "لطفا به Univer اجازه دسترسی به کلیپ بورد خود را بدهید."
+    }
+  },
+  textEditor: {
+    formulaError: "لطفا یک فرمول معتبر مانند =SUM(A1) وارد کنید.",
+    rangeError: "لطفا یک محدوده معتبر مانند A1:B10 وارد کنید."
+  },
+  rangeSelector: {
+    title: "انتخاب محدوده داده",
+    addAnotherRange: "افزودن محدوده",
+    buttonTooltip: "انتخاب محدوده داده",
+    placeHolder: "انتخاب محدوده یا وارد کردن.",
+    confirm: "تایید",
+    cancel: "انصراف"
+  },
+  "global-shortcut": "کلید میانبر جهانی"
+};
+export {
+  i as default
+};
