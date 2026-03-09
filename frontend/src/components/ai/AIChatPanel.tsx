@@ -46,7 +46,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     setLoading(true)
 
     try {
-      const res = await api.post('/ai/chat', { messages: updatedMessages })
+      const res = await api.post<{ reply: string }>('/ai/chat', { messages: updatedMessages })
       const assistantMessage: Message = {
         role: 'assistant',
         content: res.data.reply,

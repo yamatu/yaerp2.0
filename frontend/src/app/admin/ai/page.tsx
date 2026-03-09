@@ -19,9 +19,10 @@ export default function AdminAIPage() {
     const loadConfig = async () => {
       try {
         const res = await api.get('/admin/ai/config')
-        setEndpoint(res.data.endpoint || '')
-        setModel(res.data.model || '')
-        setConfigured(!!(res.data.endpoint && res.data.model))
+        const data = res.data as { endpoint?: string; model?: string }
+        setEndpoint(data.endpoint || '')
+        setModel(data.model || '')
+        setConfigured(!!(data.endpoint && data.model))
       } catch {
         setConfigured(false)
       } finally {
