@@ -470,7 +470,7 @@ export default function HomePage() {
                   </button>
                 ))}
               </div>
-            )
+            )}
 
             {/* Search bar */}
             {!loading && workbooks.length > 0 && (
