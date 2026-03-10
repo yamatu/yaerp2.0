@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { AlertCircle, ImagePlus, Lock, X } from 'lucide-react'
+import { AlertCircle, ImagePlus, Save, X } from 'lucide-react'
 import type { IWorkbookData, IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -52,23 +52,75 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const latestSheetRef = useRef(sheet)
   const univerApiRef = useRef<ReturnType<typeof createUniver> | null>(null)
+  const persistRef = useRef<(() => Promise<void>) | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showImagePicker, setShowImagePicker] = useState(false)
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([])
   const [loadingGallery, setLoadingGallery] = useState(false)
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
+  const [univerHasOverlay, setUniverHasOverlay] = useState(false)
 
-  // Toggle body class to hide global FABs when image picker is open
+  // Hide global FABs when image picker or Univer overlay is open
   useEffect(() => {
-    if (showImagePicker) {
+    if (showImagePicker || univerHasOverlay) {
       document.body.classList.add('fab-hidden')
     } else {
       document.body.classList.remove('fab-hidden')
     }
     return () => { document.body.classList.remove('fab-hidden') }
-  }, [showImagePicker])
+  }, [showImagePicker, univerHasOverlay])
+
+  // Watch Univer container for overlay/dialog elements (panels, modals, popups)
+  useEffect(() => {
+    const check = () => {
+      // Univer renders dialogs/panels into the container or body — check for common selectors
+      const overlays = document.querySelectorAll(
+        '.univer-dialog, .univer-sidebar, .univer-panel, .univer-confirm-modal, ' +
+        '[class*="univer-dialog"], [class*="univer-sidebar"], [class*="univer-panel"], ' +
+        '[class*="univer-confirm"], [class*="univer-popup"]'
+      )
+      setUniverHasOverlay(overlays.length > 0)
+    }
+
+    const observer = new MutationObserver(check)
+    observer.observe(document.body, { childList: true, subtree: true })
+    check()
+    return () => observer.disconnect()
+  }, [])
 
   useEffect(() => { latestSheetRef.current = sheet }, [sheet])
+
+  // Manual save handler — triggers immediate persist
+  const handleManualSave = useCallback(async () => {
+    if (!persistRef.current) return
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
+    setSaveStatus('saving')
+    try {
+      await persistRef.current()
+      setSaveStatus('saved')
+      setTimeout(() => setSaveStatus('idle'), 1500)
+    } catch (e) {
+      console.error('Manual save failed:', e)
+      setSaveStatus('idle')
+    }
+  }, [])
+
+  // Ctrl+S shortcut
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault()
+        e.stopPropagation()
+        handleManualSave()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown, true)
+    return () => window.removeEventListener('keydown', handleKeyDown, true)
+  }, [handleManualSave])
 
   // Stable sheet.id for mount — ONLY re-mount when sheet.id changes
   const sheetId = sheet.id
@@ -165,6 +217,9 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
           })
         }
 
+        // Expose persistSnapshot for manual save
+        persistRef.current = persistSnapshot
+
         const schedulePersist = () => {
           if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
           saveTimerRef.current = setTimeout(() => {
@@ -176,6 +231,7 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
 
         cleanup = () => {
           disposable.dispose()
+          persistRef.current = null
           if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
           univerApiRef.current = null
           ;(univer as { dispose?: () => void }).dispose?.()
@@ -216,7 +272,6 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
     const { univerAPI } = result
     try {
       // Use Facade API to set value in the currently selected cell
-      // getActiveWorkbook → getActiveSheet → getSelection → getActiveRange
       const wb = univerAPI.getActiveWorkbook?.()
       const ws = wb?.getActiveSheet?.()
       const sel = ws?.getSelection?.()
@@ -261,7 +316,6 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
     } catch (err) {
       console.error('Upload failed:', err)
     }
-    e.target.value = ''
   }, [insertImageToCell])
 
   if (error) {
@@ -275,20 +329,45 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
     )
   }
 
+  const showFabs = !showImagePicker && !univerHasOverlay
+
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
-      {/* Floating image insert button — hidden when picker is open */}
-      {!showImagePicker && (
-        <button
-          type="button"
-          onClick={openImagePicker}
-          className="absolute right-3 bottom-3 z-20 flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800"
-          title="插入图片"
-        >
-          <ImagePlus className="h-5 w-5" />
-        </button>
+      {/* Floating buttons — hidden when any overlay/panel is open */}
+      {showFabs && (
+        <div className="absolute right-3 bottom-3 z-20 flex flex-col items-center gap-2">
+          <button
+            type="button"
+            onClick={handleManualSave}
+            className={`flex h-9 w-9 items-center justify-center rounded-full shadow-lg transition ${
+              saveStatus === 'saving'
+                ? 'bg-amber-500 text-white'
+                : saveStatus === 'saved'
+                ? 'bg-emerald-500 text-white'
+                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+            }`}
+            title="保存 (Ctrl+S)"
+          >
+            <Save className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={openImagePicker}
+            className="flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800"
+            title="插入图片"
+          >
+            <ImagePlus className="h-5 w-5" />
+          </button>
+        </div>
+      )}
+
+      {/* Save status toast */}
+      {saveStatus === 'saved' && (
+        <div className="absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full bg-emerald-500 px-4 py-1.5 text-xs font-semibold text-white shadow-lg">
+          已保存
+        </div>
       )}
 
       {/* Image picker modal */}
