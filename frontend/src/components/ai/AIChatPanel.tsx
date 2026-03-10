@@ -90,8 +90,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   return (
     <div
       ref={panelRef}
-      className="fixed bottom-[5.5rem] right-6 z-50 flex w-80 flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl"
-      style={{ height: 420, maxHeight: 'calc(100vh - 120px)' }}
+      className="fixed bottom-[5.5rem] right-4 z-50 flex w-80 flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl"
+      style={{ height: 400, maxHeight: 'calc(100vh - 120px)' }}
     >
       {/* Header */}
       <div className="flex items-center justify-between rounded-t-2xl bg-slate-900 px-4 py-3">

@@ -58,6 +58,16 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([])
   const [loadingGallery, setLoadingGallery] = useState(false)
 
+  // Toggle body class to hide global FABs when image picker is open
+  useEffect(() => {
+    if (showImagePicker) {
+      document.body.classList.add('fab-hidden')
+    } else {
+      document.body.classList.remove('fab-hidden')
+    }
+    return () => { document.body.classList.remove('fab-hidden') }
+  }, [showImagePicker])
+
   useEffect(() => { latestSheetRef.current = sheet }, [sheet])
 
   // Stable sheet.id for mount — ONLY re-mount when sheet.id changes
@@ -269,15 +279,17 @@ export default function UniverSheetEditor({ workbookId, sheet }: Props) {
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
-      {/* Floating image insert button */}
-      <button
-        type="button"
-        onClick={openImagePicker}
-        className="absolute right-3 bottom-3 z-20 flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800"
-        title="插入图片"
-      >
-        <ImagePlus className="h-5 w-5" />
-      </button>
+      {/* Floating image insert button — hidden when picker is open */}
+      {!showImagePicker && (
+        <button
+          type="button"
+          onClick={openImagePicker}
+          className="absolute right-3 bottom-3 z-20 flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800"
+          title="插入图片"
+        >
+          <ImagePlus className="h-5 w-5" />
+        </button>
+      )}
 
       {/* Image picker modal */}
       {showImagePicker && (

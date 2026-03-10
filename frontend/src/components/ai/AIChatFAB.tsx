@@ -12,10 +12,10 @@ export default function AIChatFAB({ onClick, isOpen }: AIChatFABProps) {
     <button
       type="button"
       onClick={onClick}
-      className="fixed bottom-20 right-6 z-[60] flex h-12 w-12 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800 hover:scale-105 active:scale-95"
+      className="fixed bottom-20 right-4 z-[60] flex h-11 w-11 items-center justify-center rounded-full bg-slate-900/90 text-white shadow-lg backdrop-blur transition hover:bg-slate-800 hover:scale-105 active:scale-95"
       aria-label={isOpen ? '关闭 AI 助手' : '打开 AI 助手'}
     >
-      {isOpen ? <X className="h-5 w-5" /> : <Bot className="h-5 w-5" />}
+      {isOpen ? <X className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
     </button>
   )
 }
