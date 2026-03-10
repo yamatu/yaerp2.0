@@ -105,6 +105,21 @@ func (r *UserRepo) Update(id int64, req *model.UpdateUserRequest) error {
 	return nil
 }
 
+func (r *UserRepo) UpdatePassword(id int64, hashedPassword string) error {
+	result, err := r.db.Exec(
+		`UPDATE users SET password = $1, updated_at = $2 WHERE id = $3`,
+		hashedPassword, time.Now(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("update user password: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("user %d not found", id)
+	}
+	return nil
+}
+
 func (r *UserRepo) Delete(id int64) error {
 	result, err := r.db.Exec(`DELETE FROM users WHERE id = $1`, id)
 	if err != nil {
@@ -115,6 +130,18 @@ func (r *UserRepo) Delete(id int64) error {
 		return fmt.Errorf("user %d not found", id)
 	}
 	return nil
+}
+
+func (r *UserRepo) IsDefaultAdminUser(id int64) (bool, error) {
+	var username string
+	err := r.db.QueryRow(`SELECT username FROM users WHERE id = $1`, id).Scan(&username)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check default admin: %w", err)
+	}
+	return username == "admin", nil
 }
 
 func (r *UserRepo) List(page, size int) ([]model.User, int64, error) {

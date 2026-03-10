@@ -102,6 +102,8 @@ export default function HomePage() {
   const [assignmentMessage, setAssignmentMessage] = useState('')
   const [folderSearchQuery, setFolderSearchQuery] = useState('')
   const [folderPage, setFolderPage] = useState(1)
+  const [movingWorkbookId, setMovingWorkbookId] = useState<number | null>(null)
+  const [draggedWorkbookId, setDraggedWorkbookId] = useState<number | null>(null)
   const searchRef = useRef<HTMLDivElement>(null)
   const adminMode = isAdmin(profile)
   const workbookPageSize = adminMode ? 12 : 9
@@ -173,6 +175,9 @@ export default function HomePage() {
     const start = (folderPage - 1) * foldersPerPage
     return filteredFolders.slice(start, start + foldersPerPage)
   }, [filteredFolders, folderPage])
+  const currentFolderWorkbooks = useMemo(() => {
+    return [...contents.workbooks].sort((left, right) => right.updated_at.localeCompare(left.updated_at))
+  }, [contents.workbooks])
 
   useEffect(() => { setFolderPage(1) }, [folderSearchQuery])
   useEffect(() => {
@@ -223,10 +228,10 @@ export default function HomePage() {
     if (!newName.trim()) return
 
     try {
-      await api.post('/workbooks', { name: newName.trim() })
+      await api.post('/workbooks', { name: newName.trim(), folder_id: currentFolderId })
       setNewName('')
       setCreating(false)
-      await refresh()
+      await Promise.all([refresh(), refreshFolder()])
     } catch (err) {
       console.error('Failed to create workbook:', err)
     }
@@ -297,6 +302,28 @@ export default function HomePage() {
       await refresh()
     } catch (err) {
       console.error('Failed to rename workbook:', err)
+    }
+  }
+
+  const handleMoveWorkbookToFolder = async (workbookId: number, targetFolderId: number | null) => {
+    setMovingWorkbookId(workbookId)
+    try {
+      await moveWorkbook(workbookId, targetFolderId)
+      await refresh()
+    } catch (err) {
+      console.error('Failed to move workbook:', err)
+    } finally {
+      setMovingWorkbookId(null)
+    }
+  }
+
+  const handleDeleteFolder = async (folderId: number, folderName: string) => {
+    if (!confirm(`确定要删除文件夹「${folderName}」吗？文件夹中的工作簿会回到根目录。`)) return
+    try {
+      await deleteFolder(folderId)
+      await refresh()
+    } catch (err) {
+      console.error('Failed to delete folder:', err)
     }
   }
 
@@ -389,47 +416,6 @@ export default function HomePage() {
               </div>
             </div>
           </header>
-
-          {creating && (
-            <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
-              <div className="flex flex-col gap-4 lg:flex-row lg:items-end">
-                <div className="flex-1 space-y-2">
-                  <div className="text-sm font-semibold text-slate-800">创建新的业务工作簿</div>
-                  <p className="text-sm text-slate-500">
-                    可以从销售、采购、库存或人事主题开始，后续在工作表里逐步扩展字段与权限。
-                  </p>
-                  <input
-                    type="text"
-                    value={newName}
-                    onChange={(e) => setNewName(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleCreateWorkbook()}
-                    placeholder="例如：销售订单中心、员工台账"
-                    className="h-12 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
-                    autoFocus
-                  />
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleCreateWorkbook}
-                    className="inline-flex items-center justify-center rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
-                  >
-                    创建工作簿
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCreating(false)
-                      setNewName('')
-                    }}
-                    className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                  >
-                    取消
-                  </button>
-                </div>
-              </div>
-            </section>
-          )}
 
           {adminMode && (
             <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
@@ -572,6 +558,36 @@ export default function HomePage() {
               </div>
             )}
 
+            {creating && (
+              <div className="mb-4 flex items-center gap-3">
+                <FolderKanban className="h-5 w-5 text-sky-600" />
+                <input
+                  type="text"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newName.trim()) {
+                      void handleCreateWorkbook()
+                    }
+                    if (e.key === 'Escape') {
+                      setCreating(false)
+                      setNewName('')
+                    }
+                  }}
+                  placeholder={currentFolderId !== null ? '输入工作簿名称，按 Enter 创建到当前文件夹' : '输入工作簿名称，按 Enter 创建'}
+                  className="h-10 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={() => { setCreating(false); setNewName('') }}
+                  className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+
             {/* Folder list */}
             {contents.folders.length > 0 && (
               <div className="mb-4 space-y-3">
@@ -611,21 +627,101 @@ export default function HomePage() {
                 )}
                 <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-4">
                   {paginatedFolders.map((folder) => (
-                  <button
-                    key={folder.id}
-                    type="button"
-                    onClick={() => void navigateToFolder(folder.id)}
-                    className="group flex items-center gap-3 rounded-2xl border border-slate-200 bg-white/90 p-4 text-left transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-md"
-                  >
-                    <FolderIcon className="h-8 w-8 flex-shrink-0 text-amber-400" />
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-semibold text-slate-900">{folder.name}</div>
-                      <div className="text-xs text-slate-400">文件夹</div>
+                    <div
+                      key={folder.id}
+                      onDragOver={(event) => {
+                        if (draggedWorkbookId !== null) {
+                          event.preventDefault()
+                        }
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        if (draggedWorkbookId !== null) {
+                          void handleMoveWorkbookToFolder(draggedWorkbookId, folder.id)
+                          setDraggedWorkbookId(null)
+                        }
+                      }}
+                      className={`group rounded-2xl border bg-white/90 p-4 text-left transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-md ${
+                        draggedWorkbookId !== null ? 'border-dashed border-slate-300' : 'border-slate-200'
+                      }`}
+                    >
+                      <div className="mb-3 flex items-start justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void navigateToFolder(folder.id)}
+                          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                        >
+                          <FolderIcon className="h-8 w-8 flex-shrink-0 text-amber-400" />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-semibold text-slate-900">{folder.name}</div>
+                            <div className="text-xs text-slate-400">可拖入工作簿</div>
+                          </div>
+                          <ChevronRight className="h-4 w-4 flex-shrink-0 text-slate-300 transition group-hover:translate-x-0.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteFolder(folder.id, folder.name)}
+                          className="rounded-full p-1.5 text-slate-300 transition hover:bg-rose-50 hover:text-rose-600"
+                          title="删除文件夹"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
-                    <ChevronRight className="h-4 w-4 flex-shrink-0 text-slate-300 transition group-hover:translate-x-0.5" />
-                  </button>
-                ))}
+                  ))}
                 </div>
+              </div>
+            )}
+
+            {currentFolderId !== null && (
+              <div className="mb-6 space-y-3 rounded-[24px] border border-slate-200 bg-slate-50/70 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900">当前文件夹中的工作簿</div>
+                    <div className="text-xs text-slate-500">新建工作簿会直接进入这里，也可以把现有工作簿移进来。</div>
+                  </div>
+                  <div className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-500">
+                    {currentFolderWorkbooks.length} 个工作簿
+                  </div>
+                </div>
+
+                {currentFolderWorkbooks.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
+                    当前文件夹里还没有工作簿。你可以直接在这里新建，或从下方总列表把工作簿移入当前文件夹。
+                  </div>
+                ) : (
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+                    {currentFolderWorkbooks.map((workbook) => (
+                      <div
+                        key={`folder-${workbook.id}`}
+                        draggable
+                        onDragStart={() => setDraggedWorkbookId(workbook.id)}
+                        onDragEnd={() => setDraggedWorkbookId(null)}
+                        className="rounded-[20px] border border-slate-200 bg-white p-4 shadow-sm"
+                      >
+                        <button type="button" onClick={() => router.push(`/sheets/${workbook.id}`)} className="w-full text-left">
+                          <div className="flex items-center gap-2 text-xs text-slate-500">
+                            <FolderKanban className="h-3.5 w-3.5 text-sky-600" />
+                            工作簿 #{workbook.id}
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-slate-950">{workbook.name}</div>
+                          <div className="mt-1 text-sm text-slate-500">{workbook.description?.trim() || '当前文件夹内的工作簿'}</div>
+                        </button>
+                        <div className="mt-4 flex items-center justify-between gap-3">
+                          <div className="text-xs text-slate-400">更新于 {new Date(workbook.updated_at).toLocaleString('zh-CN')}</div>
+                          <button
+                            type="button"
+                            onClick={() => handleMoveWorkbookToFolder(workbook.id, null)}
+                            disabled={movingWorkbookId === workbook.id}
+                            className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {movingWorkbookId === workbook.id ? '处理中...' : '移出文件夹'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -756,11 +852,14 @@ export default function HomePage() {
                         </span>
                       </div>
                     )}
-                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
                       {group.items.map((workbook) => (
                         <div
                           key={workbook.id}
-                          className="group relative rounded-[26px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)]"
+                          draggable
+                          onDragStart={() => setDraggedWorkbookId(workbook.id)}
+                          onDragEnd={() => setDraggedWorkbookId(null)}
+                          className="group relative rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)]"
                         >
                           {adminMode && (
                             <div className="absolute right-3 top-3 flex gap-1 opacity-0 transition group-hover:opacity-100">
@@ -816,19 +915,41 @@ export default function HomePage() {
                                 </span>
                               )}
                             </div>
-                            <h3 className="text-xl font-semibold text-slate-950">{workbook.name}</h3>
-                            <p className="mt-2 min-h-[48px] text-sm leading-6 text-slate-500">
+                            <h3 className="text-lg font-semibold text-slate-950">{workbook.name}</h3>
+                            <p className="mt-2 min-h-[40px] text-sm leading-6 text-slate-500">
                               {workbook.description?.trim() || '进入后可添加多个工作表，并继续扩展字段、权限和自动化流程。'}
                             </p>
                             <div className="mt-5 space-y-1 text-sm text-slate-500">
                               <div>创建于 {new Date(workbook.created_at).toLocaleDateString('zh-CN')}</div>
                               <div>更新于 {new Date(workbook.updated_at).toLocaleString('zh-CN')}</div>
                             </div>
-                            <div className="mt-5 flex items-center justify-end text-sm font-medium text-sky-700">
+                          </button>
+                          <div className="mt-5 flex items-center justify-between gap-3">
+                            {currentFolderId !== null && (
+                              workbook.folder_id === currentFolderId ? (
+                                <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                                  已在当前文件夹
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleMoveWorkbookToFolder(workbook.id, currentFolderId)}
+                                  disabled={movingWorkbookId === workbook.id}
+                                  className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  {movingWorkbookId === workbook.id ? '移动中...' : '移入当前文件夹'}
+                                </button>
+                              )
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => router.push(`/sheets/${workbook.id}`)}
+                              className="ml-auto inline-flex items-center text-sm font-medium text-sky-700"
+                            >
                               打开
                               <ArrowRight className="ml-1 h-4 w-4 transition group-hover:translate-x-0.5" />
-                            </div>
-                          </button>
+                            </button>
+                          </div>
                         </div>
                       ))}
                     </div>

@@ -117,14 +117,6 @@ export default function LoginPage() {
                 </div>
               </div>
 
-              <div className="mb-6 rounded-[22px] border border-amber-100 bg-amber-50/80 p-4 text-sm text-amber-900">
-                <div className="font-semibold">本地默认管理员账号</div>
-                <div className="mt-2 flex flex-wrap gap-2 text-xs font-medium">
-                  <span className="rounded-full bg-white px-3 py-1 text-slate-700">用户名：admin</span>
-                  <span className="rounded-full bg-white px-3 py-1 text-slate-700">密码：admin123</span>
-                </div>
-              </div>
-
               {error && (
                 <div className="mb-5 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">
                   {error}
@@ -170,7 +162,7 @@ export default function LoginPage() {
             </div>
 
             <div className="rounded-[24px] border border-slate-200 bg-white/80 p-5 text-sm leading-7 text-slate-500 shadow-sm">
-              如需新增员工账号，请先使用管理员登录，再进入首页的“员工账号”模块进行统一创建与权限分配。
+              如需新增或重置员工账号，请联系系统管理员在后台统一创建与分配权限。
             </div>
           </div>
         </section>

@@ -117,6 +117,7 @@ func main() {
 	{
 		api.GET("/auth/me", authHandler.Me)
 		api.POST("/auth/logout", authHandler.Logout)
+		api.POST("/auth/change-password", authHandler.ChangePassword)
 
 		// Workbooks
 		api.GET("/workbooks", sheetHandler.ListWorkbooks)
@@ -177,6 +178,7 @@ func main() {
 			admin.PUT("/users/:id", userHandler.UpdateUser)
 			admin.DELETE("/users/:id", userHandler.DeleteUser)
 			admin.POST("/users/:id/roles", userHandler.AssignRoles)
+			admin.POST("/users/:id/password", userHandler.ResetPassword)
 
 			// Roles
 			admin.GET("/roles", roleHandler.ListRoles)

@@ -6,11 +6,11 @@ import type { IWorkbookData, IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
+import { UniverSheetsDrawingPreset } from '@univerjs/preset-sheets-drawing'
 import { UniverSheetsFilterPreset } from '@univerjs/preset-sheets-filter'
 import UniverPresetSheetsFilterZhCN from '@univerjs/preset-sheets-filter/locales/zh-CN'
 import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-replace'
 import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
-import { UniverSheetsDrawingUIPlugin } from '@univerjs/sheets-drawing-ui'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
@@ -84,6 +84,18 @@ function escapeHtml(value: string) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;')
+}
+
+async function toImageFile(img: GalleryImage): Promise<File> {
+  const response = await fetch(img.url)
+  if (!response.ok) {
+    throw new Error('读取图库图片失败，请确认图片仍可访问。')
+  }
+
+  const blob = await response.blob()
+  const extension = blob.type.split('/')[1] || 'png'
+  const normalizedName = img.filename || `gallery-image.${extension}`
+  return new File([blob], normalizedName, { type: blob.type || 'image/png' })
 }
 
 export default function UniverSheetEditor({ workbookId, sheet, onExternalReload }: Props) {
@@ -529,10 +541,10 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
               contextMenu: true,
               footer: false,
             }),
+            UniverSheetsDrawingPreset(),
             UniverSheetsFilterPreset(),
             UniverSheetsFindReplacePreset(),
           ],
-          plugins: [UniverSheetsDrawingUIPlugin],
         })
 
         const { univer, univerAPI } = univerResult
@@ -647,9 +659,11 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
         throw new Error('请先选中要插入图片的单元格。')
       }
 
+      const imageFile = await toImageFile(img)
+
       const inserted = await (range as typeof range & {
-        insertCellImageAsync?: (file: string) => Promise<boolean>
-      }).insertCellImageAsync?.(img.url)
+        insertCellImageAsync?: (file: File | string) => Promise<boolean>
+      }).insertCellImageAsync?.(imageFile)
       if (!inserted) {
         throw new Error('图片插入失败，请确认当前工作表已启用图片能力。')
       }
@@ -670,22 +684,33 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
     try {
       const res = await api.upload(file)
       if (res.code === 0 && res.data) {
-        // Get the URL for the uploaded file
         const urlRes = await api.get<{ url: string }>(`/files/${res.data.id}`)
         if (urlRes.code === 0 && urlRes.data) {
-          await insertImageToCell({
-            id: res.data.id,
-            filename: file.name,
-            url: urlRes.data.url,
-            size: file.size,
-          })
+          const result = univerApiRef.current
+          const { univerAPI } = result || {}
+          const wb = univerAPI?.getActiveWorkbook?.()
+          const ws = wb?.getActiveSheet?.()
+          const range = ws?.getActiveRange?.() || ws?.getSelection?.()?.getActiveRange?.()
+          if (!ws || !range) {
+            throw new Error('请先选中要插入图片的单元格。')
+          }
+
+          const inserted = await (range as typeof range & {
+            insertCellImageAsync?: (file: File | string) => Promise<boolean>
+          }).insertCellImageAsync?.(file)
+          if (!inserted) {
+            throw new Error('本地图片插入失败，请稍后重试。')
+          }
+
+          await handleManualSave()
+          setShowImagePicker(false)
         }
       }
     } catch (err) {
       console.error('Upload failed:', err)
-      setActionError('上传图片失败，请稍后再试。')
+      setActionError(err instanceof Error ? err.message : '上传图片失败，请稍后再试。')
     }
-  }, [insertImageToCell])
+  }, [handleManualSave])
 
   const handlePrintSheet = useCallback((mode: 'print' | 'pdf') => {
     try {

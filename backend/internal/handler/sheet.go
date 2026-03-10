@@ -51,6 +51,7 @@ func (h *SheetHandler) CreateWorkbook(c *gin.Context) {
 		Name:        req.Name,
 		Description: &req.Description,
 		OwnerID:     userID,
+		FolderID:    req.FolderID,
 		IsTemplate:  req.IsTemplate,
 	}
 	if err := h.sheetService.CreateWorkbook(wb); err != nil {

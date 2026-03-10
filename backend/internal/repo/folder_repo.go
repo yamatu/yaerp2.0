@@ -114,14 +114,18 @@ func (r *FolderRepo) ListWorkbooksInFolder(folderID *int64) ([]model.Workbook, e
 
 	if folderID == nil {
 		queryRows, err = r.db.Query(
-			`SELECT id, name, description, owner_id, created_at, updated_at
-			 FROM workbooks WHERE folder_id IS NULL
+			`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+			 FROM workbooks w
+			 LEFT JOIN users u ON u.id = w.owner_id
+			 WHERE w.folder_id IS NULL
 			 ORDER BY name`,
 		)
 	} else {
 		queryRows, err = r.db.Query(
-			`SELECT id, name, description, owner_id, created_at, updated_at
-			 FROM workbooks WHERE folder_id = $1
+			`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+			 FROM workbooks w
+			 LEFT JOIN users u ON u.id = w.owner_id
+			 WHERE w.folder_id = $1
 			 ORDER BY name`, *folderID,
 		)
 	}
@@ -133,7 +137,7 @@ func (r *FolderRepo) ListWorkbooksInFolder(folderID *int64) ([]model.Workbook, e
 	wbs := make([]model.Workbook, 0)
 	for queryRows.Next() {
 		var wb model.Workbook
-		if err := queryRows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
+		if err := queryRows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan workbook: %w", err)
 		}
 		wbs = append(wbs, wb)

@@ -32,10 +32,10 @@ func (r *SheetRepo) CreateWorkbook(wb *model.Workbook) error {
 		status = 1
 	}
 	err := r.db.QueryRow(
-		`INSERT INTO workbooks (name, description, owner_id, metadata, is_template, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO workbooks (name, description, owner_id, folder_id, metadata, is_template, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id`,
-		wb.Name, wb.Description, wb.OwnerID, metadata, wb.IsTemplate, status, now, now,
+		wb.Name, wb.Description, wb.OwnerID, wb.FolderID, metadata, wb.IsTemplate, status, now, now,
 	).Scan(&wb.ID)
 	if err != nil {
 		return fmt.Errorf("create workbook: %w", err)
@@ -50,11 +50,11 @@ func (r *SheetRepo) CreateWorkbook(wb *model.Workbook) error {
 func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	var wb model.Workbook
 	err := r.db.QueryRow(
-		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id
 		 WHERE w.id = $1`, id,
-	).Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt)
+	).Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("workbook %d not found", id)
 	}
@@ -78,7 +78,7 @@ func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workb
 	}
 
 	offset := (page - 1) * size
-	query := `SELECT w.id, w.name, w.description, w.owner_id, u.username, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+	query := `SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id`
 	args := make([]interface{}, 0, 3)
@@ -100,7 +100,7 @@ func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workb
 	wbs := make([]model.Workbook, 0)
 	for rows.Next() {
 		var wb model.Workbook
-		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
+		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
 			return nil, 0, fmt.Errorf("scan workbook: %w", err)
 		}
 		wbs = append(wbs, wb)
