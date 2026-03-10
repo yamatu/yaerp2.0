@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -52,4 +53,26 @@ func (h *BackupHandler) DownloadCombined(c *gin.Context) {
 	filename := fmt.Sprintf("yaerp_backup_%s.tar.gz", time.Now().Format("20060102_150405"))
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	c.Data(http.StatusOK, "application/gzip", data)
+}
+
+func (h *BackupHandler) RestoreDatabase(c *gin.Context) {
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "restore file is required"})
+		return
+	}
+	defer file.Close()
+
+	payload, err := io.ReadAll(file)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": -1, "message": "failed to read restore file"})
+		return
+	}
+
+	if err := h.backupService.RestoreDatabase(header.Filename, payload); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "database restored successfully"})
 }

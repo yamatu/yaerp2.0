@@ -4,35 +4,34 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"strings"
+	"sync"
 	"time"
 
 	"yaerp/config"
+	"yaerp/migrations"
 )
 
 type BackupService struct {
-	cfg *config.Config
+	cfg       *config.Config
+	db        *sql.DB
+	restoreMu sync.Mutex
 }
 
-func NewBackupService(cfg *config.Config) *BackupService {
-	return &BackupService{cfg: cfg}
+func NewBackupService(cfg *config.Config, db *sql.DB) *BackupService {
+	return &BackupService{cfg: cfg, db: db}
 }
 
 // DumpDatabase runs pg_dump and returns the SQL dump as bytes.
 func (s *BackupService) DumpDatabase() ([]byte, error) {
-	args := []string{
-		"-h", s.cfg.Postgres.Host,
-		"-p", fmt.Sprintf("%d", s.cfg.Postgres.Port),
-		"-U", s.cfg.Postgres.User,
-		"-d", s.cfg.Postgres.DB,
-		"--no-password",
-	}
-
-	cmd := exec.Command("pg_dump", args...)
-	cmd.Env = append(cmd.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
-
+	cmd := exec.Command("pg_dump", s.baseCommandArgs("--no-password")...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -42,6 +41,37 @@ func (s *BackupService) DumpDatabase() ([]byte, error) {
 	}
 
 	return stdout.Bytes(), nil
+}
+
+func (s *BackupService) RestoreDatabase(filename string, payload []byte) error {
+	s.restoreMu.Lock()
+	defer s.restoreMu.Unlock()
+
+	sqlDump, err := extractRestoreSQL(filename, payload)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(sqlDump)) == 0 {
+		return fmt.Errorf("restore file does not contain SQL data")
+	}
+
+	resetSQL := []byte(`DROP SCHEMA IF EXISTS public CASCADE;
+CREATE SCHEMA public;
+GRANT ALL ON SCHEMA public TO CURRENT_USER;
+GRANT ALL ON SCHEMA public TO PUBLIC;`)
+	if err := s.runPSQL(resetSQL); err != nil {
+		return fmt.Errorf("reset database failed: %w", err)
+	}
+
+	if err := s.runPSQL(sqlDump); err != nil {
+		return fmt.Errorf("restore database failed: %w", err)
+	}
+
+	if err := migrations.Apply(s.db); err != nil {
+		return fmt.Errorf("apply migrations after restore failed: %w", err)
+	}
+
+	return nil
 }
 
 // ExportConfig returns a JSON representation of non-sensitive configuration.
@@ -122,4 +152,95 @@ func addToTar(tw *tar.Writer, name string, data []byte) error {
 		return fmt.Errorf("write tar data for %s: %w", name, err)
 	}
 	return nil
+}
+
+func (s *BackupService) baseCommandArgs(extraArgs ...string) []string {
+	args := []string{
+		"-h", s.cfg.Postgres.Host,
+		"-p", fmt.Sprintf("%d", s.cfg.Postgres.Port),
+		"-U", s.cfg.Postgres.User,
+		"-d", s.cfg.Postgres.DB,
+	}
+	return append(args, extraArgs...)
+}
+
+func (s *BackupService) runPSQL(input []byte) error {
+	cmd := exec.Command("psql", s.baseCommandArgs("--no-password", "-v", "ON_ERROR_STOP=1", "-f", "-")...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
+	cmd.Stdin = bytes.NewReader(input)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("psql failed: %s: %w", stderr.String(), err)
+	}
+
+	return nil
+}
+
+func extractRestoreSQL(filename string, payload []byte) ([]byte, error) {
+	lowerName := strings.ToLower(filename)
+
+	switch {
+	case strings.HasSuffix(lowerName, ".tar.gz") || strings.HasSuffix(lowerName, ".tgz"):
+		return extractSQLFromTarGz(payload)
+	case strings.HasSuffix(lowerName, ".sql.gz") || strings.HasSuffix(lowerName, ".gz"):
+		return gunzipBytes(payload)
+	case strings.HasSuffix(lowerName, ".sql"):
+		return payload, nil
+	default:
+		if bytes.HasPrefix(payload, []byte{0x1f, 0x8b}) {
+			return gunzipBytes(payload)
+		}
+		return payload, nil
+	}
+}
+
+func gunzipBytes(payload []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("open gzip: %w", err)
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read gzip content: %w", err)
+	}
+
+	return data, nil
+}
+
+func extractSQLFromTarGz(payload []byte) ([]byte, error) {
+	gzReader, err := gzip.NewReader(bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("open backup archive: %w", err)
+	}
+	defer gzReader.Close()
+
+	tarReader := tar.NewReader(gzReader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read backup archive: %w", err)
+		}
+		if header == nil || header.Typeflag != tar.TypeReg {
+			continue
+		}
+
+		name := strings.ToLower(header.Name)
+		if name == "database.sql" || strings.HasSuffix(name, ".sql") {
+			data, err := io.ReadAll(tarReader)
+			if err != nil {
+				return nil, fmt.Errorf("read sql from backup archive: %w", err)
+			}
+			return data, nil
+		}
+	}
+
+	return nil, fmt.Errorf("database.sql not found in backup archive")
 }

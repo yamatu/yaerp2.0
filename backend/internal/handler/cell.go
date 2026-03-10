@@ -47,13 +47,13 @@ func (h *CellHandler) BatchUpdate(c *gin.Context) {
 		}
 
 		if !isAdmin {
-			locked, err := h.sheetService.IsCellLocked(change.SheetID, change.Row, change.Col)
+			protected, reason, err := h.sheetService.CheckProtection(change.SheetID, change.Row, change.Col, userID)
 			if err != nil {
 				response.ServerError(c, err.Error())
 				return
 			}
-			if locked {
-				response.Forbidden(c, fmt.Sprintf("cell %s%d is locked", change.Col, change.Row+1))
+			if protected {
+				response.Forbidden(c, reason)
 				return
 			}
 		}
@@ -93,6 +93,16 @@ func (h *CellHandler) InsertRow(c *gin.Context) {
 		return
 	}
 
+	protected, reason, err := h.sheetService.CheckProtection(sheetID, body.AfterRow, "", userID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	if protected {
+		response.Forbidden(c, reason)
+		return
+	}
+
 	if err := h.sheetService.InsertRow(sheetID, body.AfterRow); err != nil {
 		response.ServerError(c, err.Error())
 		return
@@ -122,6 +132,16 @@ func (h *CellHandler) DeleteRow(c *gin.Context) {
 	}
 	if !allowed {
 		response.Forbidden(c, "no permission to delete rows")
+		return
+	}
+
+	protected, reason, err := h.sheetService.CheckProtection(sheetID, rowIndex, "", userID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	if protected {
+		response.Forbidden(c, reason)
 		return
 	}
 

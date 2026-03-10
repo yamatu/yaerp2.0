@@ -27,6 +27,7 @@ interface SheetOption {
   id: number
   name: string
   workbookName: string
+  columns: string[]
 }
 
 interface SheetPermission {
@@ -83,7 +84,12 @@ export default function PermissionsPage() {
         const wbDetail = await api.get<Workbook>(`/workbooks/${wb.id}`)
         if (wbDetail.code === 0 && wbDetail.data?.sheets) {
           for (const s of wbDetail.data.sheets) {
-            allSheets.push({ id: s.id, name: s.name, workbookName: wb.name })
+            allSheets.push({
+              id: s.id,
+              name: s.name,
+              workbookName: wb.name,
+              columns: Array.isArray(s.columns) ? s.columns.map((column) => column.key) : [],
+            })
           }
         }
       }
@@ -104,27 +110,27 @@ export default function PermissionsPage() {
   const fetchPermissions = useCallback(async () => {
     if (!selectedSheet || !selectedRole) return
     try {
-      // GetPermissionMatrix is per-user, but we can use it to see current state
-      // For admin config we read from the sheet permission endpoint
       const res = await api.get<{
         sheet: { canView: boolean; canEdit: boolean; canDelete: boolean; canExport: boolean }
         columns: Record<string, string>
         cells: Record<string, string>
-      }>(`/sheets/${selectedSheet}/permissions`)
+      }>(`/permissions/sheets/${selectedSheet}/roles/${selectedRole}`)
 
       if (res.code === 0 && res.data) {
+        const selectedSheetOption = sheetOptions.find((item) => item.id === selectedSheet)
+        const availableColumns = selectedSheetOption?.columns || []
         setSheetPermission({
           can_view: res.data.sheet.canView ?? false,
           can_edit: res.data.sheet.canEdit ?? false,
           can_delete: res.data.sheet.canDelete ?? false,
           can_export: res.data.sheet.canExport ?? false,
         })
-        // Convert columns map to array
-        const colEntries = Object.entries(res.data.columns || {})
-        setColumnPerms(colEntries.map(([key, perm]) => ({
-          column_key: key,
-          permission: perm as 'read' | 'write' | 'none',
-        })))
+        setColumnPerms(
+          availableColumns.map((key) => ({
+            column_key: key,
+            permission: (res.data?.columns?.[key] as 'read' | 'write' | 'none' | undefined) || 'none',
+          }))
+        )
         return
       }
       setSheetPermission(defaultSheetPermission)
@@ -133,7 +139,7 @@ export default function PermissionsPage() {
       setSheetPermission(defaultSheetPermission)
       setColumnPerms([])
     }
-  }, [selectedSheet, selectedRole])
+  }, [selectedSheet, selectedRole, sheetOptions])
 
   useEffect(() => { fetchPermissions() }, [fetchPermissions])
 
@@ -143,12 +149,12 @@ export default function PermissionsPage() {
     setError('')
     setSuccess('')
     try {
-      // Backend uses POST /permissions/sheet with body { sheet_id, role_id, can_view, ... }
       await api.post('/permissions/sheet', {
         sheet_id: selectedSheet,
         role_id: selectedRole,
         ...sheetPermission,
       })
+      await fetchPermissions()
       setSuccess('工作表权限已保存')
       setTimeout(() => setSuccess(''), 2000)
     } catch (err) {
@@ -173,13 +179,13 @@ export default function PermissionsPage() {
     setError('')
     setSuccess('')
     try {
-      // Backend uses POST /permissions/cell with body { sheet_id, role_id, column_key, permission }
       await api.post('/permissions/cell', {
         sheet_id: selectedSheet,
         role_id: selectedRole,
         column_key: col.column_key,
         permission: col.permission,
       })
+      await fetchPermissions()
       setSuccess(`列 ${col.column_key} 权限已保存`)
       setTimeout(() => setSuccess(''), 2000)
     } catch (err) {
@@ -204,6 +210,7 @@ export default function PermissionsPage() {
           permission: col.permission,
         })
       }
+      await fetchPermissions()
       setSuccess('全部列权限已保存')
       setTimeout(() => setSuccess(''), 2000)
     } catch (err) {

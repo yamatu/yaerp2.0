@@ -10,6 +10,7 @@ type Workbook struct {
 	Name        string          `json:"name" db:"name"`
 	Description *string         `json:"description" db:"description"`
 	OwnerID     int64           `json:"owner_id" db:"owner_id"`
+	OwnerName   *string         `json:"owner_name,omitempty" db:"owner_name"`
 	Metadata    json.RawMessage `json:"metadata" db:"metadata"`
 	IsTemplate  bool            `json:"is_template" db:"is_template"`
 	Status      int             `json:"status" db:"status"`
@@ -50,6 +51,33 @@ type CreateWorkbookRequest struct {
 type UpdateWorkbookRequest struct {
 	Name        *string `json:"name"`
 	Description *string `json:"description"`
+}
+
+type AssignWorkbookRequest struct {
+	UserIDs []int64 `json:"user_ids" binding:"required,min=1"`
+}
+
+type UpdateProtectionRequest struct {
+	Scope     string  `json:"scope" binding:"required,oneof=row column cell"`
+	Action    string  `json:"action" binding:"required,oneof=lock unlock"`
+	RowIndex  *int    `json:"row_index,omitempty"`
+	ColumnKey *string `json:"column_key,omitempty"`
+}
+
+type ProtectionInfo struct {
+	Scope       string    `json:"scope"`
+	Key         string    `json:"key"`
+	RowIndex    *int      `json:"row_index,omitempty"`
+	ColumnKey   *string   `json:"column_key,omitempty"`
+	OwnerID     int64     `json:"owner_id"`
+	OwnerName   string    `json:"owner_name"`
+	ProtectedAt time.Time `json:"protected_at"`
+}
+
+type ProtectionSnapshot struct {
+	Rows    []ProtectionInfo `json:"rows"`
+	Columns []ProtectionInfo `json:"columns"`
+	Cells   []ProtectionInfo `json:"cells"`
 }
 
 type CreateSheetRequest struct {

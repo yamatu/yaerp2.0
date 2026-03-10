@@ -64,3 +64,25 @@ func (h *PermissionHandler) GetPermissionMatrix(c *gin.Context) {
 
 	response.OK(c, matrix)
 }
+
+func (h *PermissionHandler) GetPermissionMatrixForRole(c *gin.Context) {
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	roleID, err := strconv.ParseInt(c.Param("roleId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid role id")
+		return
+	}
+
+	matrix, err := h.permService.GetPermissionMatrixForRole(sheetID, roleID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	response.OK(c, matrix)
+}

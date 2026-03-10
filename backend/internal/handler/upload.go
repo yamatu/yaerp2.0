@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"errors"
+	"fmt"
+	"net/http"
 	"strconv"
 
 	"yaerp/internal/service"
@@ -50,6 +53,29 @@ func (h *UploadHandler) GetFile(c *gin.Context) {
 	}
 
 	response.OK(c, gin.H{"url": url})
+}
+
+func (h *UploadHandler) ServeFile(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid file id")
+		return
+	}
+
+	attachment, reader, err := h.uploadService.OpenFile(id, c.Query("signature"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidFileSignature):
+			response.Forbidden(c, "invalid file signature")
+		default:
+			response.NotFound(c, err.Error())
+		}
+		return
+	}
+	defer reader.Close()
+
+	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", attachment.Filename))
+	c.DataFromReader(http.StatusOK, attachment.Size, attachment.MimeType, reader, nil)
 }
 
 func (h *UploadHandler) ListImages(c *gin.Context) {

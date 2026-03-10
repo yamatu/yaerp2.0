@@ -9,8 +9,10 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@univerjs/presets": "^0.6.2",
     "@univerjs/preset-sheets-core": "^0.6.2",
+    "@univerjs/preset-sheets-find-replace": "^0.6.10",
+    "@univerjs/presets": "^0.6.2",
+    "@univerjs/sheets-drawing-ui": "^0.6.10",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.460.0",

@@ -23,15 +23,25 @@ func NewSheetRepo(db *sql.DB) *SheetRepo {
 
 func (r *SheetRepo) CreateWorkbook(wb *model.Workbook) error {
 	now := time.Now()
+	metadata := wb.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage(`{}`)
+	}
+	status := wb.Status
+	if status == 0 {
+		status = 1
+	}
 	err := r.db.QueryRow(
-		`INSERT INTO workbooks (name, description, owner_id, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO workbooks (name, description, owner_id, metadata, is_template, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING id`,
-		wb.Name, wb.Description, wb.OwnerID, now, now,
+		wb.Name, wb.Description, wb.OwnerID, metadata, wb.IsTemplate, status, now, now,
 	).Scan(&wb.ID)
 	if err != nil {
 		return fmt.Errorf("create workbook: %w", err)
 	}
+	wb.Metadata = metadata
+	wb.Status = status
 	wb.CreatedAt = now
 	wb.UpdatedAt = now
 	return nil
@@ -40,9 +50,11 @@ func (r *SheetRepo) CreateWorkbook(wb *model.Workbook) error {
 func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	var wb model.Workbook
 	err := r.db.QueryRow(
-		`SELECT id, name, description, owner_id, created_at, updated_at
-		 FROM workbooks WHERE id = $1`, id,
-	).Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.CreatedAt, &wb.UpdatedAt)
+		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+		 FROM workbooks w
+		 LEFT JOIN users u ON u.id = w.owner_id
+		 WHERE w.id = $1`, id,
+	).Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("workbook %d not found", id)
 	}
@@ -52,21 +64,34 @@ func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	return &wb, nil
 }
 
-func (r *SheetRepo) ListWorkbooks(ownerID int64, page, size int) ([]model.Workbook, int64, error) {
+func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workbook, int64, error) {
 	var total int64
-	err := r.db.QueryRow(
-		`SELECT COUNT(*) FROM workbooks WHERE owner_id = $1`, ownerID,
-	).Scan(&total)
+	countQuery := `SELECT COUNT(*) FROM workbooks`
+	countArgs := make([]interface{}, 0, 1)
+	if ownerID != nil {
+		countQuery += ` WHERE owner_id = $1`
+		countArgs = append(countArgs, *ownerID)
+	}
+	err := r.db.QueryRow(countQuery, countArgs...).Scan(&total)
 	if err != nil {
 		return nil, 0, fmt.Errorf("count workbooks: %w", err)
 	}
 
 	offset := (page - 1) * size
-	rows, err := r.db.Query(
-		`SELECT id, name, description, owner_id, created_at, updated_at
-		 FROM workbooks WHERE owner_id = $1
-		 ORDER BY id LIMIT $2 OFFSET $3`, ownerID, size, offset,
-	)
+	query := `SELECT w.id, w.name, w.description, w.owner_id, u.username, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+		 FROM workbooks w
+		 LEFT JOIN users u ON u.id = w.owner_id`
+	args := make([]interface{}, 0, 3)
+	if ownerID != nil {
+		query += ` WHERE w.owner_id = $1`
+		args = append(args, *ownerID)
+		query += ` ORDER BY w.updated_at DESC, w.id DESC LIMIT $2 OFFSET $3`
+		args = append(args, size, offset)
+	} else {
+		query += ` ORDER BY w.updated_at DESC, w.id DESC LIMIT $1 OFFSET $2`
+		args = append(args, size, offset)
+	}
+	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list workbooks: %w", err)
 	}
@@ -75,7 +100,7 @@ func (r *SheetRepo) ListWorkbooks(ownerID int64, page, size int) ([]model.Workbo
 	wbs := make([]model.Workbook, 0)
 	for rows.Next() {
 		var wb model.Workbook
-		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
+		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
 			return nil, 0, fmt.Errorf("scan workbook: %w", err)
 		}
 		wbs = append(wbs, wb)
@@ -121,18 +146,40 @@ func (r *SheetRepo) DeleteWorkbook(id int64) error {
 
 func (r *SheetRepo) CreateSheet(s *model.Sheet) error {
 	now := time.Now()
+	frozen := s.Frozen
+	if len(frozen) == 0 {
+		frozen = json.RawMessage(`{"row":0,"col":0}`)
+	}
+	config := s.Config
+	if len(config) == 0 {
+		config = json.RawMessage(`{}`)
+	}
 	err := r.db.QueryRow(
-		`INSERT INTO sheets (workbook_id, name, sort_order, columns, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING id, frozen, config`,
-		s.WorkbookID, s.Name, s.SortOrder, s.Columns, now, now,
-	).Scan(&s.ID, &s.Frozen, &s.Config)
+		`INSERT INTO sheets (workbook_id, name, sort_order, columns, frozen, config, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 RETURNING id`,
+		s.WorkbookID, s.Name, s.SortOrder, s.Columns, frozen, config, now, now,
+	).Scan(&s.ID)
 	if err != nil {
 		return fmt.Errorf("create sheet: %w", err)
 	}
+	s.Frozen = frozen
+	s.Config = config
 	s.CreatedAt = now
 	s.UpdatedAt = now
 	return nil
+}
+
+func (r *SheetRepo) GetNextSheetSortOrder(workbookID int64) (int, error) {
+	var nextSortOrder int
+	err := r.db.QueryRow(
+		`SELECT COALESCE(MAX(sort_order), -1) + 1 FROM sheets WHERE workbook_id = $1`,
+		workbookID,
+	).Scan(&nextSortOrder)
+	if err != nil {
+		return 0, fmt.Errorf("get next sheet sort order: %w", err)
+	}
+	return nextSortOrder, nil
 }
 
 func (r *SheetRepo) GetSheet(id int64) (*model.Sheet, error) {

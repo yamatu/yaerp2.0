@@ -26,6 +26,7 @@ export interface Workbook {
   name: string
   description?: string
   owner_id: number
+  owner_name?: string
   metadata: Record<string, unknown>
   is_template: boolean
   status: number
@@ -49,9 +50,37 @@ export interface Sheet {
 export interface SheetConfig {
   zoom?: number
   lockedCells?: Record<string, boolean>
+  protections?: {
+    rows?: Record<string, ProtectionOwner>
+    columns?: Record<string, ProtectionOwner>
+    cells?: Record<string, ProtectionOwner>
+  }
   mergedCells?: MergedCellRange[]
   advancedFilter?: AdvancedFilterConfig
   univerSheetData?: unknown
+  univerStyles?: unknown
+}
+
+export interface ProtectionOwner {
+  ownerId: number
+  ownerName: string
+  protectedAt: string
+}
+
+export interface ProtectionInfo {
+  scope: 'row' | 'column' | 'cell'
+  key: string
+  row_index?: number
+  column_key?: string
+  owner_id: number
+  owner_name: string
+  protected_at: string
+}
+
+export interface ProtectionSnapshot {
+  rows: ProtectionInfo[]
+  columns: ProtectionInfo[]
+  cells: ProtectionInfo[]
 }
 
 export interface MergedCellRange {
@@ -113,7 +142,7 @@ export interface CellStyle {
 }
 
 export interface CellRecord {
-  value: unknown
+  value?: unknown
   style?: CellStyle
 }
 
@@ -199,4 +228,28 @@ export interface AIConfigStatus {
   configured: boolean
   endpoint: string
   model: string
+}
+
+export interface AISpreadsheetOperation {
+  kind?: 'update_cell' | 'insert_row' | 'insert_column' | 'fill_formula'
+  sheet_id: number
+  sheet_name: string
+  row?: number
+  column_key?: string
+  column_name?: string
+  current_value?: unknown
+  value: unknown
+  reason?: string
+  row_values?: Record<string, unknown>
+  column_type?: string
+  insert_after_column_key?: string
+  start_row?: number
+  end_row?: number
+  formula_template?: string
+}
+
+export interface AISpreadsheetPlanResponse {
+  reply: string
+  model: string
+  operations: AISpreadsheetOperation[]
 }

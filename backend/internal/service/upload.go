@@ -2,7 +2,13 @@ package service
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"path/filepath"
 	"time"
@@ -15,12 +21,16 @@ import (
 type UploadService struct {
 	minioClient    *miniopkg.Client
 	attachmentRepo *repo.AttachmentRepo
+	fileURLSecret  string
 }
 
-func NewUploadService(minioClient *miniopkg.Client, attachmentRepo *repo.AttachmentRepo) *UploadService {
+var ErrInvalidFileSignature = errors.New("invalid file signature")
+
+func NewUploadService(minioClient *miniopkg.Client, attachmentRepo *repo.AttachmentRepo, fileURLSecret string) *UploadService {
 	return &UploadService{
 		minioClient:    minioClient,
 		attachmentRepo: attachmentRepo,
+		fileURLSecret:  fileURLSecret,
 	}
 }
 
@@ -52,18 +62,11 @@ func (s *UploadService) Upload(file multipart.File, header *multipart.FileHeader
 }
 
 func (s *UploadService) GetFileURL(attachmentID int64) (string, error) {
-	attachment, err := s.attachmentRepo.GetByID(attachmentID)
-	if err != nil {
+	if _, err := s.attachmentRepo.GetByID(attachmentID); err != nil {
 		return "", fmt.Errorf("attachment not found: %w", err)
 	}
 
-	ctx := context.Background()
-	url, err := s.minioClient.GetPresignedURL(ctx, attachment.ObjectKey, time.Hour)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate URL: %w", err)
-	}
-
-	return url, nil
+	return s.buildFileAccessURL(attachmentID), nil
 }
 
 type AttachmentWithURL struct {
@@ -77,11 +80,9 @@ func (s *UploadService) ListImages(page, size int) ([]*AttachmentWithURL, int64,
 		return nil, 0, err
 	}
 
-	ctx := context.Background()
 	result := make([]*AttachmentWithURL, 0, len(list))
 	for _, a := range list {
-		url, _ := s.minioClient.GetPresignedURL(ctx, a.ObjectKey, time.Hour)
-		result = append(result, &AttachmentWithURL{Attachment: *a, URL: url})
+		result = append(result, &AttachmentWithURL{Attachment: *a, URL: s.buildFileAccessURL(a.ID)})
 	}
 	return result, total, nil
 }
@@ -94,4 +95,37 @@ func (s *UploadService) DeleteFile(id int64) error {
 	ctx := context.Background()
 	_ = s.minioClient.Delete(ctx, a.ObjectKey)
 	return nil
+}
+
+func (s *UploadService) OpenFile(attachmentID int64, signature string) (*model.Attachment, io.ReadCloser, error) {
+	if !s.isValidSignature(attachmentID, signature) {
+		return nil, nil, ErrInvalidFileSignature
+	}
+
+	attachment, err := s.attachmentRepo.GetByID(attachmentID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("attachment not found: %w", err)
+	}
+
+	reader, err := s.minioClient.GetObject(context.Background(), attachment.ObjectKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open attachment: %w", err)
+	}
+
+	return attachment, reader, nil
+}
+
+func (s *UploadService) buildFileAccessURL(attachmentID int64) string {
+	return fmt.Sprintf("/api/files/%d/content?signature=%s", attachmentID, s.signAttachmentID(attachmentID))
+}
+
+func (s *UploadService) signAttachmentID(attachmentID int64) string {
+	mac := hmac.New(sha256.New, []byte(s.fileURLSecret))
+	_, _ = mac.Write([]byte(fmt.Sprintf("attachment:%d", attachmentID)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *UploadService) isValidSignature(attachmentID int64, signature string) bool {
+	expected := s.signAttachmentID(attachmentID)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1
 }

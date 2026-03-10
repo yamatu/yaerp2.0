@@ -2,11 +2,14 @@
 
 import {
   ArrowRight,
+  ArrowUpDown,
+  ChevronLeft,
   ChevronRight,
   Database,
   FolderIcon,
   FolderKanban,
   FolderPlus,
+  Layers3,
   Images,
   LogOut,
   MessageSquare,
@@ -18,6 +21,7 @@ import {
   Sparkles,
   Trash2,
   Users,
+  UserRoundPlus,
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -27,7 +31,7 @@ import { useWorkbooks } from '@/hooks/useSheet'
 import { useFileManager } from '@/hooks/useFileManager'
 import api from '@/lib/api'
 import { clearTokens, fetchCurrentUser, getStoredUser, isAdmin } from '@/lib/auth'
-import type { AuthUser } from '@/types'
+import type { AuthUser, PageData, User, Workbook } from '@/types'
 
 const adminLinks = [
   {
@@ -87,7 +91,20 @@ export default function HomePage() {
   const [editWorkbookName, setEditWorkbookName] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [searchFocused, setSearchFocused] = useState(false)
+  const [workbookSortBy, setWorkbookSortBy] = useState<'updated_at' | 'created_at' | 'name'>('updated_at')
+  const [workbookSortOrder, setWorkbookSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [groupByOwner, setGroupByOwner] = useState(true)
+  const [workbookPage, setWorkbookPage] = useState(1)
+  const [assigningWorkbook, setAssigningWorkbook] = useState<Workbook | null>(null)
+  const [assignableUsers, setAssignableUsers] = useState<User[]>([])
+  const [selectedAssigneeIds, setSelectedAssigneeIds] = useState<number[]>([])
+  const [assignmentLoading, setAssignmentLoading] = useState(false)
+  const [assignmentMessage, setAssignmentMessage] = useState('')
+  const [folderSearchQuery, setFolderSearchQuery] = useState('')
+  const [folderPage, setFolderPage] = useState(1)
   const searchRef = useRef<HTMLDivElement>(null)
+  const adminMode = isAdmin(profile)
+  const workbookPageSize = adminMode ? 12 : 9
 
   // Fuzzy match: each char of query must appear in order within target
   const fuzzyMatch = (query: string, target: string): boolean => {
@@ -103,9 +120,64 @@ export default function HomePage() {
   const filteredWorkbooks = useMemo(() => {
     if (!searchQuery.trim()) return workbooks
     return workbooks.filter(
-      (wb) => fuzzyMatch(searchQuery, wb.name) || fuzzyMatch(searchQuery, wb.description || '')
+      (wb) =>
+        fuzzyMatch(searchQuery, wb.name) ||
+        fuzzyMatch(searchQuery, wb.description || '') ||
+        fuzzyMatch(searchQuery, wb.owner_name || '')
     )
   }, [workbooks, searchQuery])
+
+  const sortedWorkbooks = useMemo(() => {
+    return [...filteredWorkbooks].sort((left, right) => {
+      if (workbookSortBy === 'name') {
+        const compare = left.name.localeCompare(right.name, 'zh-CN', { numeric: true, sensitivity: 'base' })
+        return workbookSortOrder === 'asc' ? compare : -compare
+      }
+
+      const leftValue = new Date(left[workbookSortBy]).getTime()
+      const rightValue = new Date(right[workbookSortBy]).getTime()
+      return workbookSortOrder === 'asc' ? leftValue - rightValue : rightValue - leftValue
+    })
+  }, [filteredWorkbooks, workbookSortBy, workbookSortOrder])
+
+  const totalWorkbookPages = Math.max(1, Math.ceil(sortedWorkbooks.length / workbookPageSize))
+  const paginatedWorkbooks = useMemo(() => {
+    const start = (workbookPage - 1) * workbookPageSize
+    return sortedWorkbooks.slice(start, start + workbookPageSize)
+  }, [sortedWorkbooks, workbookPage, workbookPageSize])
+
+  const workbookGroups = useMemo(() => {
+    if (!adminMode || !groupByOwner) {
+      return [{ label: '', items: paginatedWorkbooks }]
+    }
+
+    const groups = new Map<string, Workbook[]>()
+    paginatedWorkbooks.forEach((workbook) => {
+      const label = workbook.owner_name || `用户 #${workbook.owner_id}`
+      const existing = groups.get(label) || []
+      existing.push(workbook)
+      groups.set(label, existing)
+    })
+
+    return Array.from(groups.entries()).map(([label, items]) => ({ label, items }))
+  }, [adminMode, groupByOwner, paginatedWorkbooks])
+
+  const foldersPerPage = 8
+  const filteredFolders = useMemo(() => {
+    const keyword = folderSearchQuery.trim().toLowerCase()
+    if (!keyword) return contents.folders
+    return contents.folders.filter((f) => f.name.toLowerCase().includes(keyword))
+  }, [contents.folders, folderSearchQuery])
+  const totalFolderPages = Math.max(1, Math.ceil(filteredFolders.length / foldersPerPage))
+  const paginatedFolders = useMemo(() => {
+    const start = (folderPage - 1) * foldersPerPage
+    return filteredFolders.slice(start, start + foldersPerPage)
+  }, [filteredFolders, folderPage])
+
+  useEffect(() => { setFolderPage(1) }, [folderSearchQuery])
+  useEffect(() => {
+    if (folderPage > totalFolderPages) setFolderPage(totalFolderPages)
+  }, [folderPage, totalFolderPages])
 
   // Suggestions: top 5 matching names shown in dropdown
   const suggestions = useMemo(() => {
@@ -173,7 +245,38 @@ export default function HomePage() {
     }
   }
 
-  const adminMode = isAdmin(profile)
+  useEffect(() => {
+    setWorkbookPage(1)
+  }, [searchQuery, workbookSortBy, workbookSortOrder, groupByOwner])
+
+  useEffect(() => {
+    if (workbookPage > totalWorkbookPages) {
+      setWorkbookPage(totalWorkbookPages)
+    }
+  }, [workbookPage, totalWorkbookPages])
+
+  useEffect(() => {
+    if (!assigningWorkbook || !adminMode) return
+
+    let active = true
+    ;(async () => {
+      try {
+        const res = await api.get<PageData<User>>('/users?page=1&size=200')
+        if (!active || res.code !== 0 || !res.data) return
+        const users = res.data.list.filter((user) => {
+          const isAdminUser = user.roles?.some((role) => role.code === 'admin')
+          return user.status === 1 && !isAdminUser
+        })
+        setAssignableUsers(users)
+      } catch (err) {
+        console.error('Failed to load assignable users:', err)
+      }
+    })()
+
+    return () => {
+      active = false
+    }
+  }, [adminMode, assigningWorkbook])
 
   const handleDeleteWorkbook = async (e: React.MouseEvent, workbookId: number) => {
     e.stopPropagation()
@@ -194,6 +297,33 @@ export default function HomePage() {
       await refresh()
     } catch (err) {
       console.error('Failed to rename workbook:', err)
+    }
+  }
+
+  const handleAssignWorkbook = async () => {
+    if (!assigningWorkbook || selectedAssigneeIds.length === 0) return
+
+    setAssignmentLoading(true)
+    setAssignmentMessage('')
+
+    try {
+      const res = await api.post(`/workbooks/${assigningWorkbook.id}/assign`, {
+        user_ids: selectedAssigneeIds,
+      })
+
+      if (res.code !== 0) {
+        setAssignmentMessage(res.message || '发放任务失败，请稍后重试。')
+        return
+      }
+
+      setAssignmentMessage(`已向 ${selectedAssigneeIds.length} 位员工发放任务工作簿。`)
+      setSelectedAssigneeIds([])
+      await refresh()
+    } catch (err) {
+      console.error('Failed to assign workbook:', err)
+      setAssignmentMessage('发放任务失败，请稍后重试。')
+    } finally {
+      setAssignmentLoading(false)
     }
   }
 
@@ -242,45 +372,7 @@ export default function HomePage() {
                   <div className="mt-1 text-3xl font-semibold text-slate-950">{workbooks.length}</div>
                   <div className="mt-3 flex items-center gap-2 text-sm text-slate-500">
                     <FolderKanban className="h-4 w-4 text-sky-600" />
-                    所有表格入口集中在同一工作台
-                  </div>
-                </div>
-
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm sm:col-span-2">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div>
-                      <div className="text-sm text-slate-500">会话操作</div>
-                      <div className="mt-1 text-lg font-semibold text-slate-950">
-                        {adminMode ? '管理员模式已启用' : '标准成员模式'}
-                      </div>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setCreating((prev) => !prev)}
-                        className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
-                      >
-                        <Plus className="h-4 w-4" />
-                        新建工作簿
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => router.push('/gallery')}
-                        className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
-                      >
-                        <Images className="h-4 w-4" />
-                        图库
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleLogout}
-                        disabled={loggingOut}
-                        className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        <LogOut className="h-4 w-4" />
-                        {loggingOut ? '退出中...' : '退出登录'}
-                      </button>
-                    </div>
+                    {adminMode ? '管理员模式已启用' : '所有表格入口集中在同一工作台'}
                   </div>
                 </div>
               </div>
@@ -373,17 +465,44 @@ export default function HomePage() {
                 </div>
                 <h2 className="mt-2 text-2xl font-semibold text-slate-950">业务工作簿</h2>
                 <p className="mt-2 text-sm text-slate-500">
-                  用工作簿组织你的业务模块，再在工作表里扩展字段、权限和协作规则。
+                  {adminMode
+                    ? '管理员可按员工查看全部工作簿，并按时间排序、搜索和发放任务模板。'
+                    : '用工作簿组织你的业务模块，再在工作表里扩展字段、权限和协作规则。'}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCreating((prev) => !prev)}
+                  className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
+                >
+                  <Plus className="h-4 w-4" />
+                  新建工作簿
+                </button>
                 <button
                   type="button"
                   onClick={() => setCreatingFolder(true)}
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                 >
                   <FolderPlus className="h-4 w-4" />
                   新建文件夹
+                </button>
+                <button
+                  type="button"
+                  onClick={() => router.push('/gallery')}
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+                >
+                  <Images className="h-4 w-4" />
+                  图库
+                </button>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  disabled={loggingOut}
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <LogOut className="h-4 w-4" />
+                  {loggingOut ? '退出中...' : '退出登录'}
                 </button>
               </div>
             </div>
@@ -453,8 +572,43 @@ export default function HomePage() {
 
             {/* Folder list */}
             {contents.folders.length > 0 && (
-              <div className="mb-4 grid gap-3 md:grid-cols-3 lg:grid-cols-4">
-                {contents.folders.map((folder) => (
+              <div className="mb-4 space-y-3">
+                {/* Folder search + pagination toolbar */}
+                {contents.folders.length > foldersPerPage && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative flex-1 max-w-xs">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                      <input
+                        type="text"
+                        value={folderSearchQuery}
+                        onChange={(e) => setFolderSearchQuery(e.target.value)}
+                        placeholder="搜索文件夹..."
+                        className="h-9 w-full rounded-xl border border-slate-200 bg-white pl-9 pr-3 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                      />
+                    </div>
+                    <div className="text-xs text-slate-500">
+                      {filteredFolders.length} 个文件夹 / 第 {folderPage} 页
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setFolderPage((c) => Math.max(1, c - 1))}
+                      disabled={folderPage <= 1}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFolderPage((c) => Math.min(totalFolderPages, c + 1))}
+                      disabled={folderPage >= totalFolderPages}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
+                <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-4">
+                  {paginatedFolders.map((folder) => (
                   <button
                     key={folder.id}
                     type="button"
@@ -469,52 +623,89 @@ export default function HomePage() {
                     <ChevronRight className="h-4 w-4 flex-shrink-0 text-slate-300 transition group-hover:translate-x-0.5" />
                   </button>
                 ))}
+                </div>
               </div>
             )}
 
             {/* Search bar */}
             {!loading && workbooks.length > 0 && (
-              <div ref={searchRef} className="relative mb-5">
-                <div className="relative">
-                  <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    onFocus={() => setSearchFocused(true)}
-                    placeholder="搜索工作簿名称..."
-                    className="h-11 w-full rounded-2xl border border-slate-200 bg-white pl-11 pr-10 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                  />
-                  {searchQuery && (
+              <div className="mb-5 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <div ref={searchRef} className="relative flex-1 xl:max-w-xl">
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      onFocus={() => setSearchFocused(true)}
+                      placeholder={adminMode ? '搜索工作簿 / 描述 / 员工...' : '搜索工作簿名称...'}
+                      className="h-11 w-full rounded-2xl border border-slate-200 bg-white pl-11 pr-10 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                    />
+                    {searchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => { setSearchQuery(''); setSearchFocused(false) }}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                  {suggestions.length > 0 && (
+                    <div className="absolute left-0 right-0 top-full z-20 mt-1 rounded-2xl border border-slate-200 bg-white py-1 shadow-lg">
+                      {suggestions.map((wb) => (
+                        <button
+                          key={wb.id}
+                          type="button"
+                          onClick={() => { router.push(`/sheets/${wb.id}`); setSearchFocused(false) }}
+                          className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm transition hover:bg-slate-50"
+                        >
+                          <FolderKanban className="h-4 w-4 flex-shrink-0 text-sky-600" />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-medium text-slate-900">{wb.name}</div>
+                            <div className="truncate text-xs text-slate-400">{wb.owner_name || wb.description || '无描述'}</div>
+                          </div>
+                          <ArrowRight className="h-3.5 w-3.5 flex-shrink-0 text-slate-300" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={workbookSortBy}
+                    onChange={(event) => setWorkbookSortBy(event.target.value as 'updated_at' | 'created_at' | 'name')}
+                    className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                  >
+                    <option value="updated_at">按更新时间</option>
+                    <option value="created_at">按创建时间</option>
+                    <option value="name">按名称</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setWorkbookSortOrder((current) => (current === 'desc' ? 'asc' : 'desc'))}
+                    className="inline-flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                  >
+                    <ArrowUpDown className="h-4 w-4" />
+                    {workbookSortOrder === 'desc' ? '降序' : '升序'}
+                  </button>
+                  {adminMode && (
                     <button
                       type="button"
-                      onClick={() => { setSearchQuery(''); setSearchFocused(false) }}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                      onClick={() => setGroupByOwner((current) => !current)}
+                      className={`inline-flex h-11 items-center gap-2 rounded-2xl border px-4 text-sm font-medium transition ${
+                        groupByOwner
+                          ? 'border-sky-200 bg-sky-50 text-sky-700'
+                          : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      }`}
                     >
-                      <X className="h-4 w-4" />
+                      <Layers3 className="h-4 w-4" />
+                      {groupByOwner ? '按员工分组中' : '按员工分组'}
                     </button>
                   )}
                 </div>
                 {/* Suggestions dropdown */}
-                {suggestions.length > 0 && (
-                  <div className="absolute left-0 right-0 top-full z-20 mt-1 rounded-2xl border border-slate-200 bg-white py-1 shadow-lg">
-                    {suggestions.map((wb) => (
-                      <button
-                        key={wb.id}
-                        type="button"
-                        onClick={() => { router.push(`/sheets/${wb.id}`); setSearchFocused(false) }}
-                        className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm transition hover:bg-slate-50"
-                      >
-                        <FolderKanban className="h-4 w-4 flex-shrink-0 text-sky-600" />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate font-medium text-slate-900">{wb.name}</div>
-                          <div className="truncate text-xs text-slate-400">{wb.description || '无描述'}</div>
-                        </div>
-                        <ArrowRight className="h-3.5 w-3.5 flex-shrink-0 text-slate-300" />
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
             )}
 
@@ -550,63 +741,219 @@ export default function HomePage() {
               </div>
             )}
 
-            {!loading && !error && filteredWorkbooks.length > 0 && (
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {filteredWorkbooks.map((workbook) => (
-                  <div
-                    key={workbook.id}
-                    className="group relative rounded-[26px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)]"
-                  >
-                    {adminMode && (
-                      <div className="absolute right-3 top-3 flex gap-1 opacity-0 transition group-hover:opacity-100">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setEditingWorkbook({ id: workbook.id, name: workbook.name })
-                            setEditWorkbookName(workbook.name)
-                          }}
-                          className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
-                          title="重命名"
-                        >
-                          <PencilLine className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(e) => handleDeleteWorkbook(e, workbook.id)}
-                          className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
-                          title="删除工作簿"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => router.push(`/sheets/${workbook.id}`)}
-                      className="w-full text-left"
-                    >
-                      <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-500">
-                        <FolderKanban className="h-3.5 w-3.5 text-sky-600" />
-                        工作簿 #{workbook.id}
-                      </div>
-                      <h3 className="text-xl font-semibold text-slate-950">{workbook.name}</h3>
-                      <p className="mt-2 min-h-[48px] text-sm leading-6 text-slate-500">
-                        {workbook.description?.trim() || '进入后可添加多个工作表，并继续扩展字段、权限和自动化流程。'}
-                      </p>
-                      <div className="mt-5 flex items-center justify-between text-sm text-slate-500">
-                        <span>创建于 {new Date(workbook.created_at).toLocaleDateString('zh-CN')}</span>
-                        <span className="inline-flex items-center gap-1 font-medium text-sky-700">
-                          打开
-                          <ArrowRight className="h-4 w-4 transition group-hover:translate-x-0.5" />
+            {!loading && !error && paginatedWorkbooks.length > 0 && (
+              <div className="space-y-6">
+                {workbookGroups.map((group) => (
+                  <div key={group.label || 'default'} className="space-y-3">
+                    {group.label && (
+                      <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                        <Users className="h-4 w-4 text-sky-600" />
+                        {group.label}
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
+                          {group.items.length} 个工作簿
                         </span>
                       </div>
-                    </button>
+                    )}
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                      {group.items.map((workbook) => (
+                        <div
+                          key={workbook.id}
+                          className="group relative rounded-[26px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)]"
+                        >
+                          {adminMode && (
+                            <div className="absolute right-3 top-3 flex gap-1 opacity-0 transition group-hover:opacity-100">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  setAssigningWorkbook(workbook)
+                                  setSelectedAssigneeIds([])
+                                  setAssignmentMessage('')
+                                }}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-sky-200 bg-sky-50 text-sky-600 transition hover:bg-sky-100"
+                                title="发放任务"
+                              >
+                                <UserRoundPlus className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  setEditingWorkbook({ id: workbook.id, name: workbook.name })
+                                  setEditWorkbookName(workbook.name)
+                                }}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
+                                title="重命名"
+                              >
+                                <PencilLine className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => handleDeleteWorkbook(e, workbook.id)}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
+                                title="删除工作簿"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => router.push(`/sheets/${workbook.id}`)}
+                            className="w-full text-left"
+                          >
+                            <div className="mb-4 flex flex-wrap items-center gap-2">
+                              <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-500">
+                                <FolderKanban className="h-3.5 w-3.5 text-sky-600" />
+                                工作簿 #{workbook.id}
+                              </span>
+                              {adminMode && workbook.owner_name && (
+                                <span className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
+                                  <Users className="h-3.5 w-3.5" />
+                                  {workbook.owner_name}
+                                </span>
+                              )}
+                            </div>
+                            <h3 className="text-xl font-semibold text-slate-950">{workbook.name}</h3>
+                            <p className="mt-2 min-h-[48px] text-sm leading-6 text-slate-500">
+                              {workbook.description?.trim() || '进入后可添加多个工作表，并继续扩展字段、权限和自动化流程。'}
+                            </p>
+                            <div className="mt-5 space-y-1 text-sm text-slate-500">
+                              <div>创建于 {new Date(workbook.created_at).toLocaleDateString('zh-CN')}</div>
+                              <div>更新于 {new Date(workbook.updated_at).toLocaleString('zh-CN')}</div>
+                            </div>
+                            <div className="mt-5 flex items-center justify-end text-sm font-medium text-sky-700">
+                              打开
+                              <ArrowRight className="ml-1 h-4 w-4 transition group-hover:translate-x-0.5" />
+                            </div>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/90 px-4 py-3">
+                  <div className="text-sm text-slate-500">
+                    共 {sortedWorkbooks.length} 个工作簿，当前第 {workbookPage} / {totalWorkbookPages} 页
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setWorkbookPage((current) => Math.max(1, current - 1))}
+                      disabled={workbookPage <= 1}
+                      className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      上一页
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setWorkbookPage((current) => Math.min(totalWorkbookPages, current + 1))}
+                      disabled={workbookPage >= totalWorkbookPages}
+                      className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      下一页
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
           </section>
+
+          {assigningWorkbook && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">
+              <div className="w-full max-w-2xl rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8">
+                <div className="mb-6 flex items-start justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Task Assignment</div>
+                    <h2 className="mt-2 text-2xl font-semibold text-slate-950">发放任务工作簿</h2>
+                    <p className="mt-2 text-sm text-slate-500">
+                      将工作簿「{assigningWorkbook.name}」复制给选中的员工，作为待执行任务模板。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAssigningWorkbook(null)
+                      setSelectedAssigneeIds([])
+                    }}
+                    className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+
+                {assignmentMessage && (
+                  <div className="mb-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium text-sky-700">
+                    {assignmentMessage}
+                  </div>
+                )}
+
+                <div className="max-h-[380px] space-y-3 overflow-y-auto pr-1">
+                  {assignableUsers.map((user) => {
+                    const checked = selectedAssigneeIds.includes(user.id)
+
+                    return (
+                      <label
+                        key={user.id}
+                        className={`flex cursor-pointer items-center gap-3 rounded-2xl border px-4 py-3 transition ${
+                          checked ? 'border-sky-200 bg-sky-50' : 'border-slate-200 bg-slate-50/60 hover:bg-white'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) => {
+                            setSelectedAssigneeIds((current) =>
+                              event.target.checked
+                                ? [...current, user.id]
+                                : current.filter((id) => id !== user.id)
+                            )
+                          }}
+                          className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="font-semibold text-slate-900">{user.username}</div>
+                          <div className="truncate text-sm text-slate-500">{user.email}</div>
+                        </div>
+                      </label>
+                    )
+                  })}
+                  {assignableUsers.length === 0 && (
+                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+                      暂无可发放任务的员工账号。
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-6 flex items-center justify-between gap-3">
+                  <div className="text-sm text-slate-500">
+                    已选择 {selectedAssigneeIds.length} 位员工
+                  </div>
+                  <div className="flex gap-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAssigningWorkbook(null)
+                        setSelectedAssigneeIds([])
+                      }}
+                      className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleAssignWorkbook}
+                      disabled={assignmentLoading || selectedAssigneeIds.length === 0}
+                      className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {assignmentLoading ? '发放中...' : '发放任务'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Rename Workbook Dialog */}
           {editingWorkbook && (

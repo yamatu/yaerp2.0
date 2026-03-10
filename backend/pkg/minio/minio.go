@@ -56,6 +56,20 @@ func (c *Client) Upload(ctx context.Context, objectKey string, reader io.Reader,
 	return err
 }
 
+func (c *Client) GetObject(ctx context.Context, objectKey string) (*minio.Object, error) {
+	object, err := c.client.GetObject(ctx, c.bucket, objectKey, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := object.Stat(); err != nil {
+		_ = object.Close()
+		return nil, err
+	}
+
+	return object, nil
+}
+
 func (c *Client) GetPresignedURL(ctx context.Context, objectKey string, expires time.Duration) (string, error) {
 	url, err := c.client.PresignedGetObject(ctx, c.bucket, objectKey, expires, nil)
 	if err != nil {

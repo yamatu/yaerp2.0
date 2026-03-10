@@ -8,12 +8,13 @@ import (
 )
 
 type PermissionService struct {
-	permRepo *repo.PermissionRepo
-	userRepo *repo.UserRepo
+	permRepo  *repo.PermissionRepo
+	userRepo  *repo.UserRepo
+	sheetRepo *repo.SheetRepo
 }
 
-func NewPermissionService(permRepo *repo.PermissionRepo, userRepo *repo.UserRepo) *PermissionService {
-	return &PermissionService{permRepo: permRepo, userRepo: userRepo}
+func NewPermissionService(permRepo *repo.PermissionRepo, userRepo *repo.UserRepo, sheetRepo *repo.SheetRepo) *PermissionService {
+	return &PermissionService{permRepo: permRepo, userRepo: userRepo, sheetRepo: sheetRepo}
 }
 
 func (s *PermissionService) SetSheetPermission(req *model.SetSheetPermissionRequest) error {
@@ -63,7 +64,25 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 		}
 	}
 
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sheet: %w", err)
+	}
+
+	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workbook: %w", err)
+	}
+
+	if workbook.OwnerID == userID {
+		return fullAccessMatrix(), nil
+	}
+
 	return s.permRepo.GetPermissionMatrix(sheetID, roleIDs)
+}
+
+func (s *PermissionService) GetPermissionMatrixForRole(sheetID, roleID int64) (*model.PermissionMatrix, error) {
+	return s.permRepo.GetPermissionMatrix(sheetID, []int64{roleID})
 }
 
 func (s *PermissionService) IsAdmin(userID int64) (bool, error) {
@@ -112,4 +131,14 @@ func (s *PermissionService) CheckCellPermission(sheetID int64, userID int64, col
 func permissionSatisfies(has, needs string) bool {
 	levels := map[string]int{"none": 0, "read": 1, "write": 2}
 	return levels[has] >= levels[needs]
+}
+
+func fullAccessMatrix() *model.PermissionMatrix {
+	return &model.PermissionMatrix{
+		Sheet: model.SheetPerm{
+			CanView: true, CanEdit: true, CanDelete: true, CanExport: true,
+		},
+		Columns: make(map[string]string),
+		Cells:   make(map[string]string),
+	}
 }

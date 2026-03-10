@@ -10,8 +10,15 @@ export function usePermission(sheetId: number) {
 
   useEffect(() => {
     async function fetch() {
-      if (!sheetId) return
+      if (!sheetId) {
+        setPermissions(null)
+        setLoading(false)
+        return
+      }
+
       setLoading(true)
+      setPermissions(null)
+
       try {
         const res = await api.get<PermissionMatrix>(`/sheets/${sheetId}/permissions`)
         if (res.code === 0 && res.data) {

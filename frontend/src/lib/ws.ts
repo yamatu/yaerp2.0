@@ -9,6 +9,7 @@ class WSClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
+  private pendingMessages: string[] = []
 
   private getWSUrl() {
     if (typeof window === 'undefined') {
@@ -30,6 +31,10 @@ class WSClient {
   }
 
   connect() {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return
+    }
+
     const token = getAccessToken()
     if (!token) return
 
@@ -39,6 +44,8 @@ class WSClient {
     this.ws.onopen = () => {
       this.reconnectAttempts = 0
       console.log('WebSocket connected')
+      this.pendingMessages.forEach((message) => this.ws?.send(message))
+      this.pendingMessages = []
     }
 
     this.ws.onmessage = (event) => {
@@ -87,9 +94,13 @@ class WSClient {
   }
 
   send(msg: WSMessage) {
+    const payload = JSON.stringify(msg)
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg))
+      this.ws.send(payload)
+      return
     }
+
+    this.pendingMessages.push(payload)
   }
 
   joinSheet(sheetId: number) {

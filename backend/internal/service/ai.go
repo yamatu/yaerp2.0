@@ -7,19 +7,24 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"yaerp/config"
+	"yaerp/internal/model"
+	"yaerp/internal/repo"
 )
 
 type AIService struct {
-	cfg *config.Config
-	db  *sql.DB
+	cfg       *config.Config
+	db        *sql.DB
+	sheetRepo *repo.SheetRepo
 }
 
-func NewAIService(cfg *config.Config, db *sql.DB) *AIService {
-	return &AIService{cfg: cfg, db: db}
+func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo) *AIService {
+	return &AIService{cfg: cfg, db: db, sheetRepo: sheetRepo}
 }
 
 type ChatMessage struct {
@@ -42,6 +47,40 @@ type AIConfigStatus struct {
 	Model      string `json:"model"`
 }
 
+type SpreadsheetPlanRequest struct {
+	WorkbookID int64   `json:"workbook_id" binding:"required"`
+	SheetIDs   []int64 `json:"sheet_ids" binding:"required,min=1"`
+	Prompt     string  `json:"prompt" binding:"required"`
+}
+
+type SpreadsheetOperation struct {
+	Kind                 string                 `json:"kind,omitempty"`
+	SheetID              int64                  `json:"sheet_id"`
+	SheetName            string                 `json:"sheet_name"`
+	Row                  int                    `json:"row,omitempty"`
+	ColumnKey            string                 `json:"column_key,omitempty"`
+	ColumnName           string                 `json:"column_name,omitempty"`
+	CurrentValue         interface{}            `json:"current_value,omitempty"`
+	Value                interface{}            `json:"value,omitempty"`
+	Reason               string                 `json:"reason,omitempty"`
+	RowValues            map[string]interface{} `json:"row_values,omitempty"`
+	ColumnType           string                 `json:"column_type,omitempty"`
+	InsertAfterColumnKey string                 `json:"insert_after_column_key,omitempty"`
+	StartRow             *int                   `json:"start_row,omitempty"`
+	EndRow               *int                   `json:"end_row,omitempty"`
+	FormulaTemplate      string                 `json:"formula_template,omitempty"`
+}
+
+type SpreadsheetPlanResponse struct {
+	Reply      string                 `json:"reply"`
+	Model      string                 `json:"model"`
+	Operations []SpreadsheetOperation `json:"operations"`
+}
+
+type SpreadsheetApplyRequest struct {
+	Operations []SpreadsheetOperation `json:"operations" binding:"required,min=1"`
+}
+
 // GetConfig returns the current AI configuration status (non-sensitive).
 func (s *AIService) GetConfig() *AIConfigStatus {
 	endpoint, model := s.getActiveConfig()
@@ -53,11 +92,15 @@ func (s *AIService) GetConfig() *AIConfigStatus {
 }
 
 // UpdateConfig persists AI config to the settings table.
+// If apiKey is empty, the existing key is preserved (not overwritten).
 func (s *AIService) UpdateConfig(endpoint, apiKey, model string) error {
 	settings := map[string]string{
 		"ai_endpoint": endpoint,
-		"ai_api_key":  apiKey,
 		"ai_model":    model,
+	}
+	// Only update api_key if a new value is provided
+	if apiKey != "" {
+		settings["ai_api_key"] = apiKey
 	}
 	for key, value := range settings {
 		_, err := s.db.Exec(
@@ -97,10 +140,87 @@ func (s *AIService) Chat(userID int64, messages []ChatMessage) (*ChatResponse, e
 
 	allMessages := append([]ChatMessage{systemMsg}, messages...)
 
-	// Build request body
+	return s.callChatCompletion(endpoint, apiKey, model, allMessages)
+}
+
+func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*SpreadsheetPlanResponse, error) {
+	endpoint, model := s.getActiveConfig()
+	apiKey := s.getAPIKey()
+
+	if endpoint == "" || apiKey == "" {
+		return nil, fmt.Errorf("AI is not configured. Please set the API endpoint and key in admin settings")
+	}
+
+	contextPayload, sheetMeta, err := s.buildSpreadsheetContext(req.WorkbookID, req.SheetIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	messages := []ChatMessage{
+		{
+			Role: "system",
+			Content: "你是 YaERP 表格批处理助手。你必须只返回 JSON 对象，不要输出 Markdown、解释文字或代码块。" +
+				` 返回格式必须是 {"reply":"中文回复","operations":[{"kind":"update_cell","sheet_id":1,"sheet_name":"工作表","row":0,"column_key":"status","value":"已完成","reason":"更新原因"}]}` +
+				`。支持的 kind: update_cell、insert_row、insert_column、fill_formula。` +
+				` update_cell 使用 row(0-based 数据行) + column_key + value；` +
+				` insert_row 使用 row(插入后的目标数据行索引) + row_values；` +
+				` insert_column 使用 column_key + column_name + column_type，可选 insert_after_column_key；` +
+				` fill_formula 使用 column_key + start_row + end_row + formula_template，formula_template 里可使用 {{row}} 表示当前 Excel 行号（第一条数据是 2）。` +
+				" column_key 必须严格使用上下文中的列 key；只能修改已提供的工作表；如果用户没有要求修改表格，operations 返回空数组。",
+		},
+		{
+			Role:    "user",
+			Content: fmt.Sprintf("用户需求：%s\n\n以下是管理员选中的工作簿数据范围(JSON)：\n%s", req.Prompt, contextPayload),
+		},
+	}
+
+	apiResp, err := s.callChatCompletion(endpoint, apiKey, model, messages)
+	if err != nil {
+		return nil, err
+	}
+
+	parsed, err := parseSpreadsheetPlan(apiResp.Reply)
+	if err != nil {
+		return nil, err
+	}
+
+	parsed.Model = apiResp.Model
+	parsed.Operations = enrichSpreadsheetOperations(parsed.Operations, sheetMeta)
+	return parsed, nil
+}
+
+func (s *AIService) ApplySpreadsheetPlan(userID int64, operations []SpreadsheetOperation) error {
+	touchedSheets := make(map[int64]struct{})
+
+	for _, op := range operations {
+		normalized := normalizeSpreadsheetOperation(op)
+		if normalized.SheetID == 0 {
+			return fmt.Errorf("invalid spreadsheet operation")
+		}
+
+		if err := s.applySpreadsheetOperation(userID, normalized); err != nil {
+			return err
+		}
+		touchedSheets[normalized.SheetID] = struct{}{}
+	}
+
+	for sheetID := range touchedSheets {
+		sheet, err := s.sheetRepo.GetSheet(sheetID)
+		if err != nil {
+			return fmt.Errorf("reload touched sheet: %w", err)
+		}
+		if err := s.invalidateSheetSnapshot(sheet); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages []ChatMessage) (*ChatResponse, error) {
 	requestBody := map[string]interface{}{
 		"model":    model,
-		"messages": allMessages,
+		"messages": messages,
 	}
 
 	body, err := json.Marshal(requestBody)
@@ -108,7 +228,6 @@ func (s *AIService) Chat(userID int64, messages []ChatMessage) (*ChatResponse, e
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	// Ensure endpoint ends with /chat/completions
 	chatURL := strings.TrimRight(endpoint, "/")
 	if !strings.HasSuffix(chatURL, "/chat/completions") {
 		chatURL += "/chat/completions"
@@ -155,10 +274,442 @@ func (s *AIService) Chat(userID int64, messages []ChatMessage) (*ChatResponse, e
 		return nil, fmt.Errorf("no response from AI model")
 	}
 
-	return &ChatResponse{
-		Reply: apiResp.Choices[0].Message.Content,
-		Model: apiResp.Model,
-	}, nil
+	return &ChatResponse{Reply: apiResp.Choices[0].Message.Content, Model: apiResp.Model}, nil
+}
+
+func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) (string, map[int64]sheetPreviewMeta, error) {
+	workbook, err := s.sheetRepo.GetWorkbook(workbookID)
+	if err != nil {
+		return "", nil, err
+	}
+
+	allSheets, err := s.sheetRepo.GetSheetsByWorkbook(workbookID)
+	if err != nil {
+		return "", nil, err
+	}
+
+	selected := make(map[int64]struct{}, len(sheetIDs))
+	for _, sheetID := range sheetIDs {
+		selected[sheetID] = struct{}{}
+	}
+
+	meta := make(map[int64]sheetPreviewMeta)
+	payload := map[string]interface{}{
+		"workbook": map[string]interface{}{
+			"id":   workbook.ID,
+			"name": workbook.Name,
+		},
+		"sheets": make([]map[string]interface{}, 0, len(sheetIDs)),
+	}
+
+	sheetsPayload := make([]map[string]interface{}, 0, len(sheetIDs))
+	for _, sheet := range allSheets {
+		if _, ok := selected[sheet.ID]; !ok {
+			continue
+		}
+
+		rows, err := s.sheetRepo.GetRows(sheet.ID)
+		if err != nil {
+			return "", nil, fmt.Errorf("load rows for sheet %d: %w", sheet.ID, err)
+		}
+
+		columns := make([]sheetPreviewColumn, 0)
+		if len(sheet.Columns) > 0 {
+			_ = json.Unmarshal(sheet.Columns, &columns)
+		}
+
+		rowItems := make([]map[string]interface{}, 0, len(rows))
+		currentValues := make(map[string]interface{})
+		for index, row := range rows {
+			if index >= 200 {
+				break
+			}
+
+			data := make(map[string]interface{})
+			_ = json.Unmarshal(row.Data, &data)
+			rowItems = append(rowItems, map[string]interface{}{
+				"row":  row.RowIndex,
+				"data": data,
+			})
+			for key, value := range data {
+				currentValues[fmt.Sprintf("%d:%s", row.RowIndex, key)] = value
+			}
+		}
+
+		columnNames := make(map[string]string)
+		for _, column := range columns {
+			columnNames[column.Key] = column.Name
+		}
+
+		meta[sheet.ID] = sheetPreviewMeta{
+			SheetName:     sheet.Name,
+			ColumnNames:   columnNames,
+			CurrentValues: currentValues,
+		}
+
+		sheetsPayload = append(sheetsPayload, map[string]interface{}{
+			"sheet_id":   sheet.ID,
+			"sheet_name": sheet.Name,
+			"columns":    columns,
+			"rows":       rowItems,
+		})
+	}
+
+	if len(sheetsPayload) == 0 {
+		return "", nil, fmt.Errorf("no selected sheets found in workbook")
+	}
+
+	sort.Slice(sheetsPayload, func(i, j int) bool {
+		return fmt.Sprintf("%v", sheetsPayload[i]["sheet_id"]) < fmt.Sprintf("%v", sheetsPayload[j]["sheet_id"])
+	})
+	payload["sheets"] = sheetsPayload
+
+	contextBytes, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return "", nil, fmt.Errorf("marshal spreadsheet context: %w", err)
+	}
+
+	return string(contextBytes), meta, nil
+}
+
+func parseSpreadsheetPlan(reply string) (*SpreadsheetPlanResponse, error) {
+	content := strings.TrimSpace(reply)
+	if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSpace(strings.TrimPrefix(content, "json"))
+		content = strings.TrimSpace(strings.TrimSuffix(content, "```"))
+	}
+
+	start := strings.Index(content, "{")
+	end := strings.LastIndex(content, "}")
+	if start >= 0 && end > start {
+		content = content[start : end+1]
+	}
+
+	var parsed SpreadsheetPlanResponse
+	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+		return nil, fmt.Errorf("AI 未返回可解析的 JSON 结果: %w", err)
+	}
+
+	return &parsed, nil
+}
+
+func normalizeSpreadsheetOperation(operation SpreadsheetOperation) SpreadsheetOperation {
+	if strings.TrimSpace(operation.Kind) == "" {
+		operation.Kind = "update_cell"
+	}
+	return operation
+}
+
+func parseSheetColumns(raw json.RawMessage) ([]sheetColumnPayload, error) {
+	if len(raw) == 0 {
+		return []sheetColumnPayload{}, nil
+	}
+	var columns []sheetColumnPayload
+	if err := json.Unmarshal(raw, &columns); err != nil {
+		return nil, fmt.Errorf("parse sheet columns: %w", err)
+	}
+	return columns, nil
+}
+
+func expandFormulaTemplate(template string, rowIndex int) string {
+	rowNumber := strconv.Itoa(rowIndex + 2)
+	dataRowNumber := strconv.Itoa(rowIndex + 1)
+	result := strings.ReplaceAll(template, "{{row}}", rowNumber)
+	result = strings.ReplaceAll(result, "{{data_row}}", dataRowNumber)
+	return result
+}
+
+func firstNonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
+}
+
+type sheetPreviewColumn struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type sheetPreviewMeta struct {
+	SheetName     string
+	ColumnNames   map[string]string
+	CurrentValues map[string]interface{}
+}
+
+type sheetColumnPayload struct {
+	Key            string                 `json:"key"`
+	Name           string                 `json:"name"`
+	Type           string                 `json:"type"`
+	Width          int                    `json:"width,omitempty"`
+	Required       bool                   `json:"required,omitempty"`
+	Validation     map[string]interface{} `json:"validation,omitempty"`
+	Formula        string                 `json:"formula,omitempty"`
+	Options        []string               `json:"options,omitempty"`
+	CurrencyCode   string                 `json:"currencyCode,omitempty"`
+	CurrencySource string                 `json:"currencySource,omitempty"`
+}
+
+func enrichSpreadsheetOperations(operations []SpreadsheetOperation, meta map[int64]sheetPreviewMeta) []SpreadsheetOperation {
+	result := make([]SpreadsheetOperation, 0, len(operations))
+	for _, operation := range operations {
+		sheetMeta, ok := meta[operation.SheetID]
+		if !ok {
+			continue
+		}
+		if operation.SheetName == "" {
+			operation.SheetName = sheetMeta.SheetName
+		}
+		if operation.ColumnName == "" {
+			operation.ColumnName = sheetMeta.ColumnNames[operation.ColumnKey]
+		}
+		if currentValue, ok := sheetMeta.CurrentValues[fmt.Sprintf("%d:%s", operation.Row, operation.ColumnKey)]; ok {
+			operation.CurrentValue = currentValue
+		}
+		result = append(result, operation)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].SheetID == result[j].SheetID {
+			if result[i].Row == result[j].Row {
+				return result[i].ColumnKey < result[j].ColumnKey
+			}
+			return result[i].Row < result[j].Row
+		}
+		return result[i].SheetID < result[j].SheetID
+	})
+
+	return result
+}
+
+func (s *AIService) applySpreadsheetOperation(userID int64, operation SpreadsheetOperation) error {
+	switch operation.Kind {
+	case "insert_row":
+		return s.applyInsertRowOperation(userID, operation)
+	case "insert_column":
+		return s.applyInsertColumnOperation(userID, operation)
+	case "fill_formula":
+		return s.applyFillFormulaOperation(userID, operation)
+	default:
+		return s.applyCellUpdateOperation(userID, operation)
+	}
+}
+
+func (s *AIService) applyCellUpdateOperation(userID int64, operation SpreadsheetOperation) error {
+	if strings.TrimSpace(operation.ColumnKey) == "" || operation.Row < 0 {
+		return fmt.Errorf("invalid update_cell operation")
+	}
+
+	rows, err := s.sheetRepo.GetRows(operation.SheetID)
+	if err != nil {
+		return fmt.Errorf("load sheet rows: %w", err)
+	}
+
+	rowData := make(map[string]interface{})
+	for _, row := range rows {
+		if row.RowIndex != operation.Row {
+			continue
+		}
+		if err := json.Unmarshal(row.Data, &rowData); err != nil {
+			rowData = make(map[string]interface{})
+		}
+		break
+	}
+
+	rowData[operation.ColumnKey] = operation.Value
+	data, err := json.Marshal(rowData)
+	if err != nil {
+		return fmt.Errorf("marshal row data: %w", err)
+	}
+
+	if err := s.sheetRepo.UpsertRow(operation.SheetID, operation.Row, data, userID); err != nil {
+		return fmt.Errorf("apply spreadsheet operation: %w", err)
+	}
+
+	return nil
+}
+
+func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetOperation) error {
+	if operation.Row < 0 {
+		return fmt.Errorf("invalid insert_row row index")
+	}
+
+	if err := s.sheetRepo.InsertRow(operation.SheetID, operation.Row-1); err != nil {
+		return fmt.Errorf("insert row: %w", err)
+	}
+
+	rowValues := operation.RowValues
+	if rowValues == nil {
+		rowValues = map[string]interface{}{}
+	}
+	if len(rowValues) == 0 {
+		return nil
+	}
+
+	data, err := json.Marshal(rowValues)
+	if err != nil {
+		return fmt.Errorf("marshal inserted row values: %w", err)
+	}
+
+	if err := s.sheetRepo.UpsertRow(operation.SheetID, operation.Row, data, userID); err != nil {
+		return fmt.Errorf("persist inserted row: %w", err)
+	}
+
+	return nil
+}
+
+func (s *AIService) applyInsertColumnOperation(userID int64, operation SpreadsheetOperation) error {
+	sheet, err := s.sheetRepo.GetSheet(operation.SheetID)
+	if err != nil {
+		return fmt.Errorf("load target sheet: %w", err)
+	}
+
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return err
+	}
+	if operation.ColumnKey == "" {
+		return fmt.Errorf("insert_column requires column_key")
+	}
+
+	insertIndex := len(columns)
+	if operation.InsertAfterColumnKey != "" {
+		for index, column := range columns {
+			if column.Key == operation.InsertAfterColumnKey {
+				insertIndex = index + 1
+				break
+			}
+		}
+	}
+
+	newColumn := sheetColumnPayload{
+		Key:   operation.ColumnKey,
+		Name:  firstNonEmpty(operation.ColumnName, operation.ColumnKey),
+		Type:  firstNonEmpty(operation.ColumnType, "text"),
+		Width: 140,
+	}
+	columns = append(columns, sheetColumnPayload{})
+	copy(columns[insertIndex+1:], columns[insertIndex:])
+	columns[insertIndex] = newColumn
+
+	nextColumns, err := json.Marshal(columns)
+	if err != nil {
+		return fmt.Errorf("marshal inserted column metadata: %w", err)
+	}
+	sheet.Columns = nextColumns
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return fmt.Errorf("persist inserted column: %w", err)
+	}
+
+	rows, err := s.sheetRepo.GetRows(operation.SheetID)
+	if err != nil {
+		return fmt.Errorf("load rows after column insert: %w", err)
+	}
+	for _, row := range rows {
+		data := make(map[string]interface{})
+		if err := json.Unmarshal(row.Data, &data); err != nil {
+			data = make(map[string]interface{})
+		}
+
+		if operation.FormulaTemplate != "" {
+			data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, row.RowIndex)
+		} else if operation.Value != nil {
+			data[operation.ColumnKey] = operation.Value
+		}
+
+		encoded, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("marshal inserted column row data: %w", err)
+		}
+		if err := s.sheetRepo.UpsertRow(operation.SheetID, row.RowIndex, encoded, userID); err != nil {
+			return fmt.Errorf("apply inserted column values: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *AIService) applyFillFormulaOperation(userID int64, operation SpreadsheetOperation) error {
+	if strings.TrimSpace(operation.ColumnKey) == "" || strings.TrimSpace(operation.FormulaTemplate) == "" {
+		return fmt.Errorf("fill_formula requires column_key and formula_template")
+	}
+
+	rows, err := s.sheetRepo.GetRows(operation.SheetID)
+	if err != nil {
+		return fmt.Errorf("load rows for formula fill: %w", err)
+	}
+
+	startRow := 0
+	if operation.StartRow != nil {
+		startRow = *operation.StartRow
+	}
+	endRow := startRow
+	if operation.EndRow != nil {
+		endRow = *operation.EndRow
+	} else {
+		for _, row := range rows {
+			if row.RowIndex > endRow {
+				endRow = row.RowIndex
+			}
+		}
+	}
+	if endRow < startRow {
+		endRow = startRow
+	}
+
+	rowMap := make(map[int]map[string]interface{})
+	for _, row := range rows {
+		data := make(map[string]interface{})
+		if err := json.Unmarshal(row.Data, &data); err != nil {
+			data = make(map[string]interface{})
+		}
+		rowMap[row.RowIndex] = data
+	}
+
+	for rowIndex := startRow; rowIndex <= endRow; rowIndex++ {
+		data := rowMap[rowIndex]
+		if data == nil {
+			data = make(map[string]interface{})
+		}
+		data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, rowIndex)
+		encoded, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("marshal formula fill row data: %w", err)
+		}
+		if err := s.sheetRepo.UpsertRow(operation.SheetID, rowIndex, encoded, userID); err != nil {
+			return fmt.Errorf("apply formula fill: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *AIService) invalidateSheetSnapshot(sheet *model.Sheet) error {
+	if len(sheet.Config) == 0 {
+		return nil
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(sheet.Config, &payload); err != nil {
+		return nil
+	}
+
+	delete(payload, "univerSheetData")
+	delete(payload, "univerStyles")
+
+	nextConfig, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal invalidated sheet config: %w", err)
+	}
+
+	sheet.Config = nextConfig
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return fmt.Errorf("persist invalidated sheet config: %w", err)
+	}
+
+	return nil
 }
 
 // getActiveConfig returns endpoint and model, preferring DB settings over env vars.
