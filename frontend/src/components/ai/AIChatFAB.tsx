@@ -1,20 +1,21 @@
 'use client'
 
-import { Bot } from 'lucide-react'
+import { Bot, X } from 'lucide-react'
 
 interface AIChatFABProps {
   onClick: () => void
+  isOpen?: boolean
 }
 
-export default function AIChatFAB({ onClick }: AIChatFABProps) {
+export default function AIChatFAB({ onClick, isOpen }: AIChatFABProps) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="fixed bottom-6 right-6 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800 hover:scale-105 active:scale-95"
-      aria-label="打开 AI 助手"
+      className="fixed bottom-20 right-6 z-[60] flex h-12 w-12 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800 hover:scale-105 active:scale-95"
+      aria-label={isOpen ? '关闭 AI 助手' : '打开 AI 助手'}
     >
-      <Bot className="h-6 w-6" />
+      {isOpen ? <X className="h-5 w-5" /> : <Bot className="h-5 w-5" />}
     </button>
   )
 }
