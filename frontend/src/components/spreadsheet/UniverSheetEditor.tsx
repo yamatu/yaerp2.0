@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { AlertCircle, Columns3, FileOutput, Filter, FilterX, ImagePlus, Lock, Printer, Rows3, Save, Shield, Square, Unlock, X } from 'lucide-react'
+import { AlertCircle, ChevronUp, Columns3, FileOutput, Filter, FilterX, ImagePlus, Lock, Printer, Rows3, Save, Shield, Square, Unlock, Wrench, X } from 'lucide-react'
 import type { IWorkbookData, IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -99,6 +99,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
   const [loadingGallery, setLoadingGallery] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
   const [univerHasOverlay, setUniverHasOverlay] = useState(false)
+  const [toolbarExpanded, setToolbarExpanded] = useState(false)
   const [hasFilter, setHasFilter] = useState(false)
   const [actionError, setActionError] = useState('')
   const [showProtectionPanel, setShowProtectionPanel] = useState(false)
@@ -790,52 +791,66 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
-      {/* Floating buttons — hidden when any overlay/panel is open */}
+      {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
         <div className="absolute right-3 bottom-16 z-20 flex flex-col items-center gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              syncSelectionState()
-              setShowProtectionPanel((current) => !current)
-            }}
-            className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
-              showProtectionPanel
-                ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
-                : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-            }`}
-            title="保护设置"
-          >
-            <Shield className="h-4 w-4" />
-          </button>
-          <button
-            type="button"
-            onClick={hasFilter ? handleClearFilter : handleEnableFilter}
-            className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
-              hasFilter
-                ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
-                : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-            }`}
-            title={hasFilter ? '清除筛选' : '启用筛选'}
-          >
-            {hasFilter ? <FilterX className="h-4 w-4" /> : <Filter className="h-4 w-4" />}
-          </button>
-          <button
-            type="button"
-            onClick={() => handlePrintSheet('print')}
-            className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
-            title="打印当前表"
-          >
-            <Printer className="h-4 w-4" />
-          </button>
-          <button
-            type="button"
-            onClick={() => handlePrintSheet('pdf')}
-            className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
-            title="导出 PDF"
-          >
-            <FileOutput className="h-4 w-4" />
-          </button>
+          {/* Expanded tools — slide up when toggled */}
+          {toolbarExpanded && (
+            <div className="flex flex-col items-center gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
+              <button
+                type="button"
+                onClick={() => {
+                  syncSelectionState()
+                  setShowProtectionPanel((current) => !current)
+                }}
+                className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
+                  showProtectionPanel
+                    ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                }`}
+                title="保护设置"
+              >
+                <Shield className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={hasFilter ? handleClearFilter : handleEnableFilter}
+                className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
+                  hasFilter
+                    ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
+                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                }`}
+                title={hasFilter ? '清除筛选' : '启用筛选'}
+              >
+                {hasFilter ? <FilterX className="h-4 w-4" /> : <Filter className="h-4 w-4" />}
+              </button>
+              <button
+                type="button"
+                onClick={() => handlePrintSheet('print')}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+                title="打印当前表"
+              >
+                <Printer className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handlePrintSheet('pdf')}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+                title="导出 PDF"
+              >
+                <FileOutput className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={openImagePicker}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+                title="插入图片"
+              >
+                <ImagePlus className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+          {/* Always visible: Save + Toolbar toggle */}
           <button
             type="button"
             onClick={handleManualSave}
@@ -852,11 +867,15 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
           </button>
           <button
             type="button"
-            onClick={openImagePicker}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-slate-900 text-white shadow-lg transition hover:bg-slate-800"
-            title="插入图片"
+            onClick={() => setToolbarExpanded((v) => !v)}
+            className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg transition ${
+              toolbarExpanded
+                ? 'bg-slate-700 text-white hover:bg-slate-600'
+                : 'bg-slate-900 text-white hover:bg-slate-800'
+            }`}
+            title={toolbarExpanded ? '收起工具栏' : '展开工具栏'}
           >
-            <ImagePlus className="h-5 w-5" />
+            {toolbarExpanded ? <ChevronUp className="h-5 w-5" /> : <Wrench className="h-5 w-5" />}
           </button>
         </div>
       )}

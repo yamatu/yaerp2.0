@@ -351,7 +351,18 @@ export default function HomePage() {
 
               <div className="grid gap-3 sm:grid-cols-2 lg:min-w-[460px]">
                 <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
-                  <div className="text-sm text-slate-500">当前用户</div>
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm text-slate-500">当前用户</div>
+                    <button
+                      type="button"
+                      onClick={handleLogout}
+                      disabled={loggingOut}
+                      className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-500 transition hover:border-slate-300 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <LogOut className="h-3 w-3" />
+                      {loggingOut ? '退出中...' : '退出'}
+                    </button>
+                  </div>
                   <div className="mt-1 text-xl font-semibold text-slate-950">
                     {profile?.username || '未加载'}
                   </div>
@@ -473,14 +484,6 @@ export default function HomePage() {
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setCreating((prev) => !prev)}
-                  className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
-                >
-                  <Plus className="h-4 w-4" />
-                  新建工作簿
-                </button>
-                <button
-                  type="button"
                   onClick={() => setCreatingFolder(true)}
                   className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
                 >
@@ -489,20 +492,19 @@ export default function HomePage() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => setCreating((prev) => !prev)}
+                  className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
+                >
+                  <Plus className="h-4 w-4" />
+                  新建工作簿
+                </button>
+                <button
+                  type="button"
                   onClick={() => router.push('/gallery')}
                   className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
                 >
                   <Images className="h-4 w-4" />
                   图库
-                </button>
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  disabled={loggingOut}
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  <LogOut className="h-4 w-4" />
-                  {loggingOut ? '退出中...' : '退出登录'}
                 </button>
               </div>
             </div>
