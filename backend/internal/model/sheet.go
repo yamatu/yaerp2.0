@@ -11,6 +11,7 @@ type Workbook struct {
 	Description *string         `json:"description" db:"description"`
 	OwnerID     int64           `json:"owner_id" db:"owner_id"`
 	OwnerName   *string         `json:"owner_name,omitempty" db:"owner_name"`
+	FolderID    *int64          `json:"folder_id,omitempty" db:"folder_id"`
 	Metadata    json.RawMessage `json:"metadata" db:"metadata"`
 	IsTemplate  bool            `json:"is_template" db:"is_template"`
 	Status      int             `json:"status" db:"status"`
@@ -46,6 +47,7 @@ type CreateWorkbookRequest struct {
 	Name        string `json:"name" binding:"required"`
 	Description string `json:"description"`
 	IsTemplate  bool   `json:"is_template"`
+	FolderID    *int64 `json:"folder_id"`
 }
 
 type UpdateWorkbookRequest struct {

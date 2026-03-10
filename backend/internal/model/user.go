@@ -36,3 +36,12 @@ type UpdateUserRequest struct {
 	Avatar *string `json:"avatar"`
 	Status *int    `json:"status"`
 }
+
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required,min=6"`
+	NewPassword     string `json:"new_password" binding:"required,min=6"`
+}
+
+type ResetPasswordRequest struct {
+	NewPassword string `json:"new_password" binding:"required,min=6"`
+}

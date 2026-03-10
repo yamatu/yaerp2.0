@@ -32,6 +32,7 @@ export default function UsersManagementPage() {
   const [editingUser, setEditingUser] = useState<AuthUser | null>(null)
   const [editForm, setEditForm] = useState({ email: '', isActive: true })
   const [selectedRoles, setSelectedRoles] = useState<number[]>([])
+  const [resetPassword, setResetPassword] = useState('')
   const [showCreateForm, setShowCreateForm] = useState(false)
   const [createForm, setCreateForm] = useState<CreateUserForm>({
     username: '',
@@ -77,6 +78,7 @@ export default function UsersManagementPage() {
     setEditingUser(user)
     setEditForm({ email: user.email || '', isActive: user.status === 1 })
     setSelectedRoles(user.roles.map((role) => role.id))
+    setResetPassword('')
   }
 
   const handleSave = async () => {
@@ -175,6 +177,30 @@ export default function UsersManagementPage() {
   }
 
   const activeUsers = users.filter((user) => user.status === 1).length
+  const isProtectedAdmin = (user: AuthUser) => user.username === 'admin'
+
+  const handleResetPassword = async () => {
+    if (!editingUser || !resetPassword.trim()) {
+      setError('请填写新密码')
+      return
+    }
+    if (resetPassword.trim().length < 6) {
+      setError('新密码至少 6 位')
+      return
+    }
+
+    setSubmitting(true)
+    setError('')
+    try {
+      await api.post(`/users/${editingUser.id}/password`, { new_password: resetPassword.trim() })
+      setResetPassword('')
+    } catch (err) {
+      console.error('Failed to reset user password:', err)
+      setError('重置密码失败')
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   return (
     <AuthGuard requireRole="admin">
@@ -414,7 +440,7 @@ export default function UsersManagementPage() {
                               <button
                                 type="button"
                                 onClick={() => handleDelete(user.id)}
-                                disabled={submitting || user.id === currentUser?.id}
+                                disabled={submitting || user.id === currentUser?.id || isProtectedAdmin(user)}
                                 className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
@@ -467,10 +493,35 @@ export default function UsersManagementPage() {
                         type="checkbox"
                         checked={editForm.isActive}
                         onChange={(e) => setEditForm((prev) => ({ ...prev, isActive: e.target.checked }))}
+                        disabled={isProtectedAdmin(editingUser)}
                         className="rounded"
                       />
                       允许该员工账号正常登录和使用系统
                     </label>
+                    {isProtectedAdmin(editingUser) && (
+                      <div className="mt-2 text-xs font-medium text-amber-700">
+                        默认管理员账号受保护，不可禁用或删除。
+                      </div>
+                    )}
+
+                    <div className="mt-5">
+                      <label className="mb-2 block text-sm font-semibold text-slate-700">重置密码</label>
+                      <input
+                        type="password"
+                        value={resetPassword}
+                        onChange={(e) => setResetPassword(e.target.value)}
+                        placeholder="输入不少于 6 位的新密码"
+                        className="h-11 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleResetPassword}
+                        disabled={submitting || !resetPassword.trim()}
+                        className="mt-3 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        重置该用户密码
+                      </button>
+                    </div>
                   </div>
 
                   <div>
@@ -481,11 +532,12 @@ export default function UsersManagementPage() {
                           key={role.id}
                           type="button"
                           onClick={() => toggleRole(role.id, 'edit')}
+                          disabled={isProtectedAdmin(editingUser)}
                           className={`rounded-full border px-3 py-2 text-sm font-medium transition ${
                             selectedRoles.includes(role.id)
                               ? 'border-sky-300 bg-sky-100 text-sky-700'
                               : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
-                          }`}
+                          } disabled:cursor-not-allowed disabled:opacity-50`}
                         >
                           {role.name}
                         </button>

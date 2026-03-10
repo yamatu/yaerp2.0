@@ -27,6 +27,7 @@ export interface Workbook {
   description?: string
   owner_id: number
   owner_name?: string
+  folder_id?: number | null
   metadata: Record<string, unknown>
   is_template: boolean
   status: number

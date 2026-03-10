@@ -86,3 +86,20 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	}
 	response.OKMsg(c, "logged out")
 }
+
+func (h *AuthHandler) ChangePassword(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+
+	var req model.ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	if err := h.authService.ChangePassword(userID, req.CurrentPassword, req.NewPassword); err != nil {
+		response.Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	response.OKMsg(c, "password updated")
+}
