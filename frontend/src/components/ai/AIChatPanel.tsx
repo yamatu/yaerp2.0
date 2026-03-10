@@ -70,22 +70,18 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     }
   }
 
+  if (!open) return null
+
   return (
     <>
       {/* Backdrop */}
-      {open && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/20"
-          onClick={onClose}
-        />
-      )}
+      <div
+        className="fixed inset-0 z-50 bg-slate-950/20"
+        onClick={onClose}
+      />
 
       {/* Panel */}
-      <div
-        className={`fixed right-0 top-0 h-full w-96 z-[51] bg-white shadow-2xl flex flex-col transition-transform duration-300 ease-in-out ${
-          open ? 'translate-x-0' : 'translate-x-full pointer-events-none'
-        }`}
-      >
+      <div className="fixed right-0 top-0 h-full w-96 z-[51] bg-white shadow-2xl flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
           <h2 className="text-lg font-semibold text-slate-900">
