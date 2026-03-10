@@ -82,8 +82,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
 
       {/* Panel */}
       <div
-        className={`fixed right-0 top-0 h-full w-96 z-50 bg-white shadow-2xl flex flex-col transition-transform duration-300 ease-in-out ${
-          open ? 'translate-x-0' : 'translate-x-full'
+        className={`fixed right-0 top-0 h-full w-96 z-[51] bg-white shadow-2xl flex flex-col transition-transform duration-300 ease-in-out ${
+          open ? 'translate-x-0' : 'translate-x-full pointer-events-none'
         }`}
       >
         {/* Header */}
@@ -92,8 +92,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             YaERP 智能助手
           </h2>
           <button
-            onClick={onClose}
-            className="text-slate-400 hover:text-slate-600 transition"
+            type="button"
+            onClick={() => onClose()}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition"
             aria-label="关闭"
           >
             <X className="w-5 h-5" />
