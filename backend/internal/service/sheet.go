@@ -15,6 +15,7 @@ import (
 
 var ErrWorkbookAccessDenied = errors.New("workbook access denied")
 var ErrProtectionDenied = errors.New("protection denied")
+var ErrSheetPermissionDenied = errors.New("sheet permission denied")
 
 type protectionOwner struct {
 	OwnerID     int64  `json:"ownerId"`
@@ -39,7 +40,17 @@ func NewSheetService(sheetRepo *repo.SheetRepo, permService *PermissionService) 
 
 // Workbook operations
 
-func (s *SheetService) CreateWorkbook(workbook *model.Workbook) error {
+func (s *SheetService) CreateWorkbookForUser(userID int64, workbook *model.Workbook) error {
+	if workbook.FolderID != nil {
+		canWriteFolder, err := s.permService.CanWriteFolder(*workbook.FolderID, userID)
+		if err != nil {
+			return err
+		}
+		if !canWriteFolder {
+			return ErrFolderManageDenied
+		}
+	}
+
 	return s.sheetRepo.CreateWorkbook(workbook)
 }
 
@@ -53,12 +64,24 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 		return nil, err
 	}
 
-	canManageWorkbook, err := s.canManageWorkbook(userID, wb)
+	canManageWorkbook, err := s.CanManageWorkbook(userID, wb)
 	if err != nil {
 		return nil, err
 	}
 	if canManageWorkbook {
 		wb.Sheets = sheets
+		return wb, nil
+	}
+
+	canViewWorkbook, err := s.permService.CanViewWorkbook(wb, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !canViewWorkbook {
+		return nil, ErrWorkbookAccessDenied
+	}
+	if len(sheets) == 0 {
+		wb.Sheets = []model.Sheet{}
 		return wb, nil
 	}
 
@@ -98,25 +121,12 @@ func (s *SheetService) ListWorkbooks(userID int64, page, size int) ([]model.Work
 
 	accessible := make([]model.Workbook, 0, len(allWorkbooks))
 	for _, workbook := range allWorkbooks {
-		if workbook.OwnerID == userID {
-			accessible = append(accessible, workbook)
-			continue
-		}
-
-		sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbook.ID)
+		canView, err := s.permService.CanViewWorkbook(&workbook, userID)
 		if err != nil {
 			return nil, 0, err
 		}
-
-		for _, sheet := range sheets {
-			matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
-			if err != nil {
-				return nil, 0, err
-			}
-			if matrix.Sheet.CanView {
-				accessible = append(accessible, workbook)
-				break
-			}
+		if canView {
+			accessible = append(accessible, workbook)
 		}
 	}
 
@@ -133,11 +143,44 @@ func (s *SheetService) ListWorkbooks(userID int64, page, size int) ([]model.Work
 	return accessible[start:end], total, nil
 }
 
-func (s *SheetService) UpdateWorkbook(workbook *model.Workbook) error {
+func (s *SheetService) UpdateWorkbookForUser(userID int64, workbook *model.Workbook) error {
+	existing, err := s.sheetRepo.GetWorkbook(workbook.ID)
+	if err != nil {
+		return err
+	}
+
+	canManageWorkbook, err := s.CanManageWorkbook(userID, existing)
+	if err != nil {
+		return err
+	}
+	if !canManageWorkbook {
+		return ErrWorkbookAccessDenied
+	}
+
+	if workbook.Name == "" {
+		workbook.Name = existing.Name
+	}
+	if workbook.Description == nil {
+		workbook.Description = existing.Description
+	}
+
 	return s.sheetRepo.UpdateWorkbook(workbook)
 }
 
-func (s *SheetService) DeleteWorkbook(id int64) error {
+func (s *SheetService) DeleteWorkbookForUser(userID, id int64) error {
+	workbook, err := s.sheetRepo.GetWorkbook(id)
+	if err != nil {
+		return err
+	}
+
+	canManageWorkbook, err := s.CanManageWorkbook(userID, workbook)
+	if err != nil {
+		return err
+	}
+	if !canManageWorkbook {
+		return ErrWorkbookAccessDenied
+	}
+
 	return s.sheetRepo.DeleteWorkbook(id)
 }
 
@@ -149,7 +192,7 @@ func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) erro
 		return err
 	}
 
-	canManageWorkbook, err := s.canManageWorkbook(userID, wb)
+	canManageWorkbook, err := s.CanManageWorkbook(userID, wb)
 	if err != nil {
 		return err
 	}
@@ -167,9 +210,19 @@ func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) erro
 }
 
 func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.Sheet) error {
+	if err := s.ensureEditableCellsAuthorized(userID, existing, sheet); err != nil {
+		return err
+	}
 	if err := s.ensureProtectedCellsUnchanged(userID, existing, sheet); err != nil {
 		return err
 	}
+
+	mergedConfig, err := mergeProtectionState(existing.Config, sheet.Config)
+	if err != nil {
+		return err
+	}
+	sheet.Config = mergedConfig
+
 	return s.sheetRepo.UpdateSheet(sheet)
 }
 
@@ -294,11 +347,31 @@ func (s *SheetService) UpdateCells(userID int64, changes []model.CellUpdate) err
 }
 
 func (s *SheetService) InsertRow(sheetID int64, rowIndex int) error {
-	return s.sheetRepo.InsertRow(sheetID, rowIndex)
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return err
+	}
+
+	nextConfig, err := shiftProtectionRowsInConfig(sheet.Config, rowIndex, true)
+	if err != nil {
+		return err
+	}
+
+	return s.sheetRepo.InsertRowWithConfig(sheetID, rowIndex, nextConfig)
 }
 
 func (s *SheetService) DeleteRow(sheetID int64, rowIndex int) error {
-	return s.sheetRepo.DeleteRow(sheetID, rowIndex)
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return err
+	}
+
+	nextConfig, err := shiftProtectionRowsInConfig(sheet.Config, rowIndex, false)
+	if err != nil {
+		return err
+	}
+
+	return s.sheetRepo.DeleteRowWithConfig(sheetID, rowIndex, nextConfig)
 }
 
 func (s *SheetService) GetProtectionSnapshot(sheetID int64) (*model.ProtectionSnapshot, error) {
@@ -456,17 +529,13 @@ func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey strin
 	return false, "", nil
 }
 
-func (s *SheetService) canManageWorkbook(userID int64, workbook *model.Workbook) (bool, error) {
-	if workbook.OwnerID == userID {
-		return true, nil
-	}
-
-	isAdmin, err := s.permService.IsAdmin(userID)
+func (s *SheetService) CanManageWorkbook(userID int64, workbook *model.Workbook) (bool, error) {
+	canManage, err := s.permService.CanManageWorkbook(workbook, userID)
 	if err != nil {
-		return false, fmt.Errorf("check admin role: %w", err)
+		return false, fmt.Errorf("check workbook manage permission: %w", err)
 	}
 
-	return isAdmin, nil
+	return canManage, nil
 }
 
 func parseSheetConfigProtection(config json.RawMessage) (map[string]interface{}, protectionMaps, map[string]bool, error) {
@@ -658,6 +727,71 @@ func (s *SheetService) ensureProtectedCellsUnchanged(userID int64, existing, nex
 	return nil
 }
 
+func (s *SheetService) ensureEditableCellsAuthorized(userID int64, existing, next *model.Sheet) error {
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if isAdmin {
+		return nil
+	}
+
+	currentCells := extractUniverCellData(existing.Config)
+	nextCells := extractUniverCellData(next.Config)
+	if len(currentCells) == 0 && len(nextCells) == 0 {
+		return nil
+	}
+
+	columnKeys, err := parseColumnKeys(next.Columns)
+	if err != nil {
+		return err
+	}
+	if len(columnKeys) == 0 {
+		columnKeys, err = parseColumnKeys(existing.Columns)
+		if err != nil {
+			return err
+		}
+	}
+
+	keys := make(map[string]struct{}, len(currentCells)+len(nextCells))
+	for key := range currentCells {
+		keys[key] = struct{}{}
+	}
+	for key := range nextCells {
+		keys[key] = struct{}{}
+	}
+
+	for key := range keys {
+		if currentCells[key] == nextCells[key] {
+			continue
+		}
+
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		worksheetRow, err := strconv.Atoi(parts[0])
+		if err != nil || worksheetRow <= 0 {
+			continue
+		}
+		columnIndex, err := strconv.Atoi(parts[1])
+		if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) {
+			continue
+		}
+
+		columnKey := columnKeys[columnIndex]
+		allowed, err := s.permService.CheckCellPermission(existing.ID, userID, columnKey, worksheetRow-1, "write")
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, columnKey, worksheetRow+1)
+		}
+	}
+
+	return nil
+}
+
 func (s *SheetService) checkProtectionByWorksheetRow(config json.RawMessage, worksheetRowIndex int, colKey string, userID int64) (bool, string, error) {
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
@@ -764,4 +898,156 @@ func parseColumnKeys(raw json.RawMessage) ([]string, error) {
 		keys = append(keys, column.Key)
 	}
 	return keys, nil
+}
+
+func mergeProtectionState(existingConfig, nextConfig json.RawMessage) (json.RawMessage, error) {
+	nextPayload, _, _, err := parseSheetConfigProtection(nextConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	_, existingProtections, existingLegacyLocks, err := parseSheetConfigProtection(existingConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	if hasAnyProtection(existingProtections) {
+		nextPayload["protections"] = existingProtections
+	} else {
+		delete(nextPayload, "protections")
+	}
+
+	if len(existingLegacyLocks) > 0 {
+		nextPayload["lockedCells"] = existingLegacyLocks
+	} else {
+		delete(nextPayload, "lockedCells")
+	}
+
+	mergedConfig, err := json.Marshal(nextPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged protection config: %w", err)
+	}
+
+	return mergedConfig, nil
+}
+
+func shiftProtectionRowsInConfig(config json.RawMessage, rowIndex int, insert bool) (json.RawMessage, error) {
+	payload, protections, legacyLocks, err := parseSheetConfigProtection(config)
+	if err != nil {
+		return nil, err
+	}
+
+	anchorWorksheetRow := rowIndex + 1
+	protections.Rows = shiftRowProtectionMap(protections.Rows, anchorWorksheetRow, insert)
+	protections.Cells = shiftCellProtectionMap(protections.Cells, anchorWorksheetRow, insert)
+	legacyLocks = shiftLegacyLockMap(legacyLocks, anchorWorksheetRow, insert)
+
+	if hasAnyProtection(protections) {
+		payload["protections"] = protections
+	} else {
+		delete(payload, "protections")
+	}
+
+	if len(legacyLocks) > 0 {
+		payload["lockedCells"] = legacyLocks
+	} else {
+		delete(payload, "lockedCells")
+	}
+
+	nextConfig, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal shifted protection config: %w", err)
+	}
+
+	return nextConfig, nil
+}
+
+func shiftRowProtectionMap(items map[string]protectionOwner, anchorWorksheetRow int, insert bool) map[string]protectionOwner {
+	shifted := make(map[string]protectionOwner, len(items))
+	for key, info := range items {
+		row, err := strconv.Atoi(key)
+		if err != nil {
+			shifted[key] = info
+			continue
+		}
+
+		nextRow, keep := shiftProtectedRowIndex(row, anchorWorksheetRow, insert)
+		if !keep {
+			continue
+		}
+		shifted[strconv.Itoa(nextRow)] = info
+	}
+
+	return shifted
+}
+
+func shiftCellProtectionMap(items map[string]protectionOwner, anchorWorksheetRow int, insert bool) map[string]protectionOwner {
+	shifted := make(map[string]protectionOwner, len(items))
+	for key, info := range items {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			shifted[key] = info
+			continue
+		}
+
+		row, err := strconv.Atoi(parts[0])
+		if err != nil {
+			shifted[key] = info
+			continue
+		}
+
+		nextRow, keep := shiftProtectedRowIndex(row, anchorWorksheetRow, insert)
+		if !keep {
+			continue
+		}
+		shifted[fmt.Sprintf("%d:%s", nextRow, parts[1])] = info
+	}
+
+	return shifted
+}
+
+func shiftLegacyLockMap(items map[string]bool, anchorWorksheetRow int, insert bool) map[string]bool {
+	shifted := make(map[string]bool, len(items))
+	for key, locked := range items {
+		if !locked {
+			continue
+		}
+
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			shifted[key] = true
+			continue
+		}
+
+		row, err := strconv.Atoi(parts[0])
+		if err != nil {
+			shifted[key] = true
+			continue
+		}
+
+		nextRow, keep := shiftProtectedRowIndex(row, anchorWorksheetRow, insert)
+		if !keep {
+			continue
+		}
+		shifted[fmt.Sprintf("%d:%s", nextRow, parts[1])] = true
+	}
+
+	return shifted
+}
+
+func shiftProtectedRowIndex(row, anchorWorksheetRow int, insert bool) (int, bool) {
+	if insert {
+		if row > anchorWorksheetRow {
+			return row + 1, true
+		}
+		return row, true
+	}
+
+	if row == anchorWorksheetRow {
+		return 0, false
+	}
+	if row > anchorWorksheetRow {
+		return row - 1, true
+	}
+	return row, true
 }

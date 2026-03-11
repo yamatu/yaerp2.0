@@ -35,9 +35,11 @@ func (r *FolderRepo) Create(f *model.Folder) error {
 func (r *FolderRepo) GetByID(id int64) (*model.Folder, error) {
 	var f model.Folder
 	err := r.db.QueryRow(
-		`SELECT id, name, parent_id, owner_id, created_at, updated_at
-		 FROM folders WHERE id = $1`, id,
-	).Scan(&f.ID, &f.Name, &f.ParentID, &f.OwnerID, &f.CreatedAt, &f.UpdatedAt)
+		`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
+		 FROM folders f
+		 LEFT JOIN users u ON u.id = f.owner_id
+		 WHERE f.id = $1`, id,
+	).Scan(&f.ID, &f.Name, &f.ParentID, &f.OwnerID, &f.OwnerName, &f.CreatedAt, &f.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("folder %d not found", id)
 	}
@@ -81,15 +83,19 @@ func (r *FolderRepo) ListSubFolders(parentID *int64) ([]model.Folder, error) {
 
 	if parentID == nil {
 		queryRows, err = r.db.Query(
-			`SELECT id, name, parent_id, owner_id, created_at, updated_at
-			 FROM folders WHERE parent_id IS NULL
-			 ORDER BY name`,
+			`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
+			 FROM folders f
+			 LEFT JOIN users u ON u.id = f.owner_id
+			 WHERE f.parent_id IS NULL
+			 ORDER BY f.name`,
 		)
 	} else {
 		queryRows, err = r.db.Query(
-			`SELECT id, name, parent_id, owner_id, created_at, updated_at
-			 FROM folders WHERE parent_id = $1
-			 ORDER BY name`, *parentID,
+			`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
+			 FROM folders f
+			 LEFT JOIN users u ON u.id = f.owner_id
+			 WHERE f.parent_id = $1
+			 ORDER BY f.name`, *parentID,
 		)
 	}
 	if err != nil {
@@ -100,12 +106,110 @@ func (r *FolderRepo) ListSubFolders(parentID *int64) ([]model.Folder, error) {
 	folders := make([]model.Folder, 0)
 	for queryRows.Next() {
 		var f model.Folder
-		if err := queryRows.Scan(&f.ID, &f.Name, &f.ParentID, &f.OwnerID, &f.CreatedAt, &f.UpdatedAt); err != nil {
+		if err := queryRows.Scan(&f.ID, &f.Name, &f.ParentID, &f.OwnerID, &f.OwnerName, &f.CreatedAt, &f.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan folder: %w", err)
 		}
 		folders = append(folders, f)
 	}
 	return folders, queryRows.Err()
+}
+
+func (r *FolderRepo) SetShares(folderID int64, shares []model.FolderShareEntry) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM folder_shares WHERE folder_id = $1`, folderID); err != nil {
+		return fmt.Errorf("clear shares: %w", err)
+	}
+
+	for _, share := range shares {
+		if _, err := tx.Exec(
+			`INSERT INTO folder_shares (folder_id, user_id, access_level)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (folder_id, user_id)
+			 DO UPDATE SET access_level = EXCLUDED.access_level`,
+			folderID, share.UserID, share.AccessLevel,
+		); err != nil {
+			return fmt.Errorf("insert share: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	return nil
+}
+
+func (r *FolderRepo) ListShares(folderID int64) ([]model.FolderShareUser, error) {
+	rows, err := r.db.Query(
+		`SELECT u.id, u.username, u.email, fs.access_level
+		 FROM folder_shares fs
+		 INNER JOIN users u ON u.id = fs.user_id
+		 WHERE fs.folder_id = $1
+		 ORDER BY u.username, u.id`,
+		folderID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list shares: %w", err)
+	}
+	defer rows.Close()
+
+	shares := make([]model.FolderShareUser, 0)
+	for rows.Next() {
+		var user model.FolderShareUser
+		if err := rows.Scan(&user.ID, &user.Username, &user.Email, &user.AccessLevel); err != nil {
+			return nil, fmt.Errorf("scan shared user: %w", err)
+		}
+		shares = append(shares, user)
+	}
+
+	return shares, rows.Err()
+}
+
+func (r *FolderRepo) GetShareAccessLevel(folderID, userID int64) (string, error) {
+	var accessLevel string
+	err := r.db.QueryRow(
+		`SELECT access_level FROM folder_shares WHERE folder_id = $1 AND user_id = $2`,
+		folderID, userID,
+	).Scan(&accessLevel)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("check folder share: %w", err)
+	}
+	return accessLevel, nil
+}
+
+func (r *FolderRepo) ListDirectlySharedFolders(userID int64) ([]model.Folder, error) {
+	rows, err := r.db.Query(
+		`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, fs.access_level, f.created_at, f.updated_at
+		 FROM folder_shares fs
+		 INNER JOIN folders f ON f.id = fs.folder_id
+		 LEFT JOIN users u ON u.id = f.owner_id
+		 WHERE fs.user_id = $1 AND f.owner_id <> $1
+		 ORDER BY f.updated_at DESC, f.id DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list shared folders: %w", err)
+	}
+	defer rows.Close()
+
+	folders := make([]model.Folder, 0)
+	for rows.Next() {
+		var folder model.Folder
+		if err := rows.Scan(&folder.ID, &folder.Name, &folder.ParentID, &folder.OwnerID, &folder.OwnerName, &folder.AccessLevel, &folder.CreatedAt, &folder.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan shared folder: %w", err)
+		}
+		folders = append(folders, folder)
+	}
+
+	return folders, rows.Err()
 }
 
 func (r *FolderRepo) ListWorkbooksInFolder(folderID *int64) ([]model.Workbook, error) {

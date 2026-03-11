@@ -10,6 +10,7 @@ class WSClient {
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
   private pendingMessages: string[] = []
+  private joinedSheetId: number | null = null
 
   private getWSUrl() {
     if (typeof window === 'undefined') {
@@ -45,7 +46,11 @@ class WSClient {
       this.reconnectAttempts = 0
       console.log('WebSocket connected')
       this.pendingMessages.forEach((message) => this.ws?.send(message))
+      const hadPendingMessages = this.pendingMessages.length > 0
       this.pendingMessages = []
+      if (!hadPendingMessages && this.joinedSheetId !== null) {
+        this.ws?.send(JSON.stringify({ type: 'join_sheet', sheetId: this.joinedSheetId }))
+      }
     }
 
     this.ws.onmessage = (event) => {
@@ -104,6 +109,11 @@ class WSClient {
   }
 
   joinSheet(sheetId: number) {
+    if (this.joinedSheetId === sheetId && this.ws?.readyState === WebSocket.OPEN) {
+      return
+    }
+    this.joinedSheetId = sheetId
+    this.pendingMessages = this.pendingMessages.filter((message) => !message.includes('"type":"join_sheet"'))
     this.send({ type: 'join_sheet', sheetId })
   }
 

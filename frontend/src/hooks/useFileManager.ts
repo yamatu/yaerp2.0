@@ -20,6 +20,7 @@ export function useFileManager() {
       setContents(res.data ?? { folders: [], workbooks: [] })
     } catch (err) {
       console.error('Failed to load folder contents:', err)
+      setContents({ folders: [], workbooks: [] })
       setError('加载文件夹内容失败')
     } finally {
       setLoading(false)

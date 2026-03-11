@@ -40,6 +40,31 @@ func (h *UserHandler) ListUsers(c *gin.Context) {
 	response.OKPage(c, users, total, page, size)
 }
 
+func (h *UserHandler) ListShareableUsers(c *gin.Context) {
+	currentUserID := c.GetInt64("user_id")
+
+	users, _, err := h.userRepo.List(1, 1000)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	shareable := make([]model.User, 0, len(users))
+	for _, user := range users {
+		if user.ID == currentUserID || user.Status != 1 {
+			continue
+		}
+		shareable = append(shareable, model.User{
+			ID:       user.ID,
+			Username: user.Username,
+			Email:    user.Email,
+			Status:   user.Status,
+		})
+	}
+
+	response.OK(c, shareable)
+}
+
 func (h *UserHandler) UpdateUser(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {

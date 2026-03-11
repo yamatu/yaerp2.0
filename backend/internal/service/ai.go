@@ -18,13 +18,28 @@ import (
 )
 
 type AIService struct {
-	cfg       *config.Config
-	db        *sql.DB
-	sheetRepo *repo.SheetRepo
+	cfg             *config.Config
+	db              *sql.DB
+	sheetRepo       *repo.SheetRepo
+	sheetService    *SheetService
+	permService     *PermissionService
+	uploadService   *UploadService
+	scheduleService *AIScheduleService
+	tools           map[string]ToolFunc
 }
 
-func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo) *AIService {
-	return &AIService{cfg: cfg, db: db, sheetRepo: sheetRepo}
+func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo, sheetService *SheetService, permService *PermissionService, uploadService *UploadService, scheduleService *AIScheduleService) *AIService {
+	service := &AIService{
+		cfg:             cfg,
+		db:              db,
+		sheetRepo:       sheetRepo,
+		sheetService:    sheetService,
+		permService:     permService,
+		uploadService:   uploadService,
+		scheduleService: scheduleService,
+	}
+	service.tools = service.buildToolRegistry()
+	return service
 }
 
 type ChatMessage struct {
@@ -37,8 +52,19 @@ type ChatRequest struct {
 }
 
 type ChatResponse struct {
-	Reply string `json:"reply"`
-	Model string `json:"model"`
+	Reply             string                 `json:"reply"`
+	Model             string                 `json:"model"`
+	TouchedSheetIDs   []int64                `json:"touched_sheet_ids,omitempty"`
+	PendingOperations []SpreadsheetOperation `json:"pending_operations,omitempty"`
+	ToolTraces        []ChatToolTrace        `json:"tool_traces,omitempty"`
+}
+
+type ChatToolTrace struct {
+	Name            string      `json:"name"`
+	Status          string      `json:"status"`
+	Summary         string      `json:"summary,omitempty"`
+	Data            interface{} `json:"data,omitempty"`
+	TouchedSheetIDs []int64     `json:"touched_sheet_ids,omitempty"`
 }
 
 type AIConfigStatus struct {
@@ -117,30 +143,7 @@ func (s *AIService) UpdateConfig(endpoint, apiKey, model string) error {
 
 // Chat sends messages to the OpenAI-compatible API and returns the response.
 func (s *AIService) Chat(userID int64, messages []ChatMessage) (*ChatResponse, error) {
-	endpoint, model := s.getActiveConfig()
-	apiKey := s.getAPIKey()
-
-	if endpoint == "" || apiKey == "" {
-		return nil, fmt.Errorf("AI is not configured. Please set the API endpoint and key in admin settings")
-	}
-
-	// Build context from user's accessible sheet data
-	context := s.buildUserContext(userID)
-
-	// Prepend system message with context
-	systemMsg := ChatMessage{
-		Role: "system",
-		Content: fmt.Sprintf(
-			"你是 YaERP 智能助手，帮助用户分析和处理他们的表格数据。以下是用户当前可访问的工作簿摘要：\n\n%s\n\n"+
-				"请基于这些数据回答用户的问题。如果用户的问题与表格数据无关，你也可以回答通用问题。"+
-				"始终使用中文回复。",
-			context,
-		),
-	}
-
-	allMessages := append([]ChatMessage{systemMsg}, messages...)
-
-	return s.callChatCompletion(endpoint, apiKey, model, allMessages)
+	return s.chatWithTools(userID, messages)
 }
 
 func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*SpreadsheetPlanResponse, error) {
@@ -161,9 +164,10 @@ func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*Spread
 			Role: "system",
 			Content: "你是 YaERP 表格批处理助手。你必须只返回 JSON 对象，不要输出 Markdown、解释文字或代码块。" +
 				` 返回格式必须是 {"reply":"中文回复","operations":[{"kind":"update_cell","sheet_id":1,"sheet_name":"工作表","row":0,"column_key":"status","value":"已完成","reason":"更新原因"}]}` +
-				`。支持的 kind: update_cell、insert_row、insert_column、fill_formula。` +
+				`。支持的 kind: update_cell、insert_row、delete_row、insert_column、fill_formula。` +
 				` update_cell 使用 row(0-based 数据行) + column_key + value；` +
 				` insert_row 使用 row(插入后的目标数据行索引) + row_values；` +
+				` delete_row 使用 row(需要删除的 0-based 数据行索引)；` +
 				` insert_column 使用 column_key + column_name + column_type，可选 insert_after_column_key；` +
 				` fill_formula 使用 column_key + start_row + end_row + formula_template，formula_template 里可使用 {{row}} 表示当前 Excel 行号（第一条数据是 2）。` +
 				" column_key 必须严格使用上下文中的列 key；只能修改已提供的工作表；如果用户没有要求修改表格，operations 返回空数组。",
@@ -190,31 +194,8 @@ func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*Spread
 }
 
 func (s *AIService) ApplySpreadsheetPlan(userID int64, operations []SpreadsheetOperation) error {
-	touchedSheets := make(map[int64]struct{})
-
-	for _, op := range operations {
-		normalized := normalizeSpreadsheetOperation(op)
-		if normalized.SheetID == 0 {
-			return fmt.Errorf("invalid spreadsheet operation")
-		}
-
-		if err := s.applySpreadsheetOperation(userID, normalized); err != nil {
-			return err
-		}
-		touchedSheets[normalized.SheetID] = struct{}{}
-	}
-
-	for sheetID := range touchedSheets {
-		sheet, err := s.sheetRepo.GetSheet(sheetID)
-		if err != nil {
-			return fmt.Errorf("reload touched sheet: %w", err)
-		}
-		if err := s.invalidateSheetSnapshot(sheet); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err := s.executeSpreadsheetOperations(userID, operations)
+	return err
 }
 
 func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages []ChatMessage) (*ChatResponse, error) {
@@ -488,6 +469,8 @@ func (s *AIService) applySpreadsheetOperation(userID int64, operation Spreadshee
 	switch operation.Kind {
 	case "insert_row":
 		return s.applyInsertRowOperation(userID, operation)
+	case "delete_row":
+		return s.applyDeleteRowOperation(userID, operation)
 	case "insert_column":
 		return s.applyInsertColumnOperation(userID, operation)
 	case "fill_formula":
@@ -502,29 +485,12 @@ func (s *AIService) applyCellUpdateOperation(userID int64, operation Spreadsheet
 		return fmt.Errorf("invalid update_cell operation")
 	}
 
-	rows, err := s.sheetRepo.GetRows(operation.SheetID)
-	if err != nil {
-		return fmt.Errorf("load sheet rows: %w", err)
-	}
-
-	rowData := make(map[string]interface{})
-	for _, row := range rows {
-		if row.RowIndex != operation.Row {
-			continue
-		}
-		if err := json.Unmarshal(row.Data, &rowData); err != nil {
-			rowData = make(map[string]interface{})
-		}
-		break
-	}
-
-	rowData[operation.ColumnKey] = operation.Value
-	data, err := json.Marshal(rowData)
+	rawValue, err := json.Marshal(operation.Value)
 	if err != nil {
 		return fmt.Errorf("marshal row data: %w", err)
 	}
 
-	if err := s.sheetRepo.UpsertRow(operation.SheetID, operation.Row, data, userID); err != nil {
+	if err := s.sheetService.UpdateCells(userID, []model.CellUpdate{{SheetID: operation.SheetID, Row: operation.Row, Col: operation.ColumnKey, Value: rawValue}}); err != nil {
 		return fmt.Errorf("apply spreadsheet operation: %w", err)
 	}
 
@@ -536,7 +502,7 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 		return fmt.Errorf("invalid insert_row row index")
 	}
 
-	if err := s.sheetRepo.InsertRow(operation.SheetID, operation.Row-1); err != nil {
+	if err := s.sheetService.InsertRow(operation.SheetID, operation.Row-1); err != nil {
 		return fmt.Errorf("insert row: %w", err)
 	}
 
@@ -555,6 +521,18 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 
 	if err := s.sheetRepo.UpsertRow(operation.SheetID, operation.Row, data, userID); err != nil {
 		return fmt.Errorf("persist inserted row: %w", err)
+	}
+
+	return nil
+}
+
+func (s *AIService) applyDeleteRowOperation(_ int64, operation SpreadsheetOperation) error {
+	if operation.Row < 0 {
+		return fmt.Errorf("invalid delete_row row index")
+	}
+
+	if err := s.sheetService.DeleteRow(operation.SheetID, operation.Row); err != nil {
+		return fmt.Errorf("delete row: %w", err)
 	}
 
 	return nil
@@ -746,43 +724,26 @@ func (s *AIService) getSetting(key string) string {
 
 // buildUserContext creates a summary of user's accessible data.
 func (s *AIService) buildUserContext(userID int64) string {
-	rows, err := s.db.Query(
-		`SELECT w.name, s.name,
-		  (SELECT COUNT(*) FROM rows r WHERE r.sheet_id = s.id)
-		 FROM workbooks w
-		 JOIN sheets s ON s.workbook_id = w.id
-		 WHERE w.owner_id = $1
-		 ORDER BY w.name, s.sort_order
-		 LIMIT 20`, userID,
-	)
+	snapshot, err := s.buildUserContextSnapshot(userID, 20)
 	if err != nil {
 		return "无法加载用户数据。"
 	}
-	defer rows.Close()
 
-	var sb strings.Builder
-	currentWorkbook := ""
-
-	for rows.Next() {
-		var wbName, sheetName string
-		var rowCount int
-		if err := rows.Scan(&wbName, &sheetName, &rowCount); err != nil {
-			continue
-		}
-
-		if wbName != currentWorkbook {
-			if currentWorkbook != "" {
-				sb.WriteString("\n")
-			}
-			sb.WriteString(fmt.Sprintf("工作簿「%s」：\n", wbName))
-			currentWorkbook = wbName
-		}
-		sb.WriteString(fmt.Sprintf("  - 工作表「%s」（%d 行数据）\n", sheetName, rowCount))
+	workbooks, _ := snapshot["workbooks"].([]map[string]any)
+	if len(workbooks) == 0 {
+		return "用户暂无可访问工作簿。"
 	}
 
-	if sb.Len() == 0 {
-		return "用户暂无工作簿数据。"
+	var builder strings.Builder
+	for _, workbook := range workbooks {
+		builder.WriteString(fmt.Sprintf("工作簿「%v」(ID:%v)：\n", workbook["workbook_name"], workbook["workbook_id"]))
+		sheets, _ := workbook["sheets"].([]map[string]any)
+		for _, sheet := range sheets {
+			columns, _ := sheet["columns"].([]sheetColumnPayload)
+			builder.WriteString(fmt.Sprintf("  - 工作表「%v」(ID:%v, %d 列)\n", sheet["sheet_name"], sheet["sheet_id"], len(columns)))
+		}
+		builder.WriteString("\n")
 	}
 
-	return sb.String()
+	return strings.TrimSpace(builder.String())
 }

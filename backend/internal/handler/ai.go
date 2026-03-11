@@ -38,6 +38,17 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		return
 	}
 
+	if h.hub != nil {
+		for _, sheetID := range result.TouchedSheetIDs {
+			payload, _ := json.Marshal(ws.Message{
+				Type:    "sheet_reload",
+				SheetID: sheetID,
+				UserID:  userID,
+			})
+			h.hub.BroadcastToSheet(sheetID, payload, nil)
+		}
+	}
+
 	response.OK(c, result)
 }
 

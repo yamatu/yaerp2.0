@@ -2,6 +2,7 @@ package ws
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -9,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
+	"yaerp/internal/model"
+	"yaerp/internal/service"
 	jwtpkg "yaerp/pkg/jwt"
 )
 
@@ -28,12 +31,14 @@ const (
 )
 
 type WSHandler struct {
-	Hub    *Hub
-	JWTUtil *jwtpkg.JWTUtil
+	Hub          *Hub
+	JWTUtil      *jwtpkg.JWTUtil
+	PermService  *service.PermissionService
+	SheetService *service.SheetService
 }
 
-func NewWSHandler(hub *Hub, jwtUtil *jwtpkg.JWTUtil) *WSHandler {
-	return &WSHandler{Hub: hub, JWTUtil: jwtUtil}
+func NewWSHandler(hub *Hub, jwtUtil *jwtpkg.JWTUtil, permService *service.PermissionService, sheetService *service.SheetService) *WSHandler {
+	return &WSHandler{Hub: hub, JWTUtil: jwtUtil, PermService: permService, SheetService: sheetService}
 }
 
 func (h *WSHandler) HandleWS(c *gin.Context) {
@@ -100,14 +105,106 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 
 		switch msg.Type {
 		case "join_sheet":
+			matrix, err := h.PermService.GetPermissionMatrix(msg.SheetID, client.UserID)
+			if err != nil {
+				log.Printf("failed to check sheet permission for user %d: %v", client.UserID, err)
+				continue
+			}
+			if !matrix.Sheet.CanView {
+				log.Printf("blocked websocket join for user %d on sheet %d", client.UserID, msg.SheetID)
+				continue
+			}
 			h.Hub.JoinSheet(client, msg.SheetID)
 
 		case "cell_update", "batch_update", "row_insert", "row_delete":
+			if err := h.validateMutationMessage(client, &msg); err != nil {
+				log.Printf("blocked websocket mutation for user %d on sheet %d: %v", client.UserID, client.SheetID, err)
+				continue
+			}
+
 			// Broadcast to other users viewing same sheet
 			broadcastData, _ := json.Marshal(msg)
 			h.Hub.BroadcastToSheet(client.SheetID, broadcastData, client)
 		}
 	}
+}
+
+func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error {
+	if client.SheetID == 0 || client.SheetID != msg.SheetID {
+		return fmt.Errorf("client is not joined to target sheet")
+	}
+
+	matrix, err := h.PermService.GetPermissionMatrix(client.SheetID, client.UserID)
+	if err != nil {
+		return err
+	}
+	if !matrix.Sheet.CanEdit {
+		return fmt.Errorf("sheet edit permission denied")
+	}
+
+	switch msg.Type {
+	case "cell_update":
+		return h.validateCellChange(client, msg.Row, msg.Col)
+	case "batch_update":
+		var changes []model.CellUpdate
+		if err := json.Unmarshal(msg.Changes, &changes); err != nil {
+			return fmt.Errorf("invalid batch payload: %w", err)
+		}
+		for _, change := range changes {
+			if change.SheetID != client.SheetID {
+				return fmt.Errorf("batch contains mismatched sheet id")
+			}
+			if err := h.validateCellChange(client, change.Row, change.Col); err != nil {
+				return err
+			}
+		}
+	case "row_insert":
+		return h.validateRowMutation(client, msg.AfterRow)
+	case "row_delete":
+		return h.validateRowMutation(client, msg.Row)
+	}
+
+	return nil
+}
+
+func (h *WSHandler) validateCellChange(client *Client, row int, col string) error {
+	allowed, err := h.PermService.CheckCellPermission(client.SheetID, client.UserID, col, row, "write")
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("cell write permission denied")
+	}
+
+	protected, _, err := h.SheetService.CheckProtection(client.SheetID, row, col, client.UserID)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return fmt.Errorf("cell is protected")
+	}
+
+	return nil
+}
+
+func (h *WSHandler) validateRowMutation(client *Client, row int) error {
+	allowed, err := h.PermService.CheckCellPermission(client.SheetID, client.UserID, "", row, "write")
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("row write permission denied")
+	}
+
+	protected, _, err := h.SheetService.CheckProtection(client.SheetID, row, "", client.UserID)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return fmt.Errorf("row is protected")
+	}
+
+	return nil
 }
 
 func (h *WSHandler) writePump(conn *websocket.Conn, client *Client) {

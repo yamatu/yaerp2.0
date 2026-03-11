@@ -27,6 +27,17 @@ func (r *PermissionRepo) SetSheetPermission(perm *model.SheetPermission) error {
 	return err
 }
 
+func (r *PermissionRepo) SetUserSheetPermission(perm *model.UserSheetPermission) error {
+	_, err := r.db.Exec(
+		`INSERT INTO user_sheet_permissions (sheet_id, user_id, can_view, can_edit, can_delete, can_export)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (sheet_id, user_id)
+		 DO UPDATE SET can_view = $3, can_edit = $4, can_delete = $5, can_export = $6`,
+		perm.SheetID, perm.UserID, perm.CanView, perm.CanEdit, perm.CanDelete, perm.CanExport,
+	)
+	return err
+}
+
 func (r *PermissionRepo) GetSheetPermissions(sheetID, roleID int64) (*model.SheetPermission, error) {
 	var p model.SheetPermission
 	err := r.db.QueryRow(
@@ -73,6 +84,47 @@ func (r *PermissionRepo) GetCellPermissions(sheetID, roleID int64) ([]model.Cell
 		}
 		perms = append(perms, p)
 	}
+	return perms, rows.Err()
+}
+
+func (r *PermissionRepo) GetUserSheetPermission(sheetID, userID int64) (*model.UserSheetPermission, error) {
+	var p model.UserSheetPermission
+	err := r.db.QueryRow(
+		`SELECT id, sheet_id, user_id, can_view, can_edit, can_delete, can_export
+		 FROM user_sheet_permissions WHERE sheet_id = $1 AND user_id = $2`,
+		sheetID, userID,
+	).Scan(&p.ID, &p.SheetID, &p.UserID, &p.CanView, &p.CanEdit, &p.CanDelete, &p.CanExport)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (r *PermissionRepo) ListUserSheetPermissions(sheetID int64) ([]model.UserSheetPermission, error) {
+	rows, err := r.db.Query(
+		`SELECT id, sheet_id, user_id, can_view, can_edit, can_delete, can_export
+		 FROM user_sheet_permissions
+		 WHERE sheet_id = $1
+		 ORDER BY user_id`,
+		sheetID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	perms := make([]model.UserSheetPermission, 0)
+	for rows.Next() {
+		var p model.UserSheetPermission
+		if err := rows.Scan(&p.ID, &p.SheetID, &p.UserID, &p.CanView, &p.CanEdit, &p.CanDelete, &p.CanExport); err != nil {
+			return nil, err
+		}
+		perms = append(perms, p)
+	}
+
 	return perms, rows.Err()
 }
 

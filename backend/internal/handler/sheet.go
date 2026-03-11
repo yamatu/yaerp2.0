@@ -54,7 +54,11 @@ func (h *SheetHandler) CreateWorkbook(c *gin.Context) {
 		FolderID:    req.FolderID,
 		IsTemplate:  req.IsTemplate,
 	}
-	if err := h.sheetService.CreateWorkbook(wb); err != nil {
+	if err := h.sheetService.CreateWorkbookForUser(userID, wb); err != nil {
+		if errors.Is(err, service.ErrFolderManageDenied) {
+			response.Forbidden(c, "you do not have permission to create workbooks in this folder")
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
@@ -81,6 +85,7 @@ func (h *SheetHandler) GetWorkbook(c *gin.Context) {
 }
 
 func (h *SheetHandler) UpdateWorkbook(c *gin.Context) {
+	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "invalid workbook id")
@@ -100,7 +105,11 @@ func (h *SheetHandler) UpdateWorkbook(c *gin.Context) {
 	if req.Description != nil {
 		wb.Description = req.Description
 	}
-	if err := h.sheetService.UpdateWorkbook(wb); err != nil {
+	if err := h.sheetService.UpdateWorkbookForUser(userID, wb); err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+			response.Forbidden(c, "you do not have permission to manage this workbook")
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
@@ -108,12 +117,17 @@ func (h *SheetHandler) UpdateWorkbook(c *gin.Context) {
 }
 
 func (h *SheetHandler) DeleteWorkbook(c *gin.Context) {
+	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "invalid workbook id")
 		return
 	}
-	if err := h.sheetService.DeleteWorkbook(id); err != nil {
+	if err := h.sheetService.DeleteWorkbookForUser(userID, id); err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+			response.Forbidden(c, "you do not have permission to manage this workbook")
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
@@ -201,6 +215,10 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	}
 	if err := h.sheetService.UpdateSheetForUser(userID, existing, sheet); err != nil {
 		if errors.Is(err, service.ErrProtectionDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		if errors.Is(err, service.ErrSheetPermissionDenied) {
 			response.Forbidden(c, err.Error())
 			return
 		}

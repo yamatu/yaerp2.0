@@ -10,6 +10,16 @@ type SheetPermission struct {
 	CanExport bool  `json:"can_export" db:"can_export"`
 }
 
+type UserSheetPermission struct {
+	ID        int64 `json:"id" db:"id"`
+	SheetID   int64 `json:"sheet_id" db:"sheet_id"`
+	UserID    int64 `json:"user_id" db:"user_id"`
+	CanView   bool  `json:"can_view" db:"can_view"`
+	CanEdit   bool  `json:"can_edit" db:"can_edit"`
+	CanDelete bool  `json:"can_delete" db:"can_delete"`
+	CanExport bool  `json:"can_export" db:"can_export"`
+}
+
 type CellPermission struct {
 	ID         int64  `json:"id" db:"id"`
 	SheetID    int64  `json:"sheet_id" db:"sheet_id"`
@@ -35,6 +45,15 @@ type SheetPerm struct {
 type SetSheetPermissionRequest struct {
 	SheetID   int64 `json:"sheet_id" binding:"required"`
 	RoleID    int64 `json:"role_id" binding:"required"`
+	CanView   bool  `json:"can_view"`
+	CanEdit   bool  `json:"can_edit"`
+	CanDelete bool  `json:"can_delete"`
+	CanExport bool  `json:"can_export"`
+}
+
+type SetUserSheetPermissionRequest struct {
+	SheetID   int64 `json:"sheet_id" binding:"required"`
+	UserID    int64 `json:"user_id" binding:"required"`
 	CanView   bool  `json:"can_view"`
 	CanEdit   bool  `json:"can_edit"`
 	CanDelete bool  `json:"can_delete"`

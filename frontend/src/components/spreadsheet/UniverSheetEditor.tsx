@@ -13,6 +13,7 @@ import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-repl
 import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import api from '@/lib/api'
+import { usePermission } from '@/hooks/usePermission'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
@@ -22,6 +23,7 @@ import type { AuthUser, ProtectionInfo, ProtectionSnapshot, Row, Sheet } from '@
 interface Props {
   workbookId: string | number
   sheet: Sheet
+  reloadToken?: string
   onExternalReload?: () => Promise<void> | void
 }
 
@@ -98,11 +100,12 @@ async function toImageFile(img: GalleryImage): Promise<File> {
   return new File([blob], normalizedName, { type: blob.type || 'image/png' })
 }
 
-export default function UniverSheetEditor({ workbookId, sheet, onExternalReload }: Props) {
+export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const latestSheetRef = useRef(sheet)
   const univerApiRef = useRef<ReturnType<typeof createUniver> | null>(null)
+  const workbookApiRef = useRef<{ setEditable: (editable: boolean) => void } | null>(null)
   const persistRef = useRef<(() => Promise<void>) | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -122,6 +125,10 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const adminMode = isAdmin(profile)
   const sheetId = sheet.id
+  const { permissions, loading: permissionLoading } = usePermission(sheetId)
+  const canEditSheet = permissions?.sheet.canEdit ?? false
+  const canExportSheet = permissions?.sheet.canExport ?? false
+  const editLocked = permissionLoading || !canEditSheet
 
   const syncFilterState = useCallback(() => {
     try {
@@ -231,11 +238,26 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
   useEffect(() => { latestSheetRef.current = sheet }, [sheet])
 
   useEffect(() => {
+    setLoading(true)
+    setError('')
+    setActionError('')
+    setSelectionState(null)
+    setProtectionSnapshot({ rows: [], columns: [], cells: [] })
+    setShowProtectionPanel(false)
+    setToolbarExpanded(false)
+    setHasFilter(false)
+  }, [sheetId])
+
+  useEffect(() => {
     void refreshProtectionSnapshot()
   }, [refreshProtectionSnapshot])
 
   // Manual save handler — triggers immediate persist
   const handleManualSave = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能保存表格。')
+      return
+    }
     if (!persistRef.current) return
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current)
@@ -251,9 +273,13 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
       setActionError(e instanceof Error ? e.message : '保存失败，请稍后再试。')
       setSaveStatus('idle')
     }
-  }, [])
+  }, [editLocked])
 
   const handleEnableFilter = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能修改筛选。')
+      return
+    }
     setActionError('')
 
     try {
@@ -279,9 +305,13 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
       console.error('Failed to enable filter:', err)
       setActionError(err instanceof Error ? err.message : '启用筛选失败，请稍后再试。')
     }
-  }, [handleManualSave, syncFilterState])
+  }, [editLocked, handleManualSave, syncFilterState])
 
   const handleClearFilter = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能修改筛选。')
+      return
+    }
     setActionError('')
 
     try {
@@ -297,9 +327,13 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
       console.error('Failed to clear filter:', err)
       setActionError(err instanceof Error ? err.message : '清除筛选失败，请稍后再试。')
     }
-  }, [handleManualSave, syncFilterState])
+  }, [editLocked, handleManualSave, syncFilterState])
 
   const handleProtectionChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock') => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能修改保护状态。')
+      return
+    }
     const selection = syncSelectionState()
     if (!selection) {
       setActionError('请先在工作表中选中一个单元格。')
@@ -344,9 +378,13 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
     } finally {
       setProtectionAction('')
     }
-  }, [refreshProtectionSnapshot, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, sheetId, syncSelectionState])
 
   const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column', action: 'lock' | 'unlock') => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能修改保护状态。')
+      return
+    }
     const selection = syncSelectionState()
     if (!selection) {
       setActionError('请先在工作表中框选需要保护的范围。')
@@ -393,7 +431,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
     } finally {
       setProtectionAction('')
     }
-  }, [refreshProtectionSnapshot, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, sheetId, syncSelectionState])
 
   const applyIncomingChanges = useCallback((changes: Array<{ row: number; col: string; value: unknown }>) => {
     if (changes.length === 0) return
@@ -424,7 +462,6 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
 
   useEffect(() => {
     wsClient.connect()
-    wsClient.joinSheet(sheetId)
 
     const unsubscribeBatch = wsClient.on('batch_update', (msg) => {
       if (msg.sheetId !== sheetId || !Array.isArray(msg.changes)) return
@@ -439,16 +476,10 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
       applyIncomingChanges(changes)
     })
 
-    const unsubscribeReload = wsClient.on('sheet_reload', (msg) => {
-      if (msg.sheetId !== sheetId) return
-      void onExternalReload?.()
-    })
-
     return () => {
       unsubscribeBatch()
-      unsubscribeReload()
     }
-  }, [applyIncomingChanges, onExternalReload, sheetId])
+  }, [applyIncomingChanges, sheetId])
 
   // Ctrl+S shortcut
   useEffect(() => {
@@ -518,9 +549,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
         await ensureHeight()
         if (disposed || !containerRef.current) return
 
-        containerRef.current.innerHTML = ''
-
-        const localeKey = LocaleType.ZH_CN
+		const localeKey = LocaleType.ZH_CN
         const univerResult = createUniver({
           locale: localeKey,
           theme: defaultTheme,
@@ -551,7 +580,8 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
         univerApiRef.current = univerResult
 
         const workbookApi = univerAPI.createUniverSheet(workbookData)
-        workbookApi.setEditable(true)
+        workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
+        workbookApi.setEditable(canEditSheet)
         syncFilterState()
         syncSelectionState()
         if (!disposed) setLoading(false)
@@ -599,6 +629,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
         cleanup = () => {
           disposable.dispose()
           persistRef.current = null
+          workbookApiRef.current = null
           if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
           univerApiRef.current = null
           setHasFilter(false)
@@ -610,10 +641,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
             console.error('Failed to dispose Univer instance:', disposeError)
           }
 
-          if (containerRef.current) {
-            containerRef.current.innerHTML = ''
-          }
-        }
+		}
       } catch (mountError) {
         console.error('Failed to initialize Univer sheet:', mountError)
         if (!disposed) {
@@ -626,10 +654,22 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
     mount()
     return () => { disposed = true; cleanup?.() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sheetId, workbookId])
+  }, [reloadToken, sheetId, workbookId])
+
+  useEffect(() => {
+    try {
+      workbookApiRef.current?.setEditable(canEditSheet)
+    } catch {
+      // Ignore Univer editable sync issues and keep server-side checks authoritative.
+    }
+  }, [canEditSheet])
 
   // Gallery image picker
   const openImagePicker = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能插入图片。')
+      return
+    }
     setShowImagePicker(true)
     setLoadingGallery(true)
     try {
@@ -644,7 +684,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
     } finally {
       setLoadingGallery(false)
     }
-  }, [])
+  }, [editLocked])
 
   const insertImageToCell = useCallback(async (img: GalleryImage) => {
     const result = univerApiRef.current
@@ -679,6 +719,10 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
 
   // Handle direct file upload from picker
   const handleDirectUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能上传图片。')
+      return
+    }
     const file = e.target.files?.[0]
     if (!file) return
     try {
@@ -710,9 +754,13 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
       console.error('Upload failed:', err)
       setActionError(err instanceof Error ? err.message : '上传图片失败，请稍后再试。')
     }
-  }, [handleManualSave])
+  }, [editLocked, handleManualSave])
 
   const handlePrintSheet = useCallback((mode: 'print' | 'pdf') => {
+    if (!canExportSheet) {
+      setActionError('当前账号没有导出权限，不能打印或导出 PDF。')
+      return
+    }
     try {
       const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
       const worksheet = workbook?.getActiveSheet?.()
@@ -781,7 +829,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
       console.error('Failed to print sheet:', err)
       setActionError(err instanceof Error ? err.message : '打印失败，请稍后再试。')
     }
-  }, [])
+  }, [canExportSheet])
 
   if (error) {
     return (
@@ -806,7 +854,7 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
         (item) => item.row_index === selectionState.rowIndex && item.column_key === selectionState.columnKey
       ) || null
     : null
-  const canReleaseProtection = (item: ProtectionInfo | null) => Boolean(item && (adminMode || item.owner_id === profile?.id))
+  const canReleaseProtection = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
   const visibleProtectionBadges = [
     ...protectionSnapshot.rows.slice(0, 3).map((item) => `行 ${(item.row_index || 0) + 1} - ${item.owner_name}`),
     ...protectionSnapshot.columns.slice(0, 3).map((item) => `列 ${item.column_key || item.key} - ${item.owner_name}`),
@@ -840,11 +888,12 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
               <button
                 type="button"
                 onClick={hasFilter ? handleClearFilter : handleEnableFilter}
+                disabled={editLocked}
                 className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
                   hasFilter
                     ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
                     : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                }`}
+                } disabled:cursor-not-allowed disabled:opacity-50`}
                 title={hasFilter ? '清除筛选' : '启用筛选'}
               >
                 {hasFilter ? <FilterX className="h-4 w-4" /> : <Filter className="h-4 w-4" />}
@@ -852,7 +901,8 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
               <button
                 type="button"
                 onClick={() => handlePrintSheet('print')}
-                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+                disabled={!canExportSheet}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="打印当前表"
               >
                 <Printer className="h-4 w-4" />
@@ -860,7 +910,8 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
               <button
                 type="button"
                 onClick={() => handlePrintSheet('pdf')}
-                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+                disabled={!canExportSheet}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="导出 PDF"
               >
                 <FileOutput className="h-4 w-4" />
@@ -868,7 +919,8 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
               <button
                 type="button"
                 onClick={openImagePicker}
-                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+                disabled={editLocked}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="插入图片"
               >
                 <ImagePlus className="h-4 w-4" />
@@ -879,13 +931,14 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
           <button
             type="button"
             onClick={handleManualSave}
+            disabled={editLocked}
             className={`flex h-9 w-9 items-center justify-center rounded-full shadow-lg transition ${
               saveStatus === 'saving'
                 ? 'bg-amber-500 text-white'
                 : saveStatus === 'saved'
                 ? 'bg-emerald-500 text-white'
                 : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-            }`}
+            } disabled:cursor-not-allowed disabled:opacity-50`}
             title="保存 (Ctrl+S)"
           >
             <Save className="h-4 w-4" />
@@ -924,6 +977,11 @@ export default function UniverSheetEditor({ workbookId, sheet, onExternalReload 
           </div>
 
           <div className="space-y-3">
+            {editLocked && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
+                当前账号只有查看权限，可以查看保护状态，但不能加锁、解锁或保存表格。
+              </div>
+            )}
             {selectionState && (selectionState.endRowIndex > selectionState.rowIndex || selectionState.endColumnKey !== selectionState.columnKey) && (
               <div className="rounded-xl border border-sky-200 bg-sky-50/80 p-3">
                 <div className="mb-2 text-sm font-semibold text-sky-800">批量保护所选范围</div>
