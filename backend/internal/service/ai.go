@@ -514,12 +514,21 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 		return nil
 	}
 
-	data, err := json.Marshal(rowValues)
-	if err != nil {
-		return fmt.Errorf("marshal inserted row values: %w", err)
+	changes := make([]model.CellUpdate, 0, len(rowValues))
+	for key, value := range rowValues {
+		rawValue, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("marshal inserted row value: %w", err)
+		}
+		changes = append(changes, model.CellUpdate{
+			SheetID: operation.SheetID,
+			Row:     operation.Row,
+			Col:     key,
+			Value:   rawValue,
+		})
 	}
 
-	if err := s.sheetRepo.UpsertRow(operation.SheetID, operation.Row, data, userID); err != nil {
+	if err := s.sheetService.UpdateCells(userID, changes); err != nil {
 		return fmt.Errorf("persist inserted row: %w", err)
 	}
 
