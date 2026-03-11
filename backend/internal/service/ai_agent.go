@@ -198,6 +198,7 @@ func (s *AIService) buildAgentMessages(userID int64, messages []ChatMessage) []m
 				"你是 YaERP 智能表格助手。你必须优先使用工具来查询或修改表格，不要编造不存在的数据。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
+					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
 					"当前用户可访问的数据摘要如下：\n\n%s",
 				context,
 			),
@@ -436,6 +437,13 @@ func sortedTouchedSheetIDs(items map[int64]struct{}) []int64 {
 	return result
 }
 
+func buildQuerySheetSummary(sheetName string, rowCount, columnCount int) string {
+	if rowCount == 0 && columnCount > 0 {
+		return fmt.Sprintf("已查询工作表 %s：当前只有表头/列定义，共 %d 列，没有数据行", sheetName, columnCount)
+	}
+	return fmt.Sprintf("已查询工作表 %s，返回 %d 行数据", sheetName, rowCount)
+}
+
 func (s *AIService) toolGetUserContext(userID int64, _ map[string]any) (*toolExecutionResult, error) {
 	context, err := s.buildUserContextSnapshot(userID, 20)
 	if err != nil {
@@ -462,6 +470,7 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 	if err != nil {
 		return nil, err
 	}
+	rowBase := getSheetRowBase(rows)
 
 	startRow, _ := intArgWithDefault(args, "start_row", 0)
 	limit, _ := intArgWithDefault(args, "limit", 50)
@@ -481,7 +490,8 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 
 	filteredRows := make([]map[string]any, 0, limit)
 	for _, row := range rows {
-		if row.RowIndex < startRow {
+		normalizedRowIndex := row.RowIndex - rowBase
+		if normalizedRowIndex < startRow {
 			continue
 		}
 		data := map[string]any{}
@@ -507,8 +517,10 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 			data = nextData
 		}
 		filteredRows = append(filteredRows, map[string]any{
-			"row":  row.RowIndex,
-			"data": data,
+			"row":         normalizedRowIndex,
+			"source_row":  row.RowIndex,
+			"display_row": normalizedRowIndex + 2,
+			"data":        data,
 		})
 		if len(filteredRows) >= limit {
 			break
@@ -516,12 +528,14 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 	}
 
 	return &toolExecutionResult{Data: map[string]any{
-		"sheet_id":   sheet.ID,
-		"sheet_name": sheet.Name,
-		"columns":    columns,
-		"rows":       filteredRows,
-		"total_rows": len(rows),
-	}, Summary: fmt.Sprintf("已查询工作表 %s，返回 %d 行数据", sheet.Name, len(filteredRows))}, nil
+		"sheet_id":    sheet.ID,
+		"sheet_name":  sheet.Name,
+		"columns":     columns,
+		"header_row":  columns,
+		"rows":        filteredRows,
+		"total_rows":  len(rows),
+		"header_only": len(rows) == 0 && len(columns) > 0,
+	}, Summary: buildQuerySheetSummary(sheet.Name, len(filteredRows), len(columns))}, nil
 }
 
 func (s *AIService) toolUpdateCell(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -541,6 +555,20 @@ func (s *AIService) toolUpdateCell(userID int64, args map[string]any) (*toolExec
 	if !ok {
 		return nil, fmt.Errorf("value is required")
 	}
+
+	operation, err := s.resolveSpreadsheetOperationForExecution(SpreadsheetOperation{
+		Kind:      "update_cell",
+		SheetID:   sheetID,
+		Row:       row,
+		ColumnKey: columnKey,
+		Value:     value,
+	})
+	if err != nil {
+		return nil, err
+	}
+	sheetID = operation.SheetID
+	row = operation.Row
+	columnKey = operation.ColumnKey
 
 	if err := s.validateCellWriteAccess(userID, sheetID, row, columnKey); err != nil {
 		return nil, err
@@ -577,6 +605,19 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 	}
 	rowValues := mapArg(args, "row_values")
 
+	operation, err := s.resolveSpreadsheetOperationForExecution(SpreadsheetOperation{
+		Kind:      "insert_row",
+		SheetID:   sheetID,
+		Row:       row,
+		RowValues: rowValues,
+	})
+	if err != nil {
+		return nil, err
+	}
+	sheetID = operation.SheetID
+	row = operation.Row
+	rowValues = operation.RowValues
+
 	afterRow := row - 1
 	if err := s.validateRowWriteAccess(userID, sheetID, afterRow); err != nil {
 		return nil, err
@@ -587,7 +628,7 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 		}
 	}
 
-	if err := s.sheetService.InsertRow(sheetID, afterRow); err != nil {
+	if err := s.sheetService.InsertRow(userID, sheetID, afterRow); err != nil {
 		return nil, err
 	}
 
@@ -626,10 +667,21 @@ func (s *AIService) toolDeleteRow(userID int64, args map[string]any) (*toolExecu
 		return nil, err
 	}
 
+	operation, err := s.resolveSpreadsheetOperationForExecution(SpreadsheetOperation{
+		Kind:    "delete_row",
+		SheetID: sheetID,
+		Row:     row,
+	})
+	if err != nil {
+		return nil, err
+	}
+	sheetID = operation.SheetID
+	row = operation.Row
+
 	if err := s.validateRowWriteAccess(userID, sheetID, row); err != nil {
 		return nil, err
 	}
-	if err := s.sheetService.DeleteRow(sheetID, row); err != nil {
+	if err := s.sheetService.DeleteRow(userID, sheetID, row); err != nil {
 		return nil, err
 	}
 	if err := s.invalidateSheetByID(sheetID); err != nil {
@@ -979,7 +1031,10 @@ func (s *AIService) executeSpreadsheetOperations(userID int64, operations []Spre
 	touchedSheets := make(map[int64]struct{})
 
 	for _, operation := range operations {
-		normalized := normalizeSpreadsheetOperation(operation)
+		normalized, err := s.resolveSpreadsheetOperationForExecution(operation)
+		if err != nil {
+			return nil, err
+		}
 		if normalized.SheetID == 0 {
 			return nil, fmt.Errorf("invalid spreadsheet operation")
 		}
@@ -1034,6 +1089,71 @@ func (s *AIService) validateSpreadsheetOperationAccess(userID int64, operation S
 	}
 
 	return nil
+}
+
+func (s *AIService) resolveSpreadsheetOperationForExecution(operation SpreadsheetOperation) (SpreadsheetOperation, error) {
+	operation = normalizeSpreadsheetOperation(operation)
+	if operation.SheetID == 0 {
+		return operation, nil
+	}
+
+	sheet, err := s.sheetRepo.GetSheet(operation.SheetID)
+	if err != nil {
+		return operation, err
+	}
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return operation, err
+	}
+	if strings.TrimSpace(operation.ColumnKey) == "" && strings.TrimSpace(operation.ColumnName) != "" {
+		columnName := strings.TrimSpace(operation.ColumnName)
+		for _, column := range columns {
+			if strings.EqualFold(strings.TrimSpace(column.Key), columnName) || strings.EqualFold(strings.TrimSpace(column.Name), columnName) {
+				operation.ColumnKey = column.Key
+				break
+			}
+		}
+	}
+
+	rows, err := s.sheetRepo.GetRows(operation.SheetID)
+	if err != nil {
+		return operation, err
+	}
+	rowBase := getSheetRowBase(rows)
+	rowCount := len(rows)
+
+	adjust := func(value int) int {
+		if rowCount == 0 {
+			if value > 0 {
+				return value - 1
+			}
+			return value
+		}
+		if rowBase > 0 && value >= 0 {
+			return value + rowBase
+		}
+		return value
+	}
+
+	switch operation.Kind {
+	case "update_cell", "insert_row", "delete_row":
+		operation.Row = adjust(operation.Row)
+	case "fill_formula":
+		if operation.StartRow != nil {
+			value := adjust(*operation.StartRow)
+			operation.StartRow = &value
+		}
+		if operation.EndRow != nil {
+			value := adjust(*operation.EndRow)
+			operation.EndRow = &value
+		}
+	}
+
+	if operation.Kind == "update_cell" && strings.TrimSpace(operation.ColumnKey) == "" && len(columns) > 0 {
+		operation.ColumnKey = columns[0].Key
+	}
+
+	return operation, nil
 }
 
 func (s *AIService) invalidateSheetByID(sheetID int64) error {

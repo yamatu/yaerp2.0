@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -60,6 +61,10 @@ func (h *CellHandler) BatchUpdate(c *gin.Context) {
 	}
 
 	if err := h.sheetService.UpdateCells(userID, req.Changes); err != nil {
+		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+			response.Forbidden(c, err.Error())
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
@@ -103,7 +108,11 @@ func (h *CellHandler) InsertRow(c *gin.Context) {
 		return
 	}
 
-	if err := h.sheetService.InsertRow(sheetID, body.AfterRow); err != nil {
+	if err := h.sheetService.InsertRow(userID, sheetID, body.AfterRow); err != nil {
+		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+			response.Forbidden(c, err.Error())
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
@@ -145,7 +154,11 @@ func (h *CellHandler) DeleteRow(c *gin.Context) {
 		return
 	}
 
-	if err := h.sheetService.DeleteRow(sheetID, rowIndex); err != nil {
+	if err := h.sheetService.DeleteRow(userID, sheetID, rowIndex); err != nil {
+		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+			response.Forbidden(c, err.Error())
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}

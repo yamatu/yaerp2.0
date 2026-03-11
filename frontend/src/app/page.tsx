@@ -1,8 +1,10 @@
 'use client'
 
 import {
+  EyeOff,
   ArrowRight,
   ArrowUpDown,
+  CheckSquare,
   ChevronLeft,
   ChevronRight,
   Database,
@@ -20,7 +22,10 @@ import {
   Share2,
   Shield,
   Sparkles,
+  Square,
+  Lock,
   Trash2,
+  Unlock,
   Users,
   UserRoundPlus,
   X,
@@ -114,6 +119,8 @@ export default function HomePage() {
   const [shareSaving, setShareSaving] = useState(false)
   const [shareLoadFailed, setShareLoadFailed] = useState(false)
   const [shareMessage, setShareMessage] = useState('')
+  const [selectedReclaimWorkbookIds, setSelectedReclaimWorkbookIds] = useState<number[]>([])
+  const [batchWorkbookActionLoading, setBatchWorkbookActionLoading] = useState(false)
   const searchRef = useRef<HTMLDivElement>(null)
   const adminMode = isAdmin(profile)
   const workbookPageSize = adminMode ? 12 : 9
@@ -124,6 +131,15 @@ export default function HomePage() {
   const canWriteFolder = (folder: Folder) => Boolean(folder.can_write)
   const canManageFolder = (folder: Folder) => Boolean(folder.can_manage)
   const canManageWorkbook = (workbook: Workbook) => Boolean(adminMode || workbook.owner_id === profile?.id)
+  const isAssignedTaskWorkbook = (workbook: Workbook) => {
+    const metadata = workbook.metadata || {}
+    return typeof metadata.source_workbook_id !== 'undefined' || typeof metadata.assigned_by !== 'undefined'
+  }
+  const canDeleteWorkbook = (workbook: Workbook) => {
+    if (adminMode) return true
+    const assigned = isAssignedTaskWorkbook(workbook)
+    return workbook.owner_id === profile?.id && !assigned && !workbook.is_locked && !workbook.is_hidden
+  }
 
   // Fuzzy match: each char of query must appear in order within target
   const fuzzyMatch = (query: string, target: string): boolean => {
@@ -180,6 +196,10 @@ export default function HomePage() {
 
     return Array.from(groups.entries()).map(([label, items]) => ({ label, items }))
   }, [adminMode, groupByOwner, paginatedWorkbooks])
+  const visibleAssignedTaskWorkbooks = useMemo(
+    () => (adminMode ? paginatedWorkbooks.filter((workbook) => isAssignedTaskWorkbook(workbook)) : []),
+    [adminMode, paginatedWorkbooks]
+  )
 
   const foldersPerPage = 8
   const filteredFolders = useMemo(() => {
@@ -302,6 +322,11 @@ export default function HomePage() {
   }, [workbookPage, totalWorkbookPages])
 
   useEffect(() => {
+    const visibleIds = new Set(workbooks.map((workbook) => workbook.id))
+    setSelectedReclaimWorkbookIds((current) => current.filter((id) => visibleIds.has(id)))
+  }, [workbooks])
+
+  useEffect(() => {
     if (!sharingFolder) return
 
     let active = true
@@ -369,12 +394,73 @@ export default function HomePage() {
 
   const handleDeleteWorkbook = async (e: React.MouseEvent, workbookId: number) => {
     e.stopPropagation()
+    const workbook = workbooks.find((item) => item.id === workbookId) || contents.workbooks.find((item) => item.id === workbookId)
+    if (workbook && !canDeleteWorkbook(workbook)) return
     if (!confirm('确定要删除此工作簿吗？其下所有工作表和数据将一并删除。')) return
     try {
       await api.delete(`/workbooks/${workbookId}`)
       await Promise.all([refresh(), refreshFolder()])
     } catch (err) {
       console.error('Failed to delete workbook:', err)
+    }
+  }
+
+  const handleUpdateWorkbookState = async (e: React.MouseEvent, workbookId: number, action: 'lock' | 'unlock' | 'hide' | 'unhide') => {
+    e.stopPropagation()
+    try {
+      const res = await api.put(`/workbooks/${workbookId}/state`, { action })
+      if (res.code !== 0) {
+        console.error('Failed to update workbook state:', res.message)
+        return
+      }
+      await Promise.all([refresh(), refreshFolder()])
+    } catch (err) {
+      console.error('Failed to update workbook state:', err)
+    }
+  }
+
+  const toggleReclaimWorkbookSelection = (workbookId: number) => {
+    setSelectedReclaimWorkbookIds((current) =>
+      current.includes(workbookId)
+        ? current.filter((id) => id !== workbookId)
+        : [...current, workbookId]
+    )
+  }
+
+  const handleSelectAllVisibleTaskWorkbooks = () => {
+    const ids = visibleAssignedTaskWorkbooks.map((workbook) => workbook.id)
+    if (ids.length === 0) return
+
+    setSelectedReclaimWorkbookIds((current) => {
+      const allSelected = ids.every((id) => current.includes(id))
+      if (allSelected) {
+        return current.filter((id) => !ids.includes(id))
+      }
+      return Array.from(new Set([...current, ...ids]))
+    })
+  }
+
+  const handleBatchUpdateWorkbookState = async (action: 'lock' | 'unlock' | 'hide' | 'unhide') => {
+    if (selectedReclaimWorkbookIds.length === 0) return
+
+    setBatchWorkbookActionLoading(true)
+    try {
+      const res = await api.put('/workbooks/state/batch', {
+        workbook_ids: selectedReclaimWorkbookIds,
+        action,
+      })
+      if (res.code !== 0) {
+        console.error('Failed to batch update workbook state:', res.message)
+        return
+      }
+      await Promise.all([refresh(), refreshFolder()])
+      if (action === 'hide') {
+        setSelectedReclaimWorkbookIds([])
+      }
+    } catch (err) {
+      console.error('Failed to batch update workbook state:', err)
+    } finally {
+      setBatchWorkbookActionLoading(false)
     }
   }
 
@@ -1041,6 +1127,60 @@ export default function HomePage() {
 
             {!loading && !error && paginatedWorkbooks.length > 0 && (
               <div className="space-y-6">
+                {adminMode && visibleAssignedTaskWorkbooks.length > 0 && (
+                  <div className="rounded-[24px] border border-amber-200 bg-amber-50/80 p-4">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900">批量回收任务工作簿</div>
+                        <div className="mt-1 text-xs leading-6 text-slate-600">
+                          当前页共有 {visibleAssignedTaskWorkbooks.length} 个任务工作簿，已选 {selectedReclaimWorkbookIds.length} 个。
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={handleSelectAllVisibleTaskWorkbooks}
+                          className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
+                        >
+                          {visibleAssignedTaskWorkbooks.every((workbook) => selectedReclaimWorkbookIds.includes(workbook.id)) ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                          {visibleAssignedTaskWorkbooks.every((workbook) => selectedReclaimWorkbookIds.includes(workbook.id)) ? '取消全选当前页' : '全选当前页任务'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchUpdateWorkbookState('lock')}
+                          disabled={batchWorkbookActionLoading || selectedReclaimWorkbookIds.length === 0}
+                          className="rounded-full border border-amber-200 bg-white px-3 py-2 text-xs font-semibold text-amber-700 transition hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          批量锁定
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchUpdateWorkbookState('hide')}
+                          disabled={batchWorkbookActionLoading || selectedReclaimWorkbookIds.length === 0}
+                          className="rounded-full border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          批量设为不可见
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchUpdateWorkbookState('unlock')}
+                          disabled={batchWorkbookActionLoading || selectedReclaimWorkbookIds.length === 0}
+                          className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          批量解除锁定
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchUpdateWorkbookState('unhide')}
+                          disabled={batchWorkbookActionLoading || selectedReclaimWorkbookIds.length === 0}
+                          className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          批量恢复可见
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {workbookGroups.map((group) => (
                   <div key={group.label || 'default'} className="space-y-3">
                     {group.label && (
@@ -1059,10 +1199,47 @@ export default function HomePage() {
                           draggable={canManageWorkbook(workbook)}
                           onDragStart={() => canManageWorkbook(workbook) && setDraggedWorkbookId(workbook.id)}
                           onDragEnd={() => setDraggedWorkbookId(null)}
-                          className="group relative rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)]"
+                          className={`group relative rounded-[22px] border p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)] ${
+                            workbook.is_hidden
+                              ? 'border-slate-300 bg-[linear-gradient(180deg,rgba(248,250,252,0.98),rgba(241,245,249,0.98))] opacity-75 hover:border-slate-400'
+                              : 'border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] hover:border-slate-300'
+                          }`}
                         >
+                          {adminMode && isAssignedTaskWorkbook(workbook) && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                toggleReclaimWorkbookSelection(workbook.id)
+                              }}
+                              className="absolute left-3 top-3 inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 transition hover:border-slate-300 hover:bg-slate-50"
+                              title={selectedReclaimWorkbookIds.includes(workbook.id) ? '取消选择' : '选择用于批量回收'}
+                            >
+                              {selectedReclaimWorkbookIds.includes(workbook.id) ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                            </button>
+                          )}
                           {(adminMode || canManageWorkbook(workbook)) && (
-                            <div className="absolute right-3 top-3 flex gap-1 opacity-0 transition group-hover:opacity-100">
+                            <div className={`absolute right-3 top-3 flex gap-1 opacity-0 transition group-hover:opacity-100 ${adminMode && isAssignedTaskWorkbook(workbook) ? 'pl-10' : ''}`}>
+                              {adminMode && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleUpdateWorkbookState(e, workbook.id, workbook.is_locked ? 'unlock' : 'lock')}
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 text-amber-700 transition hover:bg-amber-100"
+                                  title={workbook.is_locked ? '解除工作簿锁定' : '锁定工作簿'}
+                                >
+                                  {workbook.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                                </button>
+                              )}
+                              {adminMode && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleUpdateWorkbookState(e, workbook.id, workbook.is_hidden ? 'unhide' : 'hide')}
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-slate-100 text-slate-600 transition hover:bg-slate-200"
+                                  title={workbook.is_hidden ? '恢复工作簿可见' : '设为不可见'}
+                                >
+                                  <EyeOff className="h-3.5 w-3.5" />
+                                </button>
+                              )}
                               {adminMode && (
                                 <button
                                   type="button"
@@ -1092,14 +1269,16 @@ export default function HomePage() {
                                   >
                                     <PencilLine className="h-3.5 w-3.5" />
                                   </button>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleDeleteWorkbook(e, workbook.id)}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
-                                    title="删除工作簿"
-                                  >
-                                    <Trash2 className="h-3.5 w-3.5" />
-                                  </button>
+                                  {canDeleteWorkbook(workbook) && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleDeleteWorkbook(e, workbook.id)}
+                                      className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
+                                      title="删除工作簿"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  )}
                                 </>
                               )}
                             </div>
@@ -1114,6 +1293,18 @@ export default function HomePage() {
                                 <FolderKanban className="h-3.5 w-3.5 text-sky-600" />
                                 工作簿 #{workbook.id}
                               </span>
+                              {workbook.is_locked && (
+                                <span className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
+                                  <Lock className="h-3.5 w-3.5" />
+                                  已锁定
+                                </span>
+                              )}
+                              {workbook.is_hidden && (
+                                <span className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
+                                  <EyeOff className="h-3.5 w-3.5" />
+                                  不可见中
+                                </span>
+                              )}
                               {adminMode && workbook.owner_name && (
                                 <span className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
                                   <Users className="h-3.5 w-3.5" />

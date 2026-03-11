@@ -128,8 +128,10 @@ func main() {
 		// Workbooks
 		api.GET("/workbooks", sheetHandler.ListWorkbooks)
 		api.POST("/workbooks", sheetHandler.CreateWorkbook)
+		api.PUT("/workbooks/state/batch", sheetHandler.UpdateWorkbookStates)
 		api.GET("/workbooks/:id", sheetHandler.GetWorkbook)
 		api.PUT("/workbooks/:id", sheetHandler.UpdateWorkbook)
+		api.PUT("/workbooks/:id/state", sheetHandler.UpdateWorkbookState)
 		api.DELETE("/workbooks/:id", sheetHandler.DeleteWorkbook)
 
 		// Sheets
@@ -149,6 +151,8 @@ func main() {
 		{
 			sheetEdit.PUT("", sheetHandler.UpdateSheet)
 			sheetEdit.POST("/protections", sheetHandler.UpdateProtection)
+			sheetEdit.POST("/protections/batch", sheetHandler.UpdateProtectionBatch)
+			sheetEdit.PUT("/state", sheetHandler.UpdateSheetState)
 			sheetEdit.POST("/cells", cellHandler.BatchUpdate)
 			sheetEdit.POST("/rows", cellHandler.InsertRow)
 			sheetEdit.DELETE("/rows/:index", cellHandler.DeleteRow)

@@ -36,12 +36,15 @@ interface GalleryImage {
 
 interface SelectionState {
   rowIndex: number
+  displayRowIndex: number
   columnKey: string
   rowLabel: string
   columnLabel: string
   endRowIndex: number
+  endDisplayRowIndex: number
   endColumnKey: string
   rangeLabel: string
+  includesHeaderRow: boolean
 }
 
 function wrapWorksheetData(
@@ -159,22 +162,30 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         return null
       }
 
-      const startRow = Math.max(range.getRow(), 0)
-      const endRow = Math.max(range.getLastRow(), 0)
-      const rowLabel = `第 ${startRow + 1} 行`
+      const rawStartRow = Math.max(range.getRow(), 0)
+      const rawEndRow = Math.max(range.getLastRow(), 0)
+      const includesHeaderRow = rawStartRow === 0 || rawEndRow === 0
+      const startRow = rawStartRow - 1
+      const endRow = rawEndRow - 1
+      const displayStartRow = rawStartRow + 1
+      const displayEndRow = rawEndRow + 1
+      const rowLabel = `第 ${displayStartRow} 行`
       const rangeLabel =
         startRow === endRow && range.getColumn() === range.getLastColumn()
-          ? `${column.name || column.key} / 第 ${startRow + 1} 行`
-          : `第 ${startRow + 1}-${endRow + 1} 行 / ${column.name || column.key} 到 ${endColumn?.name || endColumn?.key || column.key}`
+          ? `${column.name || column.key} / 第 ${displayStartRow} 行`
+          : `第 ${displayStartRow}-${displayEndRow} 行 / ${column.name || column.key} 到 ${endColumn?.name || endColumn?.key || column.key}`
 
       const nextSelection = {
         rowIndex: startRow,
+        displayRowIndex: displayStartRow,
         columnKey: column.key,
         rowLabel,
         columnLabel: column.name || column.key,
         endRowIndex: endRow,
+        endDisplayRowIndex: displayEndRow,
         endColumnKey: endColumn?.key || column.key,
         rangeLabel,
+        includesHeaderRow,
       }
 
       setSelectionState(nextSelection)
@@ -339,7 +350,6 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       setActionError('请先在工作表中选中一个单元格。')
       return
     }
-
     setActionError('')
     setProtectionAction(`${scope}:${action}`)
 
@@ -380,7 +390,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     }
   }, [editLocked, refreshProtectionSnapshot, sheetId, syncSelectionState])
 
-  const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column', action: 'lock' | 'unlock') => {
+  const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock') => {
     if (editLocked) {
       setActionError('当前账号只有查看权限，不能修改保护状态。')
       return
@@ -390,7 +400,6 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       setActionError('请先在工作表中框选需要保护的范围。')
       return
     }
-
     const columns = latestSheetRef.current.columns || []
     const startColumnIndex = columns.findIndex((column) => column.key === selection.columnKey)
     const endColumnIndex = columns.findIndex((column) => column.key === selection.endColumnKey)
@@ -399,16 +408,26 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       return
     }
 
-    const requests: Array<{ scope: 'row' | 'column'; row_index?: number; column_key?: string }> = []
+    const requests: Array<{ scope: 'row' | 'column' | 'cell'; row_index?: number; column_key?: string }> = []
     if (scope === 'row') {
       for (let row = selection.rowIndex; row <= selection.endRowIndex; row += 1) {
         requests.push({ scope: 'row', row_index: row })
       }
-    } else {
+    } else if (scope === 'column') {
       const start = Math.min(startColumnIndex, endColumnIndex)
       const end = Math.max(startColumnIndex, endColumnIndex)
       for (let index = start; index <= end; index += 1) {
         requests.push({ scope: 'column', column_key: columns[index]?.key })
+      }
+    } else {
+      const start = Math.min(startColumnIndex, endColumnIndex)
+      const end = Math.max(startColumnIndex, endColumnIndex)
+      for (let row = selection.rowIndex; row <= selection.endRowIndex; row += 1) {
+        for (let index = start; index <= end; index += 1) {
+          if (columns[index]?.key) {
+            requests.push({ scope: 'cell', row_index: row, column_key: columns[index].key })
+          }
+        }
       }
     }
 
@@ -418,11 +437,11 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     setProtectionAction(`${scope}:bulk:${action}`)
 
     try {
-      for (const request of requests) {
-        const res = await api.post(`/sheets/${sheetId}/protections`, { ...request, action })
-        if (res.code !== 0) {
-          throw new Error(res.message || '批量保护失败')
-        }
+      const res = await api.post(`/sheets/${sheetId}/protections/batch`, {
+        items: requests.map((request) => ({ ...request, action })),
+      })
+      if (res.code !== 0) {
+        throw new Error(res.message || '批量保护失败')
       }
       await refreshProtectionSnapshot()
     } catch (err) {
@@ -856,7 +875,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     : null
   const canReleaseProtection = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
   const visibleProtectionBadges = [
-    ...protectionSnapshot.rows.slice(0, 3).map((item) => `行 ${(item.row_index || 0) + 1} - ${item.owner_name}`),
+    ...protectionSnapshot.rows.slice(0, 3).map((item) => `行 ${(item.row_index || 0) + 2} - ${item.owner_name}`),
     ...protectionSnapshot.columns.slice(0, 3).map((item) => `列 ${item.column_key || item.key} - ${item.owner_name}`),
   ].slice(0, 6)
 
@@ -866,17 +885,17 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
       {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
-        <div className="absolute right-3 bottom-16 z-20 flex flex-col items-center gap-2">
+        <div className="absolute right-4 bottom-20 z-20 flex flex-col items-end gap-2">
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
-            <div className="flex flex-col items-center gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
+            <div className="flex flex-col items-end gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
               <button
                 type="button"
                 onClick={() => {
                   syncSelectionState()
                   setShowProtectionPanel((current) => !current)
                 }}
-                className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
+                className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
                   showProtectionPanel
                     ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
                     : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
@@ -889,7 +908,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 type="button"
                 onClick={hasFilter ? handleClearFilter : handleEnableFilter}
                 disabled={editLocked}
-                className={`flex h-9 w-9 items-center justify-center rounded-full border shadow-lg transition ${
+                className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
                   hasFilter
                     ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
                     : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
@@ -902,7 +921,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 type="button"
                 onClick={() => handlePrintSheet('print')}
                 disabled={!canExportSheet}
-                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="打印当前表"
               >
                 <Printer className="h-4 w-4" />
@@ -911,7 +930,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 type="button"
                 onClick={() => handlePrintSheet('pdf')}
                 disabled={!canExportSheet}
-                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="导出 PDF"
               >
                 <FileOutput className="h-4 w-4" />
@@ -920,7 +939,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 type="button"
                 onClick={openImagePicker}
                 disabled={editLocked}
-                className="flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="插入图片"
               >
                 <ImagePlus className="h-4 w-4" />
@@ -932,7 +951,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
             type="button"
             onClick={handleManualSave}
             disabled={editLocked}
-            className={`flex h-9 w-9 items-center justify-center rounded-full shadow-lg transition ${
+            className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg transition ${
               saveStatus === 'saving'
                 ? 'bg-amber-500 text-white'
                 : saveStatus === 'saved'
@@ -959,7 +978,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       )}
 
       {showProtectionPanel && (
-        <div className="absolute right-16 bottom-16 z-20 w-[320px] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
+        <div className="absolute right-20 bottom-20 z-20 w-[340px] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
           <div className="mb-4 flex items-start justify-between gap-3">
             <div>
               <div className="text-sm font-semibold text-slate-900">保护设置</div>
@@ -1021,6 +1040,24 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                   >
                     <Unlock className="h-4 w-4" />
                     解除选中列保护
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleProtectionRangeChange('cell', 'lock')}
+                    disabled={protectionAction === 'cell:bulk:lock'}
+                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Lock className="h-4 w-4" />
+                    保护选中单元格
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleProtectionRangeChange('cell', 'unlock')}
+                    disabled={protectionAction === 'cell:bulk:unlock'}
+                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Unlock className="h-4 w-4" />
+                    解除选中单元格保护
                   </button>
                 </div>
               </div>
@@ -1087,13 +1124,18 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <div className="mb-2 text-sm font-semibold text-slate-800">最近的保护记录</div>
               {protectionLoading ? (
                 <div className="text-xs text-slate-400">正在加载...</div>
-              ) : protectionSnapshot.rows.length + protectionSnapshot.columns.length === 0 ? (
+              ) : protectionSnapshot.rows.length + protectionSnapshot.columns.length + protectionSnapshot.cells.length === 0 ? (
                 <div className="text-xs text-slate-400">当前工作表还没有行/列保护记录。</div>
               ) : (
                 <div className="space-y-2 text-xs text-slate-500">
-                  {[...protectionSnapshot.rows.slice(0, 3), ...protectionSnapshot.columns.slice(0, 3)].map((item) => (
+                  {[...protectionSnapshot.rows.slice(0, 2), ...protectionSnapshot.columns.slice(0, 2), ...protectionSnapshot.cells.slice(0, 2)].map((item) => (
                     <div key={`${item.scope}-${item.key}`} className="rounded-lg bg-slate-50 px-3 py-2">
-                      {item.scope === 'row' ? `第 ${(item.row_index || 0) + 1} 行` : `${item.column_key || item.key} 列`} - {item.owner_name}
+                      {item.scope === 'row'
+                        ? `第 ${(item.row_index || 0) + 2} 行`
+                        : item.scope === 'column'
+                        ? `${item.column_key || item.key} 列`
+                        : `${item.column_key || item.key}${(item.row_index || 0) + 2}`}
+                      {' '} - {item.owner_name}
                     </div>
                   ))}
                 </div>

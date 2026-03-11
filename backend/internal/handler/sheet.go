@@ -116,6 +116,57 @@ func (h *SheetHandler) UpdateWorkbook(c *gin.Context) {
 	response.OKMsg(c, "workbook updated")
 }
 
+func (h *SheetHandler) UpdateWorkbookState(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	username := c.GetString("username")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid workbook id")
+		return
+	}
+
+	var req model.UpdateWorkbookStateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	updated, err := h.sheetService.UpdateWorkbookState(userID, id, username, req.Action)
+	if err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	response.OK(c, updated)
+}
+
+func (h *SheetHandler) UpdateWorkbookStates(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	username := c.GetString("username")
+
+	var req model.BatchUpdateWorkbookStateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	updated, err := h.sheetService.UpdateWorkbookStates(userID, req.WorkbookIDs, username, req.Action)
+	if err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	response.OK(c, updated)
+}
+
 func (h *SheetHandler) DeleteWorkbook(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -124,7 +175,7 @@ func (h *SheetHandler) DeleteWorkbook(c *gin.Context) {
 		return
 	}
 	if err := h.sheetService.DeleteWorkbookForUser(userID, id); err != nil {
-		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) || errors.Is(err, service.ErrWorkbookDeletionDenied) {
 			response.Forbidden(c, "you do not have permission to manage this workbook")
 			return
 		}
@@ -222,6 +273,10 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 			response.Forbidden(c, err.Error())
 			return
 		}
+		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+			response.Forbidden(c, err.Error())
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
@@ -296,7 +351,7 @@ func (h *SheetHandler) UpdateProtection(c *gin.Context) {
 
 	updatedSheet, snapshot, err := h.sheetService.UpdateProtection(id, userID, username, &req)
 	if err != nil {
-		if errors.Is(err, service.ErrProtectionDenied) {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
 			response.Forbidden(c, err.Error())
 			return
 		}
@@ -308,6 +363,65 @@ func (h *SheetHandler) UpdateProtection(c *gin.Context) {
 		"sheet":       updatedSheet,
 		"protections": snapshot,
 	})
+}
+
+func (h *SheetHandler) UpdateProtectionBatch(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	username := c.GetString("username")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	var req model.BatchUpdateProtectionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	updatedSheet, snapshot, err := h.sheetService.UpdateProtectionBatch(id, userID, username, req.Items)
+	if err != nil {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	response.OK(c, gin.H{
+		"sheet":       updatedSheet,
+		"protections": snapshot,
+	})
+}
+
+func (h *SheetHandler) UpdateSheetState(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	username := c.GetString("username")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	var req model.UpdateSheetStateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	updatedSheet, err := h.sheetService.UpdateSheetState(id, userID, username, req.Action)
+	if err != nil {
+		if errors.Is(err, service.ErrSheetStateDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	response.OK(c, updatedSheet)
 }
 
 func (h *SheetHandler) GetSheetData(c *gin.Context) {

@@ -6,30 +6,46 @@ import (
 )
 
 type Workbook struct {
-	ID          int64           `json:"id" db:"id"`
-	Name        string          `json:"name" db:"name"`
-	Description *string         `json:"description" db:"description"`
-	OwnerID     int64           `json:"owner_id" db:"owner_id"`
-	OwnerName   *string         `json:"owner_name,omitempty" db:"owner_name"`
-	FolderID    *int64          `json:"folder_id,omitempty" db:"folder_id"`
-	Metadata    json.RawMessage `json:"metadata" db:"metadata"`
-	IsTemplate  bool            `json:"is_template" db:"is_template"`
-	Status      int             `json:"status" db:"status"`
-	CreatedAt   time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at" db:"updated_at"`
-	Sheets      []Sheet         `json:"sheets,omitempty"`
+	ID           int64           `json:"id" db:"id"`
+	Name         string          `json:"name" db:"name"`
+	Description  *string         `json:"description" db:"description"`
+	OwnerID      int64           `json:"owner_id" db:"owner_id"`
+	OwnerName    *string         `json:"owner_name,omitempty" db:"owner_name"`
+	FolderID     *int64          `json:"folder_id,omitempty" db:"folder_id"`
+	Metadata     json.RawMessage `json:"metadata" db:"metadata"`
+	IsTemplate   bool            `json:"is_template" db:"is_template"`
+	Status       int             `json:"status" db:"status"`
+	IsLocked     bool            `json:"is_locked,omitempty"`
+	IsHidden     bool            `json:"is_hidden,omitempty"`
+	LockedByID   *int64          `json:"locked_by_id,omitempty"`
+	LockedByName *string         `json:"locked_by_name,omitempty"`
+	LockedAt     *time.Time      `json:"locked_at,omitempty"`
+	HiddenByID   *int64          `json:"hidden_by_id,omitempty"`
+	HiddenByName *string         `json:"hidden_by_name,omitempty"`
+	HiddenAt     *time.Time      `json:"hidden_at,omitempty"`
+	CreatedAt    time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at" db:"updated_at"`
+	Sheets       []Sheet         `json:"sheets,omitempty"`
 }
 
 type Sheet struct {
-	ID         int64           `json:"id" db:"id"`
-	WorkbookID int64           `json:"workbook_id" db:"workbook_id"`
-	Name       string          `json:"name" db:"name"`
-	SortOrder  int             `json:"sort_order" db:"sort_order"`
-	Columns    json.RawMessage `json:"columns" db:"columns"`
-	Frozen     json.RawMessage `json:"frozen" db:"frozen"`
-	Config     json.RawMessage `json:"config" db:"config"`
-	CreatedAt  time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt  time.Time       `json:"updated_at" db:"updated_at"`
+	ID             int64           `json:"id" db:"id"`
+	WorkbookID     int64           `json:"workbook_id" db:"workbook_id"`
+	Name           string          `json:"name" db:"name"`
+	SortOrder      int             `json:"sort_order" db:"sort_order"`
+	Columns        json.RawMessage `json:"columns" db:"columns"`
+	Frozen         json.RawMessage `json:"frozen" db:"frozen"`
+	Config         json.RawMessage `json:"config" db:"config"`
+	IsLocked       bool            `json:"is_locked,omitempty"`
+	IsArchived     bool            `json:"is_archived,omitempty"`
+	LockedByID     *int64          `json:"locked_by_id,omitempty"`
+	LockedByName   *string         `json:"locked_by_name,omitempty"`
+	LockedAt       *time.Time      `json:"locked_at,omitempty"`
+	ArchivedByID   *int64          `json:"archived_by_id,omitempty"`
+	ArchivedByName *string         `json:"archived_by_name,omitempty"`
+	ArchivedAt     *time.Time      `json:"archived_at,omitempty"`
+	CreatedAt      time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at" db:"updated_at"`
 }
 
 type Row struct {
@@ -55,6 +71,15 @@ type UpdateWorkbookRequest struct {
 	Description *string `json:"description"`
 }
 
+type UpdateWorkbookStateRequest struct {
+	Action string `json:"action" binding:"required,oneof=lock unlock hide unhide"`
+}
+
+type BatchUpdateWorkbookStateRequest struct {
+	WorkbookIDs []int64 `json:"workbook_ids" binding:"required,min=1"`
+	Action      string  `json:"action" binding:"required,oneof=lock unlock hide unhide"`
+}
+
 type AssignWorkbookRequest struct {
 	UserIDs []int64 `json:"user_ids" binding:"required,min=1"`
 }
@@ -64,6 +89,14 @@ type UpdateProtectionRequest struct {
 	Action    string  `json:"action" binding:"required,oneof=lock unlock"`
 	RowIndex  *int    `json:"row_index,omitempty"`
 	ColumnKey *string `json:"column_key,omitempty"`
+}
+
+type BatchUpdateProtectionRequest struct {
+	Items []UpdateProtectionRequest `json:"items" binding:"required,min=1"`
+}
+
+type UpdateSheetStateRequest struct {
+	Action string `json:"action" binding:"required,oneof=lock unlock archive unarchive"`
 }
 
 type ProtectionInfo struct {
