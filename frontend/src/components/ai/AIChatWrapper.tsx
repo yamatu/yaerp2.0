@@ -8,17 +8,23 @@ import { isAuthenticated } from '@/lib/auth'
 export default function AIChatWrapper() {
   const [chatOpen, setChatOpen] = useState(false)
   const [hidden, setHidden] = useState(false)
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   // Listen for panels/modals opening in the editor that should hide the FAB
   useEffect(() => {
+    if (!mounted) return
     const observer = new MutationObserver(() => {
       setHidden(document.body.classList.contains('fab-hidden'))
     })
     observer.observe(document.body, { attributes: true, attributeFilter: ['class'] })
     return () => observer.disconnect()
-  }, [])
+  }, [mounted])
 
-  if (typeof window === 'undefined') return null
+  if (!mounted) return null
   if (!isAuthenticated()) return null
   if (hidden && !chatOpen) return null
 

@@ -22,6 +22,8 @@ function getOperationTitle(operation: AISpreadsheetOperation) {
   switch (operation.kind) {
     case 'insert_row':
       return `新增第 ${(operation.row ?? 0) + 1} 行`
+    case 'delete_row':
+      return `删除第 ${(operation.row ?? 0) + 1} 行`
     case 'insert_column':
       return `新增列 ${operation.column_name || operation.column_key || '未命名列'}`
     case 'fill_formula':
@@ -35,6 +37,8 @@ function getOperationDetail(operation: AISpreadsheetOperation) {
   switch (operation.kind) {
     case 'insert_row':
       return `新行内容：${JSON.stringify(operation.row_values || {}, null, 0)}`
+    case 'delete_row':
+      return '删除指定数据行'
     case 'insert_column':
       return `列 key：${operation.column_key || '-'} / 类型：${operation.column_type || 'text'} / 插入位置：${operation.insert_after_column_key ? `在 ${operation.insert_after_column_key} 后` : '追加到末尾'}`
     case 'fill_formula':

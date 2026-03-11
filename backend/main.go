@@ -67,20 +67,26 @@ func main() {
 	permRepo := repo.NewPermissionRepo(db)
 	attachRepo := repo.NewAttachmentRepo(db)
 	folderRepo := repo.NewFolderRepo(db)
+	scheduleRepo := repo.NewAIScheduleRepo(db)
 
 	// Services
 	authService := service.NewAuthService(userRepo, jwtUtil, rdb)
-	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo)
+	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo)
 	sheetService := service.NewSheetService(sheetRepo, permService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, cfg.JWT.Secret)
-	folderService := service.NewFolderService(folderRepo, userRepo)
+	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
 	backupService := service.NewBackupService(cfg, db)
-	aiService := service.NewAIService(cfg, db, sheetRepo)
+	scheduleService := service.NewAIScheduleService(scheduleRepo)
+	aiService := service.NewAIService(cfg, db, sheetRepo, sheetService, permService, uploadService, scheduleService)
+	scheduleService.SetReportGenerator(aiService.GenerateSheetReport)
+	if err := scheduleService.Start(); err != nil {
+		log.Fatalf("failed to start AI schedule service: %v", err)
+	}
 
 	// WebSocket
 	hub := ws.NewHub()
 	go hub.Run()
-	wsHandler := ws.NewWSHandler(hub, jwtUtil)
+	wsHandler := ws.NewWSHandler(hub, jwtUtil, permService, sheetService)
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(authService)
@@ -165,10 +171,15 @@ func main() {
 		api.PUT("/folders/:id", folderHandler.UpdateFolder)
 		api.DELETE("/folders/:id", folderHandler.DeleteFolder)
 		api.GET("/folders/:id/breadcrumb", folderHandler.GetBreadcrumb)
+		api.GET("/folders/shared", folderHandler.ListSharedFolders)
+		api.GET("/folders/:id/shares", folderHandler.GetShares)
+		api.GET("/folders/:id/shareable-users", folderHandler.GetShareableUsers)
+		api.PUT("/folders/:id/shares", folderHandler.SetShares)
 		api.PUT("/workbooks/:id/move", folderHandler.MoveWorkbook)
 
 		// AI Chat
 		api.POST("/ai/chat", aiHandler.Chat)
+		api.POST("/ai/spreadsheet/apply", aiHandler.ApplySpreadsheetPlan)
 
 		admin := api.Group("")
 		admin.Use(middleware.RequireAdmin(userRepo))
@@ -188,8 +199,11 @@ func main() {
 
 			// Permissions
 			admin.POST("/permissions/sheet", permHandler.SetSheetPermission)
+			admin.POST("/permissions/user-sheet", permHandler.SetUserSheetPermission)
 			admin.POST("/permissions/cell", permHandler.SetCellPermission)
 			admin.GET("/permissions/sheets/:id/roles/:roleId", permHandler.GetPermissionMatrixForRole)
+			admin.GET("/permissions/sheets/:id/users", permHandler.ListUserSheetPermissions)
+			admin.GET("/permissions/sheets/:id/users/:userId", permHandler.GetPermissionMatrixForUser)
 			admin.POST("/workbooks/:id/assign", sheetHandler.AssignWorkbook)
 
 			// Attachments (admin)

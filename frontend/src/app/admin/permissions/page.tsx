@@ -16,7 +16,7 @@ import {
 import { useCallback, useEffect, useState } from 'react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import api from '@/lib/api'
-import type { Workbook } from '@/types'
+import type { PageData, User, Workbook } from '@/types'
 
 interface Role {
   id: number
@@ -42,6 +42,14 @@ interface ColumnPerm {
   permission: 'read' | 'write' | 'none'
 }
 
+interface UserSheetPermission {
+  user_id: number
+  can_view: boolean
+  can_edit: boolean
+  can_delete: boolean
+  can_export: boolean
+}
+
 const defaultSheetPermission: SheetPermission = {
   can_view: false,
   can_edit: false,
@@ -59,10 +67,12 @@ const sheetPermissionLabels: { key: keyof SheetPermission; label: string; icon: 
 export default function PermissionsPage() {
   const [sheetOptions, setSheetOptions] = useState<SheetOption[]>([])
   const [roles, setRoles] = useState<Role[]>([])
+  const [users, setUsers] = useState<User[]>([])
   const [selectedSheet, setSelectedSheet] = useState<number | null>(null)
   const [selectedRole, setSelectedRole] = useState<number | null>(null)
   const [sheetPermission, setSheetPermission] = useState<SheetPermission>(defaultSheetPermission)
   const [columnPerms, setColumnPerms] = useState<ColumnPerm[]>([])
+  const [userPerms, setUserPerms] = useState<UserSheetPermission[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -71,9 +81,10 @@ export default function PermissionsPage() {
   // Fetch workbooks (which contain sheets) and roles
   const fetchData = useCallback(async () => {
     try {
-      const [wbRes, rolesRes] = await Promise.all([
+      const [wbRes, rolesRes, usersRes] = await Promise.all([
         api.get<Workbook[]>('/workbooks'),
         api.get<Role[]>('/roles'),
+        api.get<PageData<User>>('/users?page=1&size=500'),
       ])
 
       const workbooks = wbRes.code === 0 && wbRes.data ? wbRes.data : []
@@ -96,6 +107,11 @@ export default function PermissionsPage() {
 
       setSheetOptions(allSheets)
       setRoles(rolesRes.code === 0 && rolesRes.data ? rolesRes.data : [])
+      setUsers(
+        usersRes.code === 0 && usersRes.data
+          ? usersRes.data.list.filter((user) => user.status === 1 && !user.roles?.some((role) => role.code === 'admin'))
+          : []
+      )
     } catch (err) {
       console.error('Failed to fetch data:', err)
       setError('加载数据失败')
@@ -106,40 +122,64 @@ export default function PermissionsPage() {
 
   useEffect(() => { fetchData() }, [fetchData])
 
+  useEffect(() => {
+    if (selectedSheet && !selectedRole && roles.length > 0) {
+      setSelectedRole(roles[0].id)
+    }
+  }, [roles, selectedRole, selectedSheet])
+
   // When sheet+role are selected, fetch current permission matrix
   const fetchPermissions = useCallback(async () => {
     if (!selectedSheet || !selectedRole) return
     try {
-      const res = await api.get<{
-        sheet: { canView: boolean; canEdit: boolean; canDelete: boolean; canExport: boolean }
-        columns: Record<string, string>
-        cells: Record<string, string>
-      }>(`/permissions/sheets/${selectedSheet}/roles/${selectedRole}`)
+      const [roleRes, userRes] = await Promise.all([
+        api.get<{
+          sheet: { canView: boolean; canEdit: boolean; canDelete: boolean; canExport: boolean }
+          columns: Record<string, string>
+          cells: Record<string, string>
+        }>(`/permissions/sheets/${selectedSheet}/roles/${selectedRole}`),
+        api.get<UserSheetPermission[]>(`/permissions/sheets/${selectedSheet}/users`),
+      ])
 
-      if (res.code === 0 && res.data) {
+      if (roleRes.code === 0 && roleRes.data) {
         const selectedSheetOption = sheetOptions.find((item) => item.id === selectedSheet)
         const availableColumns = selectedSheetOption?.columns || []
         setSheetPermission({
-          can_view: res.data.sheet.canView ?? false,
-          can_edit: res.data.sheet.canEdit ?? false,
-          can_delete: res.data.sheet.canDelete ?? false,
-          can_export: res.data.sheet.canExport ?? false,
+          can_view: roleRes.data.sheet.canView ?? false,
+          can_edit: roleRes.data.sheet.canEdit ?? false,
+          can_delete: roleRes.data.sheet.canDelete ?? false,
+          can_export: roleRes.data.sheet.canExport ?? false,
         })
         setColumnPerms(
           availableColumns.map((key) => ({
             column_key: key,
-            permission: (res.data?.columns?.[key] as 'read' | 'write' | 'none' | undefined) || 'none',
+            permission: (roleRes.data?.columns?.[key] as 'read' | 'write' | 'none' | undefined) || 'none',
           }))
         )
-        return
+      } else {
+        setSheetPermission(defaultSheetPermission)
+        setColumnPerms([])
       }
-      setSheetPermission(defaultSheetPermission)
-      setColumnPerms([])
+
+      const directPerms = userRes.code === 0 && userRes.data ? userRes.data : []
+      setUserPerms(
+        users.map((user) => {
+          const matched = directPerms.find((perm) => perm.user_id === user.id)
+          return {
+            user_id: user.id,
+            can_view: matched?.can_view ?? false,
+            can_edit: matched?.can_edit ?? false,
+            can_delete: matched?.can_delete ?? false,
+            can_export: matched?.can_export ?? false,
+          }
+        })
+      )
     } catch {
       setSheetPermission(defaultSheetPermission)
       setColumnPerms([])
+      setUserPerms([])
     }
-  }, [selectedSheet, selectedRole, sheetOptions])
+  }, [selectedSheet, selectedRole, sheetOptions, users])
 
   useEffect(() => { fetchPermissions() }, [fetchPermissions])
 
@@ -219,6 +259,65 @@ export default function PermissionsPage() {
     } finally {
       setSaving(false)
     }
+  }
+
+  const handleUserPermissionChange = (userId: number, key: keyof SheetPermission, value: boolean) => {
+	setUserPerms((prev) =>
+	  prev.map((perm) =>
+	    perm.user_id === userId
+	      ? {
+	          ...perm,
+	          [key]: value,
+	          ...(key !== 'can_view' && value ? { can_view: true } : {}),
+	        }
+	      : perm
+	  )
+	)
+  }
+
+  const handleSaveUserPermission = async (perm: UserSheetPermission) => {
+	if (!selectedSheet) return
+	setSaving(true)
+	setError('')
+	setSuccess('')
+	try {
+	  await api.post('/permissions/user-sheet', {
+	    sheet_id: selectedSheet,
+	    ...perm,
+	  })
+	  await fetchPermissions()
+	  const user = users.find((item) => item.id === perm.user_id)
+	  setSuccess(`用户 ${user?.username || `#${perm.user_id}`} 的工作表权限已保存`)
+	  setTimeout(() => setSuccess(''), 2000)
+	} catch (err) {
+	  console.error('Failed to save direct user permission:', err)
+	  setError('保存用户权限失败')
+	} finally {
+	  setSaving(false)
+	}
+  }
+
+  const handleSaveAllUserPermissions = async () => {
+	if (!selectedSheet || userPerms.length === 0) return
+	setSaving(true)
+	setError('')
+	setSuccess('')
+	try {
+	  for (const perm of userPerms) {
+	    await api.post('/permissions/user-sheet', {
+	      sheet_id: selectedSheet,
+	      ...perm,
+	    })
+	  }
+	  await fetchPermissions()
+	  setSuccess('全部指定用户权限已保存')
+	  setTimeout(() => setSuccess(''), 2000)
+	} catch (err) {
+	  console.error('Failed to save direct user permissions:', err)
+	  setError('保存用户权限失败')
+	} finally {
+	  setSaving(false)
+	}
   }
 
   const selectedSheetName = sheetOptions.find((s) => s.id === selectedSheet)?.name
@@ -400,6 +499,81 @@ export default function PermissionsPage() {
                               </td>
                             </tr>
                           ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+                <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+                  <div>
+                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">User Permissions</div>
+                    <h2 className="mt-2 text-2xl font-semibold text-slate-950">指定用户权限</h2>
+                    <p className="mt-2 text-sm text-slate-500">直接指定哪些员工可以查看、编辑、删除或导出当前工作表。这里的设置会在角色权限基础上额外叠加。</p>
+                  </div>
+                  {userPerms.length > 0 && (
+                    <button type="button" onClick={handleSaveAllUserPermissions} disabled={saving} className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60">
+                      <Save className="h-4 w-4" />
+                      {saving ? '保存中...' : '保存全部用户权限'}
+                    </button>
+                  )}
+                </div>
+                {userPerms.length === 0 ? (
+                  <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-14 text-center">
+                    <Shield className="mx-auto mb-3 h-8 w-8 text-slate-300" />
+                    <h3 className="text-lg font-semibold text-slate-600">暂无可配置的员工</h3>
+                    <p className="mt-2 text-sm text-slate-400">请先在员工管理里创建并启用员工账号。</p>
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-[24px] border border-slate-200 bg-white shadow-sm">
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-slate-50 text-slate-500">
+                          <tr>
+                            <th className="px-4 py-3 text-left font-semibold">用户</th>
+                            {sheetPermissionLabels.map(({ key, label }) => (
+                              <th key={key} className="px-4 py-3 text-center font-semibold">{label}</th>
+                            ))}
+                            <th className="px-4 py-3 text-right font-semibold">操作</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {userPerms.map((perm) => {
+                            const user = users.find((item) => item.id === perm.user_id)
+
+                            return (
+                              <tr key={perm.user_id} className="hover:bg-slate-50/80">
+                                <td className="px-4 py-4">
+                                  <div className="flex items-center gap-3">
+                                    <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
+                                      <Shield className="h-3.5 w-3.5" />
+                                    </div>
+                                    <div>
+                                      <div className="font-medium text-slate-900">{user?.username || `用户 #${perm.user_id}`}</div>
+                                      <div className="text-xs text-slate-400">{user?.email || '未找到邮箱'}</div>
+                                    </div>
+                                  </div>
+                                </td>
+                                {sheetPermissionLabels.map(({ key }) => (
+                                  <td key={key} className="px-4 py-4 text-center">
+                                    <input
+                                      type="checkbox"
+                                      checked={perm[key]}
+                                      onChange={(event) => handleUserPermissionChange(perm.user_id, key, event.target.checked)}
+                                      className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                    />
+                                  </td>
+                                ))}
+                                <td className="px-4 py-4 text-right">
+                                  <button type="button" onClick={() => handleSaveUserPermission(perm)} disabled={saving} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50">
+                                    保存
+                                  </button>
+                                </td>
+                              </tr>
+                            )
+                          })}
                         </tbody>
                       </table>
                     </div>

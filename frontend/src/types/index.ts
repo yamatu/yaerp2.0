@@ -211,8 +211,19 @@ export interface Folder {
   name: string
   parent_id: number | null
   owner_id: number
+  owner_name?: string
+  access_level?: 'view' | 'edit' | 'owner' | 'admin'
+  can_write?: boolean
+  can_manage?: boolean
   created_at: string
   updated_at: string
+}
+
+export interface FolderShareUser {
+  id: number
+  username: string
+  email: string
+  access_level: 'view' | 'edit'
 }
 
 export interface FolderContents {
@@ -225,6 +236,22 @@ export interface AIChatMessage {
   content: string
 }
 
+export interface AIChatToolTrace {
+  name: string
+  status: 'success' | 'error'
+  summary?: string
+  data?: unknown
+  touched_sheet_ids?: number[]
+}
+
+export interface AIChatResponse {
+  reply: string
+  model: string
+  touched_sheet_ids?: number[]
+  pending_operations?: AISpreadsheetOperation[]
+  tool_traces?: AIChatToolTrace[]
+}
+
 export interface AIConfigStatus {
   configured: boolean
   endpoint: string
@@ -232,7 +259,7 @@ export interface AIConfigStatus {
 }
 
 export interface AISpreadsheetOperation {
-  kind?: 'update_cell' | 'insert_row' | 'insert_column' | 'fill_formula'
+  kind?: 'update_cell' | 'insert_row' | 'delete_row' | 'insert_column' | 'fill_formula'
   sheet_id: number
   sheet_name: string
   row?: number

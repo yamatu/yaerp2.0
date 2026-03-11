@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -59,6 +60,32 @@ func (s *UploadService) Upload(file multipart.File, header *multipart.FileHeader
 	}
 
 	return attachment, nil
+}
+
+func (s *UploadService) UploadBytes(filename, contentType string, data []byte, userID int64) (*model.Attachment, string, error) {
+	objectKey := fmt.Sprintf("uploads/%d/%d%s", userID, time.Now().UnixNano(), filepath.Ext(filename))
+	reader := bytes.NewReader(data)
+
+	ctx := context.Background()
+	if err := s.minioClient.Upload(ctx, objectKey, reader, int64(len(data)), contentType); err != nil {
+		return nil, "", fmt.Errorf("failed to upload generated file: %w", err)
+	}
+
+	attachment := &model.Attachment{
+		Filename:   filename,
+		MimeType:   contentType,
+		Size:       int64(len(data)),
+		Bucket:     "yaerp",
+		ObjectKey:  objectKey,
+		UploaderID: userID,
+	}
+
+	if err := s.attachmentRepo.Create(attachment); err != nil {
+		_ = s.minioClient.Delete(ctx, objectKey)
+		return nil, "", fmt.Errorf("failed to save generated attachment: %w", err)
+	}
+
+	return attachment, s.buildFileAccessURL(attachment.ID), nil
 }
 
 func (s *UploadService) GetFileURL(attachmentID int64) (string, error) {

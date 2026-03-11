@@ -340,6 +340,52 @@ func (r *SheetRepo) DeleteRow(sheetID int64, rowIndex int) error {
 	return nil
 }
 
+func (r *SheetRepo) DeleteRowWithConfig(sheetID int64, rowIndex int, config json.RawMessage) error {
+	const rowShiftOffset = 1000000
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`UPDATE sheets SET config = $1, updated_at = NOW() WHERE id = $2`,
+		config, sheetID,
+	); err != nil {
+		return fmt.Errorf("update sheet config: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`DELETE FROM rows WHERE sheet_id = $1 AND row_index = $2`,
+		sheetID, rowIndex,
+	); err != nil {
+		return fmt.Errorf("delete row: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE rows SET row_index = row_index + $3
+		 WHERE sheet_id = $1 AND row_index > $2`,
+		sheetID, rowIndex, rowShiftOffset,
+	); err != nil {
+		return fmt.Errorf("shift rows after delete: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE rows SET row_index = row_index - $3 - 1
+		 WHERE sheet_id = $1 AND row_index > ($2::int + $3::int)`,
+		sheetID, rowIndex, rowShiftOffset,
+	); err != nil {
+		return fmt.Errorf("finalize delete row shift: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	return nil
+}
+
 func (r *SheetRepo) InsertRow(sheetID int64, afterRow int) error {
 	const rowShiftOffset = 1000000
 
@@ -371,6 +417,45 @@ func (r *SheetRepo) InsertRow(sheetID int64, afterRow int) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	return nil
+}
+
+func (r *SheetRepo) InsertRowWithConfig(sheetID int64, afterRow int, config json.RawMessage) error {
+	const rowShiftOffset = 1000000
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`UPDATE sheets SET config = $1, updated_at = NOW() WHERE id = $2`,
+		config, sheetID,
+	); err != nil {
+		return fmt.Errorf("update sheet config: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE rows SET row_index = row_index + $3
+		 WHERE sheet_id = $1 AND row_index > $2`,
+		sheetID, afterRow, rowShiftOffset,
+	); err != nil {
+		return fmt.Errorf("shift rows for insert: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE rows SET row_index = row_index - $3 + 1
+		 WHERE sheet_id = $1 AND row_index > ($2::int + $3::int)`,
+		sheetID, afterRow, rowShiftOffset,
+	); err != nil {
+		return fmt.Errorf("finalize insert row shift: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
 	return nil
 }
 

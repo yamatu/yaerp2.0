@@ -17,6 +17,7 @@ import {
   Plus,
   Search,
   Settings2,
+  Share2,
   Shield,
   Sparkles,
   Trash2,
@@ -31,7 +32,7 @@ import { useWorkbooks } from '@/hooks/useSheet'
 import { useFileManager } from '@/hooks/useFileManager'
 import api from '@/lib/api'
 import { clearTokens, fetchCurrentUser, getStoredUser, isAdmin } from '@/lib/auth'
-import type { AuthUser, PageData, User, Workbook } from '@/types'
+import type { AuthUser, Folder, FolderShareUser, PageData, User, Workbook } from '@/types'
 
 const adminLinks = [
   {
@@ -74,6 +75,7 @@ export default function HomePage() {
     contents,
     breadcrumb,
     loading: folderLoading,
+    error: folderError,
     navigateTo: navigateToFolder,
     refresh: refreshFolder,
     createFolder,
@@ -104,9 +106,24 @@ export default function HomePage() {
   const [folderPage, setFolderPage] = useState(1)
   const [movingWorkbookId, setMovingWorkbookId] = useState<number | null>(null)
   const [draggedWorkbookId, setDraggedWorkbookId] = useState<number | null>(null)
+  const [sharedFolders, setSharedFolders] = useState<Folder[]>([])
+  const [sharingFolder, setSharingFolder] = useState<Folder | null>(null)
+  const [shareableUsers, setShareableUsers] = useState<User[]>([])
+  const [selectedShares, setSelectedShares] = useState<Record<number, 'view' | 'edit'>>({})
+  const [shareLoading, setShareLoading] = useState(false)
+  const [shareSaving, setShareSaving] = useState(false)
+  const [shareLoadFailed, setShareLoadFailed] = useState(false)
+  const [shareMessage, setShareMessage] = useState('')
   const searchRef = useRef<HTMLDivElement>(null)
   const adminMode = isAdmin(profile)
   const workbookPageSize = adminMode ? 12 : 9
+  const currentFolderMeta = currentFolderId !== null ? breadcrumb[breadcrumb.length - 1] || null : null
+  const canWriteCurrentFolder = currentFolderId === null || currentFolderMeta?.can_write !== false
+  const canManageCurrentFolder = currentFolderId === null || currentFolderMeta?.can_manage !== false
+
+  const canWriteFolder = (folder: Folder) => Boolean(folder.can_write)
+  const canManageFolder = (folder: Folder) => Boolean(folder.can_manage)
+  const canManageWorkbook = (workbook: Workbook) => Boolean(adminMode || workbook.owner_id === profile?.id)
 
   // Fuzzy match: each char of query must appear in order within target
   const fuzzyMatch = (query: string, target: string): boolean => {
@@ -175,6 +192,10 @@ export default function HomePage() {
     const start = (folderPage - 1) * foldersPerPage
     return filteredFolders.slice(start, start + foldersPerPage)
   }, [filteredFolders, folderPage])
+  const visibleSharedFolders = useMemo(() => {
+    const existingIds = new Set(contents.folders.map((folder) => folder.id))
+    return sharedFolders.filter((folder) => !existingIds.has(folder.id))
+  }, [contents.folders, sharedFolders])
   const currentFolderWorkbooks = useMemo(() => {
     return [...contents.workbooks].sort((left, right) => right.updated_at.localeCompare(left.updated_at))
   }, [contents.workbooks])
@@ -183,6 +204,25 @@ export default function HomePage() {
   useEffect(() => {
     if (folderPage > totalFolderPages) setFolderPage(totalFolderPages)
   }, [folderPage, totalFolderPages])
+
+  useEffect(() => {
+    let active = true
+
+    ;(async () => {
+      try {
+        const res = await api.get<Folder[]>('/folders/shared')
+        if (!active) return
+        setSharedFolders(res.code === 0 && res.data ? res.data : [])
+      } catch (err) {
+        console.error('Failed to load shared folders:', err)
+        if (active) setSharedFolders([])
+      }
+    })()
+
+    return () => {
+      active = false
+    }
+  }, [currentFolderId])
 
   // Suggestions: top 5 matching names shown in dropdown
   const suggestions = useMemo(() => {
@@ -225,6 +265,7 @@ export default function HomePage() {
   }, [])
 
   const handleCreateWorkbook = async () => {
+    if (!canWriteCurrentFolder) return
     if (!newName.trim()) return
 
     try {
@@ -261,6 +302,49 @@ export default function HomePage() {
   }, [workbookPage, totalWorkbookPages])
 
   useEffect(() => {
+    if (!sharingFolder) return
+
+    let active = true
+    setShareLoading(true)
+    setShareLoadFailed(false)
+    setShareMessage('')
+
+    ;(async () => {
+      try {
+        const [usersRes, sharesRes] = await Promise.all([
+          api.get<User[]>(`/folders/${sharingFolder.id}/shareable-users`),
+          api.get<FolderShareUser[]>(`/folders/${sharingFolder.id}/shares`),
+        ])
+
+        if (!active) return
+
+        setShareableUsers(usersRes.code === 0 && usersRes.data ? usersRes.data : [])
+        setSelectedShares(
+          sharesRes.code === 0 && sharesRes.data
+            ? sharesRes.data.reduce<Record<number, 'view' | 'edit'>>((acc, user) => {
+                acc[user.id] = user.access_level
+                return acc
+              }, {})
+            : {}
+        )
+        setShareLoadFailed(false)
+      } catch (err) {
+        console.error('Failed to load folder shares:', err)
+        if (active) {
+          setShareLoadFailed(true)
+          setShareMessage('加载共享用户失败，请稍后重试。')
+        }
+      } finally {
+        if (active) setShareLoading(false)
+      }
+    })()
+
+    return () => {
+      active = false
+    }
+  }, [sharingFolder])
+
+  useEffect(() => {
     if (!assigningWorkbook || !adminMode) return
 
     let active = true
@@ -288,7 +372,7 @@ export default function HomePage() {
     if (!confirm('确定要删除此工作簿吗？其下所有工作表和数据将一并删除。')) return
     try {
       await api.delete(`/workbooks/${workbookId}`)
-      await refresh()
+      await Promise.all([refresh(), refreshFolder()])
     } catch (err) {
       console.error('Failed to delete workbook:', err)
     }
@@ -299,7 +383,7 @@ export default function HomePage() {
     try {
       await api.put(`/workbooks/${editingWorkbook.id}`, { name: editWorkbookName.trim() })
       setEditingWorkbook(null)
-      await refresh()
+      await Promise.all([refresh(), refreshFolder()])
     } catch (err) {
       console.error('Failed to rename workbook:', err)
     }
@@ -351,6 +435,40 @@ export default function HomePage() {
       setAssignmentMessage('发放任务失败，请稍后重试。')
     } finally {
       setAssignmentLoading(false)
+    }
+  }
+
+  const handleSaveFolderShares = async () => {
+    if (!sharingFolder || shareLoading || shareLoadFailed) return
+
+    setShareSaving(true)
+    setShareMessage('')
+
+    try {
+      const res = await api.put(`/folders/${sharingFolder.id}/shares`, {
+        shares: Object.entries(selectedShares).map(([userId, accessLevel]) => ({
+          user_id: Number(userId),
+          access_level: accessLevel,
+        })),
+      })
+
+      if (res.code !== 0) {
+        setShareMessage(res.message || '保存共享设置失败，请稍后重试。')
+        return
+      }
+
+      setShareMessage('共享设置已更新。')
+      await Promise.all([
+        refreshFolder(),
+        api.get<Folder[]>('/folders/shared').then((res) => {
+          setSharedFolders(res.code === 0 && res.data ? res.data : [])
+        }),
+      ])
+    } catch (err) {
+      console.error('Failed to save folder shares:', err)
+      setShareMessage('保存共享设置失败，请稍后重试。')
+    } finally {
+      setShareSaving(false)
     }
   }
 
@@ -471,7 +589,8 @@ export default function HomePage() {
                 <button
                   type="button"
                   onClick={() => setCreatingFolder(true)}
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                  disabled={!canWriteCurrentFolder}
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <FolderPlus className="h-4 w-4" />
                   新建文件夹
@@ -479,7 +598,8 @@ export default function HomePage() {
                 <button
                   type="button"
                   onClick={() => setCreating((prev) => !prev)}
-                  className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
+                  disabled={!canWriteCurrentFolder}
+                  className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Plus className="h-4 w-4" />
                   新建工作簿
@@ -524,6 +644,18 @@ export default function HomePage() {
               </div>
             )}
 
+            {currentFolderMeta && !canWriteCurrentFolder && (
+              <div className="mb-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-700">
+                当前位于只读共享文件夹中，你可以查看和打开文件，但不能在这里新建或写入内容。
+              </div>
+            )}
+
+            {folderError && (
+              <div className="mb-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">
+                {folderError}
+              </div>
+            )}
+
             {/* Create folder inline */}
             {creatingFolder && (
               <div className="mb-4 flex items-center gap-3">
@@ -534,6 +666,7 @@ export default function HomePage() {
                   onChange={(e) => setNewFolderName(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && newFolderName.trim()) {
+                      if (!canWriteCurrentFolder) return
                       void createFolder(newFolderName.trim()).then(() => {
                         setNewFolderName('')
                         setCreatingFolder(false)
@@ -588,6 +721,49 @@ export default function HomePage() {
               </div>
             )}
 
+            {currentFolderId === null && visibleSharedFolders.length > 0 && (
+              <div className="mb-4 space-y-3 rounded-[24px] border border-sky-200 bg-sky-50/60 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900">共享给我的文件夹</div>
+                    <div className="text-xs text-slate-500">这里显示别人直接共享给你的文件夹入口，避免深层共享文件夹找不到。</div>
+                  </div>
+                  <div className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-500">
+                    {visibleSharedFolders.length} 个入口
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {visibleSharedFolders.map((folder) => (
+                    <button
+                      key={`shared-${folder.id}`}
+                      type="button"
+                      onClick={() => void navigateToFolder(folder.id)}
+                      className="rounded-2xl border border-sky-200 bg-white/90 p-4 text-left transition hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-md"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <FolderIcon className="h-8 w-8 flex-shrink-0 text-sky-500" />
+                          <div>
+                            <div className="text-sm font-semibold text-slate-900">{folder.name}</div>
+                            <div className="mt-1 text-xs text-slate-500">
+                              共享者：{folder.owner_name || `用户 #${folder.owner_id}`}
+                            </div>
+                          </div>
+                        </div>
+                        <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                          folder.access_level === 'edit'
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                            : 'bg-slate-100 text-slate-600 border border-slate-200'
+                        }`}>
+                          {folder.access_level === 'edit' ? '可写共享' : '只读共享'}
+                        </span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Folder list */}
             {contents.folders.length > 0 && (
               <div className="mb-4 space-y-3">
@@ -627,19 +803,19 @@ export default function HomePage() {
                 )}
                 <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-4">
                   {paginatedFolders.map((folder) => (
-                    <div
-                      key={folder.id}
-                      onDragOver={(event) => {
-                        if (draggedWorkbookId !== null) {
-                          event.preventDefault()
-                        }
-                      }}
-                      onDrop={(event) => {
-                        event.preventDefault()
-                        if (draggedWorkbookId !== null) {
-                          void handleMoveWorkbookToFolder(draggedWorkbookId, folder.id)
-                          setDraggedWorkbookId(null)
-                        }
+                     <div
+                       key={folder.id}
+                       onDragOver={(event) => {
+                         if (draggedWorkbookId !== null && canWriteFolder(folder)) {
+                           event.preventDefault()
+                         }
+                       }}
+                       onDrop={(event) => {
+                         event.preventDefault()
+                         if (draggedWorkbookId !== null && canWriteFolder(folder)) {
+                           void handleMoveWorkbookToFolder(draggedWorkbookId, folder.id)
+                           setDraggedWorkbookId(null)
+                         }
                       }}
                       className={`group rounded-2xl border bg-white/90 p-4 text-left transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-md ${
                         draggedWorkbookId !== null ? 'border-dashed border-slate-300' : 'border-slate-200'
@@ -654,18 +830,40 @@ export default function HomePage() {
                           <FolderIcon className="h-8 w-8 flex-shrink-0 text-amber-400" />
                           <div className="min-w-0 flex-1">
                             <div className="truncate text-sm font-semibold text-slate-900">{folder.name}</div>
-                            <div className="text-xs text-slate-400">可拖入工作簿</div>
+                            <div className="text-xs text-slate-400">
+                              {folder.can_write
+                                ? '可拖入工作簿'
+                                : `只读共享自 ${folder.owner_name || `用户 #${folder.owner_id}`}`}
+                            </div>
                           </div>
                           <ChevronRight className="h-4 w-4 flex-shrink-0 text-slate-300 transition group-hover:translate-x-0.5" />
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleDeleteFolder(folder.id, folder.name)}
-                          className="rounded-full p-1.5 text-slate-300 transition hover:bg-rose-50 hover:text-rose-600"
-                          title="删除文件夹"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                        <div className="flex items-center gap-1">
+                          {canManageFolder(folder) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSharingFolder(folder)
+                                setSelectedShares({})
+                                setShareMessage('')
+                              }}
+                              className="rounded-full p-1.5 text-slate-300 transition hover:bg-sky-50 hover:text-sky-600"
+                              title="共享文件夹"
+                            >
+                              <Share2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          {canManageFolder(folder) && (
+                            <button
+                              type="button"
+                              onClick={() => void handleDeleteFolder(folder.id, folder.name)}
+                              className="rounded-full p-1.5 text-slate-300 transition hover:bg-rose-50 hover:text-rose-600"
+                              title="删除文件夹"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -691,14 +889,14 @@ export default function HomePage() {
                   </div>
                 ) : (
                   <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-                    {currentFolderWorkbooks.map((workbook) => (
-                      <div
-                        key={`folder-${workbook.id}`}
-                        draggable
-                        onDragStart={() => setDraggedWorkbookId(workbook.id)}
-                        onDragEnd={() => setDraggedWorkbookId(null)}
-                        className="rounded-[20px] border border-slate-200 bg-white p-4 shadow-sm"
-                      >
+                     {currentFolderWorkbooks.map((workbook) => (
+                       <div
+                         key={`folder-${workbook.id}`}
+                         draggable={canManageWorkbook(workbook)}
+                         onDragStart={() => canManageWorkbook(workbook) && setDraggedWorkbookId(workbook.id)}
+                         onDragEnd={() => setDraggedWorkbookId(null)}
+                         className="rounded-[20px] border border-slate-200 bg-white p-4 shadow-sm"
+                       >
                         <button type="button" onClick={() => router.push(`/sheets/${workbook.id}`)} className="w-full text-left">
                           <div className="flex items-center gap-2 text-xs text-slate-500">
                             <FolderKanban className="h-3.5 w-3.5 text-sky-600" />
@@ -707,19 +905,21 @@ export default function HomePage() {
                           <div className="mt-2 text-lg font-semibold text-slate-950">{workbook.name}</div>
                           <div className="mt-1 text-sm text-slate-500">{workbook.description?.trim() || '当前文件夹内的工作簿'}</div>
                         </button>
-                        <div className="mt-4 flex items-center justify-between gap-3">
-                          <div className="text-xs text-slate-400">更新于 {new Date(workbook.updated_at).toLocaleString('zh-CN')}</div>
-                          <button
-                            type="button"
-                            onClick={() => handleMoveWorkbookToFolder(workbook.id, null)}
-                            disabled={movingWorkbookId === workbook.id}
-                            className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            {movingWorkbookId === workbook.id ? '处理中...' : '移出文件夹'}
-                          </button>
+                          <div className="mt-4 flex items-center justify-between gap-3">
+                            <div className="text-xs text-slate-400">更新于 {new Date(workbook.updated_at).toLocaleString('zh-CN')}</div>
+                            {canManageWorkbook(workbook) && (
+                              <button
+                                type="button"
+                                onClick={() => handleMoveWorkbookToFolder(workbook.id, null)}
+                                disabled={movingWorkbookId === workbook.id}
+                                className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {movingWorkbookId === workbook.id ? '处理中...' : '移出文件夹'}
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                     ))}
                   </div>
                 )}
               </div>
@@ -856,46 +1056,52 @@ export default function HomePage() {
                       {group.items.map((workbook) => (
                         <div
                           key={workbook.id}
-                          draggable
-                          onDragStart={() => setDraggedWorkbookId(workbook.id)}
+                          draggable={canManageWorkbook(workbook)}
+                          onDragStart={() => canManageWorkbook(workbook) && setDraggedWorkbookId(workbook.id)}
                           onDragEnd={() => setDraggedWorkbookId(null)}
                           className="group relative rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-[0_22px_50px_-30px_rgba(15,23,42,0.45)]"
                         >
-                          {adminMode && (
+                          {(adminMode || canManageWorkbook(workbook)) && (
                             <div className="absolute right-3 top-3 flex gap-1 opacity-0 transition group-hover:opacity-100">
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  setAssigningWorkbook(workbook)
-                                  setSelectedAssigneeIds([])
-                                  setAssignmentMessage('')
-                                }}
-                                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-sky-200 bg-sky-50 text-sky-600 transition hover:bg-sky-100"
-                                title="发放任务"
-                              >
-                                <UserRoundPlus className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  setEditingWorkbook({ id: workbook.id, name: workbook.name })
-                                  setEditWorkbookName(workbook.name)
-                                }}
-                                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
-                                title="重命名"
-                              >
-                                <PencilLine className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={(e) => handleDeleteWorkbook(e, workbook.id)}
-                                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
-                                title="删除工作簿"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
+                              {adminMode && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    setAssigningWorkbook(workbook)
+                                    setSelectedAssigneeIds([])
+                                    setAssignmentMessage('')
+                                  }}
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-sky-200 bg-sky-50 text-sky-600 transition hover:bg-sky-100"
+                                  title="发放任务"
+                                >
+                                  <UserRoundPlus className="h-3.5 w-3.5" />
+                                </button>
+                              )}
+                              {canManageWorkbook(workbook) && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      setEditingWorkbook({ id: workbook.id, name: workbook.name })
+                                      setEditWorkbookName(workbook.name)
+                                    }}
+                                    className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
+                                    title="重命名"
+                                  >
+                                    <PencilLine className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleDeleteWorkbook(e, workbook.id)}
+                                    className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
+                                    title="删除工作簿"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </>
+                              )}
                             </div>
                           )}
                           <button
@@ -930,7 +1136,7 @@ export default function HomePage() {
                                 <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
                                   已在当前文件夹
                                 </span>
-                              ) : (
+                              ) : canWriteCurrentFolder && canManageWorkbook(workbook) ? (
                                 <button
                                   type="button"
                                   onClick={() => void handleMoveWorkbookToFolder(workbook.id, currentFolderId)}
@@ -939,7 +1145,7 @@ export default function HomePage() {
                                 >
                                   {movingWorkbookId === workbook.id ? '移动中...' : '移入当前文件夹'}
                                 </button>
-                              )
+                              ) : null
                             )}
                             <button
                               type="button"
@@ -982,6 +1188,130 @@ export default function HomePage() {
               </div>
             )}
           </section>
+
+          {sharingFolder && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">
+              <div className="w-full max-w-2xl rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8">
+                <div className="mb-6 flex items-start justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Folder Sharing</div>
+                    <h2 className="mt-2 text-2xl font-semibold text-slate-950">共享文件夹</h2>
+                    <p className="mt-2 text-sm text-slate-500">
+                      文件夹「{sharingFolder.name}」默认仅创建者和管理员可见。你可以按用户分别设置为只读共享或可写共享。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSharingFolder(null)
+                      setShareableUsers([])
+                      setSelectedShares({})
+                      setShareMessage('')
+                    }}
+                    className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+
+                {shareMessage && (
+                  <div className="mb-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium text-sky-700">
+                    {shareMessage}
+                  </div>
+                )}
+
+                <div className="max-h-[380px] space-y-3 overflow-y-auto pr-1">
+                  {shareLoading ? (
+                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+                      正在加载可共享用户...
+                    </div>
+                  ) : shareableUsers.length === 0 ? (
+                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+                      当前没有可共享的启用账号。
+                    </div>
+                  ) : (
+                    shareableUsers.map((user) => {
+                      const accessLevel = selectedShares[user.id]
+                      const checked = Boolean(accessLevel)
+
+                      return (
+                        <label
+                          key={user.id}
+                          className={`flex cursor-pointer items-center gap-3 rounded-2xl border px-4 py-3 transition ${
+                            checked ? 'border-sky-200 bg-sky-50' : 'border-slate-200 bg-slate-50/60 hover:bg-white'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(event) => {
+                              setSelectedShares((current) => {
+                                const next = { ...current }
+                                if (event.target.checked) {
+                                  next[user.id] = next[user.id] || 'view'
+                                } else {
+                                  delete next[user.id]
+                                }
+                                return next
+                              })
+                            }}
+                            className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="font-semibold text-slate-900">{user.username}</div>
+                            <div className="truncate text-sm text-slate-500">{user.email}</div>
+                          </div>
+                          <select
+                            value={accessLevel || 'view'}
+                            disabled={!checked}
+                            onChange={(event) => {
+                              const value = event.target.value as 'view' | 'edit'
+                              setSelectedShares((current) => ({
+                                ...current,
+                                [user.id]: value,
+                              }))
+                            }}
+                            className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <option value="view">只读共享</option>
+                            <option value="edit">可写共享</option>
+                          </select>
+                        </label>
+                      )
+                    })
+                  )}
+                </div>
+
+                <div className="mt-6 flex items-center justify-between gap-3">
+                  <div className="text-sm text-slate-500">
+                    已共享给 {Object.keys(selectedShares).length} 位用户
+                  </div>
+                  <div className="flex gap-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSharingFolder(null)
+                        setShareableUsers([])
+                        setSelectedShares({})
+                        setShareMessage('')
+                      }}
+                      className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+                    >
+                      关闭
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSaveFolderShares}
+                      disabled={shareSaving || shareLoading || shareLoadFailed}
+                      className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {shareSaving ? '保存中...' : '保存共享设置'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {assigningWorkbook && (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">

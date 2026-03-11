@@ -9,30 +9,45 @@ export function usePermission(sheetId: number) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    let active = true
+
     async function fetch() {
       if (!sheetId) {
-        setPermissions(null)
-        setLoading(false)
+        if (active) {
+          setPermissions(null)
+          setLoading(false)
+        }
         return
       }
 
-      setLoading(true)
-      setPermissions(null)
+      if (active) {
+        setLoading(true)
+        setPermissions(null)
+      }
 
       try {
         const res = await api.get<PermissionMatrix>(`/sheets/${sheetId}/permissions`)
+        if (!active) return
         if (res.code === 0 && res.data) {
           setPermissions(res.data)
         } else {
           setPermissions(null)
         }
       } catch {
-        setPermissions(null)
+        if (active) {
+          setPermissions(null)
+        }
       } finally {
-        setLoading(false)
+        if (active) {
+          setLoading(false)
+        }
       }
     }
     fetch()
+
+    return () => {
+      active = false
+    }
   }, [sheetId])
 
   const canEditCell = (col: string, row?: number): boolean => {

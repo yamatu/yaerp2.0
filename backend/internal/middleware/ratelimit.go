@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,14 +46,28 @@ func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 	}()
 
 	return func(c *gin.Context) {
+		if c.Request.URL.Path == "/ws" {
+			c.Next()
+			return
+		}
+
 		ip := c.ClientIP()
+		limit := requestsPerMinute
+		key := ip
+
+		authHeader := c.GetHeader("Authorization")
+		if token, ok := strings.CutPrefix(authHeader, "Bearer "); ok && strings.TrimSpace(token) != "" {
+			key = "token:" + strings.TrimSpace(token)
+			limit = requestsPerMinute * 10
+		}
+
 		now := time.Now()
 
 		mu.Lock()
-		entry, exists := counters[ip]
+		entry, exists := counters[key]
 		if !exists || now.After(entry.expiresAt) {
 			// First request or window expired – start a new window.
-			counters[ip] = &ipCounter{
+			counters[key] = &ipCounter{
 				count:     1,
 				expiresAt: now.Add(1 * time.Minute),
 			}
@@ -61,7 +76,7 @@ func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 			return
 		}
 
-		if entry.count >= requestsPerMinute {
+		if entry.count >= limit {
 			mu.Unlock()
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": "rate limit exceeded, please try again later",
