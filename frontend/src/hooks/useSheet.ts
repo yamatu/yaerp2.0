@@ -4,6 +4,12 @@ import { useState, useEffect, useCallback } from 'react'
 import type { Sheet, Row, Workbook } from '@/types'
 import { api } from '@/lib/api'
 
+function normalizeRows(rows: Row[]): Row[] {
+  return rows
+    .filter((row) => Number.isInteger(row.row_index) && row.row_index >= 0)
+    .sort((left, right) => left.row_index - right.row_index || left.id - right.id)
+}
+
 export function useWorkbooks() {
   const [workbooks, setWorkbooks] = useState<Workbook[]>([])
   const [loading, setLoading] = useState(true)
@@ -76,7 +82,7 @@ export function useSheetData(sheetId: number, initialSheet?: Sheet | null) {
     try {
       const res = await api.get<Row[]>(`/sheets/${sheetId}/data`)
       if (res.code === 0) {
-        setRows(Array.isArray(res.data) ? res.data : [])
+        setRows(Array.isArray(res.data) ? normalizeRows(res.data) : [])
       } else {
         setRows([])
       }

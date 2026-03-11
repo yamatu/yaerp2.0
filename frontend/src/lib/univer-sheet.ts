@@ -2,6 +2,24 @@ import type { ICellData, IWorkbookData, IWorksheetData } from '@univerjs/core'
 import type { ColumnDef, Row, Sheet } from '@/types'
 import { columnIndexToLetter } from './spreadsheet'
 
+function normalizeRowsForUniver(rows: Row[]): Row[] {
+  const normalized = rows
+    .filter((row) => Number.isInteger(row.row_index) && row.row_index >= 0)
+    .sort((left, right) => left.row_index - right.row_index || left.id - right.id)
+
+  const deduped: Row[] = []
+  for (const row of normalized) {
+    const last = deduped[deduped.length - 1]
+    if (last && last.row_index === row.row_index) {
+      deduped[deduped.length - 1] = row
+      continue
+    }
+    deduped.push(row)
+  }
+
+  return deduped
+}
+
 function getHeaderColumns(sheet: Sheet, rows: Row[]): ColumnDef[] {
   if (sheet.columns && Array.isArray(sheet.columns) && sheet.columns.length > 0) {
     return sheet.columns
@@ -62,10 +80,11 @@ export function buildUniverWorkbookData(
   rows: Row[],
   locale: IWorkbookData['locale']
 ): IWorkbookData {
-  const columns = getHeaderColumns(sheet, rows)
+  const normalizedRows = normalizeRowsForUniver(rows)
+  const columns = getHeaderColumns(sheet, normalizedRows)
   const sheetKey = `sheet-${sheet.id}`
   const columnCount = Math.max(columns.length, 26)
-  const maxRowIndex = rows.reduce((max, row) => Math.max(max, row.row_index), -1)
+  const maxRowIndex = normalizedRows.reduce((max, row) => Math.max(max, row.row_index), -1)
   const rowCount = Math.max(maxRowIndex + 25, 200)
 
   const cellData: Record<number, Record<number, ICellData>> = {
@@ -76,7 +95,7 @@ export function buildUniverWorkbookData(
     cellData[0][index] = { v: column.name || columnIndexToLetter(index) }
   })
 
-  rows.forEach((row) => {
+  normalizedRows.forEach((row) => {
     const targetRow = row.row_index + 1
     cellData[targetRow] = cellData[targetRow] || {}
 
