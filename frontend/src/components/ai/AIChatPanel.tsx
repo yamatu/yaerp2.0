@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import { Bot, CheckCircle2, Clock3, Download, GripVertical, Loader2, Send, Sparkles, Trash2, Wand2, X } from 'lucide-react'
+import { Bot, CheckCircle2, ChevronDown, Clock3, Download, GripVertical, Loader2, Send, Sparkles, Trash2, Wand2, X } from 'lucide-react'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
 import type { AIChatResponse, AIChatToolTrace, AISpreadsheetOperation } from '@/types'
@@ -128,6 +128,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [messages, setMessages] = useState<PersistedMessage[]>([])
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const messagesScrollRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
@@ -140,15 +142,22 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     [messages]
   )
 
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior })
+  }, [])
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    scrollToBottom('smooth')
+  }, [messages, scrollToBottom])
 
   useEffect(() => {
     if (open && textareaRef.current) {
       setTimeout(() => textareaRef.current?.focus(), 100)
     }
-  }, [open])
+    if (open) {
+      setTimeout(() => scrollToBottom('auto'), 80)
+    }
+  }, [open, scrollToBottom])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -165,8 +174,23 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       setMessages([])
     } finally {
       historyReadyRef.current = true
+      requestAnimationFrame(() => scrollToBottom('auto'))
     }
-  }, [storageKey])
+  }, [scrollToBottom, storageKey])
+
+  useEffect(() => {
+    const el = messagesScrollRef.current
+    if (!el) return
+
+    const handleScroll = () => {
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+      setShowScrollToBottom(distance > 80)
+    }
+
+    handleScroll()
+    el.addEventListener('scroll', handleScroll)
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [open, messages.length])
 
   useEffect(() => {
     if (typeof window === 'undefined' || !historyReadyRef.current) return
@@ -285,7 +309,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   return (
     <div
       ref={panelRef}
-      className="fixed bottom-6 right-4 z-50 flex w-[min(40rem,calc(100vw-1.5rem))] flex-col rounded-3xl border border-slate-200 bg-white shadow-2xl"
+      className="fixed bottom-[74px] right-4 z-50 flex w-[min(40rem,calc(100vw-1.5rem))] flex-col rounded-3xl border border-slate-200 bg-white shadow-2xl"
       style={{ height: 'min(78vh, 760px)', maxHeight: 'calc(100vh - 48px)' }}
     >
       <div className="flex items-center justify-between rounded-t-3xl bg-slate-900 px-5 py-4">
@@ -319,7 +343,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         </div>
       </div>
 
-      <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+      <div ref={messagesScrollRef} className="relative flex-1 space-y-4 overflow-y-auto px-5 py-4">
         {messages.length === 0 && (
           <div className="mt-10 rounded-[28px] border border-dashed border-slate-300 bg-slate-50/80 px-5 py-8 text-center">
             <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-900 text-white">
@@ -432,6 +456,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             </div>
           </div>
+        )}
+        {showScrollToBottom && (
+          <button
+            type="button"
+            onClick={() => scrollToBottom('smooth')}
+            className="sticky bottom-2 ml-auto flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50"
+            title="跳到最新对话"
+          >
+            <ChevronDown className="h-4 w-4" />
+          </button>
         )}
         <div ref={messagesEndRef} />
       </div>

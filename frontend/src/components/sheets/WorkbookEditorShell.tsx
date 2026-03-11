@@ -3,8 +3,8 @@
 import dynamic from 'next/dynamic'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { useEffect, useMemo, useState } from 'react'
-import { ArrowLeft, ChevronLeft, ChevronRight, FileSpreadsheet, Maximize2, Minimize2, Plus, Search, Trash2 } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Archive, ArchiveRestore, ArrowLeft, ChevronLeft, ChevronRight, EyeOff, FileSpreadsheet, Lock, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, Plus, Search, Trash2, Unlock } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import { useWorkbook } from '@/hooks/useSheet'
 import { usePermission } from '@/hooks/usePermission'
@@ -25,10 +25,12 @@ interface Props {
 export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Props) {
   const router = useRouter()
   const { workbook, loading, error, refresh } = useWorkbook(workbookId)
+  const rootRef = useRef<HTMLDivElement>(null)
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
   const [addingSheet, setAddingSheet] = useState(false)
   const [newSheetName, setNewSheetName] = useState('')
   const [fullscreen, setFullscreen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [sheetActionError, setSheetActionError] = useState('')
   const [sheetActionLoading, setSheetActionLoading] = useState(false)
   const [sheetSearchQuery, setSheetSearchQuery] = useState('')
@@ -37,6 +39,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [sheetPage, setSheetPage] = useState(1)
 
   const sheets = workbook?.sheets || []
+  const isAdminUser = Boolean(currentUser && isAdmin(currentUser))
   const canManageWorkbook = Boolean(currentUser && (isAdmin(currentUser) || currentUser.id === workbook?.owner_id))
   const sheetsPerPage = 10
 
@@ -53,6 +56,15 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
   useEffect(() => {
     setCurrentUser(getStoredUser())
+  }, [])
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setFullscreen(Boolean(document.fullscreenElement))
+    }
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange)
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
 
   useEffect(() => {
@@ -177,6 +189,62 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
     }
   }
 
+  const handleUpdateWorkbookState = async (action: 'lock' | 'unlock' | 'hide' | 'unhide') => {
+    if (!workbook) return
+    setSheetActionError('')
+    setSheetActionLoading(true)
+
+    try {
+      const res = await api.put(`/workbooks/${workbook.id}/state`, { action })
+      if (res.code !== 0) {
+        setSheetActionError(res.message || '更新工作簿状态失败，请稍后再试。')
+        return
+      }
+      await refresh()
+      if (action === 'hide' && !isAdminUser) {
+        router.replace('/')
+      }
+    } catch (err) {
+      console.error('Failed to update workbook state:', err)
+      setSheetActionError('更新工作簿状态失败，请稍后再试。')
+    } finally {
+      setSheetActionLoading(false)
+    }
+  }
+
+  const handleUpdateSheetState = async (action: 'lock' | 'unlock' | 'archive' | 'unarchive') => {
+    if (!activeSheet) return
+    setSheetActionError('')
+    setSheetActionLoading(true)
+
+    try {
+      const res = await api.put(`/sheets/${activeSheet.id}/state`, { action })
+      if (res.code !== 0) {
+        setSheetActionError(res.message || '更新工作表状态失败，请稍后再试。')
+        return
+      }
+      await refresh()
+    } catch (err) {
+      console.error('Failed to update sheet state:', err)
+      setSheetActionError('更新工作表状态失败，请稍后再试。')
+    } finally {
+      setSheetActionLoading(false)
+    }
+  }
+
+  const handleFullscreenToggle = async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen()
+        return
+      }
+      await rootRef.current?.requestFullscreen()
+    } catch (err) {
+      console.error('Failed to toggle fullscreen:', err)
+      setSheetActionError('切换全屏失败，请确认浏览器允许全屏。')
+    }
+  }
+
   if (loading) {
     return (
       <AuthGuard>
@@ -205,9 +273,17 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
   return (
     <AuthGuard>
-      <div className={`flex flex-col bg-slate-50 ${fullscreen ? 'fixed inset-0 z-50' : 'h-screen'}`}>
+      <div ref={rootRef} className={`flex flex-col bg-slate-50 ${fullscreen ? 'fixed inset-0 z-50' : 'h-screen'}`}>
         <div className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed((current) => !current)}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+              title={sidebarCollapsed ? '展开工作表目录' : '折叠工作表目录'}
+            >
+              {sidebarCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+            </button>
             <Link href="/" className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100 hover:text-slate-900">
               <ArrowLeft className="h-4 w-4" />
               返回
@@ -216,6 +292,30 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
             <div>
               <div className="text-xs font-semibold uppercase tracking-[0.24em] text-sky-600">Workbook</div>
               <h1 className="text-sm font-semibold text-slate-900 truncate max-w-[320px]">{workbook.name}</h1>
+              {activeSheet && (
+                <div className="mt-1 flex flex-wrap gap-2">
+                  {workbook.is_locked && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-700">
+                      <Lock className="h-3 w-3" /> 工作簿已锁定
+                    </span>
+                  )}
+                  {workbook.is_hidden && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-slate-300 bg-slate-100 px-2.5 py-0.5 text-[11px] font-semibold text-slate-700">
+                      <EyeOff className="h-3 w-3" /> 工作簿不可见
+                    </span>
+                  )}
+                  {activeSheet.is_locked && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-700">
+                      <Lock className="h-3 w-3" /> 已锁定
+                    </span>
+                  )}
+                  {activeSheet.is_archived && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-0.5 text-[11px] font-semibold text-slate-700">
+                      <Archive className="h-3 w-3" /> 已归档
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -263,9 +363,53 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 删除当前表
               </button>
             )}
+            {isAdminUser && activeSheet && (
+              <button
+                type="button"
+                onClick={() => void handleUpdateWorkbookState(workbook.is_locked ? 'unlock' : 'lock')}
+                disabled={sheetActionLoading}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {workbook.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                {workbook.is_locked ? '解除工作簿锁定' : '锁定工作簿'}
+              </button>
+            )}
+            {isAdminUser && activeSheet && (
+              <button
+                type="button"
+                onClick={() => void handleUpdateWorkbookState(workbook.is_hidden ? 'unhide' : 'hide')}
+                disabled={sheetActionLoading}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <EyeOff className="h-3.5 w-3.5" />
+                {workbook.is_hidden ? '恢复工作簿可见' : '设为工作簿不可见'}
+              </button>
+            )}
+            {isAdminUser && activeSheet && (
+              <button
+                type="button"
+                onClick={() => void handleUpdateSheetState(activeSheet.is_locked ? 'unlock' : 'lock')}
+                disabled={sheetActionLoading}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {activeSheet.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                {activeSheet.is_locked ? '解除锁定' : '锁定工作表'}
+              </button>
+            )}
+            {isAdminUser && activeSheet && (
+              <button
+                type="button"
+                onClick={() => void handleUpdateSheetState(activeSheet.is_archived ? 'unarchive' : 'archive')}
+                disabled={sheetActionLoading}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {activeSheet.is_archived ? <ArchiveRestore className="h-3.5 w-3.5" /> : <Archive className="h-3.5 w-3.5" />}
+                {activeSheet.is_archived ? '取消归档' : '归档工作表'}
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => setFullscreen((v) => !v)}
+              onClick={() => void handleFullscreenToggle()}
               className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
               title={fullscreen ? '退出全屏' : '全屏'}
             >
@@ -280,8 +424,20 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
           </div>
         )}
 
+        {activeSheet && (activeSheet.is_locked || activeSheet.is_archived) && !isAdminUser && (
+          <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
+            {activeSheet.is_archived ? '当前工作表已归档，仅管理员可以修改。' : '当前工作表已锁定，仅管理员可以修改或解除锁定。'}
+          </div>
+        )}
+
+        {workbook.is_locked && !isAdminUser && (
+          <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
+            当前工作簿已被管理员锁定，你可以查看和重命名，但不能继续修改表格内容。
+          </div>
+        )}
+
         <div className="flex min-h-0 flex-1">
-          <aside className="flex w-[310px] shrink-0 flex-col border-r border-slate-200 bg-white">
+          <aside className={`flex shrink-0 flex-col border-r border-slate-200 bg-white transition-all duration-200 ${sidebarCollapsed ? 'w-[88px]' : 'w-[320px]'}`}>
             <div className="border-b border-slate-200 px-4 py-4">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -290,9 +446,10 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                   value={sheetSearchQuery}
                   onChange={(event) => setSheetSearchQuery(event.target.value)}
                   placeholder="搜索工作表名称..."
-                  className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 pl-9 pr-3 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
+                  className={`h-10 w-full rounded-xl border border-slate-200 bg-slate-50 pr-3 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100 ${sidebarCollapsed ? 'pl-10 opacity-0 pointer-events-none' : 'pl-9'}`}
                 />
               </div>
+              {!sidebarCollapsed && (
               <div className="mt-3 flex gap-2">
                 <select
                   value={sheetSortBy}
@@ -312,8 +469,9 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                   <option value="asc">升序</option>
                 </select>
               </div>
+              )}
               <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
-                <span>{filteredSheets.length} 个工作表 / 第 {sheetPage} 页</span>
+                <span>{sidebarCollapsed ? `${filteredSheets.length} 表` : `${filteredSheets.length} 个工作表 / 第 ${sheetPage} 页`}</span>
                 <div className="flex gap-1">
                   <button
                     type="button"
@@ -356,12 +514,16 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                         <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${isActive ? 'bg-white text-sky-700' : 'bg-white text-slate-500'}`}>
                           <FileSpreadsheet className="h-4 w-4" />
                         </div>
-                        <div className="min-w-0 flex-1">
+                        <div className={`min-w-0 flex-1 ${sidebarCollapsed ? 'hidden' : ''}`}>
                           <div className={`truncate text-sm font-semibold ${isActive ? 'text-slate-900' : 'text-slate-700'}`}>
                             {sheetLabel}
                           </div>
                           <div className="mt-1 text-[11px] leading-5 text-slate-500">
                             更新于 {new Date(sheet.updated_at).toLocaleString('zh-CN')}
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {sheet.is_locked && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700">锁定</span>}
+                            {sheet.is_archived && <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-semibold text-slate-700">归档</span>}
                           </div>
                         </div>
                       </div>

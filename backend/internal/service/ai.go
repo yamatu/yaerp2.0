@@ -293,6 +293,7 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 		if err != nil {
 			return "", nil, fmt.Errorf("load rows for sheet %d: %w", sheet.ID, err)
 		}
+		rowBase := getSheetRowBase(rows)
 
 		columns := make([]sheetPreviewColumn, 0)
 		if len(sheet.Columns) > 0 {
@@ -308,12 +309,15 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 
 			data := make(map[string]interface{})
 			_ = json.Unmarshal(row.Data, &data)
+			normalizedRowIndex := row.RowIndex - rowBase
 			rowItems = append(rowItems, map[string]interface{}{
-				"row":  row.RowIndex,
-				"data": data,
+				"row":         normalizedRowIndex,
+				"source_row":  row.RowIndex,
+				"display_row": normalizedRowIndex + 2,
+				"data":        data,
 			})
 			for key, value := range data {
-				currentValues[fmt.Sprintf("%d:%s", row.RowIndex, key)] = value
+				currentValues[fmt.Sprintf("%d:%s", normalizedRowIndex, key)] = value
 			}
 		}
 
@@ -332,6 +336,7 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 			"sheet_id":   sheet.ID,
 			"sheet_name": sheet.Name,
 			"columns":    columns,
+			"row_base":   rowBase,
 			"rows":       rowItems,
 		})
 	}
@@ -380,6 +385,22 @@ func normalizeSpreadsheetOperation(operation SpreadsheetOperation) SpreadsheetOp
 		operation.Kind = "update_cell"
 	}
 	return operation
+}
+
+func getSheetRowBase(rows []model.Row) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	base := rows[0].RowIndex
+	for _, row := range rows[1:] {
+		if row.RowIndex < base {
+			base = row.RowIndex
+		}
+	}
+	if base < 0 {
+		return 0
+	}
+	return base
 }
 
 func parseSheetColumns(raw json.RawMessage) ([]sheetColumnPayload, error) {
@@ -502,7 +523,7 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 		return fmt.Errorf("invalid insert_row row index")
 	}
 
-	if err := s.sheetService.InsertRow(operation.SheetID, operation.Row-1); err != nil {
+	if err := s.sheetService.InsertRow(userID, operation.SheetID, operation.Row-1); err != nil {
 		return fmt.Errorf("insert row: %w", err)
 	}
 
@@ -535,12 +556,12 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 	return nil
 }
 
-func (s *AIService) applyDeleteRowOperation(_ int64, operation SpreadsheetOperation) error {
+func (s *AIService) applyDeleteRowOperation(userID int64, operation SpreadsheetOperation) error {
 	if operation.Row < 0 {
 		return fmt.Errorf("invalid delete_row row index")
 	}
 
-	if err := s.sheetService.DeleteRow(operation.SheetID, operation.Row); err != nil {
+	if err := s.sheetService.DeleteRow(userID, operation.SheetID, operation.Row); err != nil {
 		return fmt.Errorf("delete row: %w", err)
 	}
 

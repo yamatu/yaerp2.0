@@ -31,6 +31,14 @@ export interface Workbook {
   metadata: Record<string, unknown>
   is_template: boolean
   status: number
+  is_locked?: boolean
+  is_hidden?: boolean
+  locked_by_id?: number
+  locked_by_name?: string
+  locked_at?: string
+  hidden_by_id?: number
+  hidden_by_name?: string
+  hidden_at?: string
   created_at: string
   updated_at: string
   sheets?: Sheet[]
@@ -44,12 +52,24 @@ export interface Sheet {
   columns: ColumnDef[]
   frozen: { row: number; col: number }
   config: SheetConfig
+  is_locked?: boolean
+  is_archived?: boolean
+  locked_by_id?: number
+  locked_by_name?: string
+  locked_at?: string
+  archived_by_id?: number
+  archived_by_name?: string
+  archived_at?: string
   created_at: string
   updated_at: string
 }
 
 export interface SheetConfig {
   zoom?: number
+  sheetState?: {
+    locked?: { id: number; name: string; at: string }
+    archived?: { id: number; name: string; at: string }
+  }
   lockedCells?: Record<string, boolean>
   protections?: {
     rows?: Record<string, ProtectionOwner>

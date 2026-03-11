@@ -76,14 +76,26 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sheet: %w", err)
 	}
+	if err := applySheetLifecycleState(sheet); err != nil {
+		return nil, err
+	}
 
 	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workbook: %w", err)
 	}
+	if err := applyWorkbookLifecycleState(workbook); err != nil {
+		return nil, err
+	}
+	if workbook.IsHidden {
+		return emptyPermissionMatrix(), nil
+	}
 
 	if workbook.OwnerID == userID {
-		return fullAccessMatrix(), nil
+		matrix := fullAccessMatrix()
+		applyWorkbookStateToPermissionMatrix(workbook, matrix)
+		applySheetStateToPermissionMatrix(sheet, matrix)
+		return matrix, nil
 	}
 
 	matrix, err := s.permRepo.GetPermissionMatrix(sheetID, roleIDs)
@@ -115,6 +127,9 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 		matrix.Sheet.CanDelete = matrix.Sheet.CanDelete || userPerm.CanDelete
 		matrix.Sheet.CanExport = matrix.Sheet.CanExport || userPerm.CanExport
 	}
+
+	applyWorkbookStateToPermissionMatrix(workbook, matrix)
+	applySheetStateToPermissionMatrix(sheet, matrix)
 
 	return matrix, nil
 }
@@ -155,6 +170,20 @@ func (s *PermissionService) CanManageWorkbook(workbook *model.Workbook, userID i
 }
 
 func (s *PermissionService) CanViewWorkbook(workbook *model.Workbook, userID int64) (bool, error) {
+	if err := applyWorkbookLifecycleState(workbook); err != nil {
+		return false, err
+	}
+	isAdmin, err := s.IsAdmin(userID)
+	if err != nil {
+		return false, err
+	}
+	if isAdmin {
+		return true, nil
+	}
+	if workbook.IsHidden {
+		return false, nil
+	}
+
 	canManage, err := s.CanManageWorkbook(workbook, userID)
 	if err != nil {
 		return false, err
@@ -371,6 +400,16 @@ func hasAnyDirectUserSheetPermission(perm *model.UserSheetPermission) bool {
 	}
 
 	return perm.CanView || perm.CanEdit || perm.CanDelete || perm.CanExport
+}
+
+func applySheetStateToPermissionMatrix(sheet *model.Sheet, matrix *model.PermissionMatrix) {
+	if sheet == nil || matrix == nil {
+		return
+	}
+	if sheet.IsLocked || sheet.IsArchived {
+		matrix.Sheet.CanEdit = false
+		matrix.Sheet.CanDelete = false
+	}
 }
 
 func fullAccessMatrix() *model.PermissionMatrix {

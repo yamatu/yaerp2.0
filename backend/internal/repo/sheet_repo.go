@@ -114,9 +114,9 @@ func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workb
 func (r *SheetRepo) UpdateWorkbook(wb *model.Workbook) error {
 	wb.UpdatedAt = time.Now()
 	result, err := r.db.Exec(
-		`UPDATE workbooks SET name = $1, description = $2, updated_at = $3
-		 WHERE id = $4`,
-		wb.Name, wb.Description, wb.UpdatedAt, wb.ID,
+		`UPDATE workbooks SET name = $1, description = $2, metadata = $3, updated_at = $4
+		 WHERE id = $5`,
+		wb.Name, wb.Description, wb.Metadata, wb.UpdatedAt, wb.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update workbook: %w", err)
