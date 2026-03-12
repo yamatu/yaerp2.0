@@ -8,15 +8,19 @@ class ApiClient {
     return localStorage.getItem('access_token')
   }
 
-  private async request<T>(
-    endpoint: string,
-    options: RequestInit = {}
-  ): Promise<ApiResponse<T>> {
-    const token = this.getToken()
+  private buildHeaders(options: RequestInit = {}): Record<string, string> {
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
       ...((options.headers as Record<string, string>) || {}),
     }
+    if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json'
+    }
+    return headers
+  }
+
+  private async requestRaw(endpoint: string, options: RequestInit = {}): Promise<Response> {
+    const token = this.getToken()
+    const headers = this.buildHeaders(options)
     if (token) {
       headers['Authorization'] = `Bearer ${token}`
     }
@@ -27,17 +31,19 @@ class ApiClient {
     })
 
     if (res.status === 401) {
-      // Try refresh
       const refreshed = await this.refreshToken()
       if (refreshed) {
-        headers['Authorization'] = `Bearer ${this.getToken()}`
-        const retryRes = await fetch(`${API_BASE}${endpoint}`, {
+        const retryHeaders = this.buildHeaders(options)
+        const nextToken = this.getToken()
+        if (nextToken) {
+          retryHeaders['Authorization'] = `Bearer ${nextToken}`
+        }
+        return fetch(`${API_BASE}${endpoint}`, {
           ...options,
-          headers,
+          headers: retryHeaders,
         })
-        return retryRes.json()
       }
-      // Redirect to login
+
       if (typeof window !== 'undefined') {
         localStorage.removeItem('access_token')
         localStorage.removeItem('refresh_token')
@@ -46,6 +52,14 @@ class ApiClient {
       }
     }
 
+    return res
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<ApiResponse<T>> {
+    const res = await this.requestRaw(endpoint, options)
     return res.json()
   }
 
@@ -94,6 +108,10 @@ class ApiClient {
 
   delete<T>(endpoint: string) {
     return this.request<T>(endpoint, { method: 'DELETE' })
+  }
+
+  download(endpoint: string, options: RequestInit = {}) {
+    return this.requestRaw(endpoint, options)
   }
 
   async upload(file: File): Promise<ApiResponse<{ id: number; url: string }>> {
