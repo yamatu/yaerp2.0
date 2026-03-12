@@ -96,6 +96,9 @@ func (s *SheetService) BuildSheetExportFile(userID, sheetID int64, filename stri
 
 	file := excelize.NewFile()
 	defer func() { _ = file.Close() }()
+	if err := applySheetExportWorkbookProps(file); err != nil {
+		return nil, err
+	}
 
 	excelSheetName := normalizeExcelSheetName(ctx.Sheet.Name)
 	defaultSheet := file.GetSheetName(0)
@@ -118,10 +121,13 @@ func (s *SheetService) BuildSheetExportFile(userID, sheetID int64, filename stri
 	} else {
 		applySheetExportFreeze(file, excelSheetName, snapshot, snapshotMatrix)
 	}
+	if err := file.UpdateLinkedValue(); err != nil {
+		return nil, fmt.Errorf("update formula links: %w", err)
+	}
 
 	buffer := bytes.NewBuffer(nil)
-	if err := file.Write(buffer); err != nil {
-		return nil, fmt.Errorf("write export workbook: %w", err)
+	if _, err := file.WriteTo(buffer); err != nil {
+		return nil, fmt.Errorf("stream export workbook: %w", err)
 	}
 
 	return &sheetExportFile{
@@ -129,6 +135,20 @@ func (s *SheetService) BuildSheetExportFile(userID, sheetID int64, filename stri
 		ContentType: sheetExportContentType,
 		Data:        buffer.Bytes(),
 	}, nil
+}
+
+func applySheetExportWorkbookProps(file *excelize.File) error {
+	filterPrivacy := true
+	date1904 := false
+	codeName := "ThisWorkbook"
+	if err := file.SetWorkbookProps(&excelize.WorkbookPropsOptions{
+		FilterPrivacy: &filterPrivacy,
+		Date1904:      &date1904,
+		CodeName:      &codeName,
+	}); err != nil {
+		return fmt.Errorf("set workbook props: %w", err)
+	}
+	return nil
 }
 
 func (s *SheetService) loadSheetExportContext(userID, sheetID int64) (*sheetExportContext, error) {
@@ -295,7 +315,7 @@ func writeSheetExportHeader(file *excelize.File, sheetName string, columns []she
 		if err == nil && strings.TrimSpace(cellValue) != "" {
 			continue
 		}
-		_ = file.SetCellValue(sheetName, axis, firstNonEmpty(column.Name, column.Key))
+		_ = file.SetCellValue(sheetName, axis, sanitizeExcelString(firstNonEmpty(column.Name, column.Key)))
 	}
 
 	return nil
@@ -308,7 +328,7 @@ func writeSheetExportHeaderForIndexes(file *excelize.File, sheetName string, col
 			headerName = firstNonEmpty(columns[sourceIndex].Name, columns[sourceIndex].Key)
 		}
 		axis, _ := excelize.CoordinatesToCellName(targetIndex+1, 1)
-		if err := file.SetCellValue(sheetName, axis, headerName); err != nil {
+		if err := file.SetCellValue(sheetName, axis, sanitizeExcelString(headerName)); err != nil {
 			return err
 		}
 	}
@@ -316,7 +336,7 @@ func writeSheetExportHeaderForIndexes(file *excelize.File, sheetName string, col
 }
 
 func setSheetExportCell(file *excelize.File, sheetName, axis string, cell univerExportCell, column *sheetColumnPayload) error {
-	formula := strings.TrimSpace(cell.Formula)
+	formula := sanitizeExcelString(strings.TrimSpace(cell.Formula))
 	if formula != "" {
 		if err := file.SetCellFormula(sheetName, axis, formula); err == nil {
 			return nil
@@ -331,17 +351,20 @@ func setSheetExportCell(file *excelize.File, sheetName, axis string, cell univer
 	switch typed := value.(type) {
 	case nil:
 		if formula != "" {
-			return file.SetCellValue(sheetName, axis, formula)
+			return file.SetCellValue(sheetName, axis, sanitizeExcelString(formula))
 		}
 		return nil
-	case string, float64, bool, int, int32, int64, uint, uint32, uint64:
+	case string:
+		return file.SetCellValue(sheetName, axis, sanitizeExcelString(typed))
+	case float64, bool, int, int32, int64, uint, uint32, uint64:
 		return file.SetCellValue(sheetName, axis, typed)
 	default:
-		encoded, err := json.Marshal(typed)
+		sanitized := sanitizeExcelJSONValue(typed)
+		encoded, err := json.Marshal(sanitized)
 		if err != nil {
-			return file.SetCellValue(sheetName, axis, fmt.Sprint(typed))
+			return file.SetCellValue(sheetName, axis, sanitizeExcelString(fmt.Sprint(sanitized)))
 		}
-		return file.SetCellValue(sheetName, axis, string(encoded))
+		return file.SetCellValue(sheetName, axis, sanitizeExcelString(string(encoded)))
 	}
 }
 
@@ -668,4 +691,46 @@ func columnIndexLabel(index int) string {
 		return "A"
 	}
 	return result
+}
+
+func sanitizeExcelJSONValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return sanitizeExcelString(typed)
+	case []any:
+		items := make([]any, len(typed))
+		for index, item := range typed {
+			items[index] = sanitizeExcelJSONValue(item)
+		}
+		return items
+	case map[string]any:
+		items := make(map[string]any, len(typed))
+		for key, item := range typed {
+			items[sanitizeExcelString(key)] = sanitizeExcelJSONValue(item)
+		}
+		return items
+	default:
+		return value
+	}
+}
+
+func sanitizeExcelString(value string) string {
+	if value == "" {
+		return value
+	}
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == 0x9 || r == 0xA || r == 0xD:
+			builder.WriteRune(r)
+		case r >= 0x20 && r <= 0xD7FF:
+			builder.WriteRune(r)
+		case r >= 0xE000 && r <= 0xFFFD:
+			builder.WriteRune(r)
+		case r >= 0x10000 && r <= 0x10FFFF:
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
 }
