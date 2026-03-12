@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
@@ -9,7 +9,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /yaerp-server .
 
 FROM alpine:3.19
-RUN apk --no-cache add ca-certificates tzdata postgresql16-client
+RUN apk --no-cache add ca-certificates tzdata postgresql16-client chromium nss freetype harfbuzz ttf-freefont
 ENV TZ=Asia/Shanghai
 
 COPY --from=builder /yaerp-server /yaerp-server

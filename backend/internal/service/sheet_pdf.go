@@ -1,23 +1,30 @@
 package service
 
 import (
-	"bytes"
+	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math"
+	"html"
+	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
+	"time"
 
-	"github.com/phpdave11/gofpdf"
+	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
+	"github.com/chromedp/chromedp"
 )
 
 //go:embed assets/fonts/NotoSansSC.ttf
 var sheetPDFChineseFont []byte
 
-const sheetPDFFontFamily = "sheet-pdf-body"
+var sheetPDFFontBase64 = base64.StdEncoding.EncodeToString(sheetPDFChineseFont)
+
+const sheetPDFBaseFontFamily = "YaERPPDF"
 const pxToMM = 0.2645833333
 
 type sheetPDFCell struct {
@@ -39,15 +46,11 @@ type sheetPDFGrid struct {
 }
 
 type sheetPDFLayout struct {
-	Size             string
-	Orientation      string
-	MarginLeft       float64
-	MarginTop        float64
-	MarginRight      float64
-	MarginBottom     float64
-	Scale            float64
-	ScaledColWidths  map[int]float64
-	ScaledRowHeights map[int]float64
+	CSSPageSize string
+	PageWidthMM float64
+	MarginMM    float64
+	Scale       float64
+	TotalWidth  float64
 }
 
 func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string) (*sheetExportFile, error) {
@@ -61,43 +64,118 @@ func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string)
 		return nil, err
 	}
 	layout := buildSheetPDFLayout(grid)
+	htmlDoc := renderSheetPDFHTML(grid, layout)
 
-	pdf := gofpdf.New(layout.Orientation, "mm", layout.Size, "")
-	pdf.SetMargins(layout.MarginLeft, layout.MarginTop, layout.MarginRight)
-	pdf.SetAutoPageBreak(true, layout.MarginBottom)
-	pdf.SetTitle(fmt.Sprintf("%s PDF", grid.SheetName), true)
-	pdf.SetAuthor("YaERP", true)
-	pdf.SetCreator("YaERP", true)
-
-	registerSheetPDFFonts(pdf)
-	if err := pdf.Error(); err != nil {
-		return nil, fmt.Errorf("load pdf fonts: %w", err)
-	}
-
-	pdf.AddPage()
-	if len(grid.Rows) == 0 || len(grid.Columns) == 0 {
-		renderEmptySheetPDFState(pdf, layout)
-	} else {
-		renderSheetPDFGrid(pdf, grid, layout)
-	}
-
-	buffer := bytes.NewBuffer(nil)
-	if err := pdf.Output(buffer); err != nil {
-		return nil, fmt.Errorf("write pdf file: %w", err)
+	pdfBytes, err := renderSheetPDFWithChromium(htmlDoc, layout)
+	if err != nil {
+		return nil, err
 	}
 
 	return &sheetExportFile{
 		Filename:    normalizeSheetPDFFilename(filename, ctx.Sheet.Name, sheetID),
 		ContentType: sheetPDFContentType,
-		Data:        buffer.Bytes(),
+		Data:        pdfBytes,
 	}, nil
 }
 
-func registerSheetPDFFonts(pdf *gofpdf.Fpdf) {
-	pdf.AddUTF8FontFromBytes(sheetPDFFontFamily, "", sheetPDFChineseFont)
-	pdf.AddUTF8FontFromBytes(sheetPDFFontFamily, "B", sheetPDFChineseFont)
-	pdf.AddUTF8FontFromBytes(sheetPDFFontFamily, "I", sheetPDFChineseFont)
-	pdf.AddUTF8FontFromBytes(sheetPDFFontFamily, "BI", sheetPDFChineseFont)
+func renderSheetPDFWithChromium(htmlDoc string, layout sheetPDFLayout) ([]byte, error) {
+	chromePath, err := findChromiumExecutable()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	allocatorOptions := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.ExecPath(chromePath),
+		chromedp.NoSandbox,
+		chromedp.DisableGPU,
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-software-rasterizer", true),
+		chromedp.Flag("font-render-hinting", "medium"),
+		chromedp.Flag("force-color-profile", "srgb"),
+	)
+
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, allocatorOptions...)
+	defer cancelAlloc()
+
+	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
+	defer cancelBrowser()
+
+	var pdfData []byte
+	err = chromedp.Run(browserCtx,
+		chromedp.Navigate("about:blank"),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			frameTree, err := page.GetFrameTree().Do(ctx)
+			if err != nil {
+				return fmt.Errorf("load chromium frame tree: %w", err)
+			}
+			return page.SetDocumentContent(frameTree.Frame.ID, htmlDoc).Do(ctx)
+		}),
+		chromedp.ActionFunc(waitForPrintableDocument),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			data, _, err := page.PrintToPDF().
+				WithPrintBackground(true).
+				WithDisplayHeaderFooter(false).
+				WithPreferCSSPageSize(true).
+				WithScale(layout.Scale).
+				WithMarginTop(0).
+				WithMarginBottom(0).
+				WithMarginLeft(0).
+				WithMarginRight(0).
+				Do(ctx)
+			if err != nil {
+				return fmt.Errorf("print chromium pdf: %w", err)
+			}
+			pdfData = append([]byte(nil), data...)
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return pdfData, nil
+}
+
+func waitForPrintableDocument(ctx context.Context) error {
+	script := `(async () => {
+		if (document.readyState !== 'complete') {
+			await new Promise((resolve) => window.addEventListener('load', resolve, { once: true }))
+		}
+		if (document.fonts && document.fonts.ready) {
+			await document.fonts.ready
+		}
+		await new Promise((resolve) => setTimeout(resolve, 120))
+		return true
+	})()`
+	_, exp, err := runtime.Evaluate(script).WithAwaitPromise(true).Do(ctx)
+	if err != nil {
+		return err
+	}
+	if exp != nil {
+		return fmt.Errorf("printable document not ready")
+	}
+	return nil
+}
+
+func findChromiumExecutable() (string, error) {
+	for _, envKey := range []string{"CHROME_PATH", "CHROMIUM_PATH", "CHROME_BIN"} {
+		if value := strings.TrimSpace(os.Getenv(envKey)); value != "" {
+			if resolved, err := exec.LookPath(value); err == nil {
+				return resolved, nil
+			}
+		}
+	}
+
+	for _, candidate := range []string{"chromium-browser", "chromium", "google-chrome", "google-chrome-stable", "/usr/bin/chromium-browser", "/usr/bin/chromium"} {
+		if resolved, err := exec.LookPath(candidate); err == nil {
+			return resolved, nil
+		}
+	}
+
+	return "", fmt.Errorf("chromium executable not found, please install chromium or set CHROME_PATH")
 }
 
 func (s *SheetService) buildSheetPDFGrid(ctx *sheetExportContext) (*sheetPDFGrid, error) {
@@ -396,7 +474,7 @@ func buildSheetPDFRowHeights(snapshot *univerExportWorksheet, rows []int) map[in
 				height = meta.Height
 			}
 		}
-		result[row] = math.Max(5.8, height*pxToMM)
+		result[row] = max(5.8, height*pxToMM)
 	}
 	return result
 }
@@ -414,233 +492,9 @@ func buildSheetPDFColumnWidths(snapshot *univerExportWorksheet, columns []sheetC
 		} else if column < len(columns) && columns[column].Width > 0 {
 			width = float64(columns[column].Width)
 		}
-		result[column] = math.Max(8, width*pxToMM)
+		result[column] = max(8, width*pxToMM)
 	}
 	return result
-}
-
-func buildSheetPDFLayout(grid *sheetPDFGrid) sheetPDFLayout {
-	totalWidth := 0.0
-	for _, column := range grid.Columns {
-		totalWidth += grid.ColumnWidths[column]
-	}
-
-	candidates := []struct {
-		Size        string
-		Orientation string
-		Width       float64
-		Height      float64
-	}{
-		{Size: "A4", Orientation: "P", Width: 210, Height: 297},
-		{Size: "A4", Orientation: "L", Width: 297, Height: 210},
-		{Size: "A3", Orientation: "L", Width: 420, Height: 297},
-	}
-
-	chosen := candidates[len(candidates)-1]
-	scale := 1.0
-	for _, candidate := range candidates {
-		available := candidate.Width - 16
-		if totalWidth <= available {
-			chosen = candidate
-			scale = 1
-			break
-		}
-		candidateScale := available / math.Max(totalWidth, 1)
-		if candidateScale >= 0.62 {
-			chosen = candidate
-			scale = candidateScale
-			break
-		}
-	}
-	if totalWidth > chosen.Width-16 {
-		scale = (chosen.Width - 16) / math.Max(totalWidth, 1)
-	}
-	if scale > 1 {
-		scale = 1
-	}
-	if scale < 0.5 {
-		scale = 0.5
-	}
-
-	layout := sheetPDFLayout{
-		Size:             chosen.Size,
-		Orientation:      chosen.Orientation,
-		MarginLeft:       8,
-		MarginTop:        8,
-		MarginRight:      8,
-		MarginBottom:     8,
-		Scale:            scale,
-		ScaledColWidths:  make(map[int]float64, len(grid.Columns)),
-		ScaledRowHeights: make(map[int]float64, len(grid.Rows)),
-	}
-	for _, column := range grid.Columns {
-		layout.ScaledColWidths[column] = grid.ColumnWidths[column] * scale
-	}
-	for _, row := range grid.Rows {
-		layout.ScaledRowHeights[row] = math.Max(3.6, grid.RowHeights[row]*scale)
-	}
-	return layout
-}
-
-func renderSheetPDFGrid(pdf *gofpdf.Fpdf, grid *sheetPDFGrid, layout sheetPDFLayout) {
-	for _, row := range grid.Rows {
-		rowHeight := layout.ScaledRowHeights[row]
-		if shouldAddSheetPDFPage(pdf, layout, rowHeight) {
-			pdf.AddPage()
-		}
-
-		x := layout.MarginLeft
-		y := pdf.GetY()
-		for _, column := range grid.Columns {
-			key := sheetPDFCellKey(row, column)
-			if grid.MergeCovered[key] {
-				x += layout.ScaledColWidths[column]
-				continue
-			}
-
-			width := layout.ScaledColWidths[column]
-			height := rowHeight
-			if merge, ok := grid.MergeStarts[key]; ok {
-				width = sumSheetPDFMergeWidth(layout, grid, merge)
-				height = sumSheetPDFMergeHeight(layout, grid, merge)
-			}
-
-			cell := grid.Cells[key]
-			drawSheetPDFCell(pdf, x, y, width, height, cell, layout, grid.ShowGridlines)
-			x += layout.ScaledColWidths[column]
-		}
-
-		pdf.SetY(y + rowHeight)
-	}
-}
-
-func renderEmptySheetPDFState(pdf *gofpdf.Fpdf, layout sheetPDFLayout) {
-	pageWidth, _ := pdf.GetPageSize()
-	width := pageWidth - layout.MarginLeft - layout.MarginRight
-	y := layout.MarginTop + 12
-	pdf.SetFillColor(248, 250, 252)
-	pdf.SetDrawColor(226, 232, 240)
-	pdf.RoundedRect(layout.MarginLeft, y, width, 20, 2.5, "1234", "DF")
-	pdf.SetTextColor(51, 65, 85)
-	pdf.SetFont(sheetPDFFontFamily, "B", 12)
-	pdf.SetXY(layout.MarginLeft, y+5)
-	pdf.CellFormat(width, 5, "当前工作表暂无可导出的内容", "", 0, "C", false, 0, "")
-	pdf.SetFont(sheetPDFFontFamily, "", 9)
-	pdf.SetTextColor(100, 116, 139)
-	pdf.SetXY(layout.MarginLeft+6, y+11)
-	pdf.CellFormat(width-12, 4.5, "可以先在表格中录入数据，或确认当前账号对可见列具备导出权限。", "", 0, "C", false, 0, "")
-}
-
-func drawSheetPDFCell(pdf *gofpdf.Fpdf, x, y, width, height float64, cell sheetPDFCell, layout sheetPDFLayout, showGridlines bool) {
-	style := cell.Style
-	fillR, fillG, fillB := 255, 255, 255
-	if r, g, b, ok := parseUniverColor(styleColor(style, "bg")); ok {
-		fillR, fillG, fillB = r, g, b
-	}
-	pdf.SetFillColor(fillR, fillG, fillB)
-	pdf.Rect(x, y, width, height, "F")
-
-	drawSheetPDFCellBorders(pdf, x, y, width, height, style, layout.Scale, showGridlines)
-	drawSheetPDFCellText(pdf, x, y, width, height, cell.Text, style, layout)
-}
-
-func drawSheetPDFCellBorders(pdf *gofpdf.Fpdf, x, y, width, height float64, style *univerStyleData, scale float64, showGridlines bool) {
-	if showGridlines {
-		pdf.SetDrawColor(226, 232, 240)
-		pdf.SetLineWidth(0.15 * scale)
-		pdf.Rect(x, y, width, height, "D")
-	}
-
-	if style == nil || style.Bd == nil {
-		return
-	}
-
-	drawSheetPDFBorderSide(pdf, x, y, x+width, y, style.Bd.T, scale)
-	drawSheetPDFBorderSide(pdf, x+width, y, x+width, y+height, style.Bd.R, scale)
-	drawSheetPDFBorderSide(pdf, x, y+height, x+width, y+height, style.Bd.B, scale)
-	drawSheetPDFBorderSide(pdf, x, y, x, y+height, style.Bd.L, scale)
-}
-
-func drawSheetPDFBorderSide(pdf *gofpdf.Fpdf, x1, y1, x2, y2 float64, border *univerBorderStyleData, scale float64) {
-	if border == nil || border.S == nil || *border.S == 0 {
-		return
-	}
-	r, g, b := 71, 85, 105
-	if cr, cg, cb, ok := parseUniverColor(border.CL); ok {
-		r, g, b = cr, cg, cb
-	}
-	pdf.SetDrawColor(r, g, b)
-	pdf.SetLineWidth(sheetPDFBorderWidth(*border.S) * scale)
-	pdf.Line(x1, y1, x2, y2)
-}
-
-func drawSheetPDFCellText(pdf *gofpdf.Fpdf, x, y, width, height float64, text string, style *univerStyleData, layout sheetPDFLayout) {
-	fontSize := resolveSheetPDFFontSize(style, 10) * layout.Scale
-	if fontSize < 6.2 {
-		fontSize = 6.2
-	}
-	fontStyle := resolveSheetPDFFontStyle(style)
-	pdf.SetFont(sheetPDFFontFamily, fontStyle, fontSize)
-
-	r, g, b := 15, 23, 42
-	if cr, cg, cb, ok := parseUniverColor(styleColor(style, "cl")); ok {
-		r, g, b = cr, cg, cb
-	}
-	pdf.SetTextColor(r, g, b)
-
-	padLeft, padTop, padRight, padBottom := resolveSheetPDFPadding(style, layout.Scale)
-	innerWidth := math.Max(2, width-padLeft-padRight)
-	innerHeight := math.Max(2, height-padTop-padBottom)
-	lineHeight := math.Max(2.6, fontSize*0.36+0.8*layout.Scale)
-	wrap := shouldWrapSheetPDFText(style, text)
-	lines := formatSheetPDFLines(pdf, text, innerWidth, wrap)
-	maxLines := max(1, int(math.Floor(innerHeight/lineHeight)))
-	if len(lines) > maxLines {
-		lines = lines[:maxLines]
-		lastIndex := len(lines) - 1
-		lines[lastIndex] = clipSheetPDFText(pdf, lines[lastIndex], innerWidth)
-	}
-
-	contentHeight := float64(len(lines)) * lineHeight
-	startY := y + padTop
-	switch resolveSheetPDFVerticalAlign(style) {
-	case 2:
-		startY = y + (height-contentHeight)/2
-	case 3:
-		startY = y + height - padBottom - contentHeight
-	}
-
-	align := resolveSheetPDFHorizontalAlign(style)
-	for index, line := range lines {
-		pdf.SetXY(x+padLeft, startY+float64(index)*lineHeight)
-		pdf.CellFormat(innerWidth, lineHeight, line, "", 0, align, false, 0, "")
-	}
-}
-
-func shouldAddSheetPDFPage(pdf *gofpdf.Fpdf, layout sheetPDFLayout, nextRowHeight float64) bool {
-	_, pageHeight := pdf.GetPageSize()
-	_, _, _, bottom := pdf.GetMargins()
-	return pdf.GetY()+nextRowHeight > pageHeight-bottom
-}
-
-func sumSheetPDFMergeWidth(layout sheetPDFLayout, grid *sheetPDFGrid, merge univerExportRange) float64 {
-	total := 0.0
-	for _, column := range grid.Columns {
-		if column >= merge.StartColumn && column <= merge.EndColumn {
-			total += layout.ScaledColWidths[column]
-		}
-	}
-	return total
-}
-
-func sumSheetPDFMergeHeight(layout sheetPDFLayout, grid *sheetPDFGrid, merge univerExportRange) float64 {
-	total := 0.0
-	for _, row := range grid.Rows {
-		if row >= merge.StartRow && row <= merge.EndRow {
-			total += layout.ScaledRowHeights[row]
-		}
-	}
-	return total
 }
 
 func resolveSheetPDFFontSize(style *univerStyleData, fallback float64) float64 {
@@ -650,166 +504,295 @@ func resolveSheetPDFFontSize(style *univerStyleData, fallback float64) float64 {
 	return fallback
 }
 
-func resolveSheetPDFFontStyle(style *univerStyleData) string {
-	if style == nil {
-		return ""
+func buildSheetPDFLayout(grid *sheetPDFGrid) sheetPDFLayout {
+	totalWidth := 0.0
+	for _, column := range grid.Columns {
+		totalWidth += grid.ColumnWidths[column]
 	}
-	parts := make([]string, 0, 3)
-	if style.Bl != nil && *style.Bl == 1 {
-		parts = append(parts, "B")
+	if totalWidth <= 0 {
+		totalWidth = 120
 	}
-	if style.It != nil && *style.It == 1 {
-		parts = append(parts, "I")
-	}
-	if style.Ul != nil && style.Ul.S != nil && *style.Ul.S == 1 {
-		parts = append(parts, "U")
-	}
-	return strings.Join(parts, "")
-}
 
-func resolveSheetPDFPadding(style *univerStyleData, scale float64) (float64, float64, float64, float64) {
-	left := 1.5 * scale
-	top := 1.2 * scale
-	right := 1.5 * scale
-	bottom := 1.2 * scale
-	if style != nil && style.Pd != nil {
-		if style.Pd.L != nil {
-			left = math.Max(0.6, *style.Pd.L*pxToMM*scale)
-		}
-		if style.Pd.T != nil {
-			top = math.Max(0.4, *style.Pd.T*pxToMM*scale)
-		}
-		if style.Pd.R != nil {
-			right = math.Max(0.6, *style.Pd.R*pxToMM*scale)
-		}
-		if style.Pd.B != nil {
-			bottom = math.Max(0.4, *style.Pd.B*pxToMM*scale)
-		}
+	candidates := []struct {
+		css       string
+		pageWidth float64
+	}{
+		{css: "A4 portrait", pageWidth: 210},
+		{css: "A4 landscape", pageWidth: 297},
+		{css: "A3 landscape", pageWidth: 420},
 	}
-	return left, top, right, bottom
-}
 
-func resolveSheetPDFHorizontalAlign(style *univerStyleData) string {
-	if style == nil || style.Ht == nil {
-		return "L"
-	}
-	switch *style.Ht {
-	case 2:
-		return "C"
-	case 3:
-		return "R"
-	default:
-		return "L"
-	}
-}
-
-func resolveSheetPDFVerticalAlign(style *univerStyleData) int {
-	if style == nil || style.Vt == nil {
-		return 1
-	}
-	return *style.Vt
-}
-
-func shouldWrapSheetPDFText(style *univerStyleData, text string) bool {
-	if strings.Contains(text, "\n") {
-		return true
-	}
-	if style == nil || style.Tb == nil {
-		return false
-	}
-	return *style.Tb == 3
-}
-
-func formatSheetPDFLines(pdf *gofpdf.Fpdf, text string, width float64, wrap bool) []string {
-	cleaned := strings.ReplaceAll(text, "\r", "")
-	if strings.TrimSpace(cleaned) == "" {
-		return []string{""}
-	}
-	paragraphs := strings.Split(cleaned, "\n")
-	lines := make([]string, 0, len(paragraphs))
-	for _, paragraph := range paragraphs {
-		if !wrap {
-			lines = append(lines, clipSheetPDFText(pdf, paragraph, width))
-			continue
+	margin := 8.0
+	chosen := candidates[len(candidates)-1]
+	scale := 1.0
+	for _, candidate := range candidates {
+		available := candidate.pageWidth - margin*2
+		candidateScale := available / totalWidth
+		if totalWidth <= available {
+			chosen = candidate
+			scale = 1
+			break
 		}
-		for _, line := range wrapSheetPDFText(pdf, paragraph, width) {
-			lines = append(lines, line)
+		if candidateScale >= 0.68 {
+			chosen = candidate
+			scale = candidateScale
+			break
 		}
 	}
-	if len(lines) == 0 {
-		return []string{""}
+	if scale > 1 {
+		scale = 1
 	}
-	return lines
+	if scale < 0.55 {
+		scale = 0.55
+	}
+
+	return sheetPDFLayout{
+		CSSPageSize: chosen.css,
+		PageWidthMM: chosen.pageWidth,
+		MarginMM:    margin,
+		Scale:       scale,
+		TotalWidth:  totalWidth,
+	}
 }
 
-func wrapSheetPDFText(pdf *gofpdf.Fpdf, text string, width float64) []string {
-	if strings.TrimSpace(text) == "" {
-		return []string{""}
+func renderSheetPDFHTML(grid *sheetPDFGrid, layout sheetPDFLayout) string {
+	var builder strings.Builder
+	builder.Grow(64 * 1024)
+
+	builder.WriteString("<!DOCTYPE html><html><head><meta charset=\"utf-8\" /><style>")
+	builder.WriteString("@font-face{font-family:'" + sheetPDFBaseFontFamily + "';src:url(data:font/ttf;base64,")
+	builder.WriteString(sheetPDFFontBase64)
+	builder.WriteString(") format('truetype');font-weight:100 900;font-style:normal;}\n")
+	builder.WriteString(fmt.Sprintf("@page{size:%s;margin:%.2fmm;}\n", layout.CSSPageSize, layout.MarginMM))
+	builder.WriteString("html,body{margin:0;padding:0;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;}\n")
+	builder.WriteString("body{font-family:'" + sheetPDFBaseFontFamily + "','Noto Sans SC','Microsoft YaHei',sans-serif;color:#0f172a;}\n")
+	builder.WriteString(fmt.Sprintf("table{border-collapse:collapse;table-layout:fixed;width:%.2fmm;}\n", layout.TotalWidth))
+	builder.WriteString("td{box-sizing:border-box;overflow:hidden;line-height:1.35;}\n")
+	builder.WriteString(".empty{padding:12mm 8mm;border:1px solid #cbd5e1;border-radius:3mm;background:#f8fafc;text-align:center;color:#475569;font-size:12px;}\n")
+	builder.WriteString("</style></head><body>")
+
+	if len(grid.Rows) == 0 || len(grid.Columns) == 0 {
+		builder.WriteString("<div class=\"empty\">当前工作表暂无可导出的内容</div></body></html>")
+		return builder.String()
 	}
-	segments := strings.FieldsFunc(text, func(r rune) bool { return r == '\n' })
-	if len(segments) == 0 {
-		segments = []string{text}
+
+	builder.WriteString("<table><colgroup>")
+	for _, column := range grid.Columns {
+		builder.WriteString(fmt.Sprintf("<col style=\"width:%.2fmm\" />", grid.ColumnWidths[column]))
 	}
-	lines := make([]string, 0, len(segments))
-	for _, segment := range segments {
-		current := ""
-		for _, r := range segment {
-			candidate := current + string(r)
-			if current != "" && pdf.GetStringWidth(candidate) > width {
-				lines = append(lines, current)
-				current = string(r)
+	builder.WriteString("</colgroup><tbody>")
+
+	for _, row := range grid.Rows {
+		builder.WriteString(fmt.Sprintf("<tr style=\"height:%.2fmm\">", grid.RowHeights[row]))
+		for _, column := range grid.Columns {
+			cellKey := sheetPDFCellKey(row, column)
+			if grid.MergeCovered[cellKey] {
 				continue
 			}
-			current = candidate
+
+			attrs := ""
+			if merge, ok := grid.MergeStarts[cellKey]; ok {
+				rowSpan := sheetPDFVisibleRowSpan(grid, merge)
+				colSpan := sheetPDFVisibleColSpan(grid, merge)
+				if rowSpan > 1 {
+					attrs += fmt.Sprintf(" rowspan=\"%d\"", rowSpan)
+				}
+				if colSpan > 1 {
+					attrs += fmt.Sprintf(" colspan=\"%d\"", colSpan)
+				}
+			}
+
+			cell := grid.Cells[cellKey]
+			builder.WriteString("<td")
+			builder.WriteString(attrs)
+			builder.WriteString(" style=\"")
+			builder.WriteString(buildSheetPDFCellCSS(cell.Style, grid.ShowGridlines, grid.DefaultFontSize))
+			builder.WriteString("\">")
+			builder.WriteString(renderSheetPDFCellHTML(cell.Text))
+			builder.WriteString("</td>")
 		}
-		if current != "" {
-			lines = append(lines, current)
-		}
+		builder.WriteString("</tr>")
 	}
-	if len(lines) == 0 {
-		return []string{""}
-	}
-	return lines
+
+	builder.WriteString("</tbody></table></body></html>")
+	return builder.String()
 }
 
-func clipSheetPDFText(pdf *gofpdf.Fpdf, text string, width float64) string {
-	if pdf.GetStringWidth(text) <= width {
-		return text
+func buildSheetPDFCellCSS(style *univerStyleData, showGridlines bool, defaultFontSize float64) string {
+	parts := []string{"position:relative", "font-family:'" + sheetPDFBaseFontFamily + "','Noto Sans SC','Microsoft YaHei',sans-serif", "padding:4px 6px", "vertical-align:top", "text-align:left", "white-space:pre-wrap", "overflow-wrap:anywhere"}
+	if showGridlines {
+		parts = append(parts, "border:1px solid #dbe3ec")
+	} else {
+		parts = append(parts, "border:none")
 	}
-	trimmed := text
-	for len(trimmed) > 0 && pdf.GetStringWidth(trimmed+"…") > width {
-		_, size := utf8.DecodeLastRuneInString(trimmed)
-		trimmed = trimmed[:len(trimmed)-size]
+
+	fontSize := defaultFontSize
+	if style != nil && style.FS != nil && *style.FS > 0 {
+		fontSize = *style.FS
 	}
-	if trimmed == "" {
+	parts = append(parts, fmt.Sprintf("font-size:%.2fpx", fontSize))
+
+	if style != nil {
+		if style.FF != nil && strings.TrimSpace(*style.FF) != "" {
+			parts = append(parts, "font-family:'"+escapeCSSString(strings.TrimSpace(strings.Split(*style.FF, ",")[0]))+"','"+sheetPDFBaseFontFamily+"','Microsoft YaHei',sans-serif")
+		}
+		if style.Bl != nil && *style.Bl == 1 {
+			parts = append(parts, "font-weight:700")
+		}
+		if style.It != nil && *style.It == 1 {
+			parts = append(parts, "font-style:italic")
+		}
+		decorations := make([]string, 0, 2)
+		if style.Ul != nil && style.Ul.S != nil && *style.Ul.S == 1 {
+			decorations = append(decorations, "underline")
+		}
+		if style.St != nil && style.St.S != nil && *style.St.S == 1 {
+			decorations = append(decorations, "line-through")
+		}
+		if len(decorations) > 0 {
+			parts = append(parts, "text-decoration:"+strings.Join(decorations, " "))
+		}
+		if r, g, b, ok := parseUniverColor(style.Cl); ok {
+			parts = append(parts, "color:"+cssRGBString(r, g, b))
+		}
+		if r, g, b, ok := parseUniverColor(style.Bg); ok {
+			parts = append(parts, "background:"+cssRGBString(r, g, b))
+		}
+		if style.Ht != nil {
+			switch *style.Ht {
+			case 2:
+				parts = append(parts, "text-align:center")
+			case 3:
+				parts = append(parts, "text-align:right")
+			default:
+				parts = append(parts, "text-align:left")
+			}
+		}
+		if style.Vt != nil {
+			switch *style.Vt {
+			case 2:
+				parts = append(parts, "vertical-align:middle")
+			case 3:
+				parts = append(parts, "vertical-align:bottom")
+			default:
+				parts = append(parts, "vertical-align:top")
+			}
+		}
+		if style.Tb != nil && *style.Tb != 3 {
+			parts = append(parts, "white-space:pre")
+		}
+		if style.Pd != nil {
+			parts = append(parts, fmt.Sprintf("padding:%s %s %s %s",
+				cssPaddingValue(style.Pd.T, 4),
+				cssPaddingValue(style.Pd.R, 6),
+				cssPaddingValue(style.Pd.B, 4),
+				cssPaddingValue(style.Pd.L, 6),
+			))
+		}
+		if style.Bd != nil {
+			if border := cssBorderValue(style.Bd.T); border != "" {
+				parts = append(parts, "border-top:"+border)
+			}
+			if border := cssBorderValue(style.Bd.R); border != "" {
+				parts = append(parts, "border-right:"+border)
+			}
+			if border := cssBorderValue(style.Bd.B); border != "" {
+				parts = append(parts, "border-bottom:"+border)
+			}
+			if border := cssBorderValue(style.Bd.L); border != "" {
+				parts = append(parts, "border-left:"+border)
+			}
+		}
+	}
+
+	return strings.Join(parts, ";")
+}
+
+func renderSheetPDFCellHTML(text string) string {
+	escaped := html.EscapeString(text)
+	escaped = strings.ReplaceAll(escaped, "\n", "<br />")
+	if strings.TrimSpace(text) == "" {
+		return "&nbsp;"
+	}
+	return escaped
+}
+
+func sheetPDFVisibleRowSpan(grid *sheetPDFGrid, merge univerExportRange) int {
+	count := 0
+	for _, row := range grid.Rows {
+		if row >= merge.StartRow && row <= merge.EndRow {
+			count += 1
+		}
+	}
+	return max(1, count)
+}
+
+func sheetPDFVisibleColSpan(grid *sheetPDFGrid, merge univerExportRange) int {
+	count := 0
+	for _, column := range grid.Columns {
+		if column >= merge.StartColumn && column <= merge.EndColumn {
+			count += 1
+		}
+	}
+	return max(1, count)
+}
+
+func cssPaddingValue(value *float64, fallback float64) string {
+	if value == nil {
+		return fmt.Sprintf("%.1fpx", fallback)
+	}
+	return fmt.Sprintf("%.1fpx", *value)
+}
+
+func cssBorderValue(border *univerBorderStyleData) string {
+	if border == nil || border.S == nil || *border.S == 0 {
 		return ""
 	}
-	return trimmed + "…"
+	width, style := cssBorderStyle(*border.S)
+	color := "#64748b"
+	if r, g, b, ok := parseUniverColor(border.CL); ok {
+		color = cssRGBString(r, g, b)
+	}
+	return fmt.Sprintf("%.2fpx %s %s", width, style, color)
 }
 
-func sheetPDFBorderWidth(styleType int) float64 {
-	switch styleType {
+func cssBorderStyle(styleCode int) (float64, string) {
+	switch styleCode {
 	case 13:
-		return 0.9
-	case 7, 8, 9, 10, 11, 12:
-		return 0.55
+		return 2.2, "dashed"
+	case 12:
+		return 1.5, "dashed"
+	case 11:
+		return 1.2, "dashed"
+	case 10:
+		return 1.4, "dashed"
+	case 9:
+		return 1.0, "dashed"
+	case 8:
+		return 1.8, "dashed"
+	case 7:
+		return 3.0, "double"
+	case 6:
+		return 1.0, "dotted"
+	case 5:
+		return 1.0, "dashed"
+	case 4:
+		return 1.0, "dashed"
+	case 3:
+		return 1.0, "dotted"
+	case 2:
+		return 0.8, "solid"
 	default:
-		return 0.3
+		return 1.0, "solid"
 	}
 }
 
-func styleColor(style *univerStyleData, kind string) *univerColorStyle {
-	if style == nil {
-		return nil
-	}
-	switch kind {
-	case "bg":
-		return style.Bg
-	case "cl":
-		return style.Cl
-	default:
-		return nil
-	}
+func cssRGBString(r, g, b int) string {
+	return fmt.Sprintf("rgb(%d,%d,%d)", r, g, b)
+}
+
+func escapeCSSString(value string) string {
+	return strings.ReplaceAll(value, "'", "\\'")
 }
 
 func extendSheetPDFBounds(minRow, maxRow, minCol, maxCol, row, col int, found bool) (int, int, int, int, bool) {
@@ -850,9 +833,6 @@ func exportAnyCellText(value any) string {
 	case string:
 		return strings.TrimSpace(typed)
 	case float64:
-		if math.Abs(typed-math.Round(typed)) < 1e-9 {
-			return strconv.FormatInt(int64(math.Round(typed)), 10)
-		}
 		return strconv.FormatFloat(typed, 'f', -1, 64)
 	case float32:
 		return strconv.FormatFloat(float64(typed), 'f', -1, 64)
@@ -873,6 +853,8 @@ func exportAnyCellText(value any) string {
 			return "TRUE"
 		}
 		return "FALSE"
+	case time.Time:
+		return typed.Format("2006-01-02 15:04:05")
 	case json.Number:
 		return typed.String()
 	default:

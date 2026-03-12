@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"yaerp/internal/model"
 	"yaerp/internal/service"
@@ -458,7 +460,7 @@ func (h *SheetHandler) ExportSheet(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", exportFile.Filename))
+	setExportDownloadHeaders(c, exportFile.Filename, exportFile.ContentType, len(exportFile.Data))
 	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
 }
 
@@ -481,6 +483,37 @@ func (h *SheetHandler) ExportSheetPDF(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", exportFile.Filename))
+	setExportDownloadHeaders(c, exportFile.Filename, exportFile.ContentType, len(exportFile.Data))
 	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
+}
+
+func setExportDownloadHeaders(c *gin.Context, filename, contentType string, contentLength int) {
+	escapedFilename := strings.ReplaceAll(url.QueryEscape(filename), "+", "%20")
+	asciiFallback := buildASCIIFilename(filename)
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", asciiFallback, escapedFilename))
+	c.Header("Content-Length", strconv.Itoa(contentLength))
+	c.Header("X-Content-Type-Options", "nosniff")
+}
+
+func buildASCIIFilename(filename string) string {
+	var builder strings.Builder
+	for _, r := range filename {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case strings.ContainsRune("._-() ", r):
+			builder.WriteRune(r)
+		}
+	}
+	result := strings.TrimSpace(builder.String())
+	result = strings.ReplaceAll(result, "  ", " ")
+	if result == "" || strings.HasPrefix(result, ".") {
+		ext := ""
+		if index := strings.LastIndex(filename, "."); index >= 0 {
+			ext = filename[index:]
+		}
+		return "download" + ext
+	}
+	return result
 }
