@@ -144,6 +144,8 @@ func main() {
 			sheetView.GET("/data", sheetHandler.GetSheetData)
 			sheetView.GET("/permissions", permHandler.GetPermissionMatrix)
 			sheetView.GET("/protections", sheetHandler.GetProtections)
+			sheetView.GET("/export", sheetHandler.ExportSheet)
+			sheetView.GET("/export/pdf", sheetHandler.ExportSheetPDF)
 		}
 
 		sheetEdit := api.Group("/sheets/:id")

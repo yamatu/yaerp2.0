@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { AlertCircle, ChevronUp, Columns3, FileOutput, Filter, FilterX, ImagePlus, Lock, Printer, Rows3, Save, Shield, Square, Unlock, Wrench, X } from 'lucide-react'
+import { AlertCircle, ChevronUp, Columns3, Download, FileOutput, Filter, FilterX, ImagePlus, Lock, Printer, Rows3, Save, Shield, Square, Unlock, Wrench, X } from 'lucide-react'
 import type { IWorkbookData, IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -17,8 +17,8 @@ import { usePermission } from '@/hooks/usePermission'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
-import { parseSheetConfig } from '@/lib/spreadsheet'
-import type { AuthUser, ProtectionInfo, ProtectionSnapshot, Row, Sheet } from '@/types'
+import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
+import type { AuthUser, ColumnDef, ProtectionInfo, ProtectionSnapshot, Row, Sheet } from '@/types'
 
 interface Props {
   workbookId: string | number
@@ -45,6 +45,18 @@ interface SelectionState {
   endColumnKey: string
   rangeLabel: string
   includesHeaderRow: boolean
+}
+
+interface PrintableColumn {
+  index: number
+  key: string
+  name: string
+  width: number
+}
+
+interface PrintableRow {
+  sourceRowNumber: number
+  cells: string[]
 }
 
 function wrapWorksheetData(
@@ -75,10 +87,10 @@ function wrapWorksheetData(
 function getWorksheetCellText(cell: unknown): string {
   if (!cell || typeof cell !== 'object') return ''
   const data = cell as { f?: unknown; v?: unknown }
-  if (typeof data.f === 'string' && data.f.trim()) return data.f
   if (typeof data.v === 'string' || typeof data.v === 'number' || typeof data.v === 'boolean') {
     return String(data.v)
   }
+  if (typeof data.f === 'string' && data.f.trim()) return data.f
   return ''
 }
 
@@ -89,6 +101,285 @@ function escapeHtml(value: string) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;')
+}
+
+function sanitizeDownloadFilename(value: string) {
+  const cleaned = value
+    .replace(/[\\/:*?"<>|]/g, '-')
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '')
+  return cleaned || 'sheet'
+}
+
+function parseFilenameFromDisposition(disposition: string | null, fallback: string) {
+  if (!disposition) return fallback
+
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1])
+    } catch {
+      return utf8Match[1]
+    }
+  }
+
+  const plainMatch = disposition.match(/filename="?([^";]+)"?/i)
+  return plainMatch?.[1] || fallback
+}
+
+function triggerBrowserDownload(blob: Blob, filename: string) {
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
+}
+
+function hasPrintableCellContent(cell: unknown) {
+  return getWorksheetCellText(cell).trim() !== ''
+}
+
+function estimatePrintableColumnWidth(name: string, values: string[]) {
+  const longest = values.reduce((max, value) => Math.max(max, value.trim().length), name.trim().length)
+  if (longest <= 4) return 76
+  if (longest <= 8) return 100
+  if (longest <= 12) return 128
+  if (longest <= 18) return 156
+  return 188
+}
+
+function isGenericPrintableHeader(value: string, columnIndex: number) {
+  const normalized = value.trim().toUpperCase()
+  if (!normalized) return true
+  if (normalized === columnIndexToLetter(columnIndex)) return true
+  return /^COL[_ -]?\d+$/.test(normalized)
+}
+
+function buildPrintableSheetData(savedSheet: Partial<IWorksheetData>, fallbackColumns: ColumnDef[]) {
+  const cellData = savedSheet.cellData || {}
+  const usedColumnIndexes = new Set<number>()
+
+  const dataRows = Object.entries(cellData)
+    .map(([key, row]) => ({
+      rowIndex: Number(key),
+      row: (row as Record<number, unknown> | undefined) || {},
+    }))
+    .filter(({ rowIndex }) => Number.isFinite(rowIndex) && rowIndex > 0)
+    .sort((left, right) => left.rowIndex - right.rowIndex)
+
+  dataRows.forEach(({ row }) => {
+    Object.entries(row).forEach(([key, cell]) => {
+      const index = Number(key)
+      if (Number.isFinite(index) && index >= 0 && hasPrintableCellContent(cell)) {
+        usedColumnIndexes.add(index)
+      }
+    })
+  })
+
+  if (usedColumnIndexes.size === 0) {
+    fallbackColumns.forEach((_, index) => usedColumnIndexes.add(index))
+  }
+
+  if (usedColumnIndexes.size === 0) {
+    usedColumnIndexes.add(0)
+  }
+
+  const printableColumns = Array.from(usedColumnIndexes)
+    .sort((left, right) => left - right)
+    .map((index) => {
+      const fallback = fallbackColumns[index]
+      const headerText = fallback?.name?.trim() || ''
+      return {
+        index,
+        key: fallback?.key || `col_${index + 1}`,
+        name: headerText || columnIndexToLetter(index),
+        width: 0,
+      }
+    })
+
+  const visibleRows = dataRows
+    .map(({ rowIndex, row }) => ({
+      sourceRowNumber: rowIndex + 1,
+      cells: printableColumns.map((column) => getWorksheetCellText(row[column.index])),
+    }))
+
+  let startIndex = 0
+  while (startIndex < visibleRows.length && visibleRows[startIndex].cells.every((value) => value.trim() === '')) {
+    startIndex += 1
+  }
+
+  let endIndex = visibleRows.length - 1
+  while (endIndex >= startIndex && visibleRows[endIndex].cells.every((value) => value.trim() === '')) {
+    endIndex -= 1
+  }
+
+  const printableRows = startIndex <= endIndex ? visibleRows.slice(startIndex, endIndex + 1) : []
+
+  const sizedColumns = printableColumns.map((column, index) => ({
+    ...column,
+    width: estimatePrintableColumnWidth(column.name, printableRows.map((row) => row.cells[index] || '')),
+  }))
+
+  const totalWidth = sizedColumns.reduce((sum, column) => sum + column.width, 56)
+  const landscape = sizedColumns.length > 6 || totalWidth > 720
+  const meaningfulHeaderCount = sizedColumns.filter((column) => !isGenericPrintableHeader(column.name, column.index)).length
+  const showHeader = meaningfulHeaderCount > 0 && meaningfulHeaderCount >= Math.ceil(sizedColumns.length / 2)
+
+  return {
+    columns: sizedColumns,
+    rows: printableRows,
+    landscape,
+    showHeader,
+  }
+}
+
+function buildSheetPrintHtml(savedSheet: Partial<IWorksheetData>, sheetName: string, fallbackColumns: ColumnDef[], mode: 'print' | 'pdf') {
+  const printable = buildPrintableSheetData(savedSheet, fallbackColumns)
+  const fontSize = printable.columns.length >= 10 ? 10 : 11
+  const pageSize = printable.landscape ? 'A4 landscape' : 'A4 portrait'
+  const colGroupHtml = printable.columns
+    .map((column) => `<col style="width:${column.width}px" />`)
+    .join('')
+  const rowsHtml = printable.rows.length > 0
+    ? printable.rows.map((row) => {
+        const rowCells = row.cells
+          .map((value) => `<td>${escapeHtml(value) || '&nbsp;'}</td>`)
+          .join('')
+        return `<tr><th>${row.sourceRowNumber}</th>${rowCells}</tr>`
+      }).join('')
+    : `<tr><td colspan="${printable.columns.length + 1}" class="empty-state">当前工作表暂无可导出的数据</td></tr>`
+
+  const headerHtml = printable.showHeader
+    ? `<thead><tr><th>行号</th>${printable.columns.map((column) => `<th>${escapeHtml(column.name || column.key)}</th>`).join('')}</tr></thead>`
+    : ''
+  const title = `${sheetName || '工作表'} - ${mode === 'pdf' ? '导出 PDF' : '打印'}`
+
+  return `
+    <html>
+      <head>
+        <title>${escapeHtml(title)}</title>
+        <style>
+          @page { size: ${pageSize}; margin: 10mm; }
+          * { box-sizing: border-box; }
+          html, body { margin: 0; padding: 0; background: #fff; }
+          body {
+            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            color: #0f172a;
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+            padding: 0;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: auto;
+          }
+          thead { display: table-header-group; }
+          tr { break-inside: avoid; page-break-inside: avoid; }
+          th, td {
+            border: 1px solid #cbd5e1;
+            padding: 6px 8px;
+            font-size: ${fontSize}px;
+            line-height: 1.5;
+            vertical-align: top;
+            text-align: left;
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            writing-mode: horizontal-tb;
+          }
+          thead th {
+            background: #e2e8f0;
+            font-weight: 700;
+          }
+          tbody th {
+            width: 56px;
+            min-width: 56px;
+            background: #f8fafc;
+            text-align: center;
+            white-space: nowrap;
+            font-weight: 600;
+          }
+          tbody tr:nth-child(even) td {
+            background: #fafcff;
+          }
+          .empty-state {
+            padding: 20px 12px;
+            text-align: center;
+            color: #64748b;
+          }
+          @media print {
+            body { padding: 0; }
+          }
+        </style>
+      </head>
+      <body>
+        <table>
+          <colgroup><col style="width:56px" />${colGroupHtml}</colgroup>
+          ${headerHtml}
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </body>
+    </html>
+  `
+}
+
+function printHtmlWithHiddenFrame(html: string) {
+  return new Promise<void>((resolve, reject) => {
+    const iframe = document.createElement('iframe')
+    iframe.setAttribute('aria-hidden', 'true')
+    iframe.style.position = 'fixed'
+    iframe.style.right = '0'
+    iframe.style.bottom = '0'
+    iframe.style.width = '0'
+    iframe.style.height = '0'
+    iframe.style.border = '0'
+    iframe.style.opacity = '0'
+    iframe.style.pointerEvents = 'none'
+    document.body.appendChild(iframe)
+
+    const frameWindow = iframe.contentWindow
+    const frameDocument = frameWindow?.document
+    if (!frameWindow || !frameDocument) {
+      iframe.remove()
+      reject(new Error('当前浏览器不支持内嵌打印，请更换浏览器后重试。'))
+      return
+    }
+
+    let cleaned = false
+    const cleanup = () => {
+      if (cleaned) return
+      cleaned = true
+      window.setTimeout(() => iframe.remove(), 300)
+    }
+
+    frameWindow.addEventListener('afterprint', cleanup, { once: true })
+
+    try {
+      frameDocument.open()
+      frameDocument.write(html)
+      frameDocument.close()
+
+      window.setTimeout(() => {
+        try {
+          frameWindow.focus()
+          frameWindow.print()
+          window.setTimeout(cleanup, 60000)
+          resolve()
+        } catch (error) {
+          cleanup()
+          reject(error instanceof Error ? error : new Error('打开打印对话框失败，请稍后重试。'))
+        }
+      }, 80)
+    } catch (error) {
+      cleanup()
+      reject(error instanceof Error ? error : new Error('生成打印预览失败，请稍后重试。'))
+    }
+  })
 }
 
 async function toImageFile(img: GalleryImage): Promise<File> {
@@ -106,6 +397,8 @@ async function toImageFile(img: GalleryImage): Promise<File> {
 export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const persistInFlightRef = useRef<Promise<void> | null>(null)
+  const persistQueuedRef = useRef(false)
   const latestSheetRef = useRef(sheet)
   const univerApiRef = useRef<ReturnType<typeof createUniver> | null>(null)
   const workbookApiRef = useRef<{ setEditable: (editable: boolean) => void } | null>(null)
@@ -125,6 +418,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const [protectionSnapshot, setProtectionSnapshot] = useState<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
   const [protectionLoading, setProtectionLoading] = useState(false)
   const [protectionAction, setProtectionAction] = useState('')
+  const [exportAction, setExportAction] = useState<'' | 'download' | 'print' | 'pdf'>('')
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const adminMode = isAdmin(profile)
   const sheetId = sheet.id
@@ -264,12 +558,15 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   }, [refreshProtectionSnapshot])
 
   // Manual save handler — triggers immediate persist
-  const handleManualSave = useCallback(async () => {
+  const persistCurrentSheet = useCallback(async () => {
     if (editLocked) {
-      setActionError('当前账号只有查看权限，不能保存表格。')
-      return
+      const message = '当前账号只有查看权限，不能保存表格。'
+      setActionError(message)
+      throw new Error(message)
     }
-    if (!persistRef.current) return
+    if (!persistRef.current) {
+      throw new Error('当前工作表还未加载完成。')
+    }
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current)
       saveTimerRef.current = null
@@ -281,10 +578,20 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       setTimeout(() => setSaveStatus('idle'), 1500)
     } catch (e) {
       console.error('Manual save failed:', e)
-      setActionError(e instanceof Error ? e.message : '保存失败，请稍后再试。')
+      const message = e instanceof Error ? e.message : '保存失败，请稍后再试。'
+      setActionError(message)
       setSaveStatus('idle')
+      throw (e instanceof Error ? e : new Error(message))
     }
   }, [editLocked])
+
+  const handleManualSave = useCallback(async () => {
+    try {
+      await persistCurrentSheet()
+    } catch {
+      // Errors are already surfaced through the action toast.
+    }
+  }, [persistCurrentSheet])
 
   const handleEnableFilter = useCallback(async () => {
     if (editLocked) {
@@ -311,12 +618,12 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       }
 
       syncFilterState()
-      await handleManualSave()
+      await persistCurrentSheet()
     } catch (err) {
       console.error('Failed to enable filter:', err)
       setActionError(err instanceof Error ? err.message : '启用筛选失败，请稍后再试。')
     }
-  }, [editLocked, handleManualSave, syncFilterState])
+  }, [editLocked, persistCurrentSheet, syncFilterState])
 
   const handleClearFilter = useCallback(async () => {
     if (editLocked) {
@@ -333,12 +640,12 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
       filter.remove()
       syncFilterState()
-      await handleManualSave()
+      await persistCurrentSheet()
     } catch (err) {
       console.error('Failed to clear filter:', err)
       setActionError(err instanceof Error ? err.message : '清除筛选失败，请稍后再试。')
     }
-  }, [editLocked, handleManualSave, syncFilterState])
+  }, [editLocked, persistCurrentSheet, syncFilterState])
 
   const handleProtectionChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock') => {
     if (editLocked) {
@@ -606,24 +913,50 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         if (!disposed) setLoading(false)
 
         const persistSnapshot = async () => {
-          const snap = latestSheetRef.current
-          const saved = workbookApi.save()
-          const savedSheetId = saved.sheetOrder[0]
-          const savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData>
-          if (!savedSheet) return
-          const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [])
-          const currentConfig = parseSheetConfig(snap.config)
-          const res = await api.put(`/sheets/${snap.id}`, {
-            name: savedSheet.name || snap.name,
-            sort_order: snap.sort_order,
-            columns: nextColumns,
-            frozen: snap.frozen || { row: 0, col: 0 },
-            config: { ...currentConfig, univerSheetData: savedSheet, univerStyles: saved.styles || {} },
-          })
-
-          if (res.code !== 0) {
-            throw new Error(res.message || '保存工作表失败')
+          persistQueuedRef.current = true
+          if (persistInFlightRef.current) {
+            await persistInFlightRef.current
+            return
           }
+
+          const runPersist = async () => {
+            while (persistQueuedRef.current) {
+              persistQueuedRef.current = false
+              const snap = latestSheetRef.current
+              const saved = workbookApi.save()
+              const savedSheetId = saved.sheetOrder[0]
+              const savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData>
+              if (!savedSheet) continue
+
+              const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [])
+              const currentConfig = parseSheetConfig(snap.config)
+              const nextConfig = { ...currentConfig, univerSheetData: savedSheet, univerStyles: saved.styles || {} }
+              const res = await api.put(`/sheets/${snap.id}`, {
+                name: savedSheet.name || snap.name,
+                sort_order: snap.sort_order,
+                columns: nextColumns,
+                frozen: snap.frozen || { row: 0, col: 0 },
+                config: nextConfig,
+              })
+
+              if (res.code !== 0) {
+                throw new Error(res.message || '保存工作表失败')
+              }
+
+              latestSheetRef.current = {
+                ...snap,
+                name: savedSheet.name || snap.name,
+                columns: nextColumns,
+                config: nextConfig,
+              }
+            }
+          }
+
+          const request = runPersist().finally(() => {
+            persistInFlightRef.current = null
+          })
+          persistInFlightRef.current = request
+          await request
         }
 
         // Expose persistSnapshot for manual save
@@ -649,6 +982,8 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
           disposable.dispose()
           persistRef.current = null
           workbookApiRef.current = null
+          persistQueuedRef.current = false
+          persistInFlightRef.current = null
           if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
           univerApiRef.current = null
           setHasFilter(false)
@@ -727,14 +1062,14 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         throw new Error('图片插入失败，请确认当前工作表已启用图片能力。')
       }
 
-      await handleManualSave()
+      await persistCurrentSheet()
     } catch (e) {
       console.error('Failed to insert image to cell:', e)
       setActionError(e instanceof Error ? e.message : '插入图片失败，请稍后再试。')
     }
 
     setShowImagePicker(false)
-  }, [handleManualSave])
+  }, [persistCurrentSheet])
 
   // Handle direct file upload from picker
   const handleDirectUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -765,7 +1100,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
             throw new Error('本地图片插入失败，请稍后重试。')
           }
 
-          await handleManualSave()
+          await persistCurrentSheet()
           setShowImagePicker(false)
         }
       }
@@ -773,82 +1108,128 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       console.error('Upload failed:', err)
       setActionError(err instanceof Error ? err.message : '上传图片失败，请稍后再试。')
     }
-  }, [editLocked, handleManualSave])
+  }, [editLocked, persistCurrentSheet])
 
-  const handlePrintSheet = useCallback((mode: 'print' | 'pdf') => {
+  const getCurrentSheetSnapshot = useCallback(() => {
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    if (!workbook || !worksheet) {
+      throw new Error('当前工作表还未加载完成。')
+    }
+
+    const saved = workbook.save()
+    const savedSheetId = saved.sheetOrder[0]
+    const savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData> | undefined
+    if (!savedSheet) {
+      throw new Error('未能读取当前工作表内容。')
+    }
+
+    return {
+      savedSheet,
+      columns: latestSheetRef.current.columns || [],
+    }
+  }, [])
+
+  const handleDownloadSheet = useCallback(async () => {
     if (!canExportSheet) {
-      setActionError('当前账号没有导出权限，不能打印或导出 PDF。')
+      setActionError('当前账号没有导出权限，不能下载工作表。')
       return
     }
+
+    setActionError('')
+    setExportAction('download')
     try {
-      const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
-      const worksheet = workbook?.getActiveSheet?.()
-      if (!workbook || !worksheet) {
-        throw new Error('当前工作表还未加载完成。')
+      if (canEditSheet) {
+        await persistCurrentSheet()
       }
 
-      const saved = workbook.save()
-      const savedSheetId = saved.sheetOrder[0]
-      const savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData> | undefined
-      if (!savedSheet) {
-        throw new Error('未能读取当前工作表内容。')
+      const fallbackFilename = `${sanitizeDownloadFilename(latestSheetRef.current.name || '工作表')}.xlsx`
+      const response = await api.download(`/sheets/${sheetId}/export?filename=${encodeURIComponent(fallbackFilename)}`)
+      if (!response.ok) {
+        let message = '下载工作表失败，请稍后再试。'
+        try {
+          const data = await response.json() as { message?: string }
+          if (data?.message) {
+            message = data.message
+          }
+        } catch {
+          // Ignore JSON parse errors for binary responses.
+        }
+        throw new Error(message)
       }
 
-      const columns = deriveColumnsFromUniverSheet(savedSheet, latestSheetRef.current.columns || [])
-      const cellData = savedSheet.cellData || {}
-      const dataRowKeys = Object.keys(cellData)
-        .map((key) => Number(key))
-        .filter((rowIndex) => Number.isFinite(rowIndex) && rowIndex > 0)
-      const lastDataRow = dataRowKeys.length > 0 ? Math.max(...dataRowKeys) : 1
-      const rowsHtml = Array.from({ length: lastDataRow }, (_, rowOffset) => {
-        const rowIndex = rowOffset + 1
-        const rowCells = columns.map((_, columnIndex) => {
-          const cell = (cellData[rowIndex] as Record<number, unknown> | undefined)?.[columnIndex]
-          return `<td>${escapeHtml(getWorksheetCellText(cell)) || '&nbsp;'}</td>`
-        }).join('')
-        return `<tr><th>${rowIndex + 1}</th>${rowCells}</tr>`
-      }).join('')
+      const blob = await response.blob()
+      const filename = parseFilenameFromDisposition(response.headers.get('Content-Disposition'), fallbackFilename)
+      triggerBrowserDownload(blob, filename)
+    } catch (err) {
+      console.error('Failed to download sheet:', err)
+      setActionError(err instanceof Error ? err.message : '下载工作表失败，请稍后再试。')
+    } finally {
+      setExportAction('')
+    }
+  }, [canEditSheet, canExportSheet, persistCurrentSheet, sheetId])
 
-      const headerHtml = columns.map((column) => `<th>${escapeHtml(column.name || column.key)}</th>`).join('')
-      const title = `${latestSheetRef.current.name || '工作表'} - ${mode === 'pdf' ? '导出 PDF' : '打印'}`
-      const printWindow = window.open('', '_blank', 'noopener,noreferrer,width=1200,height=900')
-      if (!printWindow) {
-        throw new Error('浏览器阻止了打印窗口，请允许弹窗后重试。')
+  const handleDownloadPdf = useCallback(async () => {
+    if (!canExportSheet) {
+      setActionError('当前账号没有导出权限，不能导出 PDF。')
+      return
+    }
+
+    setActionError('')
+    setExportAction('pdf')
+    try {
+      if (canEditSheet) {
+        await persistCurrentSheet()
       }
 
-      printWindow.document.write(`
-        <html>
-          <head>
-            <title>${escapeHtml(title)}</title>
-            <style>
-              body { font-family: "Microsoft YaHei", sans-serif; padding: 24px; color: #0f172a; }
-              h1 { margin: 0 0 8px; font-size: 24px; }
-              p { margin: 0 0 20px; color: #64748b; font-size: 12px; }
-              table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-              th, td { border: 1px solid #cbd5e1; padding: 8px 10px; font-size: 12px; vertical-align: top; word-break: break-word; }
-              thead th { background: #e2e8f0; font-weight: 700; }
-              tbody th { background: #f8fafc; width: 70px; }
-              @media print { body { padding: 0; } }
-            </style>
-          </head>
-          <body>
-            <h1>${escapeHtml(latestSheetRef.current.name || '工作表')}</h1>
-            <p>${mode === 'pdf' ? '系统已打开浏览器打印窗口，请在打印目标中选择“保存为 PDF”。' : '使用浏览器打印窗口输出当前工作表。'}</p>
-            <table>
-              <thead><tr><th>行号</th>${headerHtml}</tr></thead>
-              <tbody>${rowsHtml}</tbody>
-            </table>
-          </body>
-        </html>
-      `)
-      printWindow.document.close()
-      printWindow.focus()
-      printWindow.print()
+      const fallbackFilename = `${sanitizeDownloadFilename(latestSheetRef.current.name || '工作表')}.pdf`
+      const response = await api.download(`/sheets/${sheetId}/export/pdf?filename=${encodeURIComponent(fallbackFilename)}`)
+      if (!response.ok) {
+        let message = '导出 PDF 失败，请稍后再试。'
+        try {
+          const data = await response.json() as { message?: string }
+          if (data?.message) {
+            message = data.message
+          }
+        } catch {
+          // Ignore JSON parse errors for binary responses.
+        }
+        throw new Error(message)
+      }
+
+      const blob = await response.blob()
+      const filename = parseFilenameFromDisposition(response.headers.get('Content-Disposition'), fallbackFilename)
+      triggerBrowserDownload(blob, filename)
+    } catch (err) {
+      console.error('Failed to export PDF:', err)
+      setActionError(err instanceof Error ? err.message : '导出 PDF 失败，请稍后再试。')
+    } finally {
+      setExportAction('')
+    }
+  }, [canEditSheet, canExportSheet, persistCurrentSheet, sheetId])
+
+  const handlePrintSheet = useCallback(async () => {
+    if (!canExportSheet) {
+      setActionError('当前账号没有导出权限，不能打印工作表。')
+      return
+    }
+
+    setActionError('')
+    setExportAction('print')
+    try {
+      if (canEditSheet) {
+        await persistCurrentSheet()
+      }
+      const { savedSheet, columns } = getCurrentSheetSnapshot()
+      const html = buildSheetPrintHtml(savedSheet, latestSheetRef.current.name || '工作表', columns, 'print')
+      await printHtmlWithHiddenFrame(html)
     } catch (err) {
       console.error('Failed to print sheet:', err)
       setActionError(err instanceof Error ? err.message : '打印失败，请稍后再试。')
+    } finally {
+      setExportAction('')
     }
-  }, [canExportSheet])
+  }, [canEditSheet, canExportSheet, getCurrentSheetSnapshot, persistCurrentSheet])
 
   if (error) {
     return (
@@ -919,8 +1300,17 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               </button>
               <button
                 type="button"
-                onClick={() => handlePrintSheet('print')}
-                disabled={!canExportSheet}
+                onClick={() => void handleDownloadSheet()}
+                disabled={!canExportSheet || exportAction !== ''}
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
+                title="下载当前表"
+              >
+                <Download className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void handlePrintSheet()}
+                disabled={!canExportSheet || exportAction !== ''}
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="打印当前表"
               >
@@ -928,8 +1318,8 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               </button>
               <button
                 type="button"
-                onClick={() => handlePrintSheet('pdf')}
-                disabled={!canExportSheet}
+                onClick={() => void handleDownloadPdf()}
+                disabled={!canExportSheet || exportAction !== ''}
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="导出 PDF"
               >

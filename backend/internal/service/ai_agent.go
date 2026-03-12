@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xuri/excelize/v2"
-
 	"yaerp/internal/model"
 )
 
@@ -814,59 +812,12 @@ func (s *AIService) toolScheduleDailyReport(userID int64, args map[string]any) (
 }
 
 func (s *AIService) GenerateSheetReport(userID, sheetID int64, filename string) (*model.Attachment, string, error) {
-	if err := s.ensureSheetExportAccess(userID, sheetID); err != nil {
-		return nil, "", err
-	}
-
-	sheet, err := s.sheetRepo.GetSheet(sheetID)
-	if err != nil {
-		return nil, "", err
-	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
-	if err != nil {
-		return nil, "", err
-	}
-	columns, err := parseSheetColumns(sheet.Columns)
+	exportFile, err := s.sheetService.BuildSheetExportFile(userID, sheetID, filename)
 	if err != nil {
 		return nil, "", err
 	}
 
-	if !strings.HasSuffix(strings.ToLower(filename), ".xlsx") {
-		filename += ".xlsx"
-	}
-
-	file := excelize.NewFile()
-	defer func() { _ = file.Close() }()
-	defaultSheet := file.GetSheetName(0)
-	file.SetSheetName(defaultSheet, sheet.Name)
-
-	for index, column := range columns {
-		cell, _ := excelize.CoordinatesToCellName(index+1, 1)
-		_ = file.SetCellValue(sheet.Name, cell, firstNonEmpty(column.Name, column.Key))
-	}
-
-	for _, row := range rows {
-		data := map[string]any{}
-		_ = json.Unmarshal(row.Data, &data)
-		for index, column := range columns {
-			allowed, err := s.permService.CheckCellPermission(sheetID, userID, column.Key, row.RowIndex, "read")
-			if err != nil {
-				return nil, "", err
-			}
-			if !allowed {
-				continue
-			}
-			cell, _ := excelize.CoordinatesToCellName(index+1, row.RowIndex+2)
-			_ = file.SetCellValue(sheet.Name, cell, data[column.Key])
-		}
-	}
-
-	buffer := bytes.NewBuffer(nil)
-	if err := file.Write(buffer); err != nil {
-		return nil, "", fmt.Errorf("write report workbook: %w", err)
-	}
-
-	attachment, url, err := s.uploadService.UploadBytes(filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", buffer.Bytes(), userID)
+	attachment, url, err := s.uploadService.UploadBytes(exportFile.Filename, exportFile.ContentType, exportFile.Data, userID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -984,7 +935,7 @@ func (s *AIService) ensureSheetExportAccess(userID, sheetID int64) error {
 		return err
 	}
 	if !matrix.Sheet.CanExport {
-		return fmt.Errorf("sheet export permission denied")
+		return fmt.Errorf("%w: 当前账号没有导出这个工作表的权限", ErrSheetExportDenied)
 	}
 	return nil
 }

@@ -17,6 +17,7 @@ var ErrWorkbookAccessDenied = errors.New("workbook access denied")
 var ErrWorkbookDeletionDenied = errors.New("workbook deletion denied")
 var ErrProtectionDenied = errors.New("protection denied")
 var ErrSheetPermissionDenied = errors.New("sheet permission denied")
+var ErrSheetExportDenied = errors.New("sheet export denied")
 var ErrSheetLocked = errors.New("sheet is locked")
 var ErrSheetArchived = errors.New("sheet is archived")
 var ErrSheetStateDenied = errors.New("sheet state change denied")
@@ -995,11 +996,11 @@ func buildProtectionMessage(scope, ownerName string, rowIndex int, colKey string
 }
 
 func (s *SheetService) ensureProtectedCellsUnchanged(userID int64, existing, next *model.Sheet) error {
-	isAdmin, err := s.permService.IsAdmin(userID)
+	accessCache, err := newSheetCellAccessCache(s.permService, userID, existing.ID, existing.Config, true)
 	if err != nil {
 		return err
 	}
-	if isAdmin {
+	if accessCache.isAdmin {
 		return nil
 	}
 
@@ -1046,10 +1047,7 @@ func (s *SheetService) ensureProtectedCellsUnchanged(userID int64, existing, nex
 			continue
 		}
 
-		protected, reason, err := s.checkProtectionByWorksheetRow(existing.Config, worksheetRow, columnKeys[columnIndex], userID)
-		if err != nil {
-			return err
-		}
+		protected, reason := accessCache.checkProtection(columnKeys[columnIndex], worksheetRow, userID)
 		if protected {
 			return fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
 		}
@@ -1059,11 +1057,11 @@ func (s *SheetService) ensureProtectedCellsUnchanged(userID int64, existing, nex
 }
 
 func (s *SheetService) ensureEditableCellsAuthorized(userID int64, existing, next *model.Sheet) error {
-	isAdmin, err := s.permService.IsAdmin(userID)
+	accessCache, err := newSheetCellAccessCache(s.permService, userID, existing.ID, existing.Config, false)
 	if err != nil {
 		return err
 	}
-	if isAdmin {
+	if accessCache.isAdmin {
 		return nil
 	}
 
@@ -1111,10 +1109,7 @@ func (s *SheetService) ensureEditableCellsAuthorized(userID int64, existing, nex
 		}
 
 		columnKey := columnKeys[columnIndex]
-		allowed, err := s.permService.CheckCellPermission(existing.ID, userID, columnKey, worksheetRow-1, "write")
-		if err != nil {
-			return err
-		}
+		allowed := accessCache.allowsCell(columnKey, worksheetRow, "write")
 		if !allowed {
 			return fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, columnKey, worksheetRow+1)
 		}

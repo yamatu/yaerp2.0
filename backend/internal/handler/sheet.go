@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -436,4 +437,50 @@ func (h *SheetHandler) GetSheetData(c *gin.Context) {
 		return
 	}
 	response.OK(c, rows)
+}
+
+func (h *SheetHandler) ExportSheet(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	exportFile, err := h.sheetService.BuildSheetExportFile(userID, id, c.Query("filename"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSheetExportDenied), errors.Is(err, service.ErrWorkbookAccessDenied):
+			response.Forbidden(c, err.Error())
+		default:
+			response.ServerError(c, err.Error())
+		}
+		return
+	}
+
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", exportFile.Filename))
+	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
+}
+
+func (h *SheetHandler) ExportSheetPDF(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	exportFile, err := h.sheetService.BuildSheetPDFFile(userID, id, c.Query("filename"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSheetExportDenied), errors.Is(err, service.ErrWorkbookAccessDenied):
+			response.Forbidden(c, err.Error())
+		default:
+			response.ServerError(c, err.Error())
+		}
+		return
+	}
+
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", exportFile.Filename))
+	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
 }
