@@ -380,7 +380,7 @@ func setSheetExportColumnWidthsForIndexes(file *excelize.File, sheetName string,
 	for targetIndex, sourceIndex := range sourceIndexes {
 		width := 0.0
 		if sourceIndex < len(columns) && columns[sourceIndex].Width > 0 {
-			width = float64(columns[sourceIndex].Width) / 7.2
+			width = columns[sourceIndex].Width / 7.2
 		}
 		if meta, ok := columnData[strconv.Itoa(sourceIndex)]; ok && meta.Width > 0 {
 			width = meta.Width / 7.2

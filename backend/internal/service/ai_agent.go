@@ -68,6 +68,11 @@ func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 		"run_workflow":             s.toolRunWorkflow,
 		"preview_spreadsheet_plan": s.toolPreviewSpreadsheetPlan,
 		"apply_spreadsheet_plan":   s.toolApplySpreadsheetPlan,
+		"create_workbook":          s.toolCreateWorkbook,
+		"create_sheet":             s.toolCreateSheet,
+		"update_workbook":          s.toolUpdateWorkbook,
+		"update_sheet_name":        s.toolUpdateSheetName,
+		"set_cell_format":          s.toolSetCellFormat,
 	}
 }
 
@@ -189,6 +194,7 @@ func (s *AIService) chatWithTools(userID int64, messages []ChatMessage) (*ChatRe
 
 func (s *AIService) buildAgentMessages(userID int64, messages []ChatMessage) []map[string]any {
 	context := s.buildUserContext(userID)
+	roleHint := s.getUserRoleHint(userID)
 	result := []map[string]any{
 		{
 			"role": "system",
@@ -197,7 +203,12 @@ func (s *AIService) buildAgentMessages(userID int64, messages []ChatMessage) []m
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
 					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
-					"当前用户可访问的数据摘要如下：\n\n%s",
+					"\n\n%s"+
+					"\n\n支持的列类型：text（文本）、number（数字）、currency（货币）、date（日期）、select（下拉选择）、image（图片）、formula（公式）。"+
+					"\n支持的公式：SUM、AVERAGE、COUNT、MAX、MIN、IF、VLOOKUP、CONCATENATE 等 Excel 兼容公式。公式模板可使用 {{row}} 表示当前 Excel 行号。"+
+					"\n你可以创建和管理工作簿/工作表：使用 create_workbook 创建工作簿，create_sheet 创建工作表，update_workbook 修改工作簿名称/描述，update_sheet_name 重命名工作表，set_cell_format 修改列格式。"+
+					"\n\n当前用户可访问的数据摘要如下：\n\n%s",
+				roleHint,
 				context,
 			),
 		},
@@ -211,6 +222,17 @@ func (s *AIService) buildAgentMessages(userID int64, messages []ChatMessage) []m
 	}
 
 	return result
+}
+
+func (s *AIService) getUserRoleHint(userID int64) string {
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return "你只能查看和修改自己有权限的工作簿和工作表。"
+	}
+	if isAdmin {
+		return "你是管理员，可以查看和管理所有用户的工作簿和工作表。"
+	}
+	return "你只能查看和修改自己有权限的工作簿和工作表。"
 }
 
 func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
@@ -320,6 +342,60 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 				"operations": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			},
 			"required": []string{"operations"},
+		}),
+		buildToolDefinition("create_workbook", "创建新的工作簿。", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name":        map[string]any{"type": "string", "description": "工作簿名称"},
+				"description": map[string]any{"type": "string", "description": "工作簿描述（可选）"},
+			},
+			"required": []string{"name"},
+		}),
+		buildToolDefinition("create_sheet", "在指定工作簿中创建新的工作表，可同时定义列结构。", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"workbook_id": map[string]any{"type": "integer", "description": "目标工作簿 ID"},
+				"name":        map[string]any{"type": "string", "description": "工作表名称"},
+				"columns": map[string]any{
+					"type":        "array",
+					"description": "列定义数组（可选）",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"key":  map[string]any{"type": "string"},
+							"name": map[string]any{"type": "string"},
+							"type": map[string]any{"type": "string", "description": "列类型：text/number/currency/date/select/image/formula"},
+						},
+					},
+				},
+			},
+			"required": []string{"workbook_id", "name"},
+		}),
+		buildToolDefinition("update_workbook", "修改工作簿的名称或描述。", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"workbook_id": map[string]any{"type": "integer", "description": "工作簿 ID"},
+				"name":        map[string]any{"type": "string", "description": "新名称（可选）"},
+				"description": map[string]any{"type": "string", "description": "新描述（可选）"},
+			},
+			"required": []string{"workbook_id"},
+		}),
+		buildToolDefinition("update_sheet_name", "重命名工作表。", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id": map[string]any{"type": "integer", "description": "工作表 ID"},
+				"name":     map[string]any{"type": "string", "description": "新名称"},
+			},
+			"required": []string{"sheet_id", "name"},
+		}),
+		buildToolDefinition("set_cell_format", "修改工作表中指定列的格式类型。", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id":   map[string]any{"type": "integer", "description": "工作表 ID"},
+				"column_key": map[string]any{"type": "string", "description": "列 key"},
+				"format":     map[string]any{"type": "string", "description": "格式类型：text/number/currency/date/percentage/formula"},
+			},
+			"required": []string{"sheet_id", "column_key", "format"},
 		}),
 	}
 }
@@ -882,6 +958,227 @@ func (s *AIService) toolApplySpreadsheetPlan(userID int64, args map[string]any) 
 		return nil, err
 	}
 	return &toolExecutionResult{Data: map[string]any{"ok": true, "applied": len(operations)}, TouchedSheetIDs: touched, Summary: fmt.Sprintf("已写入 %d 条表格修改", len(operations))}, nil
+}
+
+func (s *AIService) toolCreateWorkbook(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return nil, err
+	}
+	description, _ := stringArgWithDefault(args, "description", "")
+
+	workbook := &model.Workbook{
+		Name:    name,
+		OwnerID: userID,
+	}
+	if description != "" {
+		workbook.Description = &description
+	}
+
+	if err := s.sheetService.CreateWorkbookForUser(userID, workbook); err != nil {
+		return nil, fmt.Errorf("创建工作簿失败: %w", err)
+	}
+
+	return &toolExecutionResult{
+		Data:    map[string]any{"ok": true, "workbook_id": workbook.ID, "name": workbook.Name},
+		Summary: fmt.Sprintf("已创建工作簿「%s」(ID:%d)", workbook.Name, workbook.ID),
+	}, nil
+}
+
+func (s *AIService) toolCreateSheet(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	workbookID, err := int64Arg(args, "workbook_id")
+	if err != nil {
+		return nil, err
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return nil, err
+	}
+
+	sheet := &model.Sheet{
+		WorkbookID: workbookID,
+		Name:       name,
+	}
+
+	columnsRaw, hasColumns := args["columns"]
+	if hasColumns {
+		columnsJSON, err := json.Marshal(columnsRaw)
+		if err != nil {
+			return nil, fmt.Errorf("列定义序列化失败: %w", err)
+		}
+		var columns []sheetColumnPayload
+		if err := json.Unmarshal(columnsJSON, &columns); err != nil {
+			return nil, fmt.Errorf("列定义格式错误: %w", err)
+		}
+		for i := range columns {
+			if columns[i].Key == "" {
+				columns[i].Key = columns[i].Name
+			}
+			if columns[i].Type == "" {
+				columns[i].Type = "text"
+			}
+			if columns[i].Width == 0 {
+				columns[i].Width = 140.0
+			}
+		}
+		finalJSON, err := json.Marshal(columns)
+		if err != nil {
+			return nil, fmt.Errorf("列定义序列化失败: %w", err)
+		}
+		sheet.Columns = finalJSON
+	}
+
+	if err := s.sheetService.CreateSheetForUser(userID, sheet); err != nil {
+		return nil, fmt.Errorf("创建工作表失败: %w", err)
+	}
+
+	return &toolExecutionResult{
+		Data:    map[string]any{"ok": true, "sheet_id": sheet.ID, "workbook_id": workbookID, "name": sheet.Name},
+		Summary: fmt.Sprintf("已在工作簿(ID:%d)中创建工作表「%s」(ID:%d)", workbookID, sheet.Name, sheet.ID),
+	}, nil
+}
+
+func (s *AIService) toolUpdateWorkbook(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	workbookID, err := int64Arg(args, "workbook_id")
+	if err != nil {
+		return nil, err
+	}
+
+	workbook, err := s.sheetRepo.GetWorkbook(workbookID)
+	if err != nil {
+		return nil, fmt.Errorf("工作簿不存在: %w", err)
+	}
+
+	if name, _ := stringArgWithDefault(args, "name", ""); name != "" {
+		workbook.Name = name
+	}
+	if description, _ := stringArgWithDefault(args, "description", ""); description != "" {
+		workbook.Description = &description
+	}
+
+	if err := s.sheetService.UpdateWorkbookForUser(userID, workbook); err != nil {
+		return nil, fmt.Errorf("更新工作簿失败: %w", err)
+	}
+
+	return &toolExecutionResult{
+		Data:    map[string]any{"ok": true, "workbook_id": workbook.ID, "name": workbook.Name},
+		Summary: fmt.Sprintf("已更新工作簿「%s」(ID:%d)", workbook.Name, workbook.ID),
+	}, nil
+}
+
+func (s *AIService) toolUpdateSheetName(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	sheetID, err := int64Arg(args, "sheet_id")
+	if err != nil {
+		return nil, err
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return nil, err
+	}
+
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, fmt.Errorf("工作表不存在: %w", err)
+	}
+
+	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err != nil {
+		return nil, fmt.Errorf("工作簿不存在: %w", err)
+	}
+	canManage, err := s.permService.CanManageWorkbook(workbook, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !canManage {
+		return nil, fmt.Errorf("没有权限修改该工作表")
+	}
+
+	sheet.Name = name
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return nil, fmt.Errorf("重命名工作表失败: %w", err)
+	}
+
+	return &toolExecutionResult{
+		Data:    map[string]any{"ok": true, "sheet_id": sheet.ID, "name": sheet.Name},
+		Summary: fmt.Sprintf("已重命名工作表为「%s」(ID:%d)", sheet.Name, sheet.ID),
+	}, nil
+}
+
+func (s *AIService) toolSetCellFormat(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	sheetID, err := int64Arg(args, "sheet_id")
+	if err != nil {
+		return nil, err
+	}
+	columnKey, err := stringArg(args, "column_key")
+	if err != nil {
+		return nil, err
+	}
+	format, err := stringArg(args, "format")
+	if err != nil {
+		return nil, err
+	}
+
+	validFormats := map[string]bool{
+		"text": true, "number": true, "currency": true,
+		"date": true, "percentage": true, "formula": true,
+		"select": true, "image": true,
+	}
+	if !validFormats[format] {
+		return nil, fmt.Errorf("不支持的格式类型: %s（支持 text/number/currency/date/percentage/formula/select/image）", format)
+	}
+
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, fmt.Errorf("工作表不存在: %w", err)
+	}
+
+	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err != nil {
+		return nil, fmt.Errorf("工作簿不存在: %w", err)
+	}
+	canManage, err := s.permService.CanManageWorkbook(workbook, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !canManage {
+		return nil, fmt.Errorf("没有权限修改该工作表")
+	}
+
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return nil, err
+	}
+
+	found := false
+	for i, col := range columns {
+		if col.Key == columnKey {
+			columns[i].Type = format
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("列 %s 不存在", columnKey)
+	}
+
+	nextColumns, err := json.Marshal(columns)
+	if err != nil {
+		return nil, fmt.Errorf("序列化列定义失败: %w", err)
+	}
+	sheet.Columns = nextColumns
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return nil, fmt.Errorf("更新列格式失败: %w", err)
+	}
+
+	if err := s.invalidateSheetByID(sheetID); err != nil {
+		return nil, err
+	}
+
+	return &toolExecutionResult{
+		Data:            map[string]any{"ok": true, "sheet_id": sheetID, "column_key": columnKey, "format": format},
+		TouchedSheetIDs: []int64{sheetID},
+		Summary:         fmt.Sprintf("已将列 %s 的格式设为 %s", columnKey, format),
+	}, nil
 }
 
 func (s *AIService) buildUserContextSnapshot(userID int64, limit int) (map[string]any, error) {
