@@ -4,28 +4,45 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"yaerp/config"
 	"yaerp/migrations"
+	miniopkg "yaerp/pkg/minio"
 )
 
 type BackupService struct {
 	cfg       *config.Config
 	db        *sql.DB
+	minio     *miniopkg.Client
 	restoreMu sync.Mutex
 }
 
-func NewBackupService(cfg *config.Config, db *sql.DB) *BackupService {
-	return &BackupService{cfg: cfg, db: db}
+type backupManifest struct {
+	Version            int      `json:"version"`
+	ExportedAt         string   `json:"exported_at"`
+	Database           string   `json:"database"`
+	ObjectStorage      bool     `json:"object_storage"`
+	ObjectPrefix       string   `json:"object_prefix,omitempty"`
+	MinioBucket        string   `json:"minio_bucket,omitempty"`
+	PublicBaseURL      string   `json:"public_base_url,omitempty"`
+	IncludedFiles      []string `json:"included_files"`
+	SupportedRestore   []string `json:"supported_restore"`
+	SupportsObjectData bool     `json:"supports_object_data"`
+}
+
+func NewBackupService(cfg *config.Config, db *sql.DB, minioClient *miniopkg.Client) *BackupService {
+	return &BackupService{cfg: cfg, db: db, minio: minioClient}
 }
 
 // DumpDatabase runs pg_dump and returns the SQL dump as bytes.
@@ -78,6 +95,10 @@ GRANT ALL ON SCHEMA public TO PUBLIC;`)
 func (s *BackupService) ExportConfig() ([]byte, error) {
 	configExport := map[string]interface{}{
 		"exported_at": time.Now().Format(time.RFC3339),
+		"backup": map[string]interface{}{
+			"include_object_storage": s.cfg.Backup.IncludeObjectStorage,
+			"object_prefix":          s.cfg.Backup.ObjectPrefix,
+		},
 		"postgres": map[string]interface{}{
 			"host": s.cfg.Postgres.Host,
 			"port": s.cfg.Postgres.Port,
@@ -128,6 +149,25 @@ func (s *BackupService) CombinedBackup() ([]byte, error) {
 		return nil, err
 	}
 
+	includedFiles := []string{"database.sql", "config.json"}
+
+	if s.cfg.Backup.IncludeObjectStorage && s.minio != nil {
+		objectFiles, err := s.addObjectStorageBackup(tarWriter)
+		if err != nil {
+			return nil, fmt.Errorf("object storage backup failed: %w", err)
+		}
+		includedFiles = append(includedFiles, objectFiles...)
+	}
+
+	includedFiles = append(includedFiles, "manifest.json")
+	manifestJSON, err := s.ExportManifest(includedFiles)
+	if err != nil {
+		return nil, fmt.Errorf("manifest export failed: %w", err)
+	}
+	if err := addToTar(tarWriter, "manifest.json", manifestJSON); err != nil {
+		return nil, err
+	}
+
 	if err := tarWriter.Close(); err != nil {
 		return nil, fmt.Errorf("close tar writer: %w", err)
 	}
@@ -152,6 +192,66 @@ func addToTar(tw *tar.Writer, name string, data []byte) error {
 		return fmt.Errorf("write tar data for %s: %w", name, err)
 	}
 	return nil
+}
+
+func (s *BackupService) ExportManifest(includedFiles []string) ([]byte, error) {
+	manifest := backupManifest{
+		Version:            2,
+		ExportedAt:         time.Now().Format(time.RFC3339),
+		Database:           s.cfg.Postgres.DB,
+		ObjectStorage:      s.cfg.Backup.IncludeObjectStorage && s.minio != nil,
+		ObjectPrefix:       s.cfg.Backup.ObjectPrefix,
+		MinioBucket:        s.cfg.MinIO.Bucket,
+		PublicBaseURL:      s.cfg.Backup.PublicBaseURL,
+		IncludedFiles:      includedFiles,
+		SupportedRestore:   []string{".sql", ".sql.gz", ".tar.gz", ".tgz"},
+		SupportsObjectData: s.cfg.Backup.IncludeObjectStorage && s.minio != nil,
+	}
+	return json.MarshalIndent(manifest, "", "  ")
+}
+
+func (s *BackupService) addObjectStorageBackup(tw *tar.Writer) ([]string, error) {
+	ctx := context.Background()
+	prefix := s.cfg.Backup.ObjectPrefix
+	keys, err := s.minio.ListObjectKeys(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("list object keys: %w", err)
+	}
+
+	manifest := make([]map[string]any, 0, len(keys))
+	includedFiles := make([]string, 0, len(keys)+1)
+	for _, key := range keys {
+		data, err := s.minio.GetObjectBytes(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("read object %s: %w", key, err)
+		}
+		relativeName := strings.TrimLeft(strings.TrimPrefix(key, prefix), "/")
+		archivePath := filepath.ToSlash(filepath.Join("objects", relativeName))
+		if err := addToTar(tw, archivePath, data); err != nil {
+			return nil, err
+		}
+		includedFiles = append(includedFiles, archivePath)
+		manifest = append(manifest, map[string]any{
+			"object_key":   key,
+			"archive_path": archivePath,
+			"size":         len(data),
+			"url":          s.minio.PublicURLForObject(key),
+		})
+	}
+
+	manifestJSON, err := json.MarshalIndent(map[string]any{
+		"bucket":  s.minio.BucketName(),
+		"prefix":  prefix,
+		"objects": manifest,
+	}, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal object manifest: %w", err)
+	}
+	if err := addToTar(tw, "objects/manifest.json", manifestJSON); err != nil {
+		return nil, err
+	}
+	includedFiles = append(includedFiles, "objects/manifest.json")
+	return includedFiles, nil
 }
 
 func (s *BackupService) baseCommandArgs(extraArgs ...string) []string {

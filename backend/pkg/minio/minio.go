@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -95,4 +96,48 @@ func (c *Client) GetPresignedURL(ctx context.Context, objectKey string, expires 
 
 func (c *Client) Delete(ctx context.Context, objectKey string) error {
 	return c.client.RemoveObject(ctx, c.bucket, objectKey, minio.RemoveObjectOptions{})
+}
+
+func (c *Client) ListObjectKeys(ctx context.Context, prefix string) ([]string, error) {
+	keys := make([]string, 0, 128)
+	for object := range c.client.ListObjects(ctx, c.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if object.Err != nil {
+			return nil, object.Err
+		}
+		if object.Key == "" {
+			continue
+		}
+		keys = append(keys, object.Key)
+	}
+	return keys, nil
+}
+
+func (c *Client) GetObjectBytes(ctx context.Context, objectKey string) ([]byte, error) {
+	object, err := c.GetObject(ctx, objectKey)
+	if err != nil {
+		return nil, err
+	}
+	defer object.Close()
+	return io.ReadAll(object)
+}
+
+func (c *Client) BucketName() string {
+	return c.bucket
+}
+
+func (c *Client) PublicURLForObject(objectKey string) string {
+	if c.publicEndpoint == "" {
+		return ""
+	}
+	scheme := "http"
+	if strings.HasPrefix(c.publicEndpoint, "http://") || strings.HasPrefix(c.publicEndpoint, "https://") {
+		parsed, err := url.Parse(c.publicEndpoint)
+		if err == nil {
+			return strings.TrimRight(parsed.String(), "/") + "/" + c.bucket + "/" + strings.TrimLeft(objectKey, "/")
+		}
+	}
+	if strings.HasSuffix(c.internalHost, ":443") {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s/%s/%s", scheme, c.publicEndpoint, c.bucket, strings.TrimLeft(objectKey, "/"))
 }

@@ -45,7 +45,7 @@ const backupCards: BackupCard[] = [
     iconBg: 'bg-emerald-100',
     iconColor: 'text-emerald-700',
     title: '完整备份',
-    description: '打包下载数据库与配置的完整备份压缩包（tar.gz），适用于整体环境备份和灾难恢复场景。',
+    description: '打包下载数据库、配置、备份清单以及对象存储文件的完整备份压缩包（tar.gz），适用于当前新版系统的整体恢复和迁移。',
     endpoint: '/admin/backup/combined',
     filename: 'full-backup.tar.gz',
   },
@@ -83,8 +83,19 @@ export default function BackupPage() {
       const blob = await res.blob()
       const url = window.URL.createObjectURL(blob)
       const link = document.createElement('a')
+      const disposition = res.headers.get('Content-Disposition') || ''
+      const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+      const fallbackMatch = disposition.match(/filename="?([^";]+)"?/i)
+      let serverFilename = fallbackMatch?.[1] || card.filename
+      if (utf8Match?.[1]) {
+        try {
+          serverFilename = decodeURIComponent(utf8Match[1])
+        } catch {
+          serverFilename = utf8Match[1]
+        }
+      }
       link.href = url
-      link.download = card.filename
+      link.download = serverFilename
       document.body.appendChild(link)
       link.click()
       document.body.removeChild(link)
@@ -244,7 +255,7 @@ export default function BackupPage() {
               </div>
               <h2 className="mt-3 text-2xl font-semibold text-slate-950">数据库还原</h2>
               <p className="mt-2 max-w-3xl text-sm leading-7 text-slate-600">
-                支持上传 `.sql`、`.sql.gz` 或完整备份 `.tar.gz` 文件。执行后会覆盖当前数据库，请务必先下载一份最新备份。
+                    支持上传 `.sql`、`.sql.gz` 或完整备份 `.tar.gz` 文件。完整备份中已包含数据库、配置清单和对象存储文件目录说明；执行后会覆盖当前数据库，请务必先下载一份最新完整备份。
               </p>
             </div>
 
@@ -254,7 +265,7 @@ export default function BackupPage() {
                   <div>
                     <div className="text-sm font-semibold text-slate-900">选择备份文件</div>
                     <div className="mt-2 text-sm text-slate-500">
-                      当前支持 PostgreSQL SQL 导出文件，以及本系统下载的完整备份压缩包。
+                      当前支持 PostgreSQL SQL 导出文件，以及本系统下载的新版完整备份压缩包。
                     </div>
                   </div>
 

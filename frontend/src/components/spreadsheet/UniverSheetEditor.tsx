@@ -25,6 +25,7 @@ interface Props {
   sheet: Sheet
   reloadToken?: string
   onExternalReload?: () => Promise<void> | void
+  optimisticCanEdit?: boolean
 }
 
 interface GalleryImage {
@@ -394,7 +395,18 @@ async function toImageFile(img: GalleryImage): Promise<File> {
   return new File([blob], normalizedName, { type: blob.type || 'image/png' })
 }
 
-export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload }: Props) {
+function mergeUniverStyleMap(base: Record<string, unknown> | undefined, next: Record<string, unknown> | undefined) {
+  if (!next || Object.keys(next).length === 0) {
+    return base || {}
+  }
+
+  return {
+    ...(base || {}),
+    ...next,
+  }
+}
+
+export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload, optimisticCanEdit = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const persistInFlightRef = useRef<Promise<void> | null>(null)
@@ -410,6 +422,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const [loadingGallery, setLoadingGallery] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
   const [univerHasOverlay, setUniverHasOverlay] = useState(false)
+  const [univerSidebarOpen, setUniverSidebarOpen] = useState(false)
   const [toolbarExpanded, setToolbarExpanded] = useState(false)
   const [hasFilter, setHasFilter] = useState(false)
   const [actionError, setActionError] = useState('')
@@ -425,7 +438,10 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const { permissions, loading: permissionLoading } = usePermission(sheetId)
   const canEditSheet = permissions?.sheet.canEdit ?? false
   const canExportSheet = permissions?.sheet.canExport ?? false
-  const editLocked = permissionLoading || !canEditSheet
+  const hasPermissionSnapshot = permissions !== null
+  const effectiveCanEditSheet = hasPermissionSnapshot ? canEditSheet : optimisticCanEdit
+  const effectiveCanExportSheet = hasPermissionSnapshot ? canExportSheet : optimisticCanEdit
+  const editLocked = !effectiveCanEditSheet
 
   const syncFilterState = useCallback(() => {
     try {
@@ -509,7 +525,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     }
   }, [sheetId])
 
-  // Hide global FABs when image picker or Univer modal dialog is open
+  // Hide global FABs when image picker or blocking Univer dialogs are open
   useEffect(() => {
     if (showImagePicker || univerHasOverlay || showProtectionPanel) {
       document.body.classList.add('fab-hidden')
@@ -519,19 +535,21 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     return () => { document.body.classList.remove('fab-hidden') }
   }, [showImagePicker, showProtectionPanel, univerHasOverlay])
 
-  // Watch for Univer modal overlays only (dialogs, confirm modals, sidebars)
-  // Avoid matching toolbar/panel elements that are always present
+  // Watch Univer blocking dialogs and side panels separately.
   useEffect(() => {
     const check = () => {
-      const overlays = document.querySelectorAll(
-        '.univer-dialog, .univer-confirm-modal, .univer-sidebar'
-      )
-      // Filter to only visible overlays (offsetParent !== null or has display)
+      const overlays = document.querySelectorAll('.univer-dialog, .univer-confirm-modal')
+      const sidebars = document.querySelectorAll('.univer-sidebar')
       let hasVisible = false
       overlays.forEach((el) => {
         if ((el as HTMLElement).offsetParent !== null) hasVisible = true
       })
+      let hasVisibleSidebar = false
+      sidebars.forEach((el) => {
+        if ((el as HTMLElement).offsetParent !== null) hasVisibleSidebar = true
+      })
       setUniverHasOverlay(hasVisible)
+      setUniverSidebarOpen(hasVisibleSidebar)
     }
 
     const observer = new MutationObserver(check)
@@ -907,7 +925,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
         const workbookApi = univerAPI.createUniverSheet(workbookData)
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
-        workbookApi.setEditable(canEditSheet)
+        workbookApi.setEditable(effectiveCanEditSheet)
         syncFilterState()
         syncSelectionState()
         if (!disposed) setLoading(false)
@@ -930,7 +948,14 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
               const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [])
               const currentConfig = parseSheetConfig(snap.config)
-              const nextConfig = { ...currentConfig, univerSheetData: savedSheet, univerStyles: saved.styles || {} }
+              const nextConfig = {
+                ...currentConfig,
+                univerSheetData: savedSheet,
+                univerStyles: mergeUniverStyleMap(
+                  currentConfig.univerStyles as Record<string, unknown> | undefined,
+                  saved.styles as Record<string, unknown> | undefined
+                ),
+              }
               const res = await api.put(`/sheets/${snap.id}`, {
                 name: savedSheet.name || snap.name,
                 sort_order: snap.sort_order,
@@ -1007,16 +1032,16 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
     mount()
     return () => { disposed = true; cleanup?.() }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadToken, sheetId, workbookId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
+  }, [sheetId, workbookId])
 
   useEffect(() => {
     try {
-      workbookApiRef.current?.setEditable(canEditSheet)
+      workbookApiRef.current?.setEditable(effectiveCanEditSheet)
     } catch {
       // Ignore Univer editable sync issues and keep server-side checks authoritative.
     }
-  }, [canEditSheet])
+  }, [effectiveCanEditSheet])
 
   // Gallery image picker
   const openImagePicker = useCallback(async () => {
@@ -1131,7 +1156,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   }, [])
 
   const handleDownloadSheet = useCallback(async () => {
-    if (!canExportSheet) {
+    if (!effectiveCanExportSheet) {
       setActionError('当前账号没有导出权限，不能下载工作表。')
       return
     }
@@ -1167,10 +1192,10 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     } finally {
       setExportAction('')
     }
-  }, [canEditSheet, canExportSheet, persistCurrentSheet, sheetId])
+  }, [canEditSheet, effectiveCanExportSheet, persistCurrentSheet, sheetId])
 
   const handleDownloadPdf = useCallback(async () => {
-    if (!canExportSheet) {
+    if (!effectiveCanExportSheet) {
       setActionError('当前账号没有导出权限，不能导出 PDF。')
       return
     }
@@ -1206,10 +1231,10 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     } finally {
       setExportAction('')
     }
-  }, [canEditSheet, canExportSheet, persistCurrentSheet, sheetId])
+  }, [canEditSheet, effectiveCanExportSheet, persistCurrentSheet, sheetId])
 
   const handlePrintSheet = useCallback(async () => {
-    if (!canExportSheet) {
+    if (!effectiveCanExportSheet) {
       setActionError('当前账号没有导出权限，不能打印工作表。')
       return
     }
@@ -1229,7 +1254,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     } finally {
       setExportAction('')
     }
-  }, [canEditSheet, canExportSheet, getCurrentSheetSnapshot, persistCurrentSheet])
+  }, [canEditSheet, effectiveCanExportSheet, getCurrentSheetSnapshot, persistCurrentSheet])
 
   if (error) {
     return (
@@ -1266,7 +1291,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
       {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
-        <div className="absolute right-4 bottom-20 z-20 flex flex-col items-end gap-2">
+        <div className={`fixed bottom-32 z-[70] flex flex-col items-end gap-2 md:bottom-28 ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
             <div className="flex flex-col items-end gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
@@ -1301,7 +1326,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <button
                 type="button"
                 onClick={() => void handleDownloadSheet()}
-                disabled={!canExportSheet || exportAction !== ''}
+                disabled={!effectiveCanExportSheet || exportAction !== ''}
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
                 title="下载当前表"
               >
@@ -1310,7 +1335,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <button
                 type="button"
                 onClick={() => void handlePrintSheet()}
-                disabled={!canExportSheet || exportAction !== ''}
+                disabled={!effectiveCanExportSheet || exportAction !== ''}
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="打印当前表"
               >
@@ -1319,7 +1344,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <button
                 type="button"
                 onClick={() => void handleDownloadPdf()}
-                disabled={!canExportSheet || exportAction !== ''}
+                disabled={!effectiveCanExportSheet || exportAction !== ''}
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 title="导出 PDF"
               >
