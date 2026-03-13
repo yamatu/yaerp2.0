@@ -12,6 +12,7 @@ type Config struct {
 	JWT      JWTConfig
 	Server   ServerConfig
 	AI       AIConfig
+	Backup   BackupConfig
 }
 
 type PostgresConfig struct {
@@ -54,6 +55,12 @@ type AIConfig struct {
 	Model    string
 }
 
+type BackupConfig struct {
+	IncludeObjectStorage bool
+	ObjectPrefix         string
+	PublicBaseURL        string
+}
+
 func Load() *Config {
 	return &Config{
 		Postgres: PostgresConfig{
@@ -89,6 +96,11 @@ func Load() *Config {
 			Endpoint: getEnv("AI_API_ENDPOINT", ""),
 			APIKey:   getEnv("AI_API_KEY", ""),
 			Model:    getEnv("AI_MODEL", "gpt-4o-mini"),
+		},
+		Backup: BackupConfig{
+			IncludeObjectStorage: getEnv("BACKUP_INCLUDE_OBJECT_STORAGE", "true") == "true",
+			ObjectPrefix:         getEnv("BACKUP_OBJECT_PREFIX", "uploads/"),
+			PublicBaseURL:        getEnv("BACKUP_PUBLIC_BASE_URL", ""),
 		},
 	}
 }

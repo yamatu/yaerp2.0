@@ -37,6 +37,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [sheetSortBy, setSheetSortBy] = useState<'updated_at' | 'created_at' | 'name'>('updated_at')
   const [sheetSortOrder, setSheetSortOrder] = useState<'asc' | 'desc'>('desc')
   const [sheetPage, setSheetPage] = useState(1)
+  const [optimisticEditableSheetId, setOptimisticEditableSheetId] = useState<number | null>(null)
 
   const sheets = workbook?.sheets || []
   const isAdminUser = Boolean(currentUser && isAdmin(currentUser))
@@ -67,14 +68,18 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
 
+  // Stable sheet-id list so the redirect effect does not re-fire on every
+  // workbook refresh (which gives a new `sheets` array reference).
+  const sheetIds = useMemo(() => sheets.map((s) => s.id), [sheets])
+
   useEffect(() => {
     if (loading || !workbook) return
-    if (sheets.length === 0) return
+    if (sheetIds.length === 0) return
 
-    if (requestedSheetId === null || !sheets.some((sheet) => sheet.id === requestedSheetId)) {
-      router.replace(`/sheets/${workbookId}/${sheets[0].id}`)
+    if (requestedSheetId === null || !sheetIds.includes(requestedSheetId)) {
+      router.replace(`/sheets/${workbookId}/${sheetIds[0]}`)
     }
-  }, [loading, requestedSheetId, router, sheets, workbook, workbookId])
+  }, [loading, requestedSheetId, router, sheetIds, workbook, workbookId])
 
   const filteredSheets = useMemo(() => {
     const keyword = sheetSearchQuery.trim().toLowerCase()
@@ -123,6 +128,20 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
     }
   }, [activeSheet, filteredSheets, sheetPage])
 
+  useEffect(() => {
+    if (!activeSheet || optimisticEditableSheetId === null) return
+    if (activeSheet.id !== optimisticEditableSheetId) return
+    if (!permissionLoading) {
+      setOptimisticEditableSheetId(null)
+    }
+  }, [activeSheet, optimisticEditableSheetId, permissionLoading])
+
+  useEffect(() => {
+    if (!requestedSheetId) {
+      setOptimisticEditableSheetId(null)
+    }
+  }, [requestedSheetId])
+
   const handleAddSheet = async () => {
     if (!canManageWorkbook) {
       setSheetActionError('当前账号不能在这个工作簿里新建工作表。')
@@ -146,6 +165,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
       setNewSheetName('')
       setAddingSheet(false)
+      setOptimisticEditableSheetId(res.data.id)
       await refresh()
       router.replace(`/sheets/${workbookId}/${res.data.id}`)
     } catch (err) {
@@ -541,7 +561,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
           <main className="min-w-0 flex-1 overflow-hidden">
             {activeSheet ? (
-              <UniverSheetEditor key={activeSheet.id} workbookId={workbookId} sheet={activeSheet} reloadToken={activeSheet.updated_at} onExternalReload={refresh} />
+              <UniverSheetEditor key={activeSheet.id} workbookId={workbookId} sheet={activeSheet} onExternalReload={refresh} optimisticCanEdit={optimisticEditableSheetId === activeSheet.id} />
             ) : sheets.length === 0 ? (
               <div className="flex h-full items-center justify-center bg-slate-50 text-center">
                 <div className="max-w-sm">

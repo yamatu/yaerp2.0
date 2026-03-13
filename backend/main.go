@@ -75,7 +75,7 @@ func main() {
 	sheetService := service.NewSheetService(sheetRepo, permService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, cfg.JWT.Secret)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
-	backupService := service.NewBackupService(cfg, db)
+	backupService := service.NewBackupService(cfg, db, minioClient)
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
 	aiService := service.NewAIService(cfg, db, sheetRepo, sheetService, permService, uploadService, scheduleService)
 	scheduleService.SetReportGenerator(aiService.GenerateSheetReport)
