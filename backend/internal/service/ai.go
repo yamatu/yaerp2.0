@@ -445,7 +445,7 @@ type sheetColumnPayload struct {
 	Key            string                 `json:"key"`
 	Name           string                 `json:"name"`
 	Type           string                 `json:"type"`
-	Width          int                    `json:"width,omitempty"`
+	Width          float64                `json:"width,omitempty"`
 	Required       bool                   `json:"required,omitempty"`
 	Validation     map[string]interface{} `json:"validation,omitempty"`
 	Formula        string                 `json:"formula,omitempty"`
@@ -596,7 +596,7 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 		Key:   operation.ColumnKey,
 		Name:  firstNonEmpty(operation.ColumnName, operation.ColumnKey),
 		Type:  firstNonEmpty(operation.ColumnType, "text"),
-		Width: 140,
+		Width: 140.0,
 	}
 	columns = append(columns, sheetColumnPayload{})
 	copy(columns[insertIndex+1:], columns[insertIndex:])

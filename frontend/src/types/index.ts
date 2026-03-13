@@ -279,7 +279,7 @@ export interface AIConfigStatus {
 }
 
 export interface AISpreadsheetOperation {
-  kind?: 'update_cell' | 'insert_row' | 'delete_row' | 'insert_column' | 'fill_formula'
+  kind?: 'update_cell' | 'insert_row' | 'delete_row' | 'insert_column' | 'fill_formula' | 'create_workbook' | 'create_sheet' | 'update_workbook' | 'update_sheet_name' | 'set_cell_format'
   sheet_id: number
   sheet_name: string
   row?: number

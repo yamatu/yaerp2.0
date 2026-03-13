@@ -51,6 +51,16 @@ function toolTitle(name: string) {
       return '执行修改'
     case 'run_workflow':
       return '工作流执行'
+    case 'create_workbook':
+      return '创建工作簿'
+    case 'create_sheet':
+      return '创建工作表'
+    case 'update_workbook':
+      return '修改工作簿'
+    case 'update_sheet_name':
+      return '重命名工作表'
+    case 'set_cell_format':
+      return '设置列格式'
     default:
       return name
   }
