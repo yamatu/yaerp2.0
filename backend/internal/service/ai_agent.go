@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -58,6 +62,11 @@ func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 	return map[string]ToolFunc{
 		"get_user_context":         s.toolGetUserContext,
 		"query_sheet":              s.toolQuerySheet,
+		"search_spreadsheets":      s.toolSearchSpreadsheets,
+		"search_sheet_rows":        s.toolSearchSheetRows,
+		"lookup_sheet_records":     s.toolLookupSheetRecords,
+		"calculate_sheet_metrics":  s.toolCalculateSheetMetrics,
+		"calculate_expression":     s.toolCalculateExpression,
 		"update_cell":              s.toolUpdateCell,
 		"insert_row":               s.toolInsertRow,
 		"delete_row":               s.toolDeleteRow,
@@ -237,11 +246,11 @@ func (s *AIService) getUserRoleHint(userID int64) string {
 
 func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 	return []openAIToolDefinition{
-		buildToolDefinition("get_user_context", "获取当前用户可访问的工作簿和工作表摘要。", map[string]any{
+		buildToolDefinition("get_user_context", "Get accessible workbook and sheet summary.", map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
 		}),
-		buildToolDefinition("query_sheet", "查询指定工作表的列定义和行数据。", map[string]any{
+		buildToolDefinition("query_sheet", "Query sheet columns and rows.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":    map[string]any{"type": "integer"},
@@ -251,34 +260,86 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id"},
 		}),
-		buildToolDefinition("update_cell", "更新一个单元格的值。", map[string]any{
+		buildToolDefinition("search_spreadsheets", "Search all accessible spreadsheets by keywords.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"keywords":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"mode":           map[string]any{"type": "string", "description": "any or all"},
+				"limit":          map[string]any{"type": "integer"},
+				"return_columns": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+			"required": []string{"keywords"},
+		}),
+		buildToolDefinition("search_sheet_rows", "Search rows in one sheet by keywords.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id":       map[string]any{"type": "integer"},
+				"keywords":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"mode":           map[string]any{"type": "string", "description": "any or all"},
+				"limit":          map[string]any{"type": "integer"},
+				"start_row":      map[string]any{"type": "integer"},
+				"return_columns": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+			"required": []string{"sheet_id", "keywords"},
+		}),
+		buildToolDefinition("lookup_sheet_records", "Lookup rows in one sheet by field criteria.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id":       map[string]any{"type": "integer"},
+				"criteria":       map[string]any{"type": "object"},
+				"match_mode":     map[string]any{"type": "string", "description": "contains or exact"},
+				"limit":          map[string]any{"type": "integer"},
+				"return_columns": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+			"required": []string{"sheet_id", "criteria"},
+		}),
+		buildToolDefinition("calculate_sheet_metrics", "Calculate metrics for numeric columns in a sheet.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id":    map[string]any{"type": "integer"},
+				"column_keys": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"metrics":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"keywords":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"mode":        map[string]any{"type": "string", "description": "any or all"},
+			},
+			"required": []string{"sheet_id", "column_keys", "metrics"},
+		}),
+		buildToolDefinition("calculate_expression", "Evaluate a basic math expression.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"expression": map[string]any{"type": "string"},
+				"scale":      map[string]any{"type": "integer"},
+			},
+			"required": []string{"expression"},
+		}),
+		buildToolDefinition("update_cell", "Update one cell value.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":   map[string]any{"type": "integer"},
-				"row":        map[string]any{"type": "integer", "description": "0-based 数据行索引。第一条数据行为 0，不是界面显示的第 2 行"},
+				"row":        map[string]any{"type": "integer"},
 				"column_key": map[string]any{"type": "string"},
 				"value":      map[string]any{},
 			},
 			"required": []string{"sheet_id", "row", "column_key", "value"},
 		}),
-		buildToolDefinition("insert_row", "在指定位置插入新行，并可写入多个字段值。", map[string]any{
+		buildToolDefinition("insert_row", "Insert a row at target position.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":   map[string]any{"type": "integer"},
-				"row":        map[string]any{"type": "integer", "description": "插入后的 0-based 数据行索引。空表第一条数据必须用 0，不要传界面中的第 2 行"},
+				"row":        map[string]any{"type": "integer"},
 				"row_values": map[string]any{"type": "object"},
 			},
 			"required": []string{"sheet_id", "row"},
 		}),
-		buildToolDefinition("delete_row", "删除指定数据行。", map[string]any{
+		buildToolDefinition("delete_row", "Delete one row.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id": map[string]any{"type": "integer"},
-				"row":      map[string]any{"type": "integer", "description": "0-based 数据行索引。第一条数据行为 0，不是界面显示的第 2 行"},
+				"row":      map[string]any{"type": "integer"},
 			},
 			"required": []string{"sheet_id", "row"},
 		}),
-		buildToolDefinition("insert_column", "新增一个字段列，可指定列名、列类型和插入位置。", map[string]any{
+		buildToolDefinition("insert_column", "Insert a new column.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":                map[string]any{"type": "integer"},
@@ -291,7 +352,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "column_key", "column_name"},
 		}),
-		buildToolDefinition("auto_fill_column", "按公式模板批量填充一列。", map[string]any{
+		buildToolDefinition("auto_fill_column", "Fill a column with formula template.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":         map[string]any{"type": "integer"},
@@ -302,7 +363,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "column_key", "formula_template"},
 		}),
-		buildToolDefinition("generate_report", "把指定工作表导出为 Excel 报表并返回下载地址。", map[string]any{
+		buildToolDefinition("generate_report", "Generate an Excel report for a sheet.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id": map[string]any{"type": "integer"},
@@ -310,7 +371,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id"},
 		}),
-		buildToolDefinition("schedule_daily_report", "创建每日定时报表任务。", map[string]any{
+		buildToolDefinition("schedule_daily_report", "Create a daily report schedule.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":          map[string]any{"type": "integer"},
@@ -320,14 +381,14 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "time"},
 		}),
-		buildToolDefinition("run_workflow", "批量执行多条表格工作流操作。", map[string]any{
+		buildToolDefinition("run_workflow", "Execute multiple spreadsheet operations.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"operations": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			},
 			"required": []string{"operations"},
 		}),
-		buildToolDefinition("preview_spreadsheet_plan", "根据自然语言描述生成结构化表格操作方案。", map[string]any{
+		buildToolDefinition("preview_spreadsheet_plan", "Preview spreadsheet operations from a prompt.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"workbook_id": map[string]any{"type": "integer"},
@@ -336,64 +397,53 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"workbook_id", "sheet_ids", "prompt"},
 		}),
-		buildToolDefinition("apply_spreadsheet_plan", "执行结构化表格操作方案并写入数据库。", map[string]any{
+		buildToolDefinition("apply_spreadsheet_plan", "Apply structured spreadsheet operations.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"operations": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			},
 			"required": []string{"operations"},
 		}),
-		buildToolDefinition("create_workbook", "创建新的工作簿。", map[string]any{
+		buildToolDefinition("create_workbook", "Create a workbook.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"name":        map[string]any{"type": "string", "description": "工作簿名称"},
-				"description": map[string]any{"type": "string", "description": "工作簿描述（可选）"},
+				"name":        map[string]any{"type": "string"},
+				"description": map[string]any{"type": "string"},
 			},
 			"required": []string{"name"},
 		}),
-		buildToolDefinition("create_sheet", "在指定工作簿中创建新的工作表，可同时定义列结构。", map[string]any{
+		buildToolDefinition("create_sheet", "Create a sheet in a workbook.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"workbook_id": map[string]any{"type": "integer", "description": "目标工作簿 ID"},
-				"name":        map[string]any{"type": "string", "description": "工作表名称"},
-				"columns": map[string]any{
-					"type":        "array",
-					"description": "列定义数组（可选）",
-					"items": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"key":  map[string]any{"type": "string"},
-							"name": map[string]any{"type": "string"},
-							"type": map[string]any{"type": "string", "description": "列类型：text/number/currency/date/select/image/formula"},
-						},
-					},
-				},
+				"workbook_id": map[string]any{"type": "integer"},
+				"name":        map[string]any{"type": "string"},
+				"columns":     map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			},
 			"required": []string{"workbook_id", "name"},
 		}),
-		buildToolDefinition("update_workbook", "修改工作簿的名称或描述。", map[string]any{
+		buildToolDefinition("update_workbook", "Update workbook name or description.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"workbook_id": map[string]any{"type": "integer", "description": "工作簿 ID"},
-				"name":        map[string]any{"type": "string", "description": "新名称（可选）"},
-				"description": map[string]any{"type": "string", "description": "新描述（可选）"},
+				"workbook_id": map[string]any{"type": "integer"},
+				"name":        map[string]any{"type": "string"},
+				"description": map[string]any{"type": "string"},
 			},
 			"required": []string{"workbook_id"},
 		}),
-		buildToolDefinition("update_sheet_name", "重命名工作表。", map[string]any{
+		buildToolDefinition("update_sheet_name", "Rename a sheet.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"sheet_id": map[string]any{"type": "integer", "description": "工作表 ID"},
-				"name":     map[string]any{"type": "string", "description": "新名称"},
+				"sheet_id": map[string]any{"type": "integer"},
+				"name":     map[string]any{"type": "string"},
 			},
 			"required": []string{"sheet_id", "name"},
 		}),
-		buildToolDefinition("set_cell_format", "修改工作表中指定列的格式类型。", map[string]any{
+		buildToolDefinition("set_cell_format", "Set column format.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"sheet_id":   map[string]any{"type": "integer", "description": "工作表 ID"},
-				"column_key": map[string]any{"type": "string", "description": "列 key"},
-				"format":     map[string]any{"type": "string", "description": "格式类型：text/number/currency/date/percentage/formula"},
+				"sheet_id":   map[string]any{"type": "integer"},
+				"column_key": map[string]any{"type": "string"},
+				"format":     map[string]any{"type": "string"},
 			},
 			"required": []string{"sheet_id", "column_key", "format"},
 		}),
@@ -659,6 +709,371 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 		"total_rows":  len(rows),
 		"header_only": len(rows) == 0 && len(columns) > 0,
 	}, Summary: buildQuerySheetSummary(sheet.Name, len(filteredRows), len(columns))}, nil
+}
+
+func (s *AIService) toolSearchSpreadsheets(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	keywords := normalizeSearchKeywords(stringSliceArg(args, "keywords"))
+	if len(keywords) == 0 {
+		return nil, fmt.Errorf("keywords is required")
+	}
+	mode, _ := stringArgWithDefault(args, "mode", "any")
+	returnColumns := stringSliceArg(args, "return_columns")
+	limit, _ := intArgWithDefault(args, "limit", 20)
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	snapshot, err := s.buildUserContextSnapshot(userID, 100)
+	if err != nil {
+		return nil, err
+	}
+	workbooks, _ := snapshot["workbooks"].([]map[string]any)
+
+	matches := make([]map[string]any, 0, limit)
+	touched := make(map[int64]struct{})
+	for _, workbookItem := range workbooks {
+		workbookID, _ := toInt64(workbookItem["workbook_id"])
+		workbookName, _ := workbookItem["workbook_name"].(string)
+		sheetItems, _ := workbookItem["sheets"].([]map[string]any)
+		for _, sheetItem := range sheetItems {
+			sheetID, _ := toInt64(sheetItem["sheet_id"])
+			sheetName, _ := sheetItem["sheet_name"].(string)
+			sheet, err := s.sheetRepo.GetSheet(sheetID)
+			if err != nil {
+				continue
+			}
+			rows, err := s.sheetRepo.GetRows(sheetID)
+			if err != nil {
+				continue
+			}
+			columns, err := parseSheetColumns(sheet.Columns)
+			if err != nil {
+				continue
+			}
+			previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
+			if err != nil {
+				continue
+			}
+			for _, row := range previewRows {
+				rowMatches := collectRowKeywordMatches(row.Data, columns, keywords, mode)
+				if len(rowMatches) == 0 {
+					continue
+				}
+				matches = append(matches, map[string]any{
+					"workbook_id":   workbookID,
+					"workbook_name": workbookName,
+					"sheet_id":      sheetID,
+					"sheet_name":    sheetName,
+					"row":           row.Row,
+					"display_row":   row.DisplayRow,
+					"matches":       rowMatches,
+					"data":          filterRowDataByColumns(row.Data, columns, returnColumns),
+				})
+				touched[sheetID] = struct{}{}
+				if len(matches) >= limit {
+					return &toolExecutionResult{
+						Data: map[string]any{
+							"keywords": keywords,
+							"mode":     normalizeSearchMode(mode),
+							"limit":    limit,
+							"matches":  matches,
+						},
+						TouchedSheetIDs: sortedTouchedSheetIDs(touched),
+						Summary:         fmt.Sprintf("已在 %d 个位置找到关键字", len(matches)),
+					}, nil
+				}
+			}
+		}
+	}
+
+	return &toolExecutionResult{
+		Data: map[string]any{
+			"keywords": keywords,
+			"mode":     normalizeSearchMode(mode),
+			"limit":    limit,
+			"matches":  matches,
+		},
+		TouchedSheetIDs: sortedTouchedSheetIDs(touched),
+		Summary:         fmt.Sprintf("已在 %d 个位置找到关键字", len(matches)),
+	}, nil
+}
+
+func (s *AIService) toolSearchSheetRows(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	sheetID, err := int64Arg(args, "sheet_id")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureSheetViewAccess(userID, sheetID); err != nil {
+		return nil, err
+	}
+	keywords := normalizeSearchKeywords(stringSliceArg(args, "keywords"))
+	if len(keywords) == 0 {
+		return nil, fmt.Errorf("keywords is required")
+	}
+	mode, _ := stringArgWithDefault(args, "mode", "any")
+	returnColumns := stringSliceArg(args, "return_columns")
+	limit, _ := intArgWithDefault(args, "limit", 20)
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	startRow, _ := intArgWithDefault(args, "start_row", 0)
+
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.sheetRepo.GetRows(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return nil, err
+	}
+	previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]map[string]any, 0, limit)
+	for _, row := range previewRows {
+		if row.Row < startRow {
+			continue
+		}
+		rowMatches := collectRowKeywordMatches(row.Data, columns, keywords, mode)
+		if len(rowMatches) == 0 {
+			continue
+		}
+		results = append(results, map[string]any{
+			"sheet_id":    sheetID,
+			"sheet_name":  sheet.Name,
+			"row":         row.Row,
+			"display_row": row.DisplayRow,
+			"matches":     rowMatches,
+			"data":        filterRowDataByColumns(row.Data, columns, returnColumns),
+		})
+		if len(results) >= limit {
+			break
+		}
+	}
+
+	return &toolExecutionResult{
+		Data: map[string]any{
+			"sheet_id":   sheetID,
+			"sheet_name": sheet.Name,
+			"keywords":   keywords,
+			"mode":       normalizeSearchMode(mode),
+			"limit":      limit,
+			"rows":       results,
+		},
+		TouchedSheetIDs: []int64{sheetID},
+		Summary:         fmt.Sprintf("在工作表 %s 中找到 %d 条匹配记录", sheet.Name, len(results)),
+	}, nil
+}
+
+func (s *AIService) toolLookupSheetRecords(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	sheetID, err := int64Arg(args, "sheet_id")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureSheetViewAccess(userID, sheetID); err != nil {
+		return nil, err
+	}
+
+	criteria := mapArg(args, "criteria")
+	if len(criteria) == 0 {
+		return nil, fmt.Errorf("criteria is required")
+	}
+	matchMode, _ := stringArgWithDefault(args, "match_mode", "contains")
+	returnColumns := stringSliceArg(args, "return_columns")
+	limit, _ := intArgWithDefault(args, "limit", 20)
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.sheetRepo.GetRows(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return nil, err
+	}
+	previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]map[string]any, 0, limit)
+	for _, row := range previewRows {
+		matchedFields := collectCriteriaMatches(row.Data, columns, criteria, matchMode)
+		if len(matchedFields) == 0 {
+			continue
+		}
+
+		results = append(results, map[string]any{
+			"sheet_id":       sheetID,
+			"sheet_name":     sheet.Name,
+			"row":            row.Row,
+			"display_row":    row.DisplayRow,
+			"matched_fields": matchedFields,
+			"data":           filterRowDataByColumns(row.Data, columns, returnColumns),
+		})
+		if len(results) >= limit {
+			break
+		}
+	}
+
+	return &toolExecutionResult{
+		Data: map[string]any{
+			"sheet_id":     sheetID,
+			"sheet_name":   sheet.Name,
+			"criteria":     criteria,
+			"match_mode":   normalizeLookupMode(matchMode),
+			"limit":        limit,
+			"matched_rows": len(results),
+			"rows":         results,
+		},
+		TouchedSheetIDs: []int64{sheetID},
+		Summary:         fmt.Sprintf("matched %d records in %s", len(results), sheet.Name),
+	}, nil
+}
+
+func (s *AIService) toolCalculateSheetMetrics(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	sheetID, err := int64Arg(args, "sheet_id")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureSheetViewAccess(userID, sheetID); err != nil {
+		return nil, err
+	}
+	columnKeys := normalizeSearchKeywords(stringSliceArg(args, "column_keys"))
+	if len(columnKeys) == 0 {
+		return nil, fmt.Errorf("column_keys is required")
+	}
+	metrics := normalizeSearchKeywords(stringSliceArg(args, "metrics"))
+	if len(metrics) == 0 {
+		return nil, fmt.Errorf("metrics is required")
+	}
+	keywords := normalizeSearchKeywords(stringSliceArg(args, "keywords"))
+	mode, _ := stringArgWithDefault(args, "mode", "any")
+
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.sheetRepo.GetRows(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return nil, err
+	}
+	previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
+	if err != nil {
+		return nil, err
+	}
+	filteredRows := make([]aiPreviewRow, 0, len(previewRows))
+	for _, row := range previewRows {
+		if len(keywords) == 0 || len(collectRowKeywordMatches(row.Data, columns, keywords, mode)) > 0 {
+			filteredRows = append(filteredRows, row)
+		}
+	}
+
+	calculations := make(map[string]map[string]any, len(columnKeys))
+	for _, columnKey := range columnKeys {
+		values := make([]float64, 0, len(filteredRows))
+		nonEmptyCount := 0
+		for _, row := range filteredRows {
+			value, ok := row.Data[columnKey]
+			if !ok || value == nil || strings.TrimSpace(fmt.Sprintf("%v", value)) == "" {
+				continue
+			}
+			nonEmptyCount++
+			if numeric, ok := toFloat64(value); ok {
+				values = append(values, numeric)
+			}
+		}
+
+		columnMetrics := make(map[string]any)
+		for _, metric := range metrics {
+			switch metric {
+			case "sum":
+				columnMetrics[metric] = sumFloat64(values)
+			case "avg":
+				if len(values) == 0 {
+					columnMetrics[metric] = nil
+				} else {
+					columnMetrics[metric] = sumFloat64(values) / float64(len(values))
+				}
+			case "min":
+				columnMetrics[metric] = minFloat64(values)
+			case "max":
+				columnMetrics[metric] = maxFloat64(values)
+			case "count":
+				columnMetrics[metric] = len(values)
+			case "count_non_empty":
+				columnMetrics[metric] = nonEmptyCount
+			}
+		}
+		calculations[columnKey] = columnMetrics
+	}
+
+	return &toolExecutionResult{
+		Data: map[string]any{
+			"sheet_id":        sheetID,
+			"sheet_name":      sheet.Name,
+			"keywords":        keywords,
+			"mode":            normalizeSearchMode(mode),
+			"matched_rows":    len(filteredRows),
+			"column_metrics":  calculations,
+			"requested_stats": metrics,
+		},
+		TouchedSheetIDs: []int64{sheetID},
+		Summary:         fmt.Sprintf("已完成工作表 %s 的快速计算，共统计 %d 行", sheet.Name, len(filteredRows)),
+	}, nil
+}
+
+func (s *AIService) toolCalculateExpression(_ int64, args map[string]any) (*toolExecutionResult, error) {
+	expression, err := stringArg(args, "expression")
+	if err != nil {
+		return nil, err
+	}
+	scale, _ := intArgWithDefault(args, "scale", 4)
+	if scale < 0 {
+		scale = 0
+	}
+	if scale > 8 {
+		scale = 8
+	}
+
+	result, err := evaluateMathExpression(expression)
+	if err != nil {
+		return nil, err
+	}
+
+	return &toolExecutionResult{
+		Data: map[string]any{
+			"expression":       expression,
+			"result":           result,
+			"formatted_result": formatComputedNumber(result, scale),
+			"scale":            scale,
+		},
+		Summary: fmt.Sprintf("%s = %s", expression, formatComputedNumber(result, scale)),
+	}, nil
 }
 
 func (s *AIService) toolUpdateCell(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -1675,6 +2090,323 @@ func mapArg(args map[string]any, key string) map[string]any {
 		return map[string]any{}
 	}
 	return parsed
+}
+
+func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) ([]aiPreviewRow, error) {
+	previewRows := buildAIPreviewRows(sheet, columns, rows)
+	result := make([]aiPreviewRow, 0, len(previewRows))
+	for _, row := range previewRows {
+		filtered := make(map[string]interface{}, len(row.Data))
+		for key, value := range row.Data {
+			allowed, err := s.permService.CheckCellPermission(sheet.ID, userID, key, row.SourceRow, "read")
+			if err != nil {
+				return nil, err
+			}
+			if allowed {
+				filtered[key] = value
+			}
+		}
+		row.Data = filtered
+		result = append(result, row)
+	}
+	return result, nil
+}
+
+func normalizeSearchKeywords(items []string) []string {
+	result := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func normalizeSearchMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "all":
+		return "all"
+	default:
+		return "any"
+	}
+}
+
+func normalizeLookupMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "exact":
+		return "exact"
+	default:
+		return "contains"
+	}
+}
+
+func collectRowKeywordMatches(data map[string]interface{}, columns []sheetColumnPayload, keywords []string, mode string) []map[string]any {
+	if len(keywords) == 0 || len(data) == 0 {
+		return nil
+	}
+	columnMeta := make(map[string]sheetColumnPayload, len(columns))
+	for _, column := range columns {
+		columnMeta[column.Key] = column
+	}
+	matches := make([]map[string]any, 0)
+	matchedKeywords := make(map[string]struct{}, len(keywords))
+	for key, value := range data {
+		text := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", value)))
+		if text == "" {
+			continue
+		}
+		column := columnMeta[key]
+		for _, keyword := range keywords {
+			needle := strings.ToLower(strings.TrimSpace(keyword))
+			if needle == "" || !strings.Contains(text, needle) {
+				continue
+			}
+			matchedKeywords[needle] = struct{}{}
+			matches = append(matches, map[string]any{
+				"keyword":     keyword,
+				"column_key":  key,
+				"column_name": firstNonEmpty(column.Name, key),
+				"value":       value,
+			})
+		}
+	}
+	if normalizeSearchMode(mode) == "all" {
+		for _, keyword := range keywords {
+			if _, ok := matchedKeywords[strings.ToLower(strings.TrimSpace(keyword))]; !ok {
+				return nil
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	return matches
+}
+
+func collectCriteriaMatches(data map[string]interface{}, columns []sheetColumnPayload, criteria map[string]any, matchMode string) []map[string]any {
+	if len(criteria) == 0 || len(data) == 0 {
+		return nil
+	}
+	mode := normalizeLookupMode(matchMode)
+	matches := make([]map[string]any, 0, len(criteria))
+	for rawKey, expected := range criteria {
+		columnKey, columnName := resolveColumnReference(rawKey, columns)
+		if columnKey == "" {
+			return nil
+		}
+		actual, ok := data[columnKey]
+		if !ok {
+			return nil
+		}
+		actualText := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", actual)))
+		expectedText := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", expected)))
+		if actualText == "" || expectedText == "" {
+			return nil
+		}
+		matched := actualText == expectedText
+		if mode == "contains" {
+			matched = strings.Contains(actualText, expectedText)
+		}
+		if !matched {
+			return nil
+		}
+		matches = append(matches, map[string]any{
+			"column_key":  columnKey,
+			"column_name": firstNonEmpty(columnName, columnKey),
+			"expected":    expected,
+			"value":       actual,
+		})
+	}
+	return matches
+}
+
+func resolveColumnReference(reference string, columns []sheetColumnPayload) (string, string) {
+	normalized := strings.ToLower(strings.TrimSpace(reference))
+	for _, column := range columns {
+		if strings.ToLower(strings.TrimSpace(column.Key)) == normalized || strings.ToLower(strings.TrimSpace(column.Name)) == normalized {
+			return column.Key, column.Name
+		}
+	}
+	return "", ""
+}
+
+func filterRowDataByColumns(data map[string]interface{}, columns []sheetColumnPayload, requested []string) map[string]any {
+	if len(requested) == 0 {
+		result := make(map[string]any, len(data))
+		for key, value := range data {
+			result[key] = value
+		}
+		return result
+	}
+	result := make(map[string]any, len(requested))
+	for _, item := range requested {
+		columnKey, _ := resolveColumnReference(item, columns)
+		if columnKey == "" {
+			columnKey = strings.TrimSpace(item)
+		}
+		if value, ok := data[columnKey]; ok {
+			result[columnKey] = value
+		}
+	}
+	return result
+}
+
+func toFloat64(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case json.Number:
+		parsed, err := v.Float64()
+		return parsed, err == nil
+	case string:
+		replacer := strings.NewReplacer(",", "", " ", "", "?", "", "?", "", "$", "")
+		parsed, err := strconv.ParseFloat(replacer.Replace(strings.TrimSpace(v)), 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func sumFloat64(values []float64) float64 {
+	total := 0.0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func minFloat64(values []float64) any {
+	if len(values) == 0 {
+		return nil
+	}
+	minimum := values[0]
+	for _, value := range values[1:] {
+		if value < minimum {
+			minimum = value
+		}
+	}
+	return minimum
+}
+
+func maxFloat64(values []float64) any {
+	if len(values) == 0 {
+		return nil
+	}
+	maximum := values[0]
+	for _, value := range values[1:] {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	return maximum
+}
+
+func evaluateMathExpression(expression string) (float64, error) {
+	parsed, err := parser.ParseExpr(strings.TrimSpace(expression))
+	if err != nil {
+		return 0, fmt.Errorf("invalid expression: %w", err)
+	}
+	return evalMathAST(parsed)
+}
+
+func evalMathAST(expr ast.Expr) (float64, error) {
+	switch node := expr.(type) {
+	case *ast.BasicLit:
+		if node.Kind != token.INT && node.Kind != token.FLOAT {
+			return 0, fmt.Errorf("unsupported literal")
+		}
+		return strconv.ParseFloat(node.Value, 64)
+	case *ast.BinaryExpr:
+		left, err := evalMathAST(node.X)
+		if err != nil {
+			return 0, err
+		}
+		right, err := evalMathAST(node.Y)
+		if err != nil {
+			return 0, err
+		}
+		switch node.Op {
+		case token.ADD:
+			return left + right, nil
+		case token.SUB:
+			return left - right, nil
+		case token.MUL:
+			return left * right, nil
+		case token.QUO:
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return left / right, nil
+		case token.REM:
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return math.Mod(left, right), nil
+		default:
+			return 0, fmt.Errorf("unsupported operator")
+		}
+	case *ast.UnaryExpr:
+		value, err := evalMathAST(node.X)
+		if err != nil {
+			return 0, err
+		}
+		switch node.Op {
+		case token.ADD:
+			return value, nil
+		case token.SUB:
+			return -value, nil
+		default:
+			return 0, fmt.Errorf("unsupported unary operator")
+		}
+	case *ast.ParenExpr:
+		return evalMathAST(node.X)
+	default:
+		return 0, fmt.Errorf("unsupported expression")
+	}
+}
+
+func formatComputedNumber(value float64, scale int) string {
+	if math.Abs(value-math.Round(value)) < 1e-9 {
+		return strconv.FormatInt(int64(math.Round(value)), 10)
+	}
+	formatted := strconv.FormatFloat(value, 'f', scale, 64)
+	formatted = strings.TrimRight(formatted, "0")
+	formatted = strings.TrimRight(formatted, ".")
+	return formatted
+}
+
+func toInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	case float32:
+		return int64(v), true
+	case json.Number:
+		parsed, err := v.Int64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func spreadsheetOperationsArg(args map[string]any, key string) ([]SpreadsheetOperation, error) {

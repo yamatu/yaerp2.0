@@ -29,38 +29,50 @@ function makeId() {
 
 function toolTitle(name: string) {
   switch (name) {
+    case 'get_user_context':
+      return 'Access Scope'
     case 'query_sheet':
-      return '表格查询'
+      return 'Sheet Query'
+    case 'search_spreadsheets':
+      return 'Global Search'
+    case 'search_sheet_rows':
+      return 'Sheet Search'
+    case 'lookup_sheet_records':
+      return 'Record Lookup'
+    case 'calculate_sheet_metrics':
+      return 'Sheet Metrics'
+    case 'calculate_expression':
+      return 'Calculator'
     case 'update_cell':
-      return '单元格修改'
+      return 'Update Cell'
     case 'insert_row':
-      return '新增行'
+      return 'Insert Row'
     case 'delete_row':
-      return '删除行'
+      return 'Delete Row'
     case 'insert_column':
-      return '新增列'
+      return 'Insert Column'
     case 'auto_fill_column':
-      return '批量填充'
+      return 'Auto Fill'
     case 'generate_report':
-      return '生成报表'
+      return 'Generate Report'
     case 'schedule_daily_report':
-      return '定时报表'
+      return 'Scheduled Report'
     case 'preview_spreadsheet_plan':
-      return '待确认修改方案'
+      return 'Preview Plan'
     case 'apply_spreadsheet_plan':
-      return '执行修改'
+      return 'Apply Plan'
     case 'run_workflow':
-      return '工作流执行'
+      return 'Run Workflow'
     case 'create_workbook':
-      return '创建工作簿'
+      return 'Create Workbook'
     case 'create_sheet':
-      return '创建工作表'
+      return 'Create Sheet'
     case 'update_workbook':
-      return '修改工作簿'
+      return 'Update Workbook'
     case 'update_sheet_name':
-      return '重命名工作表'
+      return 'Rename Sheet'
     case 'set_cell_format':
-      return '设置列格式'
+      return 'Set Format'
     default:
       return name
   }
@@ -109,7 +121,7 @@ function renderTracePreview(trace: AIChatToolTrace) {
         className="inline-flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
       >
         <Download className="h-3.5 w-3.5" />
-        下载 {String(data.filename || '报表')}
+        Download {String(data.filename || 'report')}
       </a>
     )
   }
@@ -117,7 +129,7 @@ function renderTracePreview(trace: AIChatToolTrace) {
   if (trace.name === 'schedule_daily_report') {
     return (
       <div className="text-xs leading-6 text-slate-500">
-        任务 #{String(data.schedule_id || '-')} / 时区 {String(data.timezone || '-')} / Cron {String(data.cron_expr || '-')}
+        Task #{String(data.schedule_id || '-')} / TZ {String(data.timezone || '-')} / Cron {String(data.cron_expr || '-')}
       </div>
     )
   }
@@ -131,7 +143,45 @@ function renderTracePreview(trace: AIChatToolTrace) {
     )
   }
 
+  if (trace.name === 'search_spreadsheets' && Array.isArray(data.matches)) {
+    return <div className="text-xs leading-6 text-slate-600">{data.matches.length} matches found</div>
+  }
+
+  if ((trace.name === 'search_sheet_rows' || trace.name === 'lookup_sheet_records') && Array.isArray(data.rows)) {
+    return <div className="text-xs leading-6 text-slate-600">{data.rows.length} rows returned</div>
+  }
+
+  if (trace.name === 'calculate_sheet_metrics' && typeof data.matched_rows === 'number') {
+    return <div className="text-xs leading-6 text-slate-600">{data.matched_rows} rows analyzed</div>
+  }
+
+  if (trace.name === 'calculate_expression' && typeof data.formatted_result === 'string') {
+    return (
+      <div className="rounded-xl bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700">
+        {String(data.expression || '')} = {data.formatted_result}
+      </div>
+    )
+  }
+
   return null
+}
+
+function renderTraceData(trace: AIChatToolTrace) {
+  if (trace.data === undefined) return null
+
+  return (
+    <details className="group mt-3 rounded-xl border border-slate-200 bg-slate-50">
+      <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-slate-600">
+        <span className="group-open:hidden">Show tool JSON</span>
+        <span className="hidden group-open:inline">Hide tool JSON</span>
+      </summary>
+      <div className="border-t border-slate-200 px-3 py-3">
+        <pre className="overflow-x-auto rounded-xl bg-slate-950 px-3 py-2 text-[11px] leading-5 text-slate-100">
+          {JSON.stringify(trace.data, null, 2)}
+        </pre>
+      </div>
+    </details>
+  )
 }
 
 export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
@@ -408,6 +458,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                       </div>
                       <div className="mt-3">
                         {renderTracePreview(trace)}
+                        {renderTraceData(trace)}
                       </div>
                     </div>
                   ))}
