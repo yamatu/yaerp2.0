@@ -8,6 +8,7 @@ out/
 
 # Go
 /backend/tmp/
+/backend/.gocache/
 
 # OS
 .DS_Store
@@ -18,3 +19,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Generated debug artifacts
+ai-chat-response*.json
+ai-preview-response*.json
+docker-compose*.bak
+frontend/tsconfig.tsbuildinfo
