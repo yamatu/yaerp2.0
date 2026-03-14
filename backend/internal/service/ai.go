@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +29,10 @@ type AIService struct {
 	scheduleService *AIScheduleService
 	tools           map[string]ToolFunc
 }
+
+const aiRequestTimeout = 180 * time.Second
+
+var bulkRowCountPattern = regexp.MustCompile(`(?i)(\d+)\s*(?:行|条|rows?)`)
 
 func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo, sheetService *SheetService, permService *PermissionService, uploadService *UploadService, scheduleService *AIScheduleService) *AIService {
 	service := &AIService{
@@ -147,6 +153,12 @@ func (s *AIService) Chat(userID int64, messages []ChatMessage) (*ChatResponse, e
 }
 
 func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*SpreadsheetPlanResponse, error) {
+	if localPlan, ok, err := s.tryBuildLocalRandomDataPlan(req); err != nil {
+		return nil, err
+	} else if ok {
+		return localPlan, nil
+	}
+
 	endpoint, model := s.getActiveConfig()
 	apiKey := s.getAPIKey()
 
@@ -166,11 +178,11 @@ func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*Spread
 				` 返回格式必须是 {"reply":"中文回复","operations":[{"kind":"update_cell","sheet_id":1,"sheet_name":"工作表","row":0,"column_key":"status","value":"已完成","reason":"更新原因"}]}` +
 				`。支持的 kind: update_cell、insert_row、delete_row、insert_column、fill_formula。` +
 				` update_cell 使用 row(0-based 数据行) + column_key + value；` +
-				` insert_row 使用 row(插入后的目标数据行索引) + row_values；` +
-				` delete_row 使用 row(需要删除的 0-based 数据行索引)；` +
+				` insert_row 使用 row(插入后的 0-based 数据行索引) + row_values；如果界面显示是第 2 行，传给工具的 row 应该是 0；空表新增第一条数据时 row 也必须是 0；` +
+				` delete_row 使用 row(需要删除的 0-based 数据行索引)；如果界面显示是第 2 行，传给工具的 row 应该是 0；` +
 				` insert_column 使用 column_key + column_name + column_type，可选 insert_after_column_key；` +
 				` fill_formula 使用 column_key + start_row + end_row + formula_template，formula_template 里可使用 {{row}} 表示当前 Excel 行号（第一条数据是 2）。` +
-				" column_key 必须严格使用上下文中的列 key；只能修改已提供的工作表；如果用户没有要求修改表格，operations 返回空数组。",
+				" rows[*].display_row 只是界面显示行号，绝对不能直接当作 row 回传。column_key 必须严格使用上下文中的列 key；只能修改已提供的工作表；如果用户没有要求修改表格，operations 返回空数组。",
 		},
 		{
 			Role:    "user",
@@ -180,17 +192,183 @@ func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*Spread
 
 	apiResp, err := s.callChatCompletion(endpoint, apiKey, model, messages)
 	if err != nil {
+		if fallbackPlan, ok, fallbackErr := s.tryBuildLocalRandomDataPlan(req); fallbackErr == nil && ok {
+			fallbackPlan.Model = "local-rules-fallback"
+			fallbackPlan.Reply = fallbackPlan.Reply + " 外部 AI 服务暂时不可用，已自动切换到本地规则生成方案。"
+			return fallbackPlan, nil
+		}
 		return nil, err
 	}
 
 	parsed, err := parseSpreadsheetPlan(apiResp.Reply)
 	if err != nil {
+		if fallbackPlan, ok, fallbackErr := s.tryBuildLocalRandomDataPlan(req); fallbackErr == nil && ok {
+			fallbackPlan.Model = "local-rules-fallback"
+			fallbackPlan.Reply = fallbackPlan.Reply + " 外部 AI 返回内容不可解析，已自动切换到本地规则生成方案。"
+			return fallbackPlan, nil
+		}
 		return nil, err
 	}
 
 	parsed.Model = apiResp.Model
 	parsed.Operations = enrichSpreadsheetOperations(parsed.Operations, sheetMeta)
 	return parsed, nil
+}
+
+func (s *AIService) tryBuildLocalRandomDataPlan(req *SpreadsheetPlanRequest) (*SpreadsheetPlanResponse, bool, error) {
+	prompt := strings.TrimSpace(req.Prompt)
+	if !looksLikeRandomDataPrompt(prompt) {
+		return nil, false, nil
+	}
+	rowCount := parseBulkRowCount(prompt)
+	if rowCount <= 0 {
+		rowCount = 20
+	}
+	if rowCount > 200 {
+		rowCount = 200
+	}
+
+	allSheets, err := s.sheetRepo.GetSheetsByWorkbook(req.WorkbookID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	selected := make(map[int64]struct{}, len(req.SheetIDs))
+	for _, sheetID := range req.SheetIDs {
+		selected[sheetID] = struct{}{}
+	}
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	operations := make([]SpreadsheetOperation, 0, len(req.SheetIDs)*rowCount)
+
+	for _, sheet := range allSheets {
+		if _, ok := selected[sheet.ID]; !ok {
+			continue
+		}
+
+		columns, err := parseSheetColumns(sheet.Columns)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(columns) == 0 {
+			return nil, false, fmt.Errorf("工作表 %s 缺少列结构，无法生成随机数据方案", sheet.Name)
+		}
+
+		rows, err := s.sheetRepo.GetRows(sheet.ID)
+		if err != nil {
+			return nil, false, fmt.Errorf("load rows for sheet %d: %w", sheet.ID, err)
+		}
+		existingRowCount := len(rows)
+		if existingRowCount == 0 {
+			existingRowCount = len(extractRowsFromSnapshot(sheet.Config, columns))
+		}
+
+		for i := 0; i < rowCount; i++ {
+			operations = append(operations, SpreadsheetOperation{
+				Kind:      "insert_row",
+				SheetID:   sheet.ID,
+				SheetName: sheet.Name,
+				Row:       existingRowCount + i,
+				RowValues: buildSyntheticRowValues(columns, existingRowCount+i, rng),
+			})
+		}
+	}
+
+	if len(operations) == 0 {
+		return nil, false, fmt.Errorf("no selected sheets found in workbook")
+	}
+
+	return &SpreadsheetPlanResponse{
+		Reply:      fmt.Sprintf("已根据当前表结构直接生成 %d 条随机数据写入方案，无需等待外部 AI 生成批量执行 JSON。", len(operations)),
+		Model:      "local-rules",
+		Operations: operations,
+	}, true, nil
+}
+
+func parseBulkRowCount(prompt string) int {
+	matches := bulkRowCountPattern.FindStringSubmatch(prompt)
+	if len(matches) < 2 {
+		return 0
+	}
+	count, err := strconv.Atoi(matches[1])
+	if err != nil || count <= 0 {
+		return 0
+	}
+	return count
+}
+
+func looksLikeRandomDataPrompt(prompt string) bool {
+	compact := strings.ToLower(strings.TrimSpace(prompt))
+	if compact == "" {
+		return false
+	}
+	hasRandomIntent := strings.Contains(compact, "随机") || strings.Contains(compact, "示例") || strings.Contains(compact, "测试数据") || strings.Contains(compact, "sample") || strings.Contains(compact, "mock")
+	hasGenerateIntent := strings.Contains(compact, "生成") || strings.Contains(compact, "填充") || strings.Contains(compact, "写入") || strings.Contains(compact, "补到") || strings.Contains(compact, "batch")
+	hasRowIntent := strings.Contains(compact, "数据") || strings.Contains(compact, "记录") || strings.Contains(compact, "行") || strings.Contains(compact, "rows") || strings.Contains(compact, "员工")
+	if hasRandomIntent && hasRowIntent {
+		return true
+	}
+	if hasRandomIntent && hasGenerateIntent {
+		return true
+	}
+	return hasRandomIntent && hasRowIntent
+}
+
+func buildSyntheticRowValues(columns []sheetColumnPayload, rowIndex int, rng *rand.Rand) map[string]interface{} {
+	values := make(map[string]interface{}, len(columns))
+	for index, column := range columns {
+		if strings.EqualFold(strings.TrimSpace(column.Type), "formula") {
+			continue
+		}
+		values[column.Key] = syntheticValueForColumn(column, rowIndex, index, rng)
+	}
+	return values
+}
+
+func syntheticValueForColumn(column sheetColumnPayload, rowIndex, columnIndex int, rng *rand.Rand) interface{} {
+	label := strings.ToLower(strings.TrimSpace(column.Name + " " + column.Key))
+	if len(column.Options) > 0 {
+		return column.Options[rng.Intn(len(column.Options))]
+	}
+
+	switch {
+	case strings.Contains(label, "id") || strings.Contains(label, "编号") || strings.Contains(label, "工号"):
+		return fmt.Sprintf("EMP%04d", rowIndex+1)
+	case strings.Contains(label, "姓名") || strings.Contains(label, "name"):
+		names := []string{"张晨", "李想", "王敏", "赵磊", "陈雪", "刘洋", "周宁", "吴迪", "郑凯", "孙悦", "朱琳", "何涛"}
+		return names[(rowIndex+columnIndex)%len(names)]
+	case strings.Contains(label, "部门") || strings.Contains(label, "department"):
+		departments := []string{"技术部", "市场部", "销售部", "人事部", "财务部", "运营部"}
+		return departments[rng.Intn(len(departments))]
+	case strings.Contains(label, "职位") || strings.Contains(label, "岗位") || strings.Contains(label, "position") || strings.Contains(label, "title"):
+		positions := []string{"专员", "工程师", "高级工程师", "主管", "经理", "分析师"}
+		return positions[rng.Intn(len(positions))]
+	case strings.Contains(label, "绩效") || strings.Contains(label, "等级") || strings.Contains(label, "grade") || strings.Contains(label, "rating"):
+		grades := []string{"A", "B", "B+", "A-", "C"}
+		return grades[rng.Intn(len(grades))]
+	case strings.Contains(label, "状态") || strings.Contains(label, "status"):
+		statuses := []string{"在职", "试用", "已转正"}
+		return statuses[rng.Intn(len(statuses))]
+	case strings.Contains(label, "年龄") || strings.Contains(label, "age"):
+		return 22 + rng.Intn(24)
+	case strings.Contains(label, "邮箱") || strings.Contains(label, "email"):
+		return fmt.Sprintf("user%03d@example.com", rowIndex+1)
+	case strings.Contains(label, "电话") || strings.Contains(label, "手机") || strings.Contains(label, "phone") || strings.Contains(label, "mobile"):
+		return fmt.Sprintf("13%09d", rng.Intn(1000000000))
+	case strings.Contains(label, "日期") || strings.Contains(label, "时间") || strings.Contains(label, "date") || strings.Contains(label, "time") || strings.EqualFold(column.Type, "date"):
+		month := time.Month(rng.Intn(12) + 1)
+		day := rng.Intn(28) + 1
+		return time.Date(2019+rng.Intn(7), month, day, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	case strings.Contains(label, "薪") || strings.Contains(label, "工资") || strings.Contains(label, "salary") || strings.Contains(label, "amount") || strings.EqualFold(column.Type, "currency"):
+		return 6000 + rng.Intn(24000)
+	case strings.Contains(label, "数量") || strings.Contains(label, "number") || strings.Contains(label, "count") || strings.EqualFold(column.Type, "number"):
+		return 1 + rng.Intn(500)
+	default:
+		if strings.EqualFold(column.Type, "select") && len(column.Options) == 0 {
+			return fmt.Sprintf("选项%d", (rowIndex%5)+1)
+		}
+		return fmt.Sprintf("%s样本%02d", firstNonEmpty(column.Name, column.Key), rowIndex+1)
+	}
 }
 
 func (s *AIService) ApplySpreadsheetPlan(userID int64, operations []SpreadsheetOperation) error {
@@ -222,7 +400,7 @@ func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: aiRequestTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)

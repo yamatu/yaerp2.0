@@ -74,6 +74,7 @@ func main() {
 	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo)
 	sheetService := service.NewSheetService(sheetRepo, permService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, cfg.JWT.Secret)
+	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
 	backupService := service.NewBackupService(cfg, db, minioClient)
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
@@ -93,6 +94,7 @@ func main() {
 	sheetHandler := handler.NewSheetHandler(sheetService)
 	cellHandler := handler.NewCellHandler(sheetService, permService)
 	uploadHandler := handler.NewUploadHandler(uploadService)
+	importHandler := handler.NewImportHandler(importService)
 	userHandler := handler.NewUserHandler(userRepo, authService)
 	roleHandler := handler.NewRoleHandler(db)
 	permHandler := handler.NewPermissionHandler(permService)
@@ -170,6 +172,8 @@ func main() {
 		api.POST("/upload", uploadHandler.Upload)
 		api.GET("/files/:id", uploadHandler.GetFile)
 		api.GET("/attachments/images", uploadHandler.ListImages)
+		api.GET("/sheets/template", importHandler.DownloadTemplate)
+		api.POST("/workbooks/:id/import/xlsx", importHandler.ImportXLSX)
 
 		// Folders
 		api.POST("/folders", folderHandler.CreateFolder)

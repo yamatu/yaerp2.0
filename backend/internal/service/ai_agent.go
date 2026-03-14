@@ -7,8 +7,8 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
-	"time"
 
 	"yaerp/internal/model"
 )
@@ -202,7 +202,7 @@ func (s *AIService) buildAgentMessages(userID int64, messages []ChatMessage) []m
 				"你是 YaERP 智能表格助手。你必须优先使用工具来查询或修改表格，不要编造不存在的数据。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
-					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
+					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；rows[*].row 一律表示 0-based 数据行索引（第一条数据行为 0，不是界面里显示的第 2 行），display_row 才是界面中的行号；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
 					"\n\n%s"+
 					"\n\n支持的列类型：text（文本）、number（数字）、currency（货币）、date（日期）、select（下拉选择）、image（图片）、formula（公式）。"+
 					"\n支持的公式：SUM、AVERAGE、COUNT、MAX、MIN、IF、VLOOKUP、CONCATENATE 等 Excel 兼容公式。公式模板可使用 {{row}} 表示当前 Excel 行号。"+
@@ -255,7 +255,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":   map[string]any{"type": "integer"},
-				"row":        map[string]any{"type": "integer"},
+				"row":        map[string]any{"type": "integer", "description": "0-based 数据行索引。第一条数据行为 0，不是界面显示的第 2 行"},
 				"column_key": map[string]any{"type": "string"},
 				"value":      map[string]any{},
 			},
@@ -265,7 +265,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":   map[string]any{"type": "integer"},
-				"row":        map[string]any{"type": "integer"},
+				"row":        map[string]any{"type": "integer", "description": "插入后的 0-based 数据行索引。空表第一条数据必须用 0，不要传界面中的第 2 行"},
 				"row_values": map[string]any{"type": "object"},
 			},
 			"required": []string{"sheet_id", "row"},
@@ -274,7 +274,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id": map[string]any{"type": "integer"},
-				"row":      map[string]any{"type": "integer"},
+				"row":      map[string]any{"type": "integer", "description": "0-based 数据行索引。第一条数据行为 0，不是界面显示的第 2 行"},
 			},
 			"required": []string{"sheet_id", "row"},
 		}),
@@ -451,7 +451,7 @@ func doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: aiRequestTimeout}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)
@@ -563,6 +563,55 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 	}
 
 	filteredRows := make([]map[string]any, 0, limit)
+
+	if len(rows) == 0 {
+		// Fallback: extract data from Univer.js snapshot if rows table is empty.
+		// In cellData, row 0 is the header; data rows start from row 1.
+		// API responses still expose rows[*].row as a 0-based data-row index,
+		// while source_row/display_row keep the worksheet coordinates for the UI.
+		snapRows := extractRowsFromSnapshot(sheet.Config, columns)
+		for _, sr := range snapRows {
+			dataRowIndex := sr.RowIndex - 1
+			// display_row = worksheet row + 1 (matches the 1-based row number in the UI)
+			displayRow := sr.RowIndex + 1
+			if dataRowIndex < startRow {
+				continue
+			}
+			data := sr.Data
+			// Apply column filter
+			if len(columnFilter) > 0 {
+				nextData := make(map[string]any, len(columnFilter))
+				for key := range columnFilter {
+					if value, ok := data[key]; ok {
+						nextData[key] = value
+					}
+				}
+				data = nextData
+			}
+			filteredRows = append(filteredRows, map[string]any{
+				"row":         dataRowIndex,
+				"source_row":  sr.RowIndex,
+				"display_row": displayRow,
+				"data":        data,
+			})
+			if len(filteredRows) >= limit {
+				break
+			}
+		}
+
+		totalRows := len(snapRows)
+		return &toolExecutionResult{Data: map[string]any{
+			"sheet_id":    sheet.ID,
+			"sheet_name":  sheet.Name,
+			"columns":     columns,
+			"header_row":  columns,
+			"rows":        filteredRows,
+			"total_rows":  totalRows,
+			"header_only": totalRows == 0 && len(columns) > 0,
+			"data_source": "snapshot",
+		}, Summary: buildQuerySheetSummary(sheet.Name, len(filteredRows), len(columns))}, nil
+	}
+
 	for _, row := range rows {
 		normalizedRowIndex := row.RowIndex - rowBase
 		if normalizedRowIndex < startRow {
@@ -692,18 +741,25 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 	row = operation.Row
 	rowValues = operation.RowValues
 
-	afterRow := row - 1
-	if err := s.validateRowWriteAccess(userID, sheetID, afterRow); err != nil {
+	existingRows, err := s.sheetRepo.GetRows(sheetID)
+	if err != nil {
 		return nil, err
 	}
-	for key := range rowValues {
-		if err := s.validateCellWriteAccess(userID, sheetID, row, key); err != nil {
+	isEmptySheet := len(existingRows) == 0
+
+	if !isEmptySheet {
+		afterRow := row - 1
+		if err := s.validateRowWriteAccess(userID, sheetID, afterRow); err != nil {
 			return nil, err
 		}
-	}
-
-	if err := s.sheetService.InsertRow(userID, sheetID, afterRow); err != nil {
-		return nil, err
+		for key := range rowValues {
+			if err := s.validateCellWriteAccess(userID, sheetID, row, key); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.sheetService.InsertRow(userID, sheetID, afterRow); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(rowValues) > 0 {
@@ -1033,7 +1089,13 @@ func (s *AIService) toolCreateSheet(userID int64, args map[string]any) (*toolExe
 	}
 
 	return &toolExecutionResult{
-		Data:    map[string]any{"ok": true, "sheet_id": sheet.ID, "workbook_id": workbookID, "name": sheet.Name},
+		Data: map[string]any{
+			"ok":          true,
+			"sheet_id":    sheet.ID,
+			"workbook_id": workbookID,
+			"name":        sheet.Name,
+			"hint":        fmt.Sprintf("Use sheet_id=%d (NOT workbook_id=%d) for insert_row, update_cell, query_sheet, etc.", sheet.ID, workbookID),
+		},
 		Summary: fmt.Sprintf("已在工作簿(ID:%d)中创建工作表「%s」(ID:%d)", workbookID, sheet.Name, sheet.ID),
 	}, nil
 }
@@ -1372,9 +1434,6 @@ func (s *AIService) resolveSpreadsheetOperationForExecution(operation Spreadshee
 
 	adjust := func(value int) int {
 		if rowCount == 0 {
-			if value > 0 {
-				return value - 1
-			}
 			return value
 		}
 		if rowBase > 0 && value >= 0 {
@@ -1384,7 +1443,15 @@ func (s *AIService) resolveSpreadsheetOperationForExecution(operation Spreadshee
 	}
 
 	switch operation.Kind {
-	case "update_cell", "insert_row", "delete_row":
+	case "insert_row":
+		if operation.Row < 0 {
+			operation.Row = 0
+		}
+		if operation.Row > rowCount {
+			operation.Row = rowCount
+		}
+		operation.Row = adjust(operation.Row)
+	case "update_cell", "delete_row":
 		operation.Row = adjust(operation.Row)
 	case "fill_formula":
 		if operation.StartRow != nil {
@@ -1402,6 +1469,88 @@ func (s *AIService) resolveSpreadsheetOperationForExecution(operation Spreadshee
 	}
 
 	return operation, nil
+}
+
+type snapshotRow struct {
+	RowIndex int
+	Data     map[string]any
+}
+
+// extractRowsFromSnapshot reads row data from univerSheetData.cellData in the
+// sheet config. This is needed because when users edit via the Univer.js UI,
+// data is saved into the config snapshot rather than the rows table.
+// Row 0 is the header row and is skipped. Column numeric indexes are mapped
+// to column keys using the provided columns definition.
+func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayload) []snapshotRow {
+	if len(config) == 0 || len(columns) == 0 {
+		return nil
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return nil
+	}
+
+	rawSheet, ok := payload["univerSheetData"]
+	if !ok {
+		return nil
+	}
+	sheetData, ok := rawSheet.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	rawCellData, ok := sheetData["cellData"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// Build column index -> key mapping
+	colIndexToKey := make(map[int]string, len(columns))
+	for i, col := range columns {
+		colIndexToKey[i] = col.Key
+	}
+
+	var rows []snapshotRow
+	for rowKeyStr, rowValue := range rawCellData {
+		rowIdx, err := strconv.Atoi(rowKeyStr)
+		if err != nil || rowIdx == 0 {
+			// skip header row (0) and non-numeric keys
+			continue
+		}
+		rowMap, ok := rowValue.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		data := make(map[string]any, len(rowMap))
+		for colKeyStr, cellValue := range rowMap {
+			colIdx, err := strconv.Atoi(colKeyStr)
+			if err != nil {
+				continue
+			}
+			colKey, ok := colIndexToKey[colIdx]
+			if !ok {
+				continue
+			}
+			// Extract the actual value from the cell object {v: ..., f: ...}
+			cellMap, ok := cellValue.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if v, exists := cellMap["v"]; exists {
+				data[colKey] = v
+			}
+		}
+		if len(data) > 0 {
+			rows = append(rows, snapshotRow{RowIndex: rowIdx, Data: data})
+		}
+	}
+
+	// Sort by row index for consistent ordering
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].RowIndex < rows[j].RowIndex
+	})
+
+	return rows
 }
 
 func (s *AIService) invalidateSheetByID(sheetID int64) error {

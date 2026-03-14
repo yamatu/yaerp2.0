@@ -18,6 +18,7 @@ import { getStoredUser, isAdmin } from '@/lib/auth'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
+import ImportXlsxButton from '@/components/spreadsheet/ImportXlsxButton'
 import type { AuthUser, ColumnDef, ProtectionInfo, ProtectionSnapshot, Row, Sheet } from '@/types'
 
 interface Props {
@@ -26,6 +27,7 @@ interface Props {
   reloadToken?: string
   onExternalReload?: () => Promise<void> | void
   optimisticCanEdit?: boolean
+  canImportWorkbook?: boolean
 }
 
 interface GalleryImage {
@@ -406,7 +408,7 @@ function mergeUniverStyleMap(base: Record<string, unknown> | undefined, next: Re
   }
 }
 
-export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload, optimisticCanEdit = false }: Props) {
+export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload, optimisticCanEdit = false, canImportWorkbook = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const persistInFlightRef = useRef<Promise<void> | null>(null)
@@ -415,6 +417,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const univerApiRef = useRef<ReturnType<typeof createUniver> | null>(null)
   const workbookApiRef = useRef<{ setEditable: (editable: boolean) => void } | null>(null)
   const persistRef = useRef<(() => Promise<void>) | null>(null)
+  const reloadTokenRef = useRef(reloadToken)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showImagePicker, setShowImagePicker] = useState(false)
@@ -849,14 +852,31 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       setLoading(true)
       setError('')
       try {
-        // Read the latest sheet data from the ref, not from closure
-        const currentSheet = latestSheetRef.current
+        // On reload (triggered by WebSocket sheet_reload), always fetch fresh
+        // data from the API instead of using the possibly-stale snapshot.
+        const isReload = reloadTokenRef.current !== reloadToken
+        reloadTokenRef.current = reloadToken
+
+        // If this is a reload, re-fetch the sheet metadata first
+        let currentSheet = latestSheetRef.current
+        if (isReload) {
+          try {
+            const sheetRes = await api.get<Sheet>(`/sheets/${currentSheet.id}`)
+            if (sheetRes.code === 0 && sheetRes.data) {
+              currentSheet = sheetRes.data
+              latestSheetRef.current = currentSheet
+            }
+          } catch {
+            // Fall through with existing sheet data
+          }
+        }
+
         setActionError('')
         const config = parseSheetConfig(currentSheet.config)
         const localeCode = 'zh-CN' as IWorkbookData['locale']
         let workbookData: IWorkbookData
 
-        if (config.univerSheetData && typeof config.univerSheetData === 'object') {
+        if (!isReload && config.univerSheetData && typeof config.univerSheetData === 'object') {
           workbookData = wrapWorksheetData(
             workbookId, currentSheet,
             config.univerSheetData as Partial<IWorksheetData>,
@@ -1033,7 +1053,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     mount()
     return () => { disposed = true; cleanup?.() }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
-  }, [sheetId, workbookId])
+  }, [sheetId, workbookId, reloadToken])
 
   useEffect(() => {
     try {
@@ -1350,6 +1370,12 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               >
                 <FileOutput className="h-4 w-4" />
               </button>
+              <ImportXlsxButton
+                workbookId={workbookId}
+                canImport={canImportWorkbook}
+                onImported={onExternalReload}
+                onError={setActionError}
+              />
               <button
                 type="button"
                 onClick={openImagePicker}
