@@ -3,7 +3,7 @@
 import dynamic from 'next/dynamic'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { Archive, ArchiveRestore, ArrowLeft, ChevronLeft, ChevronRight, EyeOff, FileSpreadsheet, Lock, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, Plus, Search, Trash2, Unlock } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import { useWorkbook } from '@/hooks/useSheet'
@@ -38,6 +38,12 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [sheetSortOrder, setSheetSortOrder] = useState<'asc' | 'desc'>('desc')
   const [sheetPage, setSheetPage] = useState(1)
   const [optimisticEditableSheetId, setOptimisticEditableSheetId] = useState<number | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
+
+  const handleSheetReload = useCallback(async () => {
+    await refresh()
+    setReloadToken((prev) => prev + 1)
+  }, [refresh])
 
   const sheets = workbook?.sheets || []
   const isAdminUser = Boolean(currentUser && isAdmin(currentUser))
@@ -53,7 +59,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const { permissions, loading: permissionLoading } = usePermission(activeSheet?.id ?? 0)
   const canDeleteActiveSheet = permissions?.sheet.canDelete ?? false
 
-  useSheetWebSocket(activeSheet?.id ?? 0, refresh)
+  useSheetWebSocket(activeSheet?.id ?? 0, handleSheetReload)
 
   useEffect(() => {
     setCurrentUser(getStoredUser())
@@ -561,7 +567,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
           <main className="min-w-0 flex-1 overflow-hidden">
             {activeSheet ? (
-              <UniverSheetEditor key={activeSheet.id} workbookId={workbookId} sheet={activeSheet} onExternalReload={refresh} optimisticCanEdit={optimisticEditableSheetId === activeSheet.id} />
+              <UniverSheetEditor key={activeSheet.id} workbookId={workbookId} sheet={activeSheet} reloadToken={String(reloadToken)} onExternalReload={refresh} optimisticCanEdit={optimisticEditableSheetId === activeSheet.id} canImportWorkbook={canManageWorkbook} />
             ) : sheets.length === 0 ? (
               <div className="flex h-full items-center justify-center bg-slate-50 text-center">
                 <div className="max-w-sm">
