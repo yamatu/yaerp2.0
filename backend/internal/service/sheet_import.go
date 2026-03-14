@@ -76,13 +76,7 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 		return nil, fmt.Errorf("读取工作表数据失败: %w", err)
 	}
 
-	headerRowIndex := -1
-	for index, row := range rows {
-		if !isImportedRowEmpty(row) {
-			headerRowIndex = index
-			break
-		}
-	}
+	headerRowIndex := detectImportedHeaderRowIndex(rows)
 	if headerRowIndex < 0 {
 		return nil, fmt.Errorf("模板中缺少表头")
 	}
@@ -96,7 +90,7 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 	excelRowNumbers := make([]int, 0, len(rows)-headerRowIndex-1)
 	for index := headerRowIndex + 1; index < len(rows); index++ {
 		row := padImportedRow(rows[index], len(headers))
-		if isImportedRowEmpty(row) {
+		if isImportedRowEmpty(row) || isImportedSummaryRow(row) {
 			continue
 		}
 		dataRows = append(dataRows, row)
@@ -252,6 +246,105 @@ func normalizeImportedHeaderRow(row []string) []string {
 	return result
 }
 
+func detectImportedHeaderRowIndex(rows [][]string) int {
+	firstNonEmpty := -1
+	for index, row := range rows {
+		if isImportedRowEmpty(row) {
+			continue
+		}
+		if firstNonEmpty < 0 {
+			firstNonEmpty = index
+		}
+		if countNonEmptyImportedCells(row) >= 2 {
+			return index
+		}
+	}
+	return firstNonEmpty
+}
+
+func countNonEmptyImportedCells(row []string) int {
+	count := 0
+	for _, cell := range row {
+		if strings.TrimSpace(cell) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func isImportedSummaryRow(row []string) bool {
+	firstNonEmptyIndex := -1
+	nonEmptyValues := make([]string, 0, len(row))
+	for index, cell := range row {
+		trimmed := strings.TrimSpace(cell)
+		if trimmed == "" {
+			continue
+		}
+		if firstNonEmptyIndex < 0 {
+			firstNonEmptyIndex = index
+		}
+		nonEmptyValues = append(nonEmptyValues, strings.ToLower(trimmed))
+	}
+
+	if len(nonEmptyValues) == 0 {
+		return false
+	}
+
+	if firstNonEmptyIndex > 0 {
+		for _, value := range nonEmptyValues {
+			if looksLikeImportedSummaryMarker(value) {
+				return true
+			}
+		}
+	}
+
+	if len(nonEmptyValues) <= 3 {
+		for _, value := range nonEmptyValues {
+			if looksLikeImportedErrorValue(value) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func looksLikeImportedSummaryMarker(value string) bool {
+	summaryMarkers := []string{
+		"total",
+		"subtotal",
+		"grand total",
+		"sum",
+		"合计",
+		"小计",
+		"汇总",
+		"总计",
+	}
+	for _, marker := range summaryMarkers {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeImportedErrorValue(value string) bool {
+	errorMarkers := []string{
+		"#value!",
+		"#name?",
+		"#ref!",
+		"#n/a",
+		"#div/0!",
+		"#num!",
+	}
+	for _, marker := range errorMarkers {
+		if value == marker {
+			return true
+		}
+	}
+	return false
+}
+
 func inferImportedColumns(headers []string, dataRows [][]string) []sheetColumnPayload {
 	seenKeys := make(map[string]int)
 	columns := make([]sheetColumnPayload, 0, len(headers))
@@ -292,22 +385,28 @@ func importedColumnSamples(dataRows [][]string, index int) []string {
 
 func inferImportedColumnType(header string, samples []string) (string, []string) {
 	label := strings.ToLower(strings.TrimSpace(header))
+	if isImportedIdentifierLabel(label) {
+		return "text", nil
+	}
 	switch {
 	case strings.Contains(label, "日期") || strings.Contains(label, "时间") || strings.Contains(label, "date") || strings.Contains(label, "time"):
 		return "date", nil
 	case strings.Contains(label, "薪") || strings.Contains(label, "金额") || strings.Contains(label, "预算") || strings.Contains(label, "salary") || strings.Contains(label, "amount"):
 		return "currency", nil
-	case strings.Contains(label, "年龄") || strings.Contains(label, "数量") || strings.Contains(label, "编号") || strings.Contains(label, "age") || strings.Contains(label, "count"):
+	case strings.Contains(label, "年龄") || strings.Contains(label, "数量") || strings.Contains(label, "age") || strings.Contains(label, "count"):
 		return "number", nil
 	case strings.Contains(label, "绩效") || strings.Contains(label, "等级") || strings.Contains(label, "状态") || strings.Contains(label, "status") || strings.Contains(label, "grade"):
 		return "select", buildImportedOptions(samples)
 	}
 
-	if len(samples) > 0 && allImportedSamplesNumeric(samples) {
+	if len(samples) > 0 && shouldInferImportedNumeric(samples) {
 		return "number", nil
 	}
 	if len(samples) > 0 && allImportedSamplesDateLike(samples) {
 		return "date", nil
+	}
+	if len(samples) > 0 && allImportedSamplesLookLikeIdentifiers(samples) {
+		return "text", nil
 	}
 	options := buildImportedOptions(samples)
 	if len(options) >= 2 && len(options) <= 8 {
@@ -340,6 +439,90 @@ func allImportedSamplesNumeric(samples []string) bool {
 		}
 	}
 	return len(samples) > 0
+}
+
+func shouldInferImportedNumeric(samples []string) bool {
+	if !allImportedSamplesNumeric(samples) {
+		return false
+	}
+	for _, sample := range samples {
+		if importedSampleLooksLikeIdentifier(sample) {
+			return false
+		}
+	}
+	return true
+}
+
+func allImportedSamplesLookLikeIdentifiers(samples []string) bool {
+	for _, sample := range samples {
+		if !importedSampleLooksLikeIdentifier(sample) {
+			return false
+		}
+	}
+	return len(samples) > 0
+}
+
+func isImportedIdentifierLabel(label string) bool {
+	identifierHints := []string{
+		"id",
+		"code",
+		"no",
+		"number",
+		"serial",
+		"sku",
+		"barcode",
+		"phone",
+		"mobile",
+		"tel",
+		"account",
+		"employee no",
+		"employee id",
+		"编号",
+		"编码",
+		"工号",
+		"学号",
+		"单号",
+		"订单号",
+		"手机",
+		"电话",
+		"账户",
+		"账号",
+		"身份证",
+		"证件",
+		"卡号",
+	}
+	for _, hint := range identifierHints {
+		if strings.Contains(label, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func importedSampleLooksLikeIdentifier(sample string) bool {
+	trimmed := strings.TrimSpace(sample)
+	if trimmed == "" {
+		return false
+	}
+	if strings.ContainsAny(trimmed, ".eE") {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "+") {
+		trimmed = trimmed[1:]
+	}
+	normalized := strings.NewReplacer(",", "", " ", "").Replace(trimmed)
+	if normalized == "" {
+		return false
+	}
+	for _, r := range normalized {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	if len(normalized) > 1 && normalized[0] == '0' {
+		return true
+	}
+	return len(normalized) >= 8
 }
 
 func allImportedSamplesDateLike(samples []string) bool {
@@ -480,7 +663,29 @@ func parseImportedDate(value string) (string, bool) {
 			return parsed.Format("2006-01-02"), true
 		}
 	}
+	if excelDate, ok := parseImportedExcelSerialDate(trimmed); ok {
+		return excelDate, true
+	}
 	return "", false
+}
+
+func parseImportedExcelSerialDate(value string) (string, bool) {
+	if value == "" || strings.ContainsAny(value, "eE") {
+		return "", false
+	}
+	numeric, err := strconv.ParseFloat(strings.ReplaceAll(value, ",", ""), 64)
+	if err != nil {
+		return "", false
+	}
+	// Excel serial dates for modern documents are typically in this range.
+	if numeric < 1 || numeric > 100000 {
+		return "", false
+	}
+	parsed, err := excelize.ExcelDateToTime(numeric, false)
+	if err != nil {
+		return "", false
+	}
+	return parsed.Format("2006-01-02"), true
 }
 
 func isImportedRowEmpty(row []string) bool {
