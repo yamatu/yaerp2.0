@@ -471,31 +471,31 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 		if err != nil {
 			return "", nil, fmt.Errorf("load rows for sheet %d: %w", sheet.ID, err)
 		}
-		rowBase := getSheetRowBase(rows)
 
 		columns := make([]sheetPreviewColumn, 0)
 		if len(sheet.Columns) > 0 {
 			_ = json.Unmarshal(sheet.Columns, &columns)
 		}
 
-		rowItems := make([]map[string]interface{}, 0, len(rows))
+		parsedColumns, err := parseSheetColumns(sheet.Columns)
+		if err != nil {
+			return "", nil, err
+		}
+		previewRows := buildAIPreviewRows(&sheet, parsedColumns, rows)
+		rowItems := make([]map[string]interface{}, 0, len(previewRows))
 		currentValues := make(map[string]interface{})
-		for index, row := range rows {
+		for index, row := range previewRows {
 			if index >= 200 {
 				break
 			}
-
-			data := make(map[string]interface{})
-			_ = json.Unmarshal(row.Data, &data)
-			normalizedRowIndex := row.RowIndex - rowBase
 			rowItems = append(rowItems, map[string]interface{}{
-				"row":         normalizedRowIndex,
-				"source_row":  row.RowIndex,
-				"display_row": normalizedRowIndex + 2,
-				"data":        data,
+				"row":         row.Row,
+				"source_row":  row.SourceRow,
+				"display_row": row.DisplayRow,
+				"data":        row.Data,
 			})
-			for key, value := range data {
-				currentValues[fmt.Sprintf("%d:%s", normalizedRowIndex, key)] = value
+			for key, value := range row.Data {
+				currentValues[fmt.Sprintf("%d:%s", row.Row, key)] = value
 			}
 		}
 
@@ -514,7 +514,7 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 			"sheet_id":   sheet.ID,
 			"sheet_name": sheet.Name,
 			"columns":    columns,
-			"row_base":   rowBase,
+			"row_base":   0,
 			"rows":       rowItems,
 		})
 	}
@@ -619,6 +619,13 @@ type sheetPreviewMeta struct {
 	CurrentValues map[string]interface{}
 }
 
+type aiPreviewRow struct {
+	Row        int
+	SourceRow  int
+	DisplayRow int
+	Data       map[string]interface{}
+}
+
 type sheetColumnPayload struct {
 	Key            string                 `json:"key"`
 	Name           string                 `json:"name"`
@@ -661,6 +668,46 @@ func enrichSpreadsheetOperations(operations []SpreadsheetOperation, meta map[int
 		return result[i].SheetID < result[j].SheetID
 	})
 
+	return result
+}
+
+func buildAIPreviewRows(sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) []aiPreviewRow {
+	snapshotRows := extractRowsFromSnapshot(sheet.Config, columns)
+	if len(snapshotRows) > 0 {
+		result := make([]aiPreviewRow, 0, len(snapshotRows))
+		for _, sr := range snapshotRows {
+			dataRowIndex := sr.RowIndex - 1
+			result = append(result, aiPreviewRow{
+				Row:        dataRowIndex,
+				SourceRow:  sr.RowIndex,
+				DisplayRow: sr.RowIndex + 1,
+				Data:       toStringAnyMap(sr.Data),
+			})
+		}
+		return result
+	}
+
+	rowBase := getSheetRowBase(rows)
+	result := make([]aiPreviewRow, 0, len(rows))
+	for _, row := range rows {
+		data := make(map[string]interface{})
+		_ = json.Unmarshal(row.Data, &data)
+		normalizedRowIndex := row.RowIndex - rowBase
+		result = append(result, aiPreviewRow{
+			Row:        normalizedRowIndex,
+			SourceRow:  row.RowIndex,
+			DisplayRow: normalizedRowIndex + 2,
+			Data:       data,
+		})
+	}
+	return result
+}
+
+func toStringAnyMap(input map[string]any) map[string]interface{} {
+	result := make(map[string]interface{}, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
 	return result
 }
 
