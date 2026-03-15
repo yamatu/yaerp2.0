@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation'
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { Archive, ArchiveRestore, ArrowLeft, ChevronLeft, ChevronRight, EyeOff, FileSpreadsheet, Lock, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, Plus, Search, Trash2, Unlock } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import { useWorkbook } from '@/hooks/useSheet'
 import { usePermission } from '@/hooks/usePermission'
 import { useSheetWebSocket } from '@/hooks/useSheetWebSocket'
@@ -39,6 +40,10 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [sheetPage, setSheetPage] = useState(1)
   const [optimisticEditableSheetId, setOptimisticEditableSheetId] = useState<number | null>(null)
   const [reloadToken, setReloadToken] = useState(0)
+  const [sidebarDragImportActive, setSidebarDragImportActive] = useState(false)
+  const [sidebarDragImportUploading, setSidebarDragImportUploading] = useState(false)
+  const [sidebarDragImportProgress, setSidebarDragImportProgress] = useState(0)
+  const sidebarDragDepthRef = useRef(0)
 
   const handleSheetReload = useCallback(async () => {
     await refresh()
@@ -49,6 +54,75 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const isAdminUser = Boolean(currentUser && isAdmin(currentUser))
   const canManageWorkbook = Boolean(currentUser && (isAdmin(currentUser) || currentUser.id === workbook?.owner_id))
   const sheetsPerPage = 10
+
+  const handleSidebarDroppedXlsxImport = useCallback(async (file: File) => {
+    if (!canManageWorkbook) {
+      setSheetActionError('Current account does not have permission to import XLSX.')
+      return
+    }
+
+    setSheetActionError('')
+    setSidebarDragImportUploading(true)
+    setSidebarDragImportProgress(0)
+
+    try {
+      const result = await uploadWorkbookXlsx(workbookId, file, {
+        onProgress: setSidebarDragImportProgress,
+      })
+      await handleSheetReload()
+      router.replace(`/sheets/${workbookId}/${result.sheet_id}`)
+    } catch (error) {
+      setSheetActionError(error instanceof Error ? error.message : 'Import failed. Please try again later.')
+    } finally {
+      setSidebarDragImportUploading(false)
+      setSidebarDragImportActive(false)
+      sidebarDragDepthRef.current = 0
+      window.setTimeout(() => setSidebarDragImportProgress(0), 400)
+    }
+  }, [canManageWorkbook, handleSheetReload, router, workbookId])
+
+  const handleSidebarDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canManageWorkbook || sidebarDragImportUploading) return
+    const hasFile = Array.from(event.dataTransfer.types || []).includes('Files')
+    if (!hasFile) return
+    event.preventDefault()
+    sidebarDragDepthRef.current += 1
+    setSidebarDragImportActive(true)
+  }, [canManageWorkbook, sidebarDragImportUploading])
+
+  const handleSidebarDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canManageWorkbook || sidebarDragImportUploading) return
+    const hasFile = Array.from(event.dataTransfer.types || []).includes('Files')
+    if (!hasFile) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }, [canManageWorkbook, sidebarDragImportUploading])
+
+  const handleSidebarDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canManageWorkbook || sidebarDragImportUploading) return
+    const hasFile = Array.from(event.dataTransfer.types || []).includes('Files')
+    if (!hasFile) return
+    event.preventDefault()
+    sidebarDragDepthRef.current = Math.max(0, sidebarDragDepthRef.current - 1)
+    if (sidebarDragDepthRef.current === 0) {
+      setSidebarDragImportActive(false)
+    }
+  }, [canManageWorkbook, sidebarDragImportUploading])
+
+  const handleSidebarDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canManageWorkbook || sidebarDragImportUploading) return
+    const files = Array.from(event.dataTransfer.files || [])
+    if (files.length === 0) return
+    event.preventDefault()
+    sidebarDragDepthRef.current = 0
+    setSidebarDragImportActive(false)
+    const xlsxFile = files.find((item) => item.name.toLowerCase().endsWith('.xlsx'))
+    if (!xlsxFile) {
+      setSheetActionError('Only .xlsx files can be dropped here.')
+      return
+    }
+    void handleSidebarDroppedXlsxImport(xlsxFile)
+  }, [canManageWorkbook, handleSidebarDroppedXlsxImport, sidebarDragImportUploading])
 
   const activeSheet = useMemo(() => {
     if (requestedSheetId === null) return null
@@ -519,7 +593,39 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
               </div>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            <div
+              className="relative min-h-0 flex-1 overflow-y-auto p-3"
+              onDragEnter={handleSidebarDragEnter}
+              onDragOver={handleSidebarDragOver}
+              onDragLeave={handleSidebarDragLeave}
+              onDrop={handleSidebarDrop}
+            >
+              {(sidebarDragImportActive || sidebarDragImportUploading) && (
+                <div className="pointer-events-none absolute inset-3 z-10 flex items-center justify-center rounded-3xl border-2 border-dashed border-sky-300 bg-sky-50/95 p-6 text-center shadow-sm">
+                  <div className="max-w-[220px]">
+                    <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-sky-600 shadow-sm">
+                      <FileSpreadsheet className="h-7 w-7" />
+                    </div>
+                    <div className="mt-4 text-sm font-semibold text-slate-900">
+                      {sidebarDragImportUploading ? '正在导入 XLSX...' : '将 XLSX 拖到这里导入到当前工作簿'}
+                    </div>
+                    <div className="mt-2 text-xs leading-5 text-slate-500">
+                      导入后会自动创建工作表并跳转到新表。
+                    </div>
+                    {sidebarDragImportUploading && (
+                      <div className="mt-4">
+                        <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600">
+                          <span>Importing</span>
+                          <span>{sidebarDragImportProgress}%</span>
+                        </div>
+                        <div className="mt-2 h-2 overflow-hidden rounded-full bg-sky-100">
+                          <div className="h-full rounded-full bg-sky-500 transition-all duration-200" style={{ width: `${sidebarDragImportProgress}%` }} />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
               <div className="space-y-2">
                 {visibleSheets.map((sheet) => {
                   const sheetLabel = sheet.name?.trim() || `工作表 ${sheets.findIndex((item) => item.id === sheet.id) + 1}`
