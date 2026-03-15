@@ -6,12 +6,16 @@ import { Download, Upload } from 'lucide-react'
 import api from '@/lib/api'
 import type { ApiResponse, Sheet } from '@/types'
 
-interface ImportResponse {
+export interface ImportResponse {
   sheet: Sheet
   sheet_id: number
   imported_rows: number
   attachment_id?: number
   attachment_url?: string
+}
+
+interface UploadWorkbookXlsxOptions {
+  onProgress?: (progress: number) => void
 }
 
 interface Props {
@@ -48,6 +52,53 @@ function triggerBrowserDownload(blob: Blob, filename: string) {
   window.URL.revokeObjectURL(url)
 }
 
+export async function uploadWorkbookXlsx(
+  workbookId: string | number,
+  file: File,
+  options: UploadWorkbookXlsxOptions = {}
+) {
+  if (!file.name.toLowerCase().endsWith('.xlsx')) {
+    throw new Error('Only .xlsx files are supported.')
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    throw new Error('File size must be 20MB or smaller.')
+  }
+
+  const token = typeof window === 'undefined' ? null : localStorage.getItem('access_token')
+  const formData = new FormData()
+  formData.append('file', file)
+  options.onProgress?.(0)
+
+  const responseText = await new Promise<string>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/workbooks/${workbookId}/import/xlsx`)
+    if (token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    }
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return
+      options.onProgress?.(Math.round((event.loaded / event.total) * 100))
+    }
+
+    xhr.onload = () => resolve(xhr.responseText)
+    xhr.onerror = () => reject(new Error('Upload failed. Check your network connection and try again.'))
+    xhr.onabort = () => reject(new Error('Upload was cancelled.'))
+    xhr.send(formData)
+  })
+
+  const payload = JSON.parse(responseText) as ApiResponse<ImportResponse> & { data?: ImportResponse & { row?: number } }
+  if (payload.code !== 0 || !payload.data?.sheet_id) {
+    const rowMessage = payload.data && 'row' in payload.data && payload.data.row
+      ? ` (error row: ${payload.data.row})`
+      : ''
+    throw new Error(`${payload.message || 'Import failed. Please try again later.'}${rowMessage}`)
+  }
+
+  options.onProgress?.(100)
+  return payload.data
+}
+
 export default function ImportXlsxButton({ workbookId, canImport, onImported, onError }: Props) {
   const router = useRouter()
   const inputRef = useRef<HTMLInputElement | null>(null)
@@ -65,14 +116,14 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
     try {
       const res = await api.download('/sheets/template')
       if (!res.ok) {
-        let message = '下载模板失败，请稍后再试。'
+        let message = 'Failed to download template.'
         try {
           const payload = await res.json() as ApiResponse<unknown>
           if (payload.message) {
             message = payload.message
           }
         } catch {
-          // ignore json parse errors
+          // Ignore JSON parse errors for non-JSON responses.
         }
         throw new Error(message)
       }
@@ -81,7 +132,7 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
       const filename = parseFilenameFromDisposition(res.headers.get('content-disposition'), 'sheet_import_template.xlsx')
       triggerBrowserDownload(blob, filename)
     } catch (error) {
-      reportError(error instanceof Error ? error.message : '下载模板失败，请稍后再试。')
+      reportError(error instanceof Error ? error.message : 'Failed to download template.')
     } finally {
       setDownloadingTemplate(false)
     }
@@ -89,61 +140,22 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
 
   const handleFileUpload = async (file: File) => {
     if (!canImport) {
-      reportError('当前账号没有新建工作表权限，不能导入 XLSX。')
+      reportError('Current account does not have permission to import XLSX.')
       return
     }
-
-    if (!file.name.toLowerCase().endsWith('.xlsx')) {
-      reportError('仅支持导入 .xlsx 文件。')
-      return
-    }
-    if (file.size > 20 * 1024 * 1024) {
-      reportError('文件大小不能超过 20MB。')
-      return
-    }
-
-    const token = typeof window === 'undefined' ? null : localStorage.getItem('access_token')
-    const formData = new FormData()
-    formData.append('file', file)
 
     setUploading(true)
     setProgress(0)
     reportError('')
 
     try {
-      const responseText = await new Promise<string>((resolve, reject) => {
-        const xhr = new XMLHttpRequest()
-        xhr.open('POST', `/api/workbooks/${workbookId}/import/xlsx`)
-        if (token) {
-          xhr.setRequestHeader('Authorization', `Bearer ${token}`)
-        }
-
-        xhr.upload.onprogress = (event) => {
-          if (!event.lengthComputable) return
-          setProgress(Math.round((event.loaded / event.total) * 100))
-        }
-
-        xhr.onload = () => {
-          resolve(xhr.responseText)
-        }
-        xhr.onerror = () => reject(new Error('上传失败，请检查网络连接。'))
-        xhr.onabort = () => reject(new Error('上传已取消。'))
-        xhr.send(formData)
+      const result = await uploadWorkbookXlsx(workbookId, file, {
+        onProgress: setProgress,
       })
-
-      const payload = JSON.parse(responseText) as ApiResponse<ImportResponse> & { data?: ImportResponse & { row?: number } }
-      if (payload.code !== 0 || !payload.data?.sheet_id) {
-        const rowMessage = payload.data && 'row' in payload.data && payload.data.row
-          ? `（错误行：${payload.data.row}）`
-          : ''
-        throw new Error(`${payload.message || '导入失败，请稍后再试。'}${rowMessage}`)
-      }
-
-      setProgress(100)
       await onImported?.()
-      router.push(`/sheets/${workbookId}/${payload.data.sheet_id}`)
+      router.push(`/sheets/${workbookId}/${result.sheet_id}`)
     } catch (error) {
-      reportError(error instanceof Error ? error.message : '导入失败，请稍后再试。')
+      reportError(error instanceof Error ? error.message : 'Import failed. Please try again later.')
     } finally {
       setUploading(false)
       setTimeout(() => setProgress(0), 400)
@@ -160,7 +172,7 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
         onClick={handleTemplateDownload}
         disabled={downloadingTemplate || uploading}
         className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-        title="下载导入模板"
+        title="Download Import Template"
       >
         <Download className="h-4 w-4" />
       </button>
@@ -169,7 +181,7 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
         onClick={() => inputRef.current?.click()}
         disabled={!canImport || uploading || downloadingTemplate}
         className="relative flex h-10 w-10 items-center justify-center rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 shadow-lg transition hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
-        title="导入 XLSX"
+        title="Import XLSX"
       >
         <Upload className="h-4 w-4" />
         <input
@@ -188,7 +200,7 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
       {uploading && (
         <div className="w-40 rounded-2xl border border-slate-200 bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
           <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600">
-            <span>导入中</span>
+            <span>Importing</span>
             <span>{progress}%</span>
           </div>
           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-200">

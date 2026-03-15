@@ -18,7 +18,7 @@ import { getStoredUser, isAdmin } from '@/lib/auth'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
-import ImportXlsxButton from '@/components/spreadsheet/ImportXlsxButton'
+import ImportXlsxButton, { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import type { AuthUser, ColumnDef, ProtectionInfo, ProtectionSnapshot, Row, Sheet } from '@/types'
 
 interface Props {
@@ -429,6 +429,10 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const [toolbarExpanded, setToolbarExpanded] = useState(false)
   const [hasFilter, setHasFilter] = useState(false)
   const [actionError, setActionError] = useState('')
+  const [dragImportActive, setDragImportActive] = useState(false)
+  const [dragImportUploading, setDragImportUploading] = useState(false)
+  const [dragImportProgress, setDragImportProgress] = useState(0)
+  const dragDepthRef = useRef(0)
   const [showProtectionPanel, setShowProtectionPanel] = useState(false)
   const [selectionState, setSelectionState] = useState<SelectionState | null>(null)
   const [protectionSnapshot, setProtectionSnapshot] = useState<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
@@ -613,6 +617,75 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       // Errors are already surfaced through the action toast.
     }
   }, [persistCurrentSheet])
+
+  const handleDroppedXlsxImport = useCallback(async (file: File) => {
+    if (!canImportWorkbook) {
+      setActionError('Current account does not have permission to import XLSX.')
+      return
+    }
+
+    setActionError('')
+    setDragImportUploading(true)
+    setDragImportProgress(0)
+
+    try {
+      const result = await uploadWorkbookXlsx(workbookId, file, {
+        onProgress: setDragImportProgress,
+      })
+      await onExternalReload?.()
+      window.location.href = `/sheets/${workbookId}/${result.sheet_id}`
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Import failed. Please try again later.')
+    } finally {
+      setDragImportUploading(false)
+      setDragImportActive(false)
+      dragDepthRef.current = 0
+      window.setTimeout(() => setDragImportProgress(0), 400)
+    }
+  }, [canImportWorkbook, onExternalReload, workbookId])
+
+  const handleContainerDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canImportWorkbook || dragImportUploading) return
+    const hasFile = Array.from(event.dataTransfer.types || []).includes('Files')
+    if (!hasFile) return
+    event.preventDefault()
+    dragDepthRef.current += 1
+    setDragImportActive(true)
+  }, [canImportWorkbook, dragImportUploading])
+
+  const handleContainerDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canImportWorkbook || dragImportUploading) return
+    const hasFile = Array.from(event.dataTransfer.types || []).includes('Files')
+    if (!hasFile) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }, [canImportWorkbook, dragImportUploading])
+
+  const handleContainerDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canImportWorkbook || dragImportUploading) return
+    const hasFile = Array.from(event.dataTransfer.types || []).includes('Files')
+    if (!hasFile) return
+    event.preventDefault()
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) {
+      setDragImportActive(false)
+    }
+  }, [canImportWorkbook, dragImportUploading])
+
+  const handleContainerDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!canImportWorkbook || dragImportUploading) return
+    const files = Array.from(event.dataTransfer.files || [])
+    if (files.length === 0) return
+    event.preventDefault()
+    dragDepthRef.current = 0
+    setDragImportActive(false)
+    const xlsxFile = files.find((item) => item.name.toLowerCase().endsWith('.xlsx'))
+    if (!xlsxFile) {
+      setActionError('Only .xlsx files can be dropped here.')
+      return
+    }
+    void handleDroppedXlsxImport(xlsxFile)
+  }, [canImportWorkbook, dragImportUploading, handleDroppedXlsxImport])
 
   const handleEnableFilter = useCallback(async () => {
     if (editLocked) {
@@ -1306,8 +1379,41 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   ].slice(0, 6)
 
   return (
-    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div
+      style={{ width: '100%', height: '100%', position: 'relative' }}
+      onDragEnter={handleContainerDragEnter}
+      onDragOver={handleContainerDragOver}
+      onDragLeave={handleContainerDragLeave}
+      onDrop={handleContainerDrop}
+    >
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
+
+      {(dragImportActive || dragImportUploading) && (
+        <div className="absolute inset-0 z-[25] flex items-center justify-center bg-slate-950/18 backdrop-blur-[2px]">
+          <div className="w-[min(28rem,calc(100%-2rem))] rounded-[28px] border border-dashed border-sky-300 bg-white/96 px-6 py-8 text-center shadow-2xl">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-sky-50 text-sky-700">
+              <Columns3 className="h-6 w-6" />
+            </div>
+            <div className="mt-4 text-base font-semibold text-slate-900">
+              {dragImportUploading ? 'Importing XLSX...' : 'Drop XLSX file to import'}
+            </div>
+            <div className="mt-2 text-sm leading-6 text-slate-500">
+              The file will be imported into this workbook and a new sheet will be created automatically.
+            </div>
+            {dragImportUploading && (
+              <div className="mx-auto mt-5 max-w-xs">
+                <div className="flex items-center justify-between text-xs font-semibold text-slate-600">
+                  <span>Uploading</span>
+                  <span>{dragImportProgress}%</span>
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                  <div className="h-full rounded-full bg-sky-500 transition-all duration-200" style={{ width: `${dragImportProgress}%` }} />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
