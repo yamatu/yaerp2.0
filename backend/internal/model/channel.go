@@ -57,9 +57,11 @@ type ChannelMessage struct {
 	SenderAvatar           *string    `json:"sender_avatar,omitempty" db:"sender_avatar"`
 	SenderType             string     `json:"sender_type" db:"sender_type"`
 	ExternalSource         *string    `json:"external_source,omitempty" db:"external_source"`
+	ExternalAccountID      *int64     `json:"external_account_id,omitempty" db:"external_account_id"`
 	ExternalMessageID      *string    `json:"external_message_id,omitempty" db:"external_message_id"`
 	ExternalSenderName     *string    `json:"external_sender_name,omitempty" db:"external_sender_name"`
 	ExternalSenderAddress  *string    `json:"external_sender_address,omitempty" db:"external_sender_address"`
+	ExternalSenderAvatar   *string    `json:"external_sender_avatar,omitempty" db:"external_sender_avatar"`
 	AssistantID            *int64     `json:"assistant_id,omitempty" db:"assistant_id"`
 	AssistantName          string     `json:"assistant_name,omitempty" db:"assistant_name"`
 	Content                string     `json:"content" db:"content"`
@@ -212,41 +214,83 @@ type WhatsAppStatus struct {
 	UpdatedAt      string                 `json:"updatedAt,omitempty"`
 }
 
+type WhatsAppAccount struct {
+	ID              int64      `json:"id"`
+	UserID          int64      `json:"user_id"`
+	Username        string     `json:"username"`
+	Email           string     `json:"email"`
+	Enabled         bool       `json:"enabled"`
+	AutoStart       bool       `json:"auto_start"`
+	Status          string     `json:"status"`
+	WhatsAppID      string     `json:"whatsapp_id"`
+	DisplayName     string     `json:"display_name"`
+	PhoneNumber     string     `json:"phone_number"`
+	ProfilePicURL   string     `json:"profile_pic_url"`
+	About           string     `json:"about"`
+	Platform        string     `json:"platform"`
+	LastError       string     `json:"last_error"`
+	LastConnectedAt *time.Time `json:"last_connected_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	QRDataURL       string     `json:"qr_data_url,omitempty"`
+	LoadingPercent  int        `json:"loading_percent"`
+	LoadingMessage  string     `json:"loading_message,omitempty"`
+}
+
 type WhatsAppChat struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	IsGroup     bool   `json:"isGroup"`
-	UnreadCount int    `json:"unreadCount"`
-	Timestamp   int64  `json:"timestamp"`
-	Pinned      bool   `json:"pinned"`
-	Archived    bool   `json:"archived"`
-	IsMuted     bool   `json:"isMuted"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	IsGroup          bool   `json:"isGroup"`
+	UnreadCount      int    `json:"unreadCount"`
+	Timestamp        int64  `json:"timestamp"`
+	Pinned           bool   `json:"pinned"`
+	Archived         bool   `json:"archived"`
+	IsMuted          bool   `json:"isMuted"`
+	ProfilePicURL    string `json:"profilePicUrl"`
+	About            string `json:"about"`
+	Description      string `json:"description"`
+	ParticipantCount int    `json:"participantCount"`
+	LastMessage      string `json:"lastMessage"`
 }
 
 type WhatsAppChannelLink struct {
-	ChannelID        int64     `json:"channel_id"`
-	WhatsAppChatID   string    `json:"whatsapp_chat_id"`
-	WhatsAppChatName string    `json:"whatsapp_chat_name"`
-	SyncInbound      bool      `json:"sync_inbound"`
-	SyncOutbound     bool      `json:"sync_outbound"`
-	CreatedBy        int64     `json:"created_by"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ChannelID                int64     `json:"channel_id"`
+	WhatsAppAccountID        int64     `json:"whatsapp_account_id"`
+	WhatsAppUserID           int64     `json:"whatsapp_user_id"`
+	WhatsAppUsername         string    `json:"whatsapp_username"`
+	WhatsAppDisplayName      string    `json:"whatsapp_display_name"`
+	WhatsAppChatID           string    `json:"whatsapp_chat_id"`
+	WhatsAppChatName         string    `json:"whatsapp_chat_name"`
+	WhatsAppChatAvatarURL    string    `json:"whatsapp_chat_avatar_url"`
+	WhatsAppChatAbout        string    `json:"whatsapp_chat_about"`
+	WhatsAppIsGroup          bool      `json:"whatsapp_is_group"`
+	WhatsAppParticipantCount int       `json:"whatsapp_participant_count"`
+	SyncInbound              bool      `json:"sync_inbound"`
+	SyncOutbound             bool      `json:"sync_outbound"`
+	CreatedBy                int64     `json:"created_by"`
+	CreatedAt                time.Time `json:"created_at"`
+	UpdatedAt                time.Time `json:"updated_at"`
 }
 
 type WhatsAppChannelLinkRequest struct {
-	WhatsAppChatID   string `json:"whatsapp_chat_id" binding:"required"`
-	WhatsAppChatName string `json:"whatsapp_chat_name"`
-	SyncInbound      *bool  `json:"sync_inbound"`
-	SyncOutbound     *bool  `json:"sync_outbound"`
+	WhatsAppAccountID        int64  `json:"whatsapp_account_id"`
+	WhatsAppChatID           string `json:"whatsapp_chat_id" binding:"required"`
+	WhatsAppChatName         string `json:"whatsapp_chat_name"`
+	WhatsAppChatAvatarURL    string `json:"whatsapp_chat_avatar_url"`
+	WhatsAppChatAbout        string `json:"whatsapp_chat_about"`
+	WhatsAppIsGroup          bool   `json:"whatsapp_is_group"`
+	WhatsAppParticipantCount int    `json:"whatsapp_participant_count"`
+	SyncInbound              *bool  `json:"sync_inbound"`
+	SyncOutbound             *bool  `json:"sync_outbound"`
 }
 
 type WhatsAppSendRequest struct {
-	ChannelID    int64  `json:"channel_id"`
-	MessageID    int64  `json:"message_id"`
-	ChatID       string `json:"chat_id"`
-	Content      string `json:"content"`
-	AttachmentID *int64 `json:"attachment_id"`
-	WorkbookID   *int64 `json:"workbook_id"`
-	SheetID      *int64 `json:"sheet_id"`
+	WhatsAppAccountID int64  `json:"whatsapp_account_id"`
+	ChannelID         int64  `json:"channel_id"`
+	MessageID         int64  `json:"message_id"`
+	ChatID            string `json:"chat_id"`
+	Content           string `json:"content"`
+	AttachmentID      *int64 `json:"attachment_id"`
+	WorkbookID        *int64 `json:"workbook_id"`
+	SheetID           *int64 `json:"sheet_id"`
 }

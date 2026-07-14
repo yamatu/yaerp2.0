@@ -241,7 +241,13 @@ func main() {
 		api.PUT("/channels/:id/whatsapp-link", whatsAppHandler.UpdateChannelLink)
 		api.DELETE("/channels/:id/whatsapp-link", whatsAppHandler.DeleteChannelLink)
 		api.POST("/channels/:id/messages/:messageId/whatsapp", whatsAppHandler.SendChannelMessage)
-		api.GET("/whatsapp/chats", whatsAppHandler.ListChats)
+		api.GET("/whatsapp/account", whatsAppHandler.GetOwnAccount)
+		api.PUT("/whatsapp/account/preferences", whatsAppHandler.UpdateOwnPreferences)
+		api.PUT("/whatsapp/account/about", whatsAppHandler.UpdateOwnAbout)
+		api.POST("/whatsapp/account/start", whatsAppHandler.StartOwnAccount)
+		api.POST("/whatsapp/account/restart", whatsAppHandler.RestartOwnAccount)
+		api.POST("/whatsapp/account/logout", whatsAppHandler.LogoutOwnAccount)
+		api.GET("/whatsapp/chats", whatsAppHandler.ListOwnChats)
 		api.POST("/whatsapp/send", whatsAppHandler.SendResource)
 
 		// Folders
@@ -319,10 +325,11 @@ func main() {
 			// WhatsApp Config (admin)
 			admin.GET("/admin/whatsapp/settings", whatsAppHandler.GetSettings)
 			admin.PUT("/admin/whatsapp/settings", whatsAppHandler.UpdateSettings)
-			admin.GET("/admin/whatsapp/status", whatsAppHandler.GetStatus)
-			admin.POST("/admin/whatsapp/start", whatsAppHandler.Start)
-			admin.POST("/admin/whatsapp/restart", whatsAppHandler.Restart)
-			admin.POST("/admin/whatsapp/logout", whatsAppHandler.Logout)
+			admin.GET("/admin/whatsapp/accounts", whatsAppHandler.ListAccounts)
+			admin.GET("/admin/whatsapp/accounts/:userId", whatsAppHandler.GetManagedAccount)
+			admin.PUT("/admin/whatsapp/accounts/:userId/preferences", whatsAppHandler.UpdateManagedPreferences)
+			admin.POST("/admin/whatsapp/accounts/:userId/:action", whatsAppHandler.ManagedAccountAction)
+			admin.GET("/admin/whatsapp/accounts/:userId/chats", whatsAppHandler.ListManagedChats)
 		}
 	}
 

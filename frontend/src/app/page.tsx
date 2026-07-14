@@ -815,6 +815,10 @@ export default function HomePage() {
                   <Images className="h-4 w-4" />
                   图库
                 </button>
+                <button type="button" onClick={() => router.push('/whatsapp')} className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 px-3 text-sm font-medium text-emerald-700 transition hover:bg-emerald-50">
+                  <MessageCircle className="h-4 w-4" />
+                  WhatsApp
+                </button>
                 <button type="button" onClick={() => router.push('/ai/summaries')} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900">
                   <BarChart3 className="h-4 w-4" />
                   AI 总结

@@ -13,9 +13,7 @@ import (
 	"yaerp/pkg/response"
 )
 
-type WhatsAppHandler struct {
-	service *service.WhatsAppService
-}
+type WhatsAppHandler struct{ service *service.WhatsAppService }
 
 func NewWhatsAppHandler(whatsAppService *service.WhatsAppService) *WhatsAppHandler {
 	return &WhatsAppHandler{service: whatsAppService}
@@ -44,46 +42,149 @@ func (h *WhatsAppHandler) UpdateSettings(c *gin.Context) {
 	response.OK(c, settings)
 }
 
-func (h *WhatsAppHandler) GetStatus(c *gin.Context) {
-	status, err := h.service.GetStatus()
+func (h *WhatsAppHandler) GetOwnAccount(c *gin.Context) { h.getAccount(c, c.GetInt64("user_id")) }
+func (h *WhatsAppHandler) StartOwnAccount(c *gin.Context) {
+	h.accountAction(c, c.GetInt64("user_id"), "start")
+}
+func (h *WhatsAppHandler) RestartOwnAccount(c *gin.Context) {
+	h.accountAction(c, c.GetInt64("user_id"), "restart")
+}
+func (h *WhatsAppHandler) LogoutOwnAccount(c *gin.Context) {
+	h.accountAction(c, c.GetInt64("user_id"), "logout")
+}
+
+func (h *WhatsAppHandler) UpdateOwnPreferences(c *gin.Context) {
+	var request struct {
+		Enabled   bool `json:"enabled"`
+		AutoStart bool `json:"auto_start"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	account, err := h.service.UpdateAccountPreferences(c.GetInt64("user_id"), c.GetInt64("user_id"), request.Enabled, request.AutoStart)
 	if err != nil {
-		response.ServerError(c, err.Error())
+		respondChannelError(c, err)
 		return
 	}
-	response.OK(c, status)
+	response.OK(c, account)
 }
 
-func (h *WhatsAppHandler) Start(c *gin.Context) {
-	if err := h.service.Start(); err != nil {
+func (h *WhatsAppHandler) UpdateOwnAbout(c *gin.Context) {
+	var request struct {
+		About string `json:"about"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	response.OKMsg(c, "WhatsApp 会话正在启动")
-}
-
-func (h *WhatsAppHandler) Restart(c *gin.Context) {
-	if err := h.service.Restart(); err != nil {
+	account, err := h.service.UpdateAccountAbout(c.GetInt64("user_id"), c.GetInt64("user_id"), request.About)
+	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	response.OKMsg(c, "WhatsApp 会话正在重启")
+	response.OK(c, account)
 }
 
-func (h *WhatsAppHandler) Logout(c *gin.Context) {
-	if err := h.service.Logout(); err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-	response.OKMsg(c, "WhatsApp 已退出登录")
-}
-
-func (h *WhatsAppHandler) ListChats(c *gin.Context) {
-	chats, err := h.service.ListChats()
+func (h *WhatsAppHandler) ListOwnChats(c *gin.Context) {
+	chats, err := h.service.ListChats(c.GetInt64("user_id"), c.GetInt64("user_id"))
 	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 	response.OK(c, chats)
+}
+
+func (h *WhatsAppHandler) ListAccounts(c *gin.Context) {
+	accounts, err := h.service.ListAccounts(c.GetInt64("user_id"))
+	if err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
+	response.OK(c, accounts)
+}
+
+func (h *WhatsAppHandler) GetManagedAccount(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid user id")
+		return
+	}
+	h.getAccount(c, userID)
+}
+
+func (h *WhatsAppHandler) ManagedAccountAction(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid user id")
+		return
+	}
+	h.accountAction(c, userID, c.Param("action"))
+}
+
+func (h *WhatsAppHandler) ListManagedChats(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid user id")
+		return
+	}
+	chats, err := h.service.ListChats(c.GetInt64("user_id"), userID)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, chats)
+}
+
+func (h *WhatsAppHandler) UpdateManagedPreferences(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid user id")
+		return
+	}
+	var request struct {
+		Enabled   bool `json:"enabled"`
+		AutoStart bool `json:"auto_start"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	account, err := h.service.UpdateAccountPreferences(c.GetInt64("user_id"), userID, request.Enabled, request.AutoStart)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, account)
+}
+
+func (h *WhatsAppHandler) getAccount(c *gin.Context, targetUserID int64) {
+	account, err := h.service.GetAccount(c.GetInt64("user_id"), targetUserID)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, account)
+}
+
+func (h *WhatsAppHandler) accountAction(c *gin.Context, targetUserID int64, action string) {
+	var err error
+	switch action {
+	case "start":
+		err = h.service.StartAccount(c.GetInt64("user_id"), targetUserID)
+	case "restart":
+		err = h.service.RestartAccount(c.GetInt64("user_id"), targetUserID)
+	case "logout":
+		err = h.service.LogoutAccount(c.GetInt64("user_id"), targetUserID)
+	default:
+		response.BadRequest(c, "unsupported action")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OKMsg(c, "WhatsApp 账号操作已提交")
 }
 
 func (h *WhatsAppHandler) GetChannelLink(c *gin.Context) {

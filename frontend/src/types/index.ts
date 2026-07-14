@@ -371,6 +371,7 @@ export interface ChannelMessage {
   external_message_id?: string
   external_sender_name?: string
   external_sender_address?: string
+  external_sender_avatar?: string
   assistant_id?: number | null
   assistant_name?: string
   content: string
@@ -422,6 +423,29 @@ export interface WhatsAppStatus {
   updatedAt?: string
 }
 
+export interface WhatsAppAccount {
+  id: number
+  user_id: number
+  username: string
+  email: string
+  enabled: boolean
+  auto_start: boolean
+  status: WhatsAppStatus['status']
+  whatsapp_id: string
+  display_name: string
+  phone_number: string
+  profile_pic_url: string
+  about: string
+  platform: string
+  last_error: string
+  last_connected_at?: string
+  created_at: string
+  updated_at: string
+  qr_data_url?: string
+  loading_percent: number
+  loading_message?: string
+}
+
 export interface WhatsAppChat {
   id: string
   name: string
@@ -431,12 +455,25 @@ export interface WhatsAppChat {
   pinned: boolean
   archived: boolean
   isMuted: boolean
+  profilePicUrl: string
+  about: string
+  description: string
+  participantCount: number
+  lastMessage: string
 }
 
 export interface WhatsAppChannelLink {
   channel_id: number
+  whatsapp_account_id: number
+  whatsapp_user_id: number
+  whatsapp_username: string
+  whatsapp_display_name: string
   whatsapp_chat_id: string
   whatsapp_chat_name: string
+  whatsapp_chat_avatar_url: string
+  whatsapp_chat_about: string
+  whatsapp_is_group: boolean
+  whatsapp_participant_count: number
   sync_inbound: boolean
   sync_outbound: boolean
   created_by: number

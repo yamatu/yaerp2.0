@@ -934,7 +934,7 @@ func channelMessageColumnsSQL() string {
 		    ELSE COALESCE(u.username, '')
 		END,
 		CASE WHEN m.sender_type IN ('ai', 'whatsapp') THEN NULL ELSE u.avatar END,
-		m.sender_type, m.external_source, m.external_message_id, m.external_sender_name, m.external_sender_address,
+		m.sender_type, m.external_source, m.external_account_id, m.external_message_id, m.external_sender_name, m.external_sender_address, m.external_sender_avatar,
 		m.assistant_id, COALESCE(ai.name, ''), COALESCE(m.content, ''),
 		m.attachment_id, a.filename, a.mime_type, a.size,
 		m.linked_workbook_id, w.name, m.linked_sheet_id, s.name, m.linked_summary_id, asp.title,
@@ -986,9 +986,11 @@ func scanChannelMessageValues(scanner interface {
 	var senderID sql.NullInt64
 	var senderAvatar sql.NullString
 	var externalSource sql.NullString
+	var externalAccountID sql.NullInt64
 	var externalMessageID sql.NullString
 	var externalSenderName sql.NullString
 	var externalSenderAddress sql.NullString
+	var externalSenderAvatar sql.NullString
 	var assistantID sql.NullInt64
 	var attachmentID sql.NullInt64
 	var attachmentFilename sql.NullString
@@ -1009,13 +1011,13 @@ func scanChannelMessageValues(scanner interface {
 	var replyRecalledAt sql.NullTime
 	var recalledAt sql.NullTime
 	var recalledBy sql.NullInt64
-	destinations := make([]any, 0, 35)
+	destinations := make([]any, 0, 37)
 	if channelName != nil {
 		destinations = append(destinations, channelName)
 	}
 	destinations = append(destinations,
 		&message.ID, &message.ChannelID, &senderID, &message.SenderName, &senderAvatar,
-		&message.SenderType, &externalSource, &externalMessageID, &externalSenderName, &externalSenderAddress,
+		&message.SenderType, &externalSource, &externalAccountID, &externalMessageID, &externalSenderName, &externalSenderAddress, &externalSenderAvatar,
 		&assistantID, &message.AssistantName, &message.Content,
 		&attachmentID, &attachmentFilename, &attachmentMimeType, &attachmentSize,
 		&workbookID, &workbookName, &sheetID, &sheetName, &summaryID, &summaryTitle, &forwardedFrom, &replyToMessageID,
@@ -1034,6 +1036,9 @@ func scanChannelMessageValues(scanner interface {
 	if externalSource.Valid {
 		message.ExternalSource = &externalSource.String
 	}
+	if externalAccountID.Valid {
+		message.ExternalAccountID = &externalAccountID.Int64
+	}
 	if externalMessageID.Valid {
 		message.ExternalMessageID = &externalMessageID.String
 	}
@@ -1042,6 +1047,9 @@ func scanChannelMessageValues(scanner interface {
 	}
 	if externalSenderAddress.Valid {
 		message.ExternalSenderAddress = &externalSenderAddress.String
+	}
+	if externalSenderAvatar.Valid {
+		message.ExternalSenderAvatar = &externalSenderAvatar.String
 	}
 	if assistantID.Valid {
 		message.AssistantID = &assistantID.Int64

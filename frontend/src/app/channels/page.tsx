@@ -55,7 +55,7 @@ import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
 import { wsClient } from '@/lib/ws'
-import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppChannelLink, WhatsAppChat, Workbook } from '@/types'
+import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, Workbook } from '@/types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -270,6 +270,8 @@ export default function ChannelsPage() {
   const [removingMemberId, setRemovingMemberId] = useState<number | null>(null)
   const [uploadingChannelAvatar, setUploadingChannelAvatar] = useState(false)
   const [whatsAppLink, setWhatsAppLink] = useState<WhatsAppChannelLink | null>(null)
+  const [whatsAppAccounts, setWhatsAppAccounts] = useState<WhatsAppAccount[]>([])
+  const [selectedWhatsAppAccountId, setSelectedWhatsAppAccountId] = useState('')
   const [whatsAppChats, setWhatsAppChats] = useState<WhatsAppChat[]>([])
   const [whatsAppChatSearch, setWhatsAppChatSearch] = useState('')
   const [selectedWhatsAppChatId, setSelectedWhatsAppChatId] = useState('')
@@ -365,6 +367,7 @@ export default function ChannelsPage() {
     if (!keyword) return whatsAppChats
     return whatsAppChats.filter((chat) => chat.name.toLowerCase().includes(keyword) || chat.id.toLowerCase().includes(keyword))
   }, [whatsAppChatSearch, whatsAppChats])
+  const selectedWhatsAppAccount = whatsAppAccounts.find((account) => String(account.id) === selectedWhatsAppAccountId) || null
 
   const filteredTableWorkbooks = useMemo(() => {
     const keyword = tableSearch.trim().toLowerCase()
@@ -667,6 +670,14 @@ export default function ChannelsPage() {
     if (!activeChannelId || !currentUserId) return
     localStorage.setItem(channelStorageKey(currentUserId, 'active-channel'), String(activeChannelId))
   }, [activeChannelId, currentUserId])
+
+  useEffect(() => {
+    setWhatsAppLink(null)
+    if (!activeChannelId) return
+    void api.get<WhatsAppChannelLink | null>(`/channels/${activeChannelId}/whatsapp-link`).then((response) => {
+      if (response.code === 0) setWhatsAppLink(response.data || null)
+    }).catch(() => undefined)
+  }, [activeChannelId])
 
   useEffect(() => {
     if (loadingChannels || !currentUserId || sidebarSearchMode !== 'channels') return
@@ -1232,30 +1243,65 @@ export default function ChannelsPage() {
   const loadWhatsAppLink = async (channelId: number) => {
     setLoadingWhatsApp(true)
     try {
-      const [linkResponse, chatsResponse] = await Promise.all([
+      const [linkResponse, accountsResponse] = await Promise.all([
         api.get<WhatsAppChannelLink | null>(`/channels/${channelId}/whatsapp-link`),
-        api.get<WhatsAppChat[]>('/whatsapp/chats'),
+        currentUser && isAdmin(currentUser)
+          ? api.get<WhatsAppAccount[]>('/admin/whatsapp/accounts')
+          : api.get<WhatsAppAccount>('/whatsapp/account'),
       ])
       const link = linkResponse.code === 0 ? linkResponse.data || null : null
+      const accounts = currentUser && isAdmin(currentUser)
+        ? ((accountsResponse.data as WhatsAppAccount[] | undefined) || [])
+        : (accountsResponse.data ? [accountsResponse.data as WhatsAppAccount] : [])
+      setWhatsAppAccounts(accounts)
       setWhatsAppLink(link)
+      const accountId = link?.whatsapp_account_id || accounts[0]?.id || 0
+      setSelectedWhatsAppAccountId(accountId ? String(accountId) : '')
       setSelectedWhatsAppChatId(link?.whatsapp_chat_id || '')
       setSyncWhatsAppInbound(link?.sync_inbound ?? true)
       setSyncWhatsAppOutbound(link?.sync_outbound ?? true)
-      setWhatsAppChats(chatsResponse.code === 0 && chatsResponse.data ? chatsResponse.data : [])
+      const account = accounts.find((item) => item.id === accountId)
+      if (account?.status === 'ready') {
+        const chatsResponse = currentUser && isAdmin(currentUser)
+          ? await api.get<WhatsAppChat[]>(`/admin/whatsapp/accounts/${account.user_id}/chats`)
+          : await api.get<WhatsAppChat[]>('/whatsapp/chats')
+        setWhatsAppChats(chatsResponse.code === 0 && chatsResponse.data ? chatsResponse.data : [])
+      } else {
+        setWhatsAppChats([])
+      }
     } catch {
+      setWhatsAppAccounts([])
       setWhatsAppChats([])
     } finally {
       setLoadingWhatsApp(false)
     }
   }
 
+  const handleWhatsAppAccountSelection = async (accountId: string) => {
+    setSelectedWhatsAppAccountId(accountId)
+    setSelectedWhatsAppChatId('')
+    setWhatsAppChats([])
+    const account = whatsAppAccounts.find((item) => String(item.id) === accountId)
+    if (!account || account.status !== 'ready') return
+    setLoadingWhatsApp(true)
+    try {
+      const response = currentUser && isAdmin(currentUser)
+        ? await api.get<WhatsAppChat[]>(`/admin/whatsapp/accounts/${account.user_id}/chats`)
+        : await api.get<WhatsAppChat[]>('/whatsapp/chats')
+      setWhatsAppChats(response.code === 0 && response.data ? response.data : [])
+    } finally {
+      setLoadingWhatsApp(false)
+    }
+  }
+
   const handleSaveWhatsAppLink = async () => {
-    if (!activeChannel || !selectedWhatsAppChatId || savingWhatsApp) return
+    if (!activeChannel || !selectedWhatsAppAccountId || !selectedWhatsAppChatId || savingWhatsApp) return
     const chat = whatsAppChats.find((item) => item.id === selectedWhatsAppChatId)
     setSavingWhatsApp(true)
     setError('')
     try {
       const response = await api.put<WhatsAppChannelLink>(`/channels/${activeChannel.id}/whatsapp-link`, {
+        whatsapp_account_id: Number(selectedWhatsAppAccountId),
         whatsapp_chat_id: selectedWhatsAppChatId,
         whatsapp_chat_name: chat?.name || whatsAppLink?.whatsapp_chat_name || selectedWhatsAppChatId,
         sync_inbound: syncWhatsAppInbound,
@@ -1284,6 +1330,7 @@ export default function ChannelsPage() {
         return
       }
       setWhatsAppLink(null)
+      setSelectedWhatsAppAccountId(whatsAppAccounts[0]?.id ? String(whatsAppAccounts[0].id) : '')
       setSelectedWhatsAppChatId('')
       setNotice('已取消 WhatsApp 关联')
     } finally {
@@ -1709,21 +1756,22 @@ export default function ChannelsPage() {
 
   return (
     <AuthGuard>
-      <div className="h-[100dvh] overflow-hidden bg-slate-100 p-0 md:p-5">
+      <div className="h-[100dvh] overflow-hidden bg-[#111b21] p-0 md:p-4">
         <div className="mx-auto flex h-full max-w-[1440px] flex-col overflow-hidden">
-          <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 md:border md:border-b-0">
-            <a href="/" className="inline-flex items-center gap-2 text-sm text-slate-500 transition hover:text-slate-900">
+          <header className="flex h-14 shrink-0 items-center justify-between border-b border-[#334047] bg-[#202c33] px-4 text-slate-100 md:border md:border-b-0 md:border-[#334047]">
+            <a href="/" className="inline-flex items-center gap-2 text-sm text-slate-300 transition hover:text-white">
               <ArrowLeft className="h-4 w-4" />
               返回首页
             </a>
             <div className="flex items-center gap-1">
-              <button type="button" onClick={() => setNotificationSettingsOpen(true)} className="relative inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600" title="频道通知设置">
+              <a href="/whatsapp" className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-[#25d366]" title="管理我的 WhatsApp"><MessageCircle className="h-4 w-4" /></a>
+              <button type="button" onClick={() => setNotificationSettingsOpen(true)} className="relative inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-white" title="频道通知设置">
                 {soundEnabled ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
                 {totalUnreadCount > 0 && (
                   <span className="absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-4 text-white">{totalUnreadCount > 99 ? '99+' : totalUnreadCount}</span>
                 )}
               </button>
-              <button type="button" onClick={() => void Promise.all([loadChannels(), activeChannelId ? loadMessages(activeChannelId) : Promise.resolve()])} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900" title="刷新">
+              <button type="button" onClick={() => void Promise.all([loadChannels(), activeChannelId ? loadMessages(activeChannelId) : Promise.resolve()])} className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-white" title="刷新">
                 <RefreshCw className="h-4 w-4" />
               </button>
             </div>
@@ -1744,9 +1792,9 @@ export default function ChannelsPage() {
             </div>
           )}
 
-          <main className="flex min-h-0 flex-1 overflow-hidden border-x border-b border-slate-200 bg-white">
-            <aside className={`${activeChannel ? 'hidden lg:flex' : 'flex'} min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white lg:w-[320px]`}>
-              <div className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200 px-4">
+          <main className="flex min-h-0 flex-1 overflow-hidden border-x border-b border-[#334047] bg-white">
+            <aside className={`${activeChannel ? 'hidden lg:flex' : 'flex'} min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white lg:w-[360px]`}>
+              <div className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-[#f0f2f5] px-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">频道</div>
                   <div className="mt-0.5 text-xs text-slate-400">{channels.length} 个会话</div>
@@ -1755,7 +1803,7 @@ export default function ChannelsPage() {
                   <button type="button" onClick={() => { setIsAssistantPickerOpen(true); void loadAvailableAssistants() }} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-700" title="打开 AI 机器人私聊">
                     <Bot className="h-4 w-4" />
                   </button>
-                  <button type="button" onClick={() => setIsCreateOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-white transition hover:bg-slate-700" title="新建频道">
+                  <button type="button" onClick={() => setIsCreateOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-[#008069] text-white transition hover:bg-[#006d59]" title="新建频道">
                     <Plus className="h-4 w-4" />
                   </button>
                 </div>
@@ -1845,7 +1893,7 @@ export default function ChannelsPage() {
                       void handlePinnedChannelDrop(channel.id)
                     }}
                     onDragEnd={() => setDraggingPinnedChannelId(null)}
-                    className={`group/channel flex border-b border-slate-100 transition ${draggingPinnedChannelId === channel.id ? 'opacity-45' : ''} ${draggingPinnedChannelId && channel.is_pinned && draggingPinnedChannelId !== channel.id ? 'hover:bg-sky-50' : ''} ${dropTargetChannelId === channel.id ? 'bg-emerald-50 ring-2 ring-inset ring-emerald-300' : channel.id === activeChannelId ? 'bg-sky-50' : 'hover:bg-slate-50'}`}
+                    className={`group/channel flex border-b border-slate-100 transition ${draggingPinnedChannelId === channel.id ? 'opacity-45' : ''} ${draggingPinnedChannelId && channel.is_pinned && draggingPinnedChannelId !== channel.id ? 'hover:bg-emerald-50' : ''} ${dropTargetChannelId === channel.id ? 'bg-emerald-50 ring-2 ring-inset ring-emerald-300' : channel.id === activeChannelId ? 'bg-[#f0f2f5]' : 'hover:bg-[#f5f6f6]'}`}
                   >
                     {channel.is_pinned && !channelSearch.trim() && (
                       <div className="flex w-5 shrink-0 cursor-grab items-center justify-center text-slate-300 active:cursor-grabbing" title="拖动调整置顶顺序">
@@ -1853,14 +1901,14 @@ export default function ChannelsPage() {
                       </div>
                     )}
                     <button type="button" onClick={() => setActiveChannelId(channel.id)} className="flex min-w-0 flex-1 gap-3 px-4 py-3 text-left">
-                      <div className={`flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg ${channel.id === activeChannelId ? 'bg-sky-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
+                      <div className={`flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full ${channel.id === activeChannelId ? 'bg-[#008069] text-white' : 'bg-slate-200 text-slate-500'}`}>
                         {channel.avatar_url ? <img src={channel.avatar_url} alt="" className="h-full w-full object-cover" /> : channel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <Hash className="h-4 w-4" />}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           {channel.is_pinned && <Pin className="h-3 w-3 shrink-0 text-sky-600" />}
                           <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-900">{channel.name}</span>
-                          {channel.unread_count > 0 && <span className="shrink-0 rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">{channel.unread_count > 99 ? '99+' : channel.unread_count}</span>}
+                          {channel.unread_count > 0 && <span className="shrink-0 rounded-full bg-[#25d366] px-1.5 py-0.5 text-[10px] font-semibold text-white">{channel.unread_count > 99 ? '99+' : channel.unread_count}</span>}
                           <span className="shrink-0 text-[11px] text-slate-400">{formatChannelTime(channel.updated_at)}</span>
                         </div>
                         <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
@@ -1882,7 +1930,7 @@ export default function ChannelsPage() {
               onDragOver={handleExternalFileDragOver}
               onDragLeave={handleExternalFileDragLeave}
               onDrop={handleExternalFileDrop}
-              className={`${activeChannel ? 'flex' : 'hidden lg:flex'} relative min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-slate-50`}
+              className={`${activeChannel ? 'flex' : 'hidden lg:flex'} relative min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#efeae2]`}
             >
               {isExternalFileDragging && activeChannel && (
                 <div className="pointer-events-none absolute inset-3 z-50 flex items-center justify-center rounded-lg border-2 border-dashed border-sky-400 bg-sky-50/95 shadow-xl">
@@ -1897,16 +1945,16 @@ export default function ChannelsPage() {
               )}
               {activeChannel ? (
                 <>
-                  <div className="flex h-16 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-4">
+                  <div className="flex h-16 shrink-0 items-center gap-3 border-b border-slate-300 bg-[#f0f2f5] px-4">
                     <button type="button" onClick={() => setActiveChannelId(null)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 lg:hidden" title="返回频道列表">
                       <ChevronLeft className="h-5 w-5" />
                     </button>
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-sky-600 text-white">
-                      {activeChannel.avatar_url ? <img src={activeChannel.avatar_url} alt="" className="h-full w-full object-cover" /> : activeChannel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <Hash className="h-4 w-4" />}
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-[#008069] text-white">
+                      {whatsAppLink?.whatsapp_chat_avatar_url ? <img src={whatsAppLink.whatsapp_chat_avatar_url} alt="" className="h-full w-full object-cover" /> : activeChannel.avatar_url ? <img src={activeChannel.avatar_url} alt="" className="h-full w-full object-cover" /> : activeChannel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <Hash className="h-4 w-4" />}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-semibold text-slate-900">{activeChannel.name}</div>
-                      <div className="mt-0.5 truncate text-xs text-slate-400">{activeChannel.channel_type === 'ai_private' ? '专属 AI 机器人会话' : (activeChannel.description || `${messages.length} 条消息`)}</div>
+                      <div className="mt-0.5 truncate text-xs text-slate-500">{whatsAppLink ? `${whatsAppLink.whatsapp_chat_name} · 通过 ${whatsAppLink.whatsapp_display_name || whatsAppLink.whatsapp_username} 沟通${whatsAppLink.whatsapp_is_group && whatsAppLink.whatsapp_participant_count ? ` · ${whatsAppLink.whatsapp_participant_count} 位成员` : ''}` : activeChannel.channel_type === 'ai_private' ? '专属 AI 机器人会话' : (activeChannel.description || `${messages.length} 条消息`)}</div>
                     </div>
                     <div className="hidden items-center gap-3 text-xs text-slate-400 sm:flex">
                       <span>{activeChannel.channel_type === 'ai_private' ? 'AI 私聊' : `${activeChannel.member_count || 1} 位成员`}</span>
@@ -1922,7 +1970,7 @@ export default function ChannelsPage() {
                     )}
                   </div>
 
-                  <div ref={messagesViewportRef} onScroll={handleMessagesScroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5 [scrollbar-gutter:stable] md:px-8">
+                  <div ref={messagesViewportRef} onScroll={handleMessagesScroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-5 [scrollbar-gutter:stable] md:px-8">
                     {loadingMessages ? (
                       <div className="text-center text-sm text-slate-400">正在加载消息...</div>
                     ) : messages.length === 0 ? (
@@ -1933,7 +1981,7 @@ export default function ChannelsPage() {
                         发送第一条消息开始交流
                       </div>
                     ) : (
-                      <div className="mx-auto max-w-4xl space-y-5">
+                      <div className="mx-auto max-w-4xl space-y-2">
                         {messages.map((message) => {
                           const isAI = message.sender_type === 'ai'
                           const isWhatsApp = message.sender_type === 'whatsapp'
@@ -1952,8 +2000,8 @@ export default function ChannelsPage() {
                           }
                           return (
                             <div data-message-id={message.id} key={message.id} onContextMenu={(event) => openMessageContextMenu(event, message)} className={`group flex items-start gap-3 rounded-lg transition ${isMine ? 'flex-row-reverse' : ''} ${highlightMessageId === message.id ? 'outline outline-2 outline-offset-4 outline-sky-300' : ''}`}>
-                              <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg text-xs font-semibold ${isMine ? 'bg-sky-600 text-white' : isAI ? 'bg-emerald-600 text-white' : isWhatsApp ? 'bg-emerald-500 text-white' : 'bg-white text-slate-600 shadow-sm'}`}>
-                                {isAI ? <Bot className="h-4 w-4" /> : isWhatsApp ? <MessageCircle className="h-4 w-4" /> : message.sender_avatar ? <img src={message.sender_avatar} alt="" className="h-full w-full object-cover" /> : initials(senderName)}
+                              <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full text-xs font-semibold ${isMine ? 'bg-[#008069] text-white' : isAI ? 'bg-emerald-600 text-white' : isWhatsApp ? 'bg-[#25d366] text-white' : 'bg-white text-slate-600 shadow-sm'}`}>
+                                {isAI ? <Bot className="h-4 w-4" /> : isWhatsApp && message.external_sender_avatar ? <img src={message.external_sender_avatar} alt="" className="h-full w-full object-cover" /> : isWhatsApp ? <MessageCircle className="h-4 w-4" /> : message.sender_avatar ? <img src={message.sender_avatar} alt="" className="h-full w-full object-cover" /> : initials(senderName)}
                               </div>
                               <div className={`flex min-w-0 max-w-[min(88%,680px)] flex-col sm:max-w-[min(78%,680px)] ${isMine ? 'items-end' : 'items-start'}`}>
                                 <div className={`mb-1 flex items-center gap-2 text-[11px] text-slate-400 ${isMine ? 'flex-row-reverse' : ''}`}>
@@ -1966,7 +2014,7 @@ export default function ChannelsPage() {
                                   <div className="mb-1 text-[11px] text-sky-600">转发的消息</div>
                                 )}
                                 <div className={`flex items-center gap-2 ${isMine ? 'flex-row-reverse' : ''}`}>
-                                  <div className={`min-w-0 space-y-2 ${(message.content || message.reply_to_message_id) ? `rounded-lg px-3 py-2 ${isMine ? 'bg-sky-600 text-white' : isAI ? 'border border-emerald-200 bg-emerald-50/70 text-slate-800' : 'border border-slate-200 bg-white text-slate-800'}` : ''}`}>
+                                  <div className={`min-w-0 space-y-2 ${(message.content || message.reply_to_message_id) ? `rounded-lg px-3 py-2 shadow-sm ${isMine ? 'bg-[#d9fdd3] text-slate-900' : isAI ? 'bg-[#e7fce8] text-slate-800' : 'bg-white text-slate-800'}` : ''}`}>
                                     {message.reply_to_message_id && (
                                       <button
                                         type="button"
@@ -1975,9 +2023,9 @@ export default function ChannelsPage() {
                                           const target = document.querySelector<HTMLElement>(`[data-message-id="${message.reply_to_message_id}"]`)
                                           target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
                                         }}
-                                        className={`block w-full min-w-0 border-l-2 pl-2 text-left text-xs ${isMine ? 'border-white/55 text-sky-50' : 'border-sky-400 text-slate-500'}`}
+                                        className={`block w-full min-w-0 border-l-2 pl-2 text-left text-xs ${isMine ? 'border-[#008069] text-slate-600' : 'border-[#00a884] text-slate-500'}`}
                                       >
-                                        <span className={`block truncate font-semibold ${isMine ? 'text-white' : 'text-sky-700'}`}>{message.reply_sender_name || '成员'}</span>
+                                        <span className={`block truncate font-semibold ${isMine ? 'text-[#006d59]' : 'text-[#008069]'}`}>{message.reply_sender_name || '成员'}</span>
                                         <span className="mt-0.5 block max-w-md truncate">{message.reply_recalled_at ? '原消息已撤回' : (message.reply_content || message.reply_attachment_filename || '消息')}</span>
                                       </button>
                                     )}
@@ -2051,8 +2099,8 @@ export default function ChannelsPage() {
                     )}
                   </div>
 
-                  <div className="shrink-0 border-t border-slate-200 bg-white p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:px-5 md:py-4">
-                    <div className="mx-auto max-w-4xl overflow-hidden rounded-lg border border-slate-200 bg-white focus-within:border-sky-300 focus-within:ring-1 focus-within:ring-sky-100">
+                  <div className="shrink-0 border-t border-slate-300 bg-[#f0f2f5] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:px-5 md:py-3">
+                    <div className="mx-auto max-w-4xl overflow-hidden rounded-lg bg-white shadow-sm focus-within:ring-1 focus-within:ring-[#00a884]/30">
                       {selectedAskAssistantId && (
                         <div className="flex items-center gap-3 border-b border-emerald-100 bg-emerald-50 px-3 py-2">
                           <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-emerald-600 text-white"><Bot className="h-3.5 w-3.5" /></div>
@@ -2156,7 +2204,7 @@ export default function ChannelsPage() {
                             </>
                           )}
                         </div>
-                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && !pendingFile && !pendingGalleryImage && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-sky-600 hover:bg-sky-700'}`} title={askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : '发送'}>
+                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && !pendingFile && !pendingGalleryImage && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : '发送'}>
                           {askingAI ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                         </button>
                       </div>
@@ -2661,10 +2709,20 @@ export default function ChannelsPage() {
                     {whatsAppLink && <span className="rounded-lg bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">已关联 {whatsAppLink.whatsapp_chat_name}</span>}
                   </div>
                   <div className="mb-3 text-xs leading-5 text-slate-500">关联后可将频道消息、图库图片和表格发送到 WhatsApp；入站消息会显示在当前频道。</div>
+                  <label className="mb-3 block">
+                    <span className="mb-1.5 block text-xs font-medium text-slate-600">用于沟通的员工 WhatsApp 账号</span>
+                    <select value={selectedWhatsAppAccountId} onChange={(event) => void handleWhatsAppAccountSelection(event.target.value)} className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-300">
+                      <option value="">选择员工账号</option>
+                      {whatsAppAccounts.map((account) => <option key={account.id} value={account.id}>{account.username} · {account.status === 'ready' ? (account.display_name || account.phone_number || '已连接') : '未连接'}</option>)}
+                    </select>
+                  </label>
+                  {selectedWhatsAppAccount && <div className="mb-3 flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700">{selectedWhatsAppAccount.profile_pic_url ? <img src={selectedWhatsAppAccount.profile_pic_url} alt="" className="h-full w-full object-cover" /> : <MessageCircle className="h-4 w-4" />}</div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-800">{selectedWhatsAppAccount.display_name || selectedWhatsAppAccount.username}</div><div className="mt-0.5 truncate text-xs text-slate-400">员工 {selectedWhatsAppAccount.username} · {selectedWhatsAppAccount.status === 'ready' ? '可用于频道沟通' : '需要先绑定 WhatsApp'}</div></div></div>}
                   {loadingWhatsApp ? (
                     <div className="flex items-center gap-2 py-6 text-sm text-slate-400"><RefreshCw className="h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div>
+                  ) : !selectedWhatsAppAccount || selectedWhatsAppAccount.status !== 'ready' ? (
+                    <div className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">所选员工尚未绑定 WhatsApp。员工可在“我的 WhatsApp”页面扫码，管理员也可以在后台代为操作。</div>
                   ) : whatsAppChats.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">WhatsApp 尚未登录，请管理员先在后台扫码连接。</div>
+                    <div className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">该员工账号没有可用的联系人或群组。</div>
                   ) : (
                     <>
                       <label className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-emerald-300 focus-within:bg-white">
@@ -2674,8 +2732,8 @@ export default function ChannelsPage() {
                       <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border border-slate-200 p-1">
                         {filteredWhatsAppChats.map((chat) => (
                           <button key={chat.id} type="button" onClick={() => setSelectedWhatsAppChatId(chat.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-50' : 'hover:bg-slate-50'}`}>
-                            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}>{chat.isGroup ? <Users className="h-3.5 w-3.5" /> : <MessageCircle className="h-3.5 w-3.5" />}</div>
-                            <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-slate-800">{chat.name}</div><div className="truncate text-xs text-slate-400">{chat.isGroup ? '群组' : '联系人'} · {chat.id}</div></div>
+                            <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}>{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-3.5 w-3.5" /> : <MessageCircle className="h-3.5 w-3.5" />}</div>
+                            <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-slate-800">{chat.name}</div><div className="truncate text-xs text-slate-400">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</div></div>
                             {selectedWhatsAppChatId === chat.id && <Check className="h-4 w-4 text-emerald-600" />}
                           </button>
                         ))}
@@ -2686,7 +2744,7 @@ export default function ChannelsPage() {
                       </div>
                       <div className="mt-3 flex justify-end gap-2">
                         {whatsAppLink && <button type="button" onClick={() => void handleDeleteWhatsAppLink()} disabled={savingWhatsApp} className="h-9 rounded-lg border border-rose-200 px-4 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50">取消关联</button>}
-                        <button type="button" onClick={() => void handleSaveWhatsAppLink()} disabled={!selectedWhatsAppChatId || savingWhatsApp} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingWhatsApp ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存关联</button>
+                        <button type="button" onClick={() => void handleSaveWhatsAppLink()} disabled={!selectedWhatsAppAccountId || !selectedWhatsAppChatId || savingWhatsApp} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingWhatsApp ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存关联</button>
                       </div>
                     </>
                   )}

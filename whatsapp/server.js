@@ -17,23 +17,49 @@ const MAX_WEBHOOK_MEDIA_BYTES = Number(process.env.WHATSAPP_MAX_MEDIA_BYTES || 2
 const app = express()
 app.use(express.json({ limit: '40mb' }))
 
-let client = null
-let localProxyUrl = ''
-let configuration = { enabled: false, proxyUrl: '' }
-let operation = Promise.resolve()
-const state = {
-  status: 'disabled',
-  qr: '',
-  qrDataUrl: '',
-  loadingPercent: 0,
-  loadingMessage: '',
-  account: null,
-  lastError: '',
-  updatedAt: new Date().toISOString(),
+const sessions = new Map()
+let configuration = { proxyUrl: '' }
+
+function createState() {
+  return {
+    status: 'disconnected',
+    qr: '',
+    qrDataUrl: '',
+    loadingPercent: 0,
+    loadingMessage: '',
+    account: null,
+    lastError: '',
+    updatedAt: new Date().toISOString(),
+  }
 }
 
-function updateState(patch) {
-  Object.assign(state, patch, { updatedAt: new Date().toISOString() })
+function normalizeSessionId(value) {
+  const sessionId = String(value || '').trim()
+  if (!/^[-_a-zA-Z0-9]+$/.test(sessionId)) throw new Error('invalid session id')
+  return sessionId
+}
+
+function getSession(value) {
+  const id = normalizeSessionId(value)
+  if (!sessions.has(id)) {
+    sessions.set(id, {
+      id,
+      client: null,
+      localProxyUrl: '',
+      operation: Promise.resolve(),
+      state: createState(),
+    })
+  }
+  return sessions.get(id)
+}
+
+function updateState(session, patch) {
+  Object.assign(session.state, patch, { updatedAt: new Date().toISOString() })
+}
+
+function queueOperation(session, task) {
+  session.operation = session.operation.then(task, task)
+  return session.operation
 }
 
 function requireInternalSecret(req, res, next) {
@@ -43,7 +69,7 @@ function requireInternalSecret(req, res, next) {
   next()
 }
 
-async function postWebhook(type, payload = {}) {
+async function postWebhook(session, type, payload = {}) {
   if (!WEBHOOK_URL || !INTERNAL_SECRET) return
   try {
     const response = await fetch(WEBHOOK_URL, {
@@ -52,14 +78,12 @@ async function postWebhook(type, payload = {}) {
         'content-type': 'application/json',
         'x-whatsapp-secret': INTERNAL_SECRET,
       },
-      body: JSON.stringify({ type, payload, occurredAt: new Date().toISOString() }),
+      body: JSON.stringify({ sessionId: session.id, type, payload, occurredAt: new Date().toISOString() }),
       signal: AbortSignal.timeout(20000),
     })
-    if (!response.ok) {
-      console.error(`WhatsApp webhook failed: ${response.status} ${await response.text()}`)
-    }
+    if (!response.ok) console.error(`WhatsApp webhook failed: ${response.status} ${await response.text()}`)
   } catch (error) {
-    console.error('WhatsApp webhook error:', error.message)
+    console.error(`WhatsApp webhook error (${session.id}):`, error.message)
   }
 }
 
@@ -69,7 +93,12 @@ function serializeId(value) {
   return value._serialized || ''
 }
 
-async function serializeMessage(message, includeMedia = false) {
+async function safeProfilePic(client, contactId) {
+  if (!contactId) return ''
+  try { return await client.getProfilePicUrl(contactId) || '' } catch { return '' }
+}
+
+async function serializeMessage(session, message, includeMedia = false) {
   const payload = {
     id: serializeId(message.id),
     chatId: message.fromMe ? message.to : message.from,
@@ -82,7 +111,6 @@ async function serializeMessage(message, includeMedia = false) {
     timestamp: message.timestamp || Math.floor(Date.now() / 1000),
     hasMedia: Boolean(message.hasMedia),
     ack: message.ack,
-    quotedMessageId: serializeId(message._data?.quotedStanzaID),
   }
   if (includeMedia && message.hasMedia) {
     try {
@@ -104,282 +132,305 @@ async function serializeMessage(message, includeMedia = false) {
     const contact = await message.getContact()
     payload.senderName = contact.pushname || contact.name || contact.shortName || contact.number || payload.author || payload.from
     payload.senderNumber = contact.number || ''
+    payload.senderProfilePicUrl = await safeProfilePic(session.client, serializeId(contact.id))
   } catch {
     payload.senderName = payload.author || payload.from
   }
   return payload
 }
 
-async function closeLocalProxy() {
-  if (!localProxyUrl) return
+async function closeLocalProxy(session) {
+  if (!session.localProxyUrl) return
   try {
-    await proxyChain.closeAnonymizedProxy(localProxyUrl, true)
+    await proxyChain.closeAnonymizedProxy(session.localProxyUrl, true)
   } catch (error) {
-    console.error('Failed to close local proxy:', error.message)
+    console.error(`Failed to close proxy (${session.id}):`, error.message)
   } finally {
-    localProxyUrl = ''
+    session.localProxyUrl = ''
   }
 }
 
-async function destroyClient() {
-  const active = client
-  client = null
+async function destroyClient(session) {
+  const active = session.client
+  session.client = null
   if (active) {
-    try {
-      await active.destroy()
-    } catch (error) {
-      console.error('Failed to destroy WhatsApp client:', error.message)
-    }
+    try { await active.destroy() } catch (error) { console.error(`Destroy failed (${session.id}):`, error.message) }
   }
-  await closeLocalProxy()
+  await closeLocalProxy(session)
 }
 
-async function clearStaleProfileLocks() {
-  const profileDir = path.join(DATA_DIR, 'auth', 'session-yaerp')
+async function migrateLegacyAdminSession(session) {
+  if (session.id !== 'user-1') return
+  const legacy = path.join(DATA_DIR, 'auth', 'session-yaerp')
+  const target = path.join(DATA_DIR, 'auth', `session-${session.id}`)
+  try {
+    await fs.access(target)
+  } catch {
+    try { await fs.rename(legacy, target) } catch { /* No legacy session. */ }
+  }
+}
+
+async function clearStaleProfileLocks(session) {
+  await migrateLegacyAdminSession(session)
+  const profileDir = path.join(DATA_DIR, 'auth', `session-${session.id}`)
   await Promise.all(['SingletonLock', 'SingletonCookie', 'SingletonSocket'].map(async (name) => {
-    try {
-      await fs.rm(path.join(profileDir, name), { force: true })
-    } catch (error) {
-      console.error(`Failed to remove stale Chromium ${name}:`, error.message)
-    }
+    try { await fs.rm(path.join(profileDir, name), { force: true }) } catch { /* Missing locks are expected. */ }
   }))
 }
 
-async function prepareProxy(proxyUrl) {
-  await closeLocalProxy()
-  if (!proxyUrl) return ''
-  localProxyUrl = await proxyChain.anonymizeProxy(proxyUrl)
-  return localProxyUrl
+async function prepareProxy(session) {
+  await closeLocalProxy(session)
+  if (!configuration.proxyUrl) return ''
+  session.localProxyUrl = await proxyChain.anonymizeProxy(configuration.proxyUrl)
+  return session.localProxyUrl
 }
 
-function bindClientEvents(nextClient) {
-  nextClient.on('loading_screen', (percent, message) => {
-    updateState({ status: 'loading', loadingPercent: Number(percent || 0), loadingMessage: message || '' })
-    void postWebhook('status', { ...state, qr: undefined, qrDataUrl: undefined })
-  })
-  nextClient.on('qr', async (qr) => {
-    const qrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 360 })
-    updateState({ status: 'qr', qr, qrDataUrl, lastError: '' })
-    void postWebhook('status', { ...state, qr: undefined })
-  })
-  nextClient.on('authenticated', () => {
-    updateState({ status: 'authenticated', qr: '', qrDataUrl: '', lastError: '' })
-    void postWebhook('status', { ...state })
-  })
-  nextClient.on('auth_failure', (message) => {
-    updateState({ status: 'auth_failure', lastError: String(message || 'authentication failed') })
-    void postWebhook('status', { ...state })
-  })
-  nextClient.on('ready', () => {
-    const info = nextClient.info
-    updateState({
-      status: 'ready',
-      qr: '',
-      qrDataUrl: '',
-      loadingPercent: 100,
-      loadingMessage: '',
-      lastError: '',
-      account: info ? {
-        wid: serializeId(info.wid),
-        pushname: info.pushname || '',
-        platform: info.platform || '',
-      } : null,
-    })
-    void postWebhook('status', { ...state })
-  })
-  nextClient.on('change_state', (sessionState) => {
-    void postWebhook('session_state', { state: sessionState })
-  })
-  nextClient.on('disconnected', (reason) => {
-    updateState({ status: 'disconnected', account: null, lastError: String(reason || '') })
-    void postWebhook('status', { ...state })
-  })
-  nextClient.on('message', async (message) => {
-    void postWebhook('message', await serializeMessage(message, true))
-  })
-  nextClient.on('message_create', async (message) => {
-    if (message.fromMe) void postWebhook('message_create', await serializeMessage(message, false))
-  })
-  nextClient.on('message_ack', (message, ack) => {
-    void postWebhook('message_ack', { id: serializeId(message.id), ack })
-  })
-  nextClient.on('message_revoke_everyone', (after, before) => {
-    void postWebhook('message_revoke', {
-      id: serializeId(after?.id),
-      beforeId: serializeId(before?.id),
-      chatId: after?.from || before?.from || '',
-    })
-  })
-}
-
-async function startClient() {
-  if (!configuration.enabled) {
-    updateState({ status: 'disabled', qr: '', qrDataUrl: '', account: null })
-    return state
+async function accountSnapshot(session, client) {
+  const info = client.info
+  if (!info) return null
+  const wid = serializeId(info.wid)
+  let about = ''
+  try {
+    const contact = await client.getContactById(wid)
+    about = await contact.getAbout() || ''
+  } catch { /* Privacy settings may hide the about text. */ }
+  return {
+    wid,
+    pushname: info.pushname || '',
+    platform: info.platform || '',
+    profilePicUrl: await safeProfilePic(client, wid),
+    about,
   }
-  await destroyClient()
-  await clearStaleProfileLocks()
-  updateState({ status: 'initializing', qr: '', qrDataUrl: '', loadingPercent: 0, loadingMessage: '', lastError: '' })
-  const proxyUrl = await prepareProxy(configuration.proxyUrl)
-  const args = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-default-browser-check',
-  ]
+}
+
+function bindClientEvents(session, client) {
+  const active = () => session.client === client
+  client.on('loading_screen', (percent, message) => {
+    if (!active()) return
+    updateState(session, { status: 'loading', loadingPercent: Number(percent || 0), loadingMessage: message || '' })
+    void postWebhook(session, 'status', { ...session.state, qr: undefined, qrDataUrl: undefined })
+  })
+  client.on('qr', async (qr) => {
+    if (!active()) return
+    const qrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 360 })
+    updateState(session, { status: 'qr', qr, qrDataUrl, lastError: '' })
+    void postWebhook(session, 'status', { ...session.state, qr: undefined })
+  })
+  client.on('authenticated', () => {
+    if (!active()) return
+    updateState(session, { status: 'authenticated', qr: '', qrDataUrl: '', lastError: '' })
+    void postWebhook(session, 'status', { ...session.state })
+  })
+  client.on('auth_failure', (message) => {
+    if (!active()) return
+    updateState(session, { status: 'auth_failure', lastError: String(message || 'authentication failed') })
+    void postWebhook(session, 'status', { ...session.state })
+  })
+  client.on('ready', async () => {
+    if (!active()) return
+    updateState(session, {
+      status: 'ready', qr: '', qrDataUrl: '', loadingPercent: 100, loadingMessage: '', lastError: '',
+      account: await accountSnapshot(session, client),
+    })
+    void postWebhook(session, 'status', { ...session.state })
+  })
+  client.on('change_state', (state) => active() && void postWebhook(session, 'session_state', { state }))
+  client.on('disconnected', (reason) => {
+    if (!active()) return
+    updateState(session, { status: 'disconnected', account: null, lastError: String(reason || '') })
+    void postWebhook(session, 'status', { ...session.state })
+  })
+  client.on('message', async (message) => active() && void postWebhook(session, 'message', await serializeMessage(session, message, true)))
+  client.on('message_create', async (message) => {
+    if (active() && message.fromMe) void postWebhook(session, 'message_create', await serializeMessage(session, message, false))
+  })
+  client.on('message_ack', (message, ack) => active() && void postWebhook(session, 'message_ack', { id: serializeId(message.id), ack }))
+  client.on('message_revoke_everyone', (after, before) => active() && void postWebhook(session, 'message_revoke', {
+    id: serializeId(after?.id), beforeId: serializeId(before?.id), chatId: after?.from || before?.from || '',
+  }))
+}
+
+async function startSession(session) {
+  await destroyClient(session)
+  await clearStaleProfileLocks(session)
+  updateState(session, { status: 'initializing', qr: '', qrDataUrl: '', loadingPercent: 0, loadingMessage: '', lastError: '' })
+  const proxyUrl = await prepareProxy(session)
+  const args = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--no-default-browser-check']
   if (proxyUrl) args.push(`--proxy-server=${proxyUrl}`)
 
-  const nextClient = new Client({
-    authStrategy: new LocalAuth({ clientId: 'yaerp', dataPath: `${DATA_DIR}/auth` }),
-    puppeteer: {
-      headless: true,
-      executablePath: CHROMIUM_PATH,
-      args,
-    },
+  const client = new Client({
+    authStrategy: new LocalAuth({ clientId: session.id, dataPath: `${DATA_DIR}/auth` }),
+    puppeteer: { headless: true, executablePath: CHROMIUM_PATH, args },
   })
-  client = nextClient
-  bindClientEvents(nextClient)
-  nextClient.initialize().catch((error) => {
-    updateState({ status: 'error', lastError: error.message })
-    void postWebhook('status', { ...state })
+  session.client = client
+  bindClientEvents(session, client)
+  client.initialize().catch((error) => {
+    if (session.client !== client) return
+    updateState(session, { status: 'error', lastError: error.message })
+    void postWebhook(session, 'status', { ...session.state })
   })
-  return state
+  return session.state
 }
 
-function queueOperation(task) {
-  operation = operation.then(task, task)
-  return operation
+function requireSession(req, res, next) {
+  try {
+    req.whatsappSession = getSession(req.params.sessionId)
+    next()
+  } catch (error) {
+    res.status(400).json({ error: error.message })
+  }
 }
 
 function requireReady(req, res, next) {
-  if (!client || state.status !== 'ready') return res.status(409).json({ error: 'WhatsApp is not ready' })
+  const session = req.whatsappSession
+  if (!session?.client || session.state.status !== 'ready') return res.status(409).json({ error: 'WhatsApp account is not ready' })
   next()
 }
 
-function serializeChat(chat) {
+function serializeChatBasic(chat) {
+  const lastMessage = chat.lastMessage
   return {
     id: serializeId(chat.id),
     name: chat.name || chat.formattedTitle || serializeId(chat.id),
     isGroup: Boolean(chat.isGroup),
     unreadCount: chat.unreadCount || 0,
-    timestamp: chat.timestamp || 0,
+    timestamp: chat.timestamp || lastMessage?.timestamp || 0,
     pinned: Boolean(chat.pinned),
     archived: Boolean(chat.archived),
     isMuted: Boolean(chat.isMuted),
+    lastMessage: lastMessage?.body || '',
   }
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, status: state.status }))
+async function enrichChat(session, chat) {
+  const basic = serializeChatBasic(chat)
+  basic.profilePicUrl = await safeProfilePic(session.client, basic.id)
+  basic.about = ''
+  basic.description = ''
+  basic.participantCount = 0
+  if (chat.isGroup) {
+    basic.description = chat.description || ''
+    basic.participantCount = Array.isArray(chat.participants) ? chat.participants.length : 0
+  } else {
+    try {
+      const contact = await chat.getContact()
+      basic.about = await contact.getAbout() || ''
+    } catch { /* Contact about may be private. */ }
+  }
+  return basic
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const result = new Array(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++
+      result[index] = await mapper(items[index], index)
+    }
+  })
+  await Promise.all(workers)
+  return result
+}
+
+app.get('/health', (_req, res) => res.json({ ok: true, sessions: sessions.size }))
 app.use(requireInternalSecret)
 
-app.get('/status', (_req, res) => res.json({ ...state, qr: undefined }))
 app.post('/configure', async (req, res, next) => {
   try {
-    configuration = {
-      enabled: Boolean(req.body.enabled),
-      proxyUrl: String(req.body.proxyUrl || '').trim(),
-    }
-    if (!configuration.enabled) await queueOperation(destroyClient)
-    res.json({ ok: true, configuration: { enabled: configuration.enabled, proxyConfigured: Boolean(configuration.proxyUrl) } })
-  } catch (error) {
-    next(error)
-  }
-})
-app.post('/session/start', async (_req, res, next) => {
-  try {
-    res.json(await queueOperation(startClient))
-  } catch (error) {
-    updateState({ status: 'error', lastError: error.message })
-    next(error)
-  }
-})
-app.post('/session/restart', async (_req, res, next) => {
-  try {
-    res.json(await queueOperation(startClient))
-  } catch (error) {
-    updateState({ status: 'error', lastError: error.message })
-    next(error)
-  }
-})
-app.post('/session/logout', async (_req, res, next) => {
-  try {
-    await queueOperation(async () => {
-      if (client) {
-        try { await client.logout() } catch (error) { console.error('WhatsApp logout failed:', error.message) }
-      }
-      await destroyClient()
-      updateState({ status: configuration.enabled ? 'disconnected' : 'disabled', qr: '', qrDataUrl: '', account: null, lastError: '' })
-    })
-    res.json(state)
-  } catch (error) {
-    next(error)
-  }
-})
-app.get('/qr', (_req, res) => res.json({ status: state.status, qrDataUrl: state.qrDataUrl, updatedAt: state.updatedAt }))
-
-app.get('/chats', requireReady, async (_req, res, next) => {
-  try {
-    const chats = await client.getChats()
-    res.json(chats.map(serializeChat).sort((a, b) => b.timestamp - a.timestamp))
+    configuration.proxyUrl = String(req.body.proxyUrl || '').trim()
+    res.json({ ok: true, proxyConfigured: Boolean(configuration.proxyUrl) })
   } catch (error) { next(error) }
 })
-app.get('/contacts', requireReady, async (_req, res, next) => {
+app.get('/sessions', (_req, res) => res.json(Array.from(sessions.values()).map((session) => ({ sessionId: session.id, ...session.state, qr: undefined }))))
+app.get('/sessions/:sessionId/status', requireSession, (req, res) => res.json({ ...req.whatsappSession.state, qr: undefined }))
+app.post('/sessions/:sessionId/start', requireSession, async (req, res, next) => {
+  try { res.json(await queueOperation(req.whatsappSession, () => startSession(req.whatsappSession))) } catch (error) { next(error) }
+})
+app.post('/sessions/:sessionId/restart', requireSession, async (req, res, next) => {
+  try { res.json(await queueOperation(req.whatsappSession, () => startSession(req.whatsappSession))) } catch (error) { next(error) }
+})
+app.post('/sessions/:sessionId/logout', requireSession, async (req, res, next) => {
+  const session = req.whatsappSession
   try {
-    const contacts = await client.getContacts()
-    res.json(contacts.filter((contact) => contact.isWAContact).map((contact) => ({
-      id: serializeId(contact.id),
-      number: contact.number || '',
+    await queueOperation(session, async () => {
+      if (session.client) {
+        try { await session.client.logout() } catch (error) { console.error(`Logout failed (${session.id}):`, error.message) }
+      }
+      await destroyClient(session)
+      updateState(session, { status: 'disconnected', qr: '', qrDataUrl: '', account: null, lastError: '' })
+    })
+    res.json(session.state)
+  } catch (error) { next(error) }
+})
+app.get('/sessions/:sessionId/profile', requireSession, requireReady, async (req, res, next) => {
+  try {
+    const account = await accountSnapshot(req.whatsappSession, req.whatsappSession.client)
+    updateState(req.whatsappSession, { account })
+    res.json(account)
+  } catch (error) { next(error) }
+})
+app.put('/sessions/:sessionId/profile/about', requireSession, requireReady, async (req, res, next) => {
+  try {
+    await req.whatsappSession.client.setStatus(String(req.body.about || '').slice(0, 139))
+    const account = await accountSnapshot(req.whatsappSession, req.whatsappSession.client)
+    updateState(req.whatsappSession, { account })
+    res.json(account)
+  } catch (error) { next(error) }
+})
+
+app.get('/sessions/:sessionId/chats', requireSession, requireReady, async (req, res, next) => {
+  try {
+    const chats = await req.whatsappSession.client.getChats()
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200)))
+    const selected = chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, limit)
+    res.json(await mapWithConcurrency(selected, 8, (chat) => enrichChat(req.whatsappSession, chat)))
+  } catch (error) { next(error) }
+})
+app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (req, res, next) => {
+  try {
+    const contacts = (await req.whatsappSession.client.getContacts()).filter((contact) => contact.isWAContact)
+    res.json(await mapWithConcurrency(contacts, 8, async (contact) => ({
+      id: serializeId(contact.id), number: contact.number || '',
       name: contact.name || contact.pushname || contact.shortName || contact.number || '',
-      isBusiness: Boolean(contact.isBusiness),
-      isMyContact: Boolean(contact.isMyContact),
+      isBusiness: Boolean(contact.isBusiness), isMyContact: Boolean(contact.isMyContact),
+      profilePicUrl: await safeProfilePic(req.whatsappSession.client, serializeId(contact.id)),
     })))
   } catch (error) { next(error) }
 })
-app.get('/chats/:chatId/messages', requireReady, async (req, res, next) => {
+app.get('/sessions/:sessionId/chats/:chatId/messages', requireSession, requireReady, async (req, res, next) => {
   try {
-    const chat = await client.getChatById(req.params.chatId)
+    const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)))
-    const messages = await chat.fetchMessages({ limit })
-    res.json(await Promise.all(messages.map((message) => serializeMessage(message, false))))
+    res.json(await Promise.all((await chat.fetchMessages({ limit })).map((message) => serializeMessage(req.whatsappSession, message, false))))
   } catch (error) { next(error) }
 })
-
-app.post('/messages/send', requireReady, async (req, res, next) => {
+app.post('/sessions/:sessionId/messages/send', requireSession, requireReady, async (req, res, next) => {
   try {
     const chatId = String(req.body.chatId || '').trim()
     if (!chatId) return res.status(400).json({ error: 'chatId is required' })
     const content = String(req.body.content || '')
-    const options = {}
-    if (req.body.quotedMessageId) options.quotedMessageId = String(req.body.quotedMessageId)
+    const options = req.body.quotedMessageId ? { quotedMessageId: String(req.body.quotedMessageId) } : {}
     let sent
     if (req.body.media?.data) {
-      const media = new MessageMedia(
-        req.body.media.mimetype || 'application/octet-stream',
-        req.body.media.data,
-        req.body.media.filename || 'attachment'
-      )
-      sent = await client.sendMessage(chatId, media, { ...options, caption: content, sendMediaAsDocument: Boolean(req.body.sendMediaAsDocument) })
+      const media = new MessageMedia(req.body.media.mimetype || 'application/octet-stream', req.body.media.data, req.body.media.filename || 'attachment')
+      sent = await req.whatsappSession.client.sendMessage(chatId, media, { ...options, caption: content, sendMediaAsDocument: Boolean(req.body.sendMediaAsDocument) })
     } else {
       if (!content) return res.status(400).json({ error: 'content or media is required' })
-      sent = await client.sendMessage(chatId, content, options)
+      sent = await req.whatsappSession.client.sendMessage(chatId, content, options)
     }
-    res.json(await serializeMessage(sent, false))
+    res.json(await serializeMessage(req.whatsappSession, sent, false))
   } catch (error) { next(error) }
 })
-app.post('/messages/:messageId/reaction', requireReady, async (req, res, next) => {
+app.post('/sessions/:sessionId/messages/:messageId/reaction', requireSession, requireReady, async (req, res, next) => {
   try {
-    const message = await client.getMessageById(req.params.messageId)
-    if (!message) return res.status(404).json({ error: 'message not found' })
-    await message.react(String(req.body.reaction || ''))
+    await req.whatsappSession.client.sendReaction(req.params.messageId, String(req.body.reaction || ''))
     res.json({ ok: true })
   } catch (error) { next(error) }
 })
-
-app.post('/chats/:chatId/action', requireReady, async (req, res, next) => {
+app.post('/sessions/:sessionId/chats/:chatId/action', requireSession, requireReady, async (req, res, next) => {
   try {
-    const chat = await client.getChatById(req.params.chatId)
+    const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
     switch (req.body.action) {
       case 'seen': await chat.sendSeen(); break
       case 'typing': await chat.sendStateTyping(); break
@@ -396,26 +447,26 @@ app.post('/chats/:chatId/action', requireReady, async (req, res, next) => {
     res.json({ ok: true })
   } catch (error) { next(error) }
 })
-app.patch('/groups/:chatId', requireReady, async (req, res, next) => {
+app.patch('/sessions/:sessionId/groups/:chatId', requireSession, requireReady, async (req, res, next) => {
   try {
-    const chat = await client.getChatById(req.params.chatId)
+    const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
     if (!chat.isGroup) return res.status(400).json({ error: 'chat is not a group' })
     if (req.body.subject) await chat.setSubject(String(req.body.subject))
     if (req.body.description !== undefined) await chat.setDescription(String(req.body.description))
-    res.json(serializeChat(chat))
+    res.json(await enrichChat(req.whatsappSession, chat))
   } catch (error) { next(error) }
 })
-app.post('/groups', requireReady, async (req, res, next) => {
+app.post('/sessions/:sessionId/groups', requireSession, requireReady, async (req, res, next) => {
   try {
     const title = String(req.body.title || '').trim()
     const participants = Array.isArray(req.body.participants) ? req.body.participants.map(String) : []
     if (!title || participants.length === 0) return res.status(400).json({ error: 'title and participants are required' })
-    res.json(await client.createGroup(title, participants))
+    res.json(await req.whatsappSession.client.createGroup(title, participants))
   } catch (error) { next(error) }
 })
-app.post('/groups/:chatId/participants', requireReady, async (req, res, next) => {
+app.post('/sessions/:sessionId/groups/:chatId/participants', requireSession, requireReady, async (req, res, next) => {
   try {
-    const chat = await client.getChatById(req.params.chatId)
+    const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
     if (!chat.isGroup) return res.status(400).json({ error: 'chat is not a group' })
     const participants = Array.isArray(req.body.participants) ? req.body.participants.map(String) : []
     let result
@@ -429,14 +480,6 @@ app.post('/groups/:chatId/participants', requireReady, async (req, res, next) =>
     res.json(result)
   } catch (error) { next(error) }
 })
-app.delete('/groups/:chatId/leave', requireReady, async (req, res, next) => {
-  try {
-    const chat = await client.getChatById(req.params.chatId)
-    if (!chat.isGroup) return res.status(400).json({ error: 'chat is not a group' })
-    await chat.leave()
-    res.json({ ok: true })
-  } catch (error) { next(error) }
-})
 
 app.use((error, _req, res, _next) => {
   console.error(error)
@@ -444,8 +487,8 @@ app.use((error, _req, res, _next) => {
 })
 
 process.on('SIGTERM', async () => {
-  await destroyClient()
+  await Promise.all(Array.from(sessions.values()).map((session) => destroyClient(session)))
   process.exit(0)
 })
 
-app.listen(PORT, () => console.log(`WhatsApp service listening on ${PORT}`))
+app.listen(PORT, () => console.log(`WhatsApp multi-account service listening on ${PORT}`))

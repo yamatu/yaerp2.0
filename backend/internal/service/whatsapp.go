@@ -27,13 +27,8 @@ import (
 const whatsappMaxSendBytes = 25 * 1024 * 1024
 
 var whatsappSettingKeys = []string{
-	"whatsapp_enabled",
-	"whatsapp_auto_start",
-	"whatsapp_proxy_type",
-	"whatsapp_proxy_host",
-	"whatsapp_proxy_port",
-	"whatsapp_proxy_username",
-	"whatsapp_proxy_password",
+	"whatsapp_enabled", "whatsapp_auto_start", "whatsapp_proxy_type", "whatsapp_proxy_host",
+	"whatsapp_proxy_port", "whatsapp_proxy_username", "whatsapp_proxy_password",
 }
 
 type WhatsAppService struct {
@@ -70,21 +65,23 @@ type whatsappSentMessage struct {
 }
 
 type whatsAppWebhookEvent struct {
+	SessionID  string          `json:"sessionId"`
 	Type       string          `json:"type"`
 	Payload    json.RawMessage `json:"payload"`
 	OccurredAt string          `json:"occurredAt"`
 }
 
 type whatsAppIncomingMessage struct {
-	ID           string             `json:"id"`
-	ChatID       string             `json:"chatId"`
-	From         string             `json:"from"`
-	Author       string             `json:"author"`
-	FromMe       bool               `json:"fromMe"`
-	Body         string             `json:"body"`
-	SenderName   string             `json:"senderName"`
-	SenderNumber string             `json:"senderNumber"`
-	Media        *whatsappSendMedia `json:"media"`
+	ID                  string             `json:"id"`
+	ChatID              string             `json:"chatId"`
+	From                string             `json:"from"`
+	Author              string             `json:"author"`
+	FromMe              bool               `json:"fromMe"`
+	Body                string             `json:"body"`
+	SenderName          string             `json:"senderName"`
+	SenderNumber        string             `json:"senderNumber"`
+	SenderProfilePicURL string             `json:"senderProfilePicUrl"`
+	Media               *whatsappSendMedia `json:"media"`
 }
 
 func NewWhatsAppService(
@@ -96,21 +93,14 @@ func NewWhatsAppService(
 	serviceURL, internalSecret, encryptionSecret string,
 ) *WhatsAppService {
 	return &WhatsAppService{
-		repo:           whatsAppRepo,
-		channelRepo:    channelRepo,
-		uploadSvc:      uploadSvc,
-		sheetSvc:       sheetSvc,
-		permSvc:        permSvc,
-		serviceURL:     strings.TrimRight(serviceURL, "/"),
-		internalSecret: internalSecret,
-		httpClient:     &http.Client{Timeout: 90 * time.Second},
-		encryptionKey:  sha256.Sum256([]byte(encryptionSecret + ":whatsapp-proxy")),
+		repo: whatsAppRepo, channelRepo: channelRepo, uploadSvc: uploadSvc, sheetSvc: sheetSvc, permSvc: permSvc,
+		serviceURL: strings.TrimRight(serviceURL, "/"), internalSecret: internalSecret,
+		httpClient:    &http.Client{Timeout: 90 * time.Second},
+		encryptionKey: sha256.Sum256([]byte(encryptionSecret + ":whatsapp-proxy")),
 	}
 }
 
-func (s *WhatsAppService) SetInboundHook(hook func(*model.ChannelMessage)) {
-	s.inboundHook = hook
-}
+func (s *WhatsAppService) SetInboundHook(hook func(*model.ChannelMessage)) { s.inboundHook = hook }
 
 func (s *WhatsAppService) GetSettings() (*model.WhatsAppSettings, error) {
 	values, err := s.repo.GetSettings(whatsappSettingKeys)
@@ -118,14 +108,14 @@ func (s *WhatsAppService) GetSettings() (*model.WhatsAppSettings, error) {
 		return nil, err
 	}
 	settings := &model.WhatsAppSettings{
-		Enabled:       parseStoredBool(values["whatsapp_enabled"]),
-		AutoStart:     values["whatsapp_auto_start"] == "" || parseStoredBool(values["whatsapp_auto_start"]),
-		ProxyType:     normalizeWhatsAppProxyType(values["whatsapp_proxy_type"]),
-		ProxyHost:     strings.TrimSpace(values["whatsapp_proxy_host"]),
-		ProxyUsername: strings.TrimSpace(values["whatsapp_proxy_username"]),
+		Enabled:                 parseStoredBool(values["whatsapp_enabled"]),
+		AutoStart:               values["whatsapp_auto_start"] == "" || parseStoredBool(values["whatsapp_auto_start"]),
+		ProxyType:               normalizeWhatsAppProxyType(values["whatsapp_proxy_type"]),
+		ProxyHost:               strings.TrimSpace(values["whatsapp_proxy_host"]),
+		ProxyUsername:           strings.TrimSpace(values["whatsapp_proxy_username"]),
+		ProxyPasswordConfigured: strings.TrimSpace(values["whatsapp_proxy_password"]) != "",
 	}
 	settings.ProxyPort, _ = strconv.Atoi(values["whatsapp_proxy_port"])
-	settings.ProxyPasswordConfigured = strings.TrimSpace(values["whatsapp_proxy_password"]) != ""
 	return settings, nil
 }
 
@@ -162,10 +152,8 @@ func (s *WhatsAppService) UpdateSettings(input *model.WhatsAppSettings) (*model.
 		"whatsapp_proxy_password": password,
 	}
 	if proxyType == "none" {
-		values["whatsapp_proxy_host"] = ""
-		values["whatsapp_proxy_port"] = "0"
-		values["whatsapp_proxy_username"] = ""
-		values["whatsapp_proxy_password"] = ""
+		values["whatsapp_proxy_host"], values["whatsapp_proxy_port"] = "", "0"
+		values["whatsapp_proxy_username"], values["whatsapp_proxy_password"] = "", ""
 	}
 	if err := s.repo.UpsertSettings(values); err != nil {
 		return nil, err
@@ -185,58 +173,120 @@ func (s *WhatsAppService) AutoStart() {
 	if err != nil || !settings.Enabled || !settings.AutoStart {
 		return
 	}
-	if err := s.Start(); err != nil {
-		fmt.Printf("WhatsApp auto start failed: %v\n", err)
-	}
-}
-
-func (s *WhatsAppService) Start() error {
-	settings, err := s.GetSettings()
-	if err != nil {
-		return err
-	}
-	if !settings.Enabled {
-		return fmt.Errorf("请先在管理后台启用 WhatsApp")
-	}
 	if err := s.configureSidecar(settings); err != nil {
-		return err
+		fmt.Printf("WhatsApp configure failed: %v\n", err)
+		return
 	}
-	return s.callSidecar(http.MethodPost, "/session/start", nil, nil)
-}
-
-func (s *WhatsAppService) Restart() error {
-	settings, err := s.GetSettings()
+	accounts, err := s.repo.ListAutoStartAccounts()
 	if err != nil {
-		return err
+		fmt.Printf("WhatsApp account list failed: %v\n", err)
+		return
 	}
-	if !settings.Enabled {
-		return fmt.Errorf("请先在管理后台启用 WhatsApp")
+	for _, account := range accounts {
+		account := account
+		go func() {
+			if err := s.startAccount(&account, false); err != nil {
+				fmt.Printf("WhatsApp auto start user %d failed: %v\n", account.UserID, err)
+			}
+		}()
 	}
-	if err := s.configureSidecar(settings); err != nil {
-		return err
-	}
-	return s.callSidecar(http.MethodPost, "/session/restart", nil, nil)
 }
 
-func (s *WhatsAppService) Logout() error {
-	return s.callSidecar(http.MethodPost, "/session/logout", nil, nil)
-}
-
-func (s *WhatsAppService) GetStatus() (*model.WhatsAppStatus, error) {
-	status := &model.WhatsAppStatus{Status: "unavailable"}
-	if err := s.callSidecar(http.MethodGet, "/status", nil, status); err != nil {
-		status.LastError = err.Error()
-		return status, nil
-	}
-	return status, nil
-}
-
-func (s *WhatsAppService) ListChats() ([]model.WhatsAppChat, error) {
-	chats := make([]model.WhatsAppChat, 0)
-	if err := s.callSidecar(http.MethodGet, "/chats", nil, &chats); err != nil {
+func (s *WhatsAppService) GetAccount(requesterID, targetUserID int64) (*model.WhatsAppAccount, error) {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
 		return nil, err
 	}
-	return chats, nil
+	s.refreshAccountStatus(account)
+	return account, nil
+}
+
+func (s *WhatsAppService) ListAccounts(requesterID int64) ([]model.WhatsAppAccount, error) {
+	isAdmin, err := s.permSvc.IsAdmin(requesterID)
+	if err != nil {
+		return nil, err
+	}
+	if !isAdmin {
+		return nil, ErrChannelManageDenied
+	}
+	accounts, err := s.repo.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	for index := range accounts {
+		s.refreshAccountStatus(&accounts[index])
+	}
+	return accounts, nil
+}
+
+func (s *WhatsAppService) UpdateAccountPreferences(requesterID, targetUserID int64, enabled, autoStart bool) (*model.WhatsAppAccount, error) {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.UpdateAccountPreferences(account.UserID, enabled, autoStart); err != nil {
+		return nil, err
+	}
+	return s.GetAccount(requesterID, account.UserID)
+}
+
+func (s *WhatsAppService) StartAccount(requesterID, targetUserID int64) error {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
+		return err
+	}
+	return s.startAccount(account, true)
+}
+
+func (s *WhatsAppService) RestartAccount(requesterID, targetUserID int64) error {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
+		return err
+	}
+	settings, err := s.GetSettings()
+	if err != nil {
+		return err
+	}
+	if !settings.Enabled {
+		return fmt.Errorf("管理员尚未启用 WhatsApp 服务")
+	}
+	if err := s.configureSidecar(settings); err != nil {
+		return err
+	}
+	return s.callSidecar(http.MethodPost, s.sessionPath(account.UserID)+"/restart", nil, nil)
+}
+
+func (s *WhatsAppService) LogoutAccount(requesterID, targetUserID int64) error {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
+		return err
+	}
+	if err := s.callSidecar(http.MethodPost, s.sessionPath(account.UserID)+"/logout", nil, nil); err != nil {
+		return err
+	}
+	_ = s.repo.UpdateAccountPreferences(account.UserID, false, account.AutoStart)
+	return s.repo.UpdateAccountRuntime(account.UserID, "disconnected", "", "", "", "", "", "", "")
+}
+
+func (s *WhatsAppService) ListChats(requesterID, targetUserID int64) ([]model.WhatsAppChat, error) {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
+		return nil, err
+	}
+	return s.listChatsForAccount(account)
+}
+
+func (s *WhatsAppService) UpdateAccountAbout(requesterID, targetUserID int64, about string) (*model.WhatsAppAccount, error) {
+	account, err := s.accountForAccess(requesterID, targetUserID)
+	if err != nil {
+		return nil, err
+	}
+	var profile map[string]interface{}
+	if err := s.callSidecar(http.MethodPut, s.sessionPath(account.UserID)+"/profile/about", map[string]string{"about": about}, &profile); err != nil {
+		return nil, err
+	}
+	s.applyRuntimeSnapshot(account.UserID, "ready", profile, "")
+	return s.GetAccount(requesterID, account.UserID)
 }
 
 func (s *WhatsAppService) GetChannelLink(userID, channelID int64) (*model.WhatsAppChannelLink, error) {
@@ -254,9 +304,27 @@ func (s *WhatsAppService) UpdateChannelLink(userID, channelID int64, request *mo
 	if err := s.requireChannelManage(userID, channelID); err != nil {
 		return nil, err
 	}
+	account, err := s.accountByIDForAccess(userID, request.WhatsAppAccountID)
+	if err != nil {
+		return nil, err
+	}
 	chatID := strings.TrimSpace(request.WhatsAppChatID)
 	if chatID == "" {
 		return nil, fmt.Errorf("请选择 WhatsApp 会话")
+	}
+	chats, err := s.listChatsForAccount(account)
+	if err != nil {
+		return nil, err
+	}
+	var selected *model.WhatsAppChat
+	for index := range chats {
+		if chats[index].ID == chatID {
+			selected = &chats[index]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("所选 WhatsApp 会话不存在或当前账号不可访问")
 	}
 	syncInbound, syncOutbound := true, true
 	if request.SyncInbound != nil {
@@ -266,20 +334,16 @@ func (s *WhatsAppService) UpdateChannelLink(userID, channelID int64, request *mo
 		syncOutbound = *request.SyncOutbound
 	}
 	link := &model.WhatsAppChannelLink{
-		ChannelID:        channelID,
-		WhatsAppChatID:   chatID,
-		WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
-		SyncInbound:      syncInbound,
-		SyncOutbound:     syncOutbound,
-		CreatedBy:        userID,
-	}
-	if link.WhatsAppChatName == "" {
-		link.WhatsAppChatName = chatID
+		ChannelID: channelID, WhatsAppAccountID: account.ID, WhatsAppUserID: account.UserID,
+		WhatsAppUsername: account.Username, WhatsAppDisplayName: account.DisplayName,
+		WhatsAppChatID: selected.ID, WhatsAppChatName: selected.Name, WhatsAppChatAvatarURL: selected.ProfilePicURL,
+		WhatsAppChatAbout: whatsAppFirstNonEmpty(selected.Description, selected.About), WhatsAppIsGroup: selected.IsGroup,
+		WhatsAppParticipantCount: selected.ParticipantCount, SyncInbound: syncInbound, SyncOutbound: syncOutbound, CreatedBy: userID,
 	}
 	if err := s.repo.UpsertChannelLink(link); err != nil {
 		return nil, err
 	}
-	return link, nil
+	return s.repo.GetChannelLink(channelID)
 }
 
 func (s *WhatsAppService) DeleteChannelLink(userID, channelID int64) error {
@@ -306,10 +370,10 @@ func (s *WhatsAppService) SendChannelMessage(userID, channelID, messageID int64)
 		return nil, err
 	}
 	link, err := s.repo.GetChannelLink(channelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("当前频道尚未关联 WhatsApp 会话")
+	}
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("当前频道尚未关联 WhatsApp 会话")
-		}
 		return nil, err
 	}
 	return s.sendStoredChannelMessage(userID, link, messageID)
@@ -319,14 +383,22 @@ func (s *WhatsAppService) SendResource(userID int64, request *model.WhatsAppSend
 	if request.MessageID > 0 && request.ChannelID > 0 {
 		return s.SendChannelMessage(userID, request.ChannelID, request.MessageID)
 	}
+	account, err := s.accountByIDForAccess(userID, request.WhatsAppAccountID)
+	if err != nil {
+		return nil, err
+	}
 	chatID := strings.TrimSpace(request.ChatID)
 	if chatID == "" && request.ChannelID > 0 {
 		if err := s.requireChannelAccess(userID, request.ChannelID); err != nil {
 			return nil, err
 		}
-		link, err := s.repo.GetChannelLink(request.ChannelID)
-		if err != nil {
+		link, linkErr := s.repo.GetChannelLink(request.ChannelID)
+		if linkErr != nil {
 			return nil, fmt.Errorf("当前频道尚未关联 WhatsApp 会话")
+		}
+		account, err = s.repo.GetAccountByID(link.WhatsAppAccountID)
+		if err != nil {
+			return nil, err
 		}
 		chatID = link.WhatsAppChatID
 	}
@@ -354,7 +426,7 @@ func (s *WhatsAppService) SendResource(userID int64, request *model.WhatsAppSend
 	if payload.Content == "" && payload.Media == nil {
 		return nil, fmt.Errorf("请输入消息或选择要发送的文件")
 	}
-	return s.sendPayload(payload)
+	return s.sendPayload(account.UserID, payload)
 }
 
 func (s *WhatsAppService) HandleWebhook(body []byte) error {
@@ -362,13 +434,28 @@ func (s *WhatsAppService) HandleWebhook(body []byte) error {
 	if err := json.Unmarshal(body, &event); err != nil {
 		return err
 	}
+	userID, err := parseWhatsAppSessionUserID(event.SessionID)
+	if err != nil {
+		return err
+	}
+	account, err := s.repo.EnsureAccount(userID)
+	if err != nil {
+		return err
+	}
 	switch event.Type {
+	case "status":
+		var status model.WhatsAppStatus
+		if err := json.Unmarshal(event.Payload, &status); err != nil {
+			return err
+		}
+		s.applyRuntimeSnapshot(userID, status.Status, status.Account, status.LastError)
+		return nil
 	case "message":
 		var incoming whatsAppIncomingMessage
 		if err := json.Unmarshal(event.Payload, &incoming); err != nil {
 			return err
 		}
-		return s.handleIncomingMessage(&incoming)
+		return s.handleIncomingMessage(account, &incoming)
 	case "message_ack":
 		var ack struct {
 			ID  string `json:"id"`
@@ -377,7 +464,7 @@ func (s *WhatsAppService) HandleWebhook(body []byte) error {
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
 			return err
 		}
-		return s.repo.UpdateMessageAck(ack.ID, ack.Ack)
+		return s.repo.UpdateMessageAck(account.ID, ack.ID, ack.Ack)
 	default:
 		return nil
 	}
@@ -387,15 +474,15 @@ func (s *WhatsAppService) ValidateInternalSecret(value string) bool {
 	return s.internalSecret != "" && value == s.internalSecret
 }
 
-func (s *WhatsAppService) handleIncomingMessage(incoming *whatsAppIncomingMessage) error {
+func (s *WhatsAppService) handleIncomingMessage(account *model.WhatsAppAccount, incoming *whatsAppIncomingMessage) error {
 	if incoming.FromMe || strings.TrimSpace(incoming.ID) == "" || strings.TrimSpace(incoming.ChatID) == "" {
 		return nil
 	}
-	exists, err := s.repo.HasExternalMessage("whatsapp", incoming.ID)
+	exists, err := s.repo.HasExternalMessage(account.ID, "whatsapp", incoming.ID)
 	if err != nil || exists {
 		return err
 	}
-	link, err := s.repo.FindChannelLinkByChatID(incoming.ChatID)
+	link, err := s.repo.FindChannelLink(account.ID, incoming.ChatID)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && !link.SyncInbound) {
 		return nil
 	}
@@ -442,16 +529,14 @@ func (s *WhatsAppService) handleIncomingMessage(incoming *whatsAppIncomingMessag
 		senderName = whatsAppFirstNonEmpty(incoming.SenderNumber, incoming.Author, incoming.From, "WhatsApp 联系人")
 	}
 	senderAddress := whatsAppFirstNonEmpty(incoming.SenderNumber, incoming.Author, incoming.From)
-	externalSource, externalID := "whatsapp", incoming.ID
+	externalSource, externalID, avatar := "whatsapp", incoming.ID, strings.TrimSpace(incoming.SenderProfilePicURL)
 	message := &model.ChannelMessage{
-		ChannelID:             link.ChannelID,
-		SenderType:            "whatsapp",
-		Content:               content,
-		AttachmentID:          attachmentID,
-		ExternalSource:        &externalSource,
-		ExternalMessageID:     &externalID,
-		ExternalSenderName:    &senderName,
-		ExternalSenderAddress: &senderAddress,
+		ChannelID: link.ChannelID, SenderType: "whatsapp", Content: content, AttachmentID: attachmentID,
+		ExternalSource: &externalSource, ExternalAccountID: &account.ID, ExternalMessageID: &externalID,
+		ExternalSenderName: &senderName, ExternalSenderAddress: &senderAddress,
+	}
+	if avatar != "" {
+		message.ExternalSenderAvatar = &avatar
 	}
 	if err := s.repo.CreateExternalMessage(message); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -459,7 +544,7 @@ func (s *WhatsAppService) handleIncomingMessage(incoming *whatsAppIncomingMessag
 		}
 		return err
 	}
-	_ = s.repo.RecordMessageLink(message.ID, incoming.ID, "inbound", nil)
+	_ = s.repo.RecordMessageLink(account.ID, message.ID, incoming.ID, "inbound", nil)
 	_ = s.repo.TouchChannel(link.ChannelID)
 	created, err := s.channelRepo.GetMessage(message.ID)
 	if err != nil {
@@ -482,7 +567,7 @@ func (s *WhatsAppService) sendStoredChannelMessage(userID int64, link *model.Wha
 	}
 	payload := &whatsappSendPayload{ChatID: link.WhatsAppChatID, Content: strings.TrimSpace(message.Content)}
 	if message.ReplyToMessageID != nil {
-		payload.QuotedMessageID, _ = s.repo.ExternalMessageID(*message.ReplyToMessageID)
+		payload.QuotedMessageID, _ = s.repo.ExternalMessageID(link.WhatsAppAccountID, *message.ReplyToMessageID)
 	}
 	if message.AttachmentID != nil {
 		if err := s.attachStoredFile(userID, *message.AttachmentID, payload, true); err != nil {
@@ -504,19 +589,19 @@ func (s *WhatsAppService) sendStoredChannelMessage(userID int64, link *model.Wha
 	if message.LinkedSummaryTitle != nil {
 		payload.Content = strings.TrimSpace(payload.Content + "\nAI 总结：" + *message.LinkedSummaryTitle)
 	}
-	sent, err := s.sendPayload(payload)
+	sent, err := s.sendPayload(link.WhatsAppUserID, payload)
 	if err != nil {
 		return nil, err
 	}
 	if sent.ID != "" {
-		_ = s.repo.RecordMessageLink(message.ID, sent.ID, "outbound", nil)
+		_ = s.repo.RecordMessageLink(link.WhatsAppAccountID, message.ID, sent.ID, "outbound", nil)
 	}
 	return sent, nil
 }
 
-func (s *WhatsAppService) sendPayload(payload *whatsappSendPayload) (*whatsappSentMessage, error) {
+func (s *WhatsAppService) sendPayload(accountUserID int64, payload *whatsappSendPayload) (*whatsappSentMessage, error) {
 	var sent whatsappSentMessage
-	if err := s.callSidecar(http.MethodPost, "/messages/send", payload, &sent); err != nil {
+	if err := s.callSidecar(http.MethodPost, s.sessionPath(accountUserID)+"/messages/send", payload, &sent); err != nil {
 		return nil, err
 	}
 	return &sent, nil
@@ -542,21 +627,13 @@ func (s *WhatsAppService) attachStoredFile(userID, attachmentID int64, payload *
 	if len(data) > whatsappMaxSendBytes {
 		return fmt.Errorf("WhatsApp 附件不能超过 25MB")
 	}
-	payload.Media = &whatsappSendMedia{
-		Data:     base64.StdEncoding.EncodeToString(data),
-		Mimetype: attachment.MimeType,
-		Filename: attachment.Filename,
-	}
+	payload.Media = &whatsappSendMedia{Data: base64.StdEncoding.EncodeToString(data), Mimetype: attachment.MimeType, Filename: attachment.Filename}
 	payload.SendMediaAsDocument = !strings.HasPrefix(strings.ToLower(attachment.MimeType), "image/")
 	return nil
 }
 
 func (s *WhatsAppService) attachExportFile(exportFile *sheetExportFile, payload *whatsappSendPayload) {
-	payload.Media = &whatsappSendMedia{
-		Data:     base64.StdEncoding.EncodeToString(exportFile.Data),
-		Mimetype: exportFile.ContentType,
-		Filename: exportFile.Filename,
-	}
+	payload.Media = &whatsappSendMedia{Data: base64.StdEncoding.EncodeToString(exportFile.Data), Mimetype: exportFile.ContentType, Filename: exportFile.Filename}
 	payload.SendMediaAsDocument = true
 }
 
@@ -566,7 +643,7 @@ func (s *WhatsAppService) saveIncomingImageToGallery(link *model.WhatsAppChannel
 		return err
 	}
 	directoryName := "WhatsApp - " + strings.TrimSpace(link.WhatsAppChatName)
-	if directoryName == "WhatsApp -" || directoryName == "WhatsApp - " {
+	if strings.TrimSpace(directoryName) == "WhatsApp -" {
 		directoryName = "WhatsApp 图片"
 	}
 	var directoryID *int64
@@ -591,6 +668,98 @@ func (s *WhatsAppService) saveIncomingImageToGallery(link *model.WhatsAppChannel
 func (s *WhatsAppService) attachChannelMessageURL(message *model.ChannelMessage) {
 	if message.AttachmentID != nil {
 		message.AttachmentURL, _ = s.uploadSvc.GetFileURL(*message.AttachmentID)
+	}
+}
+
+func (s *WhatsAppService) accountForAccess(requesterID, targetUserID int64) (*model.WhatsAppAccount, error) {
+	if targetUserID <= 0 {
+		targetUserID = requesterID
+	}
+	if targetUserID != requesterID {
+		isAdmin, err := s.permSvc.IsAdmin(requesterID)
+		if err != nil {
+			return nil, err
+		}
+		if !isAdmin {
+			return nil, ErrChannelManageDenied
+		}
+	}
+	return s.repo.EnsureAccount(targetUserID)
+}
+
+func (s *WhatsAppService) accountByIDForAccess(requesterID, accountID int64) (*model.WhatsAppAccount, error) {
+	if accountID <= 0 {
+		return s.repo.EnsureAccount(requesterID)
+	}
+	account, err := s.repo.GetAccountByID(accountID)
+	if err != nil {
+		return nil, err
+	}
+	if account.UserID != requesterID {
+		isAdmin, err := s.permSvc.IsAdmin(requesterID)
+		if err != nil {
+			return nil, err
+		}
+		if !isAdmin {
+			return nil, ErrChannelManageDenied
+		}
+	}
+	return account, nil
+}
+
+func (s *WhatsAppService) startAccount(account *model.WhatsAppAccount, enable bool) error {
+	settings, err := s.GetSettings()
+	if err != nil {
+		return err
+	}
+	if !settings.Enabled {
+		return fmt.Errorf("管理员尚未启用 WhatsApp 服务")
+	}
+	if enable {
+		if err := s.repo.UpdateAccountPreferences(account.UserID, true, account.AutoStart); err != nil {
+			return err
+		}
+	}
+	if err := s.configureSidecar(settings); err != nil {
+		return err
+	}
+	return s.callSidecar(http.MethodPost, s.sessionPath(account.UserID)+"/start", nil, nil)
+}
+
+func (s *WhatsAppService) listChatsForAccount(account *model.WhatsAppAccount) ([]model.WhatsAppChat, error) {
+	chats := make([]model.WhatsAppChat, 0)
+	if err := s.callSidecar(http.MethodGet, s.sessionPath(account.UserID)+"/chats", nil, &chats); err != nil {
+		return nil, err
+	}
+	return chats, nil
+}
+
+func (s *WhatsAppService) refreshAccountStatus(account *model.WhatsAppAccount) {
+	var status model.WhatsAppStatus
+	if err := s.callSidecar(http.MethodGet, s.sessionPath(account.UserID)+"/status", nil, &status); err != nil {
+		account.LastError = err.Error()
+		return
+	}
+	account.QRDataURL, account.LoadingPercent, account.LoadingMessage = status.QRDataURL, status.LoadingPercent, status.LoadingMessage
+	account.Status, account.LastError = status.Status, status.LastError
+	s.applyRuntimeSnapshot(account.UserID, status.Status, status.Account, status.LastError)
+	if refreshed, err := s.repo.GetAccountByUserID(account.UserID); err == nil {
+		qr, progress, loading := account.QRDataURL, account.LoadingPercent, account.LoadingMessage
+		*account = *refreshed
+		account.QRDataURL, account.LoadingPercent, account.LoadingMessage = qr, progress, loading
+	}
+}
+
+func (s *WhatsAppService) applyRuntimeSnapshot(userID int64, status string, raw map[string]interface{}, lastError string) {
+	stringValue := func(key string) string {
+		value, _ := raw[key].(string)
+		return strings.TrimSpace(value)
+	}
+	wid := stringValue("wid")
+	phone := strings.Split(wid, "@")[0]
+	if err := s.repo.UpdateAccountRuntime(userID, status, wid, stringValue("pushname"), phone,
+		stringValue("profilePicUrl"), stringValue("about"), stringValue("platform"), lastError); err != nil {
+		fmt.Printf("WhatsApp account runtime update failed for user %d: %v\n", userID, err)
 	}
 }
 
@@ -625,8 +794,7 @@ func (s *WhatsAppService) configureSidecar(settings *model.WhatsAppSettings) err
 	if err != nil {
 		return err
 	}
-	payload := map[string]interface{}{"enabled": settings.Enabled, "proxyUrl": proxyURL}
-	return s.callSidecar(http.MethodPost, "/configure", payload, nil)
+	return s.callSidecar(http.MethodPost, "/configure", map[string]interface{}{"proxyUrl": proxyURL}, nil)
 }
 
 func (s *WhatsAppService) buildProxyURL(settings *model.WhatsAppSettings) (string, error) {
@@ -641,14 +809,15 @@ func (s *WhatsAppService) buildProxyURL(settings *model.WhatsAppSettings) (strin
 	if err != nil {
 		return "", err
 	}
-	proxyURL := &url.URL{
-		Scheme: settings.ProxyType,
-		Host:   fmt.Sprintf("%s:%d", strings.TrimSpace(settings.ProxyHost), settings.ProxyPort),
-	}
+	proxyURL := &url.URL{Scheme: settings.ProxyType, Host: fmt.Sprintf("%s:%d", strings.TrimSpace(settings.ProxyHost), settings.ProxyPort)}
 	if settings.ProxyUsername != "" {
 		proxyURL.User = url.UserPassword(settings.ProxyUsername, password)
 	}
 	return proxyURL.String(), nil
+}
+
+func (s *WhatsAppService) sessionPath(userID int64) string {
+	return "/sessions/" + whatsAppSessionID(userID)
 }
 
 func (s *WhatsAppService) callSidecar(method, path string, input, output interface{}) error {
@@ -714,8 +883,7 @@ func (s *WhatsAppService) encryptSecret(value string) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	sealed := gcm.Seal(nonce, nonce, []byte(value), nil)
-	return base64.RawURLEncoding.EncodeToString(sealed), nil
+	return base64.RawURLEncoding.EncodeToString(gcm.Seal(nonce, nonce, []byte(value), nil)), nil
 }
 
 func (s *WhatsAppService) decryptSecret(value string) (string, error) {
@@ -744,10 +912,7 @@ func (s *WhatsAppService) decryptSecret(value string) (string, error) {
 	return string(plain), nil
 }
 
-func parseStoredBool(value string) bool {
-	parsed, _ := strconv.ParseBool(value)
-	return parsed
-}
+func parseStoredBool(value string) bool { parsed, _ := strconv.ParseBool(value); return parsed }
 
 func normalizeWhatsAppProxyType(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
@@ -756,6 +921,19 @@ func normalizeWhatsAppProxyType(value string) string {
 	default:
 		return "none"
 	}
+}
+
+func whatsAppSessionID(userID int64) string { return fmt.Sprintf("user-%d", userID) }
+
+func parseWhatsAppSessionUserID(sessionID string) (int64, error) {
+	if !strings.HasPrefix(sessionID, "user-") {
+		return 0, fmt.Errorf("invalid WhatsApp session")
+	}
+	userID, err := strconv.ParseInt(strings.TrimPrefix(sessionID, "user-"), 10, 64)
+	if err != nil || userID <= 0 {
+		return 0, fmt.Errorf("invalid WhatsApp session")
+	}
+	return userID, nil
 }
 
 func sanitizeWhatsAppFilename(filename string) string {
