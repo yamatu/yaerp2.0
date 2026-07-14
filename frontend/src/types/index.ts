@@ -234,6 +234,8 @@ export interface PageData<T> {
 export interface WSMessage {
   type: string
   sheetId?: number
+  channelId?: number
+  messageId?: number
   row?: number
   col?: string
   value?: unknown
@@ -364,7 +366,11 @@ export interface ChannelMessage {
   sender_id: number
   sender_name?: string
   sender_avatar?: string
-  sender_type: 'user' | 'ai'
+  sender_type: 'user' | 'ai' | 'whatsapp'
+  external_source?: string
+  external_message_id?: string
+  external_sender_name?: string
+  external_sender_address?: string
   assistant_id?: number | null
   assistant_name?: string
   content: string
@@ -389,6 +395,53 @@ export interface ChannelMessage {
   recalled_at?: string | null
   recalled_by?: number | null
   created_at: string
+}
+
+export interface WhatsAppSettings {
+  enabled: boolean
+  auto_start: boolean
+  proxy_type: 'none' | 'http' | 'https' | 'socks5'
+  proxy_host: string
+  proxy_port: number
+  proxy_username: string
+  proxy_password?: string
+  proxy_password_configured: boolean
+}
+
+export interface WhatsAppStatus {
+  status: 'disabled' | 'unavailable' | 'initializing' | 'loading' | 'qr' | 'authenticated' | 'ready' | 'disconnected' | 'auth_failure' | 'error'
+  qrDataUrl?: string
+  loadingPercent: number
+  loadingMessage?: string
+  account?: {
+    wid?: string
+    pushname?: string
+    platform?: string
+  }
+  lastError?: string
+  updatedAt?: string
+}
+
+export interface WhatsAppChat {
+  id: string
+  name: string
+  isGroup: boolean
+  unreadCount: number
+  timestamp: number
+  pinned: boolean
+  archived: boolean
+  isMuted: boolean
+}
+
+export interface WhatsAppChannelLink {
+  channel_id: number
+  whatsapp_chat_id: string
+  whatsapp_chat_name: string
+  sync_inbound: boolean
+  sync_outbound: boolean
+  created_by: number
+  created_at: string
+  updated_at: string
 }
 
 export interface ChannelMessageSearchResult extends ChannelMessage {

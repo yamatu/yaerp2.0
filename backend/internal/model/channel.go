@@ -56,6 +56,10 @@ type ChannelMessage struct {
 	SenderName             string     `json:"sender_name,omitempty" db:"sender_name"`
 	SenderAvatar           *string    `json:"sender_avatar,omitempty" db:"sender_avatar"`
 	SenderType             string     `json:"sender_type" db:"sender_type"`
+	ExternalSource         *string    `json:"external_source,omitempty" db:"external_source"`
+	ExternalMessageID      *string    `json:"external_message_id,omitempty" db:"external_message_id"`
+	ExternalSenderName     *string    `json:"external_sender_name,omitempty" db:"external_sender_name"`
+	ExternalSenderAddress  *string    `json:"external_sender_address,omitempty" db:"external_sender_address"`
 	AssistantID            *int64     `json:"assistant_id,omitempty" db:"assistant_id"`
 	AssistantName          string     `json:"assistant_name,omitempty" db:"assistant_name"`
 	Content                string     `json:"content" db:"content"`
@@ -185,4 +189,64 @@ type GalleryDirectoryAccessRequest struct {
 
 type GalleryImageRenameRequest struct {
 	Filename string `json:"filename" binding:"required"`
+}
+
+type WhatsAppSettings struct {
+	Enabled                 bool   `json:"enabled"`
+	AutoStart               bool   `json:"auto_start"`
+	ProxyType               string `json:"proxy_type"`
+	ProxyHost               string `json:"proxy_host"`
+	ProxyPort               int    `json:"proxy_port"`
+	ProxyUsername           string `json:"proxy_username"`
+	ProxyPassword           string `json:"proxy_password,omitempty"`
+	ProxyPasswordConfigured bool   `json:"proxy_password_configured"`
+}
+
+type WhatsAppStatus struct {
+	Status         string                 `json:"status"`
+	QRDataURL      string                 `json:"qrDataUrl,omitempty"`
+	LoadingPercent int                    `json:"loadingPercent"`
+	LoadingMessage string                 `json:"loadingMessage,omitempty"`
+	Account        map[string]interface{} `json:"account,omitempty"`
+	LastError      string                 `json:"lastError,omitempty"`
+	UpdatedAt      string                 `json:"updatedAt,omitempty"`
+}
+
+type WhatsAppChat struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	IsGroup     bool   `json:"isGroup"`
+	UnreadCount int    `json:"unreadCount"`
+	Timestamp   int64  `json:"timestamp"`
+	Pinned      bool   `json:"pinned"`
+	Archived    bool   `json:"archived"`
+	IsMuted     bool   `json:"isMuted"`
+}
+
+type WhatsAppChannelLink struct {
+	ChannelID        int64     `json:"channel_id"`
+	WhatsAppChatID   string    `json:"whatsapp_chat_id"`
+	WhatsAppChatName string    `json:"whatsapp_chat_name"`
+	SyncInbound      bool      `json:"sync_inbound"`
+	SyncOutbound     bool      `json:"sync_outbound"`
+	CreatedBy        int64     `json:"created_by"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type WhatsAppChannelLinkRequest struct {
+	WhatsAppChatID   string `json:"whatsapp_chat_id" binding:"required"`
+	WhatsAppChatName string `json:"whatsapp_chat_name"`
+	SyncInbound      *bool  `json:"sync_inbound"`
+	SyncOutbound     *bool  `json:"sync_outbound"`
+}
+
+type WhatsAppSendRequest struct {
+	ChannelID    int64  `json:"channel_id"`
+	MessageID    int64  `json:"message_id"`
+	ChatID       string `json:"chat_id"`
+	Content      string `json:"content"`
+	AttachmentID *int64 `json:"attachment_id"`
+	WorkbookID   *int64 `json:"workbook_id"`
+	SheetID      *int64 `json:"sheet_id"`
 }

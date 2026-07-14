@@ -9,6 +9,7 @@ import {
   ImagePlus,
   Images,
   LockKeyhole,
+  MessageCircle,
   Pencil,
   Search,
   ShieldCheck,
@@ -18,6 +19,7 @@ import {
   ZoomIn,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import type { AuthUser, GalleryDirectory, GalleryDirectoryAccess, GalleryImage, User } from '@/types'
@@ -48,6 +50,7 @@ export default function GalleryPage() {
   const [savingAccess, setSavingAccess] = useState(false)
   const [accessError, setAccessError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [whatsAppResource, setWhatsAppResource] = useState<WhatsAppSendResource | null>(null)
 
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const admin = isAdmin(profile)
@@ -421,6 +424,7 @@ export default function GalleryPage() {
                         <div className="flex items-center gap-1.5">
                           <button type="button" onClick={() => setPreview(img)} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-600" title="查看大图" aria-label={`查看 ${img.filename}`}><ZoomIn className="h-3.5 w-3.5" /></button>
                           <a href={downloadURL(img)} download={img.filename} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-600" title="下载图片" aria-label={`下载 ${img.filename}`}><Download className="h-3.5 w-3.5" /></a>
+                          <button type="button" onClick={() => setWhatsAppResource({ attachmentId: img.id, title: img.filename, defaultContent: img.filename })} className="flex h-8 w-8 items-center justify-center rounded-lg border border-emerald-200 text-emerald-600 transition hover:bg-emerald-50" title="发送到 WhatsApp" aria-label={`发送 ${img.filename} 到 WhatsApp`}><MessageCircle className="h-3.5 w-3.5" /></button>
                           {admin && <button type="button" onClick={() => handleDelete(img.id)} disabled={deleting === img.id} className="flex h-8 w-8 items-center justify-center rounded-lg border border-rose-200 text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50" title="删除图片" aria-label={`删除 ${img.filename}`}><Trash2 className="h-3.5 w-3.5" /></button>}
                         </div>
                       </div>
@@ -590,6 +594,7 @@ export default function GalleryPage() {
           </div>
         )}
       </div>
-    </AuthGuard>
+        <WhatsAppSendDialog open={Boolean(whatsAppResource)} resource={whatsAppResource} onClose={() => setWhatsAppResource(null)} />
+      </AuthGuard>
   )
 }

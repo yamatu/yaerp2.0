@@ -13,6 +13,7 @@ type Config struct {
 	Server   ServerConfig
 	AI       AIConfig
 	Backup   BackupConfig
+	WhatsApp WhatsAppConfig
 }
 
 type PostgresConfig struct {
@@ -61,6 +62,11 @@ type BackupConfig struct {
 	PublicBaseURL        string
 }
 
+type WhatsAppConfig struct {
+	ServiceURL     string
+	InternalSecret string
+}
+
 func Load() *Config {
 	return &Config{
 		Postgres: PostgresConfig{
@@ -101,6 +107,10 @@ func Load() *Config {
 			IncludeObjectStorage: getEnv("BACKUP_INCLUDE_OBJECT_STORAGE", "true") == "true",
 			ObjectPrefix:         getEnv("BACKUP_OBJECT_PREFIX", "uploads/"),
 			PublicBaseURL:        getEnv("BACKUP_PUBLIC_BASE_URL", ""),
+		},
+		WhatsApp: WhatsAppConfig{
+			ServiceURL:     getEnv("WHATSAPP_SERVICE_URL", "http://whatsapp:3010"),
+			InternalSecret: getEnv("WHATSAPP_INTERNAL_SECRET", ""),
 		},
 	}
 }

@@ -928,13 +928,22 @@ func channelMessageSelectSQL() string {
 
 func channelMessageColumnsSQL() string {
 	return `m.id, m.channel_id, m.sender_id,
-		CASE WHEN m.sender_type = 'ai' THEN COALESCE(ai.name, 'AI 助手') ELSE COALESCE(u.username, '') END,
-		CASE WHEN m.sender_type = 'ai' THEN NULL ELSE u.avatar END,
-		m.sender_type, m.assistant_id, COALESCE(ai.name, ''), COALESCE(m.content, ''),
+		CASE
+		    WHEN m.sender_type = 'ai' THEN COALESCE(ai.name, 'AI 助手')
+		    WHEN m.sender_type = 'whatsapp' THEN COALESCE(NULLIF(m.external_sender_name, ''), 'WhatsApp 联系人')
+		    ELSE COALESCE(u.username, '')
+		END,
+		CASE WHEN m.sender_type IN ('ai', 'whatsapp') THEN NULL ELSE u.avatar END,
+		m.sender_type, m.external_source, m.external_message_id, m.external_sender_name, m.external_sender_address,
+		m.assistant_id, COALESCE(ai.name, ''), COALESCE(m.content, ''),
 		m.attachment_id, a.filename, a.mime_type, a.size,
 		m.linked_workbook_id, w.name, m.linked_sheet_id, s.name, m.linked_summary_id, asp.title,
 		m.forwarded_from_message_id, m.reply_to_message_id,
-		rm.sender_id, CASE WHEN rm.sender_type = 'ai' THEN COALESCE(rai.name, 'AI 助手') ELSE ru.username END, rm.content, ra.filename, rm.recalled_at,
+		rm.sender_id, CASE
+		    WHEN rm.sender_type = 'ai' THEN COALESCE(rai.name, 'AI 助手')
+		    WHEN rm.sender_type = 'whatsapp' THEN COALESCE(NULLIF(rm.external_sender_name, ''), 'WhatsApp 联系人')
+		    ELSE ru.username
+		END, rm.content, ra.filename, rm.recalled_at,
 		m.recalled_at, m.recalled_by, m.created_at`
 }
 
@@ -976,6 +985,10 @@ func scanChannelMessageValues(scanner interface {
 	var message model.ChannelMessage
 	var senderID sql.NullInt64
 	var senderAvatar sql.NullString
+	var externalSource sql.NullString
+	var externalMessageID sql.NullString
+	var externalSenderName sql.NullString
+	var externalSenderAddress sql.NullString
 	var assistantID sql.NullInt64
 	var attachmentID sql.NullInt64
 	var attachmentFilename sql.NullString
@@ -996,13 +1009,14 @@ func scanChannelMessageValues(scanner interface {
 	var replyRecalledAt sql.NullTime
 	var recalledAt sql.NullTime
 	var recalledBy sql.NullInt64
-	destinations := make([]any, 0, 31)
+	destinations := make([]any, 0, 35)
 	if channelName != nil {
 		destinations = append(destinations, channelName)
 	}
 	destinations = append(destinations,
 		&message.ID, &message.ChannelID, &senderID, &message.SenderName, &senderAvatar,
-		&message.SenderType, &assistantID, &message.AssistantName, &message.Content,
+		&message.SenderType, &externalSource, &externalMessageID, &externalSenderName, &externalSenderAddress,
+		&assistantID, &message.AssistantName, &message.Content,
 		&attachmentID, &attachmentFilename, &attachmentMimeType, &attachmentSize,
 		&workbookID, &workbookName, &sheetID, &sheetName, &summaryID, &summaryTitle, &forwardedFrom, &replyToMessageID,
 		&replySenderID, &replySenderName, &replyContent, &replyAttachmentName, &replyRecalledAt,
@@ -1016,6 +1030,18 @@ func scanChannelMessageValues(scanner interface {
 	}
 	if senderAvatar.Valid {
 		message.SenderAvatar = &senderAvatar.String
+	}
+	if externalSource.Valid {
+		message.ExternalSource = &externalSource.String
+	}
+	if externalMessageID.Valid {
+		message.ExternalMessageID = &externalMessageID.String
+	}
+	if externalSenderName.Valid {
+		message.ExternalSenderName = &externalSenderName.String
+	}
+	if externalSenderAddress.Valid {
+		message.ExternalSenderAddress = &externalSenderAddress.String
 	}
 	if assistantID.Valid {
 		message.AssistantID = &assistantID.Int64

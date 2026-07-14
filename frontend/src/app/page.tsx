@@ -18,6 +18,7 @@ import {
   Images,
   LogOut,
   MessageSquare,
+  MessageCircle,
   PencilLine,
   Plus,
   Search,
@@ -35,6 +36,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
 import { useWorkbooks } from '@/hooks/useSheet'
 import { useFileManager } from '@/hooks/useFileManager'
 import { uploadNewWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
@@ -117,6 +119,7 @@ export default function HomePage() {
   const [newFolderName, setNewFolderName] = useState('')
   const [newName, setNewName] = useState('')
   const [profile, setProfile] = useState<AuthUser | null>(getStoredUser())
+  const [whatsAppResource, setWhatsAppResource] = useState<WhatsAppSendResource | null>(null)
   const [channelNotifications, setChannelNotifications] = useState<Channel[]>([])
   const [channelNotificationOpen, setChannelNotificationOpen] = useState(false)
   const [loggingOut, setLoggingOut] = useState(false)
@@ -1491,6 +1494,20 @@ export default function HomePage() {
                                   >
                                     <Download className="h-3.5 w-3.5" />
                                   </button>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      setWhatsAppResource({ workbookId: workbook.id, title: workbook.name, defaultContent: `工作簿：${workbook.name}` })
+                                    }}
+                                    className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-emerald-200 bg-white text-emerald-600 transition hover:bg-emerald-50"
+                                    title="发送工作簿到 WhatsApp"
+                                    aria-label={`发送 ${workbook.name} 到 WhatsApp`}
+                                    data-tooltip="发送到 WhatsApp"
+                                    data-tooltip-side="top"
+                                  >
+                                    <MessageCircle className="h-3.5 w-3.5" />
+                                  </button>
                                   {canManageWorkbook(workbook) && (
                                     <button
                                       type="button"
@@ -1890,6 +1907,7 @@ export default function HomePage() {
               </div>
             </div>
           )}
+          <WhatsAppSendDialog open={Boolean(whatsAppResource)} resource={whatsAppResource} onClose={() => setWhatsAppResource(null)} />
         </div>
       </div>
     </AuthGuard>

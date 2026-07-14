@@ -4,8 +4,9 @@ import dynamic from 'next/dynamic'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
-import { Archive, ArchiveRestore, ArrowLeft, Check, Eye, EyeOff, FileSpreadsheet, Globe2, Lock, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, PencilLine, Plus, Search, Trash2, Unlock, X } from 'lucide-react'
+import { Archive, ArchiveRestore, ArrowLeft, Check, Eye, EyeOff, FileSpreadsheet, Globe2, Lock, Maximize2, MessageCircle, Minimize2, PanelLeftClose, PanelLeftOpen, PencilLine, Plus, Search, Trash2, Unlock, X } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
 import { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import { useWorkbook } from '@/hooks/useSheet'
 import { usePermission } from '@/hooks/usePermission'
@@ -55,6 +56,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [sidebarDragImportUploading, setSidebarDragImportUploading] = useState(false)
   const [sidebarDragImportProgress, setSidebarDragImportProgress] = useState(0)
   const [sheetContextMenu, setSheetContextMenu] = useState<SheetContextMenuState | null>(null)
+  const [whatsAppResource, setWhatsAppResource] = useState<WhatsAppSendResource | null>(null)
   const sidebarDragDepthRef = useRef(0)
   const addSheetPopoverRef = useRef<HTMLDivElement>(null)
 
@@ -648,6 +650,9 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
           </div>
 
           <div className="flex items-center gap-2">
+            {activeSheet && (
+              <button type="button" onClick={() => setWhatsAppResource({ sheetId: activeSheet.id, title: `${workbook.name} / ${activeSheet.name}`, defaultContent: `工作表：${workbook.name} / ${activeSheet.name}` })} className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-emerald-200 text-emerald-600 transition hover:bg-emerald-50" title="发送当前工作表到 WhatsApp" aria-label="发送当前工作表到 WhatsApp" data-tooltip="发送到 WhatsApp"><MessageCircle className="h-4 w-4" /></button>
+            )}
             {canManageWorkbook && activeSheet && (
               <button
                 type="button"
@@ -1003,6 +1008,9 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 <button type="button" onClick={() => { router.push(`/sheets/${workbookId}/${sheetContextMenu.sheet.id}`); setSelectedSheetIds([]); setSheetContextMenu(null) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50">
                   <FileSpreadsheet className="h-4 w-4 text-slate-400" />打开工作表
                 </button>
+                <button type="button" onClick={() => { const target = sheetContextMenu.sheet; setSheetContextMenu(null); setWhatsAppResource({ sheetId: target.id, title: `${workbook.name} / ${target.name}`, defaultContent: `工作表：${workbook.name} / ${target.name}` }) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-emerald-700 hover:bg-emerald-50">
+                  <MessageCircle className="h-4 w-4 text-emerald-600" />发送到 WhatsApp
+                </button>
                 {canManageWorkbook && (
                   <button type="button" onClick={() => { setSidebarCollapsed(false); startRenameSheet(sheetContextMenu.sheet); setSelectedSheetIds([]); setSheetContextMenu(null) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50">
                     <PencilLine className="h-4 w-4 text-slate-400" />重命名
@@ -1030,6 +1038,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
             )}
           </div>
         )}
+        <WhatsAppSendDialog open={Boolean(whatsAppResource)} resource={whatsAppResource} onClose={() => setWhatsAppResource(null)} />
       </div>
     </AuthGuard>
   )

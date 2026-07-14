@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 
@@ -12,6 +13,7 @@ import (
 	"yaerp/config"
 	"yaerp/internal/handler"
 	"yaerp/internal/middleware"
+	"yaerp/internal/model"
 	"yaerp/internal/repo"
 	"yaerp/internal/service"
 	"yaerp/internal/ws"
@@ -68,6 +70,7 @@ func main() {
 	attachRepo := repo.NewAttachmentRepo(db)
 	folderRepo := repo.NewFolderRepo(db)
 	channelRepo := repo.NewChannelRepo(db)
+	whatsAppRepo := repo.NewWhatsAppRepo(db)
 	scheduleRepo := repo.NewAIScheduleRepo(db)
 
 	// Services
@@ -76,6 +79,10 @@ func main() {
 	sheetService := service.NewSheetService(sheetRepo, permService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, channelRepo, cfg.JWT.Secret)
 	channelService := service.NewChannelService(channelRepo, uploadService, sheetService, permService, userRepo)
+	whatsAppService := service.NewWhatsAppService(
+		whatsAppRepo, channelRepo, uploadService, sheetService, permService,
+		cfg.WhatsApp.ServiceURL, cfg.WhatsApp.InternalSecret, cfg.JWT.Secret,
+	)
 	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
 	backupService := service.NewBackupService(cfg, db, minioClient)
@@ -90,6 +97,20 @@ func main() {
 	// WebSocket
 	hub := ws.NewHub()
 	go hub.Run()
+	broadcastChannelMessage := func(message *model.ChannelMessage) {
+		if message == nil {
+			return
+		}
+		payload, _ := json.Marshal(ws.Message{Type: "channel_message", ChannelID: message.ChannelID, MessageID: message.ID})
+		hub.BroadcastAll(payload)
+	}
+	channelService.SetMessageCreatedHook(func(userID int64, message *model.ChannelMessage) {
+		broadcastChannelMessage(message)
+		if err := whatsAppService.ForwardChannelMessage(userID, message.ChannelID, message.ID); err != nil {
+			log.Printf("forward channel message %d to WhatsApp: %v", message.ID, err)
+		}
+	})
+	whatsAppService.SetInboundHook(broadcastChannelMessage)
 	wsHandler := ws.NewWSHandler(hub, jwtUtil, permService, sheetService)
 
 	// Handlers
@@ -98,6 +119,7 @@ func main() {
 	cellHandler := handler.NewCellHandler(sheetService, permService)
 	uploadHandler := handler.NewUploadHandler(uploadService)
 	channelHandler := handler.NewChannelHandler(channelService, uploadService, hub)
+	whatsAppHandler := handler.NewWhatsAppHandler(whatsAppService)
 	importHandler := handler.NewImportHandler(importService)
 	userHandler := handler.NewUserHandler(userRepo, authService, uploadService)
 	roleHandler := handler.NewRoleHandler(db)
@@ -122,6 +144,7 @@ func main() {
 		auth.POST("/refresh", authHandler.RefreshToken)
 	}
 	r.GET("/api/files/:id/content", uploadHandler.ServeFile)
+	r.POST("/api/internal/whatsapp/events", whatsAppHandler.Webhook)
 
 	// Protected routes
 	api := r.Group("/api")
@@ -214,6 +237,12 @@ func main() {
 		api.POST("/channels/:id/messages/:messageId/forward", channelHandler.ForwardMessage)
 		api.POST("/channels/:id/messages/:messageId/recall", channelHandler.RecallMessage)
 		api.POST("/channels/:id/messages/:messageId/save-image", channelHandler.SaveMessageImage)
+		api.GET("/channels/:id/whatsapp-link", whatsAppHandler.GetChannelLink)
+		api.PUT("/channels/:id/whatsapp-link", whatsAppHandler.UpdateChannelLink)
+		api.DELETE("/channels/:id/whatsapp-link", whatsAppHandler.DeleteChannelLink)
+		api.POST("/channels/:id/messages/:messageId/whatsapp", whatsAppHandler.SendChannelMessage)
+		api.GET("/whatsapp/chats", whatsAppHandler.ListChats)
+		api.POST("/whatsapp/send", whatsAppHandler.SendResource)
 
 		// Folders
 		api.POST("/folders", folderHandler.CreateFolder)
@@ -286,11 +315,21 @@ func main() {
 			admin.POST("/admin/ai/assistants/:id/default", aiHandler.SetDefaultAssistant)
 			admin.POST("/admin/ai/spreadsheet/preview", aiHandler.PreviewSpreadsheetPlan)
 			admin.POST("/admin/ai/spreadsheet/apply", aiHandler.ApplySpreadsheetPlan)
+
+			// WhatsApp Config (admin)
+			admin.GET("/admin/whatsapp/settings", whatsAppHandler.GetSettings)
+			admin.PUT("/admin/whatsapp/settings", whatsAppHandler.UpdateSettings)
+			admin.GET("/admin/whatsapp/status", whatsAppHandler.GetStatus)
+			admin.POST("/admin/whatsapp/start", whatsAppHandler.Start)
+			admin.POST("/admin/whatsapp/restart", whatsAppHandler.Restart)
+			admin.POST("/admin/whatsapp/logout", whatsAppHandler.Logout)
 		}
 	}
 
 	// WebSocket
 	r.GET("/ws", wsHandler.HandleWS)
+
+	go whatsAppService.AutoStart()
 
 	log.Printf("Server starting on port %s", cfg.Server.Port)
 	if err := r.Run(":" + cfg.Server.Port); err != nil {

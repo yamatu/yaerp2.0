@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   Settings2,
   Shield,
+  MessageCircle,
   Users,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
@@ -22,6 +23,7 @@ const adminModules = [
   { label: '权限矩阵', href: '/admin/permissions', icon: Settings2 },
   { label: '数据备份', href: '/admin/backup', icon: Database },
   { label: 'AI 助手', href: '/admin/ai', icon: Bot },
+  { label: 'WhatsApp', href: '/admin/whatsapp', icon: MessageCircle },
 ]
 
 interface AdminShellProps {

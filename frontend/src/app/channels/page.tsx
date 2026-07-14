@@ -22,6 +22,7 @@ import {
   Image as ImageIcon,
   Images,
   MessageSquare,
+  MessageCircle,
   Paperclip,
   Pencil,
   Pin,
@@ -53,7 +54,8 @@ import { useWorkbooks } from '@/hooks/useSheet'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
-import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, Workbook } from '@/types'
+import { wsClient } from '@/lib/ws'
+import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppChannelLink, WhatsAppChat, Workbook } from '@/types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -267,6 +269,14 @@ export default function ChannelsPage() {
   const [addingMembers, setAddingMembers] = useState(false)
   const [removingMemberId, setRemovingMemberId] = useState<number | null>(null)
   const [uploadingChannelAvatar, setUploadingChannelAvatar] = useState(false)
+  const [whatsAppLink, setWhatsAppLink] = useState<WhatsAppChannelLink | null>(null)
+  const [whatsAppChats, setWhatsAppChats] = useState<WhatsAppChat[]>([])
+  const [whatsAppChatSearch, setWhatsAppChatSearch] = useState('')
+  const [selectedWhatsAppChatId, setSelectedWhatsAppChatId] = useState('')
+  const [syncWhatsAppInbound, setSyncWhatsAppInbound] = useState(true)
+  const [syncWhatsAppOutbound, setSyncWhatsAppOutbound] = useState(true)
+  const [loadingWhatsApp, setLoadingWhatsApp] = useState(false)
+  const [savingWhatsApp, setSavingWhatsApp] = useState(false)
 
   const [previewImageMessage, setPreviewImageMessage] = useState<ChannelMessage | null>(null)
   const [imageZoom, setImageZoom] = useState(1)
@@ -349,6 +359,12 @@ export default function ChannelsPage() {
     return sortedChannels.filter((channel) => channel.id !== activeChannelId
       && (!keyword || channel.name.toLowerCase().includes(keyword)))
   }, [activeChannelId, forwardSearch, sortedChannels])
+
+  const filteredWhatsAppChats = useMemo(() => {
+    const keyword = whatsAppChatSearch.trim().toLowerCase()
+    if (!keyword) return whatsAppChats
+    return whatsAppChats.filter((chat) => chat.name.toLowerCase().includes(keyword) || chat.id.toLowerCase().includes(keyword))
+  }, [whatsAppChatSearch, whatsAppChats])
 
   const filteredTableWorkbooks = useMemo(() => {
     const keyword = tableSearch.trim().toLowerCase()
@@ -703,6 +719,17 @@ export default function ChannelsPage() {
     }, 8000)
     return () => window.clearInterval(timer)
   }, [activeChannelId, loadChannels, loadMessages, markChannelRead])
+
+  useEffect(() => {
+    wsClient.connect()
+    return wsClient.on('channel_message', (event) => {
+      void loadChannels(true)
+      if (event.channelId === activeChannelId) {
+        shouldStickToBottomRef.current = shouldStickToBottomRef.current || Boolean(messagesViewportRef.current && messagesViewportRef.current.scrollHeight - messagesViewportRef.current.scrollTop - messagesViewportRef.current.clientHeight < 120)
+        void loadMessages(activeChannelId, true)
+      }
+    })
+  }, [activeChannelId, loadChannels, loadMessages])
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -1202,6 +1229,82 @@ export default function ChannelsPage() {
     }
   }
 
+  const loadWhatsAppLink = async (channelId: number) => {
+    setLoadingWhatsApp(true)
+    try {
+      const [linkResponse, chatsResponse] = await Promise.all([
+        api.get<WhatsAppChannelLink | null>(`/channels/${channelId}/whatsapp-link`),
+        api.get<WhatsAppChat[]>('/whatsapp/chats'),
+      ])
+      const link = linkResponse.code === 0 ? linkResponse.data || null : null
+      setWhatsAppLink(link)
+      setSelectedWhatsAppChatId(link?.whatsapp_chat_id || '')
+      setSyncWhatsAppInbound(link?.sync_inbound ?? true)
+      setSyncWhatsAppOutbound(link?.sync_outbound ?? true)
+      setWhatsAppChats(chatsResponse.code === 0 && chatsResponse.data ? chatsResponse.data : [])
+    } catch {
+      setWhatsAppChats([])
+    } finally {
+      setLoadingWhatsApp(false)
+    }
+  }
+
+  const handleSaveWhatsAppLink = async () => {
+    if (!activeChannel || !selectedWhatsAppChatId || savingWhatsApp) return
+    const chat = whatsAppChats.find((item) => item.id === selectedWhatsAppChatId)
+    setSavingWhatsApp(true)
+    setError('')
+    try {
+      const response = await api.put<WhatsAppChannelLink>(`/channels/${activeChannel.id}/whatsapp-link`, {
+        whatsapp_chat_id: selectedWhatsAppChatId,
+        whatsapp_chat_name: chat?.name || whatsAppLink?.whatsapp_chat_name || selectedWhatsAppChatId,
+        sync_inbound: syncWhatsAppInbound,
+        sync_outbound: syncWhatsAppOutbound,
+      })
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || '保存 WhatsApp 关联失败')
+        return
+      }
+      setWhatsAppLink(response.data)
+      setNotice('频道 WhatsApp 关联已保存')
+    } catch {
+      setError('保存 WhatsApp 关联失败')
+    } finally {
+      setSavingWhatsApp(false)
+    }
+  }
+
+  const handleDeleteWhatsAppLink = async () => {
+    if (!activeChannel || !whatsAppLink || savingWhatsApp) return
+    setSavingWhatsApp(true)
+    try {
+      const response = await api.delete(`/channels/${activeChannel.id}/whatsapp-link`)
+      if (response.code !== 0) {
+        setError(response.message || '取消 WhatsApp 关联失败')
+        return
+      }
+      setWhatsAppLink(null)
+      setSelectedWhatsAppChatId('')
+      setNotice('已取消 WhatsApp 关联')
+    } finally {
+      setSavingWhatsApp(false)
+    }
+  }
+
+  const handleSendMessageToWhatsApp = async (message: ChannelMessage) => {
+    setContextMenu(null)
+    try {
+      const response = await api.post(`/channels/${message.channel_id}/messages/${message.id}/whatsapp`)
+      if (response.code !== 0) {
+        setError(response.message || '发送到 WhatsApp 失败')
+        return
+      }
+      setNotice('消息已发送到 WhatsApp')
+    } catch {
+      setError('发送到 WhatsApp 失败')
+    }
+  }
+
   const openManageChannel = () => {
     if (!activeChannel) return
     setManageChannelName(activeChannel.name)
@@ -1211,8 +1314,9 @@ export default function ChannelsPage() {
     setChannelMembers([])
     setChannelAIMembers([])
     setSelectedChannelAssistantIds([])
+    setWhatsAppChatSearch('')
     setIsManageOpen(true)
-    void Promise.all([loadChannelMembers(activeChannel.id), loadShareableUsers(), loadAvailableAssistants(), loadChannelAIMembers(activeChannel.id)])
+    void Promise.all([loadChannelMembers(activeChannel.id), loadShareableUsers(), loadAvailableAssistants(), loadChannelAIMembers(activeChannel.id), loadWhatsAppLink(activeChannel.id)])
   }
 
   const handleSaveAIMembers = async () => {
@@ -1832,8 +1936,9 @@ export default function ChannelsPage() {
                       <div className="mx-auto max-w-4xl space-y-5">
                         {messages.map((message) => {
                           const isAI = message.sender_type === 'ai'
-                          const isMine = !isAI && currentUserId === message.sender_id
-                          const senderName = isAI ? (message.assistant_name || 'AI 助手') : (message.sender_name || `用户 #${message.sender_id}`)
+                          const isWhatsApp = message.sender_type === 'whatsapp'
+                          const isMine = !isAI && !isWhatsApp && currentUserId === message.sender_id
+                          const senderName = isAI ? (message.assistant_name || 'AI 助手') : isWhatsApp ? (message.external_sender_name || message.sender_name || 'WhatsApp 联系人') : (message.sender_name || `用户 #${message.sender_id}`)
                           if (message.recalled_at) {
                             return (
                               <div data-message-id={message.id} key={message.id} className={`flex justify-center ${highlightMessageId === message.id ? 'outline outline-2 outline-offset-4 outline-sky-300' : ''}`}>
@@ -1847,13 +1952,14 @@ export default function ChannelsPage() {
                           }
                           return (
                             <div data-message-id={message.id} key={message.id} onContextMenu={(event) => openMessageContextMenu(event, message)} className={`group flex items-start gap-3 rounded-lg transition ${isMine ? 'flex-row-reverse' : ''} ${highlightMessageId === message.id ? 'outline outline-2 outline-offset-4 outline-sky-300' : ''}`}>
-                              <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg text-xs font-semibold ${isMine ? 'bg-sky-600 text-white' : isAI ? 'bg-emerald-600 text-white' : 'bg-white text-slate-600 shadow-sm'}`}>
-                                {isAI ? <Bot className="h-4 w-4" /> : message.sender_avatar ? <img src={message.sender_avatar} alt="" className="h-full w-full object-cover" /> : initials(senderName)}
+                              <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg text-xs font-semibold ${isMine ? 'bg-sky-600 text-white' : isAI ? 'bg-emerald-600 text-white' : isWhatsApp ? 'bg-emerald-500 text-white' : 'bg-white text-slate-600 shadow-sm'}`}>
+                                {isAI ? <Bot className="h-4 w-4" /> : isWhatsApp ? <MessageCircle className="h-4 w-4" /> : message.sender_avatar ? <img src={message.sender_avatar} alt="" className="h-full w-full object-cover" /> : initials(senderName)}
                               </div>
                               <div className={`flex min-w-0 max-w-[min(88%,680px)] flex-col sm:max-w-[min(78%,680px)] ${isMine ? 'items-end' : 'items-start'}`}>
                                 <div className={`mb-1 flex items-center gap-2 text-[11px] text-slate-400 ${isMine ? 'flex-row-reverse' : ''}`}>
                                   <span className={`font-medium ${isAI ? 'text-emerald-700' : 'text-slate-500'}`}>{senderName}</span>
                                   {isAI && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">AI</span>}
+                                  {isWhatsApp && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">WhatsApp</span>}
                                   <span>{formatTime(message.created_at)}</span>
                                 </div>
                                 {message.forwarded_from_message_id && (
@@ -2551,6 +2657,43 @@ export default function ChannelsPage() {
 
                 <section className="border-b border-slate-200 p-5">
                   <div className="mb-3 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><MessageCircle className="h-4 w-4 text-emerald-600" />WhatsApp 联动</div>
+                    {whatsAppLink && <span className="rounded-lg bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">已关联 {whatsAppLink.whatsapp_chat_name}</span>}
+                  </div>
+                  <div className="mb-3 text-xs leading-5 text-slate-500">关联后可将频道消息、图库图片和表格发送到 WhatsApp；入站消息会显示在当前频道。</div>
+                  {loadingWhatsApp ? (
+                    <div className="flex items-center gap-2 py-6 text-sm text-slate-400"><RefreshCw className="h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div>
+                  ) : whatsAppChats.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">WhatsApp 尚未登录，请管理员先在后台扫码连接。</div>
+                  ) : (
+                    <>
+                      <label className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-emerald-300 focus-within:bg-white">
+                        <Search className="h-4 w-4 shrink-0" />
+                        <input value={whatsAppChatSearch} onChange={(event) => setWhatsAppChatSearch(event.target.value)} placeholder="搜索 WhatsApp 联系人或群组" className="min-w-0 flex-1 bg-transparent outline-none" />
+                      </label>
+                      <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border border-slate-200 p-1">
+                        {filteredWhatsAppChats.map((chat) => (
+                          <button key={chat.id} type="button" onClick={() => setSelectedWhatsAppChatId(chat.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-50' : 'hover:bg-slate-50'}`}>
+                            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}>{chat.isGroup ? <Users className="h-3.5 w-3.5" /> : <MessageCircle className="h-3.5 w-3.5" />}</div>
+                            <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-slate-800">{chat.name}</div><div className="truncate text-xs text-slate-400">{chat.isGroup ? '群组' : '联系人'} · {chat.id}</div></div>
+                            {selectedWhatsAppChatId === chat.id && <Check className="h-4 w-4 text-emerald-600" />}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        <label className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 p-3"><div><div className="text-sm font-medium text-slate-700">接收 WhatsApp 消息</div><div className="mt-0.5 text-xs text-slate-400">同步文本、图片和文件到频道</div></div><input type="checkbox" checked={syncWhatsAppInbound} onChange={(event) => setSyncWhatsAppInbound(event.target.checked)} className="h-4 w-4 accent-emerald-600" /></label>
+                        <label className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 p-3"><div><div className="text-sm font-medium text-slate-700">发送频道消息</div><div className="mt-0.5 text-xs text-slate-400">新消息自动同步到 WhatsApp</div></div><input type="checkbox" checked={syncWhatsAppOutbound} onChange={(event) => setSyncWhatsAppOutbound(event.target.checked)} className="h-4 w-4 accent-emerald-600" /></label>
+                      </div>
+                      <div className="mt-3 flex justify-end gap-2">
+                        {whatsAppLink && <button type="button" onClick={() => void handleDeleteWhatsAppLink()} disabled={savingWhatsApp} className="h-9 rounded-lg border border-rose-200 px-4 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50">取消关联</button>}
+                        <button type="button" onClick={() => void handleSaveWhatsAppLink()} disabled={!selectedWhatsAppChatId || savingWhatsApp} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingWhatsApp ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存关联</button>
+                      </div>
+                    </>
+                  )}
+                </section>
+
+                <section className="border-b border-slate-200 p-5">
+                  <div className="mb-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Bot className="h-4 w-4 text-emerald-600" />频道机器人</div>
                     <span className="text-xs text-slate-400">已选择 {selectedChannelAssistantIds.length} 个</span>
                   </div>
@@ -2715,6 +2858,9 @@ export default function ChannelsPage() {
                     <button type="button" onClick={() => void copyText(contextMenu.message?.attachment_url || '', '图片地址已复制')} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Copy className="h-4 w-4 text-slate-400" />复制图片地址</button>
                     <button type="button" onClick={() => { const message = contextMenu.message; setContextMenu(null); if (message) void handleSaveImage(message, '') }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Save className="h-4 w-4 text-slate-400" />保存到图库</button>
                   </>
+                )}
+                {!contextMenu.message.recalled_at && contextMenu.message.sender_type !== 'whatsapp' && (
+                  <button type="button" onClick={() => { const message = contextMenu.message; if (message) void handleSendMessageToWhatsApp(message) }} className="flex h-9 w-full items-center gap-2.5 border-t border-slate-100 px-3 text-left text-sm text-slate-700 hover:bg-emerald-50 hover:text-emerald-800"><MessageCircle className="h-4 w-4 text-emerald-600" />发送到 WhatsApp</button>
                 )}
                 {!contextMenu.message.recalled_at && (
                   <button type="button" onClick={() => { const message = contextMenu.message; setContextMenu(null); if (message) openForwardDialog(message) }} className="flex h-9 w-full items-center gap-2.5 border-t border-slate-100 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Share2 className="h-4 w-4 text-slate-400" />转发消息</button>

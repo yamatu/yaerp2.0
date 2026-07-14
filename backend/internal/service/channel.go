@@ -24,16 +24,29 @@ var (
 )
 
 type ChannelService struct {
-	channelRepo *repo.ChannelRepo
-	uploadSvc   *UploadService
-	sheetSvc    *SheetService
-	permSvc     *PermissionService
-	userRepo    *repo.UserRepo
-	aiSvc       *AIService
+	channelRepo        *repo.ChannelRepo
+	uploadSvc          *UploadService
+	sheetSvc           *SheetService
+	permSvc            *PermissionService
+	userRepo           *repo.UserRepo
+	aiSvc              *AIService
+	messageCreatedHook func(userID int64, message *model.ChannelMessage)
 }
 
 func (s *ChannelService) SetAIService(aiSvc *AIService) {
 	s.aiSvc = aiSvc
+}
+
+func (s *ChannelService) SetMessageCreatedHook(hook func(userID int64, message *model.ChannelMessage)) {
+	s.messageCreatedHook = hook
+}
+
+func (s *ChannelService) notifyMessageCreated(userID int64, message *model.ChannelMessage) {
+	if s.messageCreatedHook == nil || message == nil {
+		return
+	}
+	copyOfMessage := *message
+	go s.messageCreatedHook(userID, &copyOfMessage)
 }
 
 type ChannelAIAskResult struct {
@@ -409,6 +422,8 @@ func (s *ChannelService) AskAI(userID, channelID int64, req *model.ChannelAIAskR
 		return nil, err
 	}
 	_ = s.channelRepo.TouchChannel(channelID)
+	s.notifyMessageCreated(userID, createdUserMessage)
+	s.notifyMessageCreated(userID, createdAssistantMessage)
 	return &ChannelAIAskResult{
 		UserMessage:       createdUserMessage,
 		AssistantMessage:  createdAssistantMessage,
@@ -650,6 +665,7 @@ func (s *ChannelService) CreateMessage(userID, channelID int64, input ChannelMes
 		return nil, err
 	}
 	s.attachMessageURL(created)
+	s.notifyMessageCreated(userID, created)
 	return created, nil
 }
 
@@ -695,6 +711,7 @@ func (s *ChannelService) ForwardMessage(userID, sourceChannelID, messageID int64
 		return nil, err
 	}
 	s.attachMessageURL(created)
+	s.notifyMessageCreated(userID, created)
 	return created, nil
 }
 

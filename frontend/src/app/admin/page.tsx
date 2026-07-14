@@ -8,6 +8,7 @@ import {
   Images,
   LayoutDashboard,
   MessageSquare,
+  MessageCircle,
   Settings2,
   Shield,
   Users,
@@ -44,6 +45,12 @@ const managementEntries = [
     description: '维护 AI 接口、模型参数和自动任务。',
     href: '/admin/ai',
     icon: Bot,
+  },
+  {
+    title: 'WhatsApp',
+    description: '二维码登录、代理配置和频道同步管理。',
+    href: '/admin/whatsapp',
+    icon: MessageCircle,
   },
 ]
 

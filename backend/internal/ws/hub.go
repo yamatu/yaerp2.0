@@ -7,18 +7,20 @@ import (
 )
 
 type Message struct {
-	Type     string          `json:"type"`
-	SheetID  int64           `json:"sheetId,omitempty"`
-	Row      int             `json:"row,omitempty"`
-	Col      string          `json:"col,omitempty"`
-	Value    json.RawMessage `json:"value,omitempty"`
-	Changes  json.RawMessage `json:"changes,omitempty"`
-	AfterRow int             `json:"afterRow,omitempty"`
-	UserID   int64           `json:"userId,omitempty"`
-	Username string          `json:"username,omitempty"`
-	ClientID string          `json:"clientId,omitempty"`
-	State    string          `json:"state,omitempty"`
-	Presence []PresenceEntry `json:"presence,omitempty"`
+	Type      string          `json:"type"`
+	SheetID   int64           `json:"sheetId,omitempty"`
+	ChannelID int64           `json:"channelId,omitempty"`
+	MessageID int64           `json:"messageId,omitempty"`
+	Row       int             `json:"row,omitempty"`
+	Col       string          `json:"col,omitempty"`
+	Value     json.RawMessage `json:"value,omitempty"`
+	Changes   json.RawMessage `json:"changes,omitempty"`
+	AfterRow  int             `json:"afterRow,omitempty"`
+	UserID    int64           `json:"userId,omitempty"`
+	Username  string          `json:"username,omitempty"`
+	ClientID  string          `json:"clientId,omitempty"`
+	State     string          `json:"state,omitempty"`
+	Presence  []PresenceEntry `json:"presence,omitempty"`
 }
 
 type PresenceEntry struct {
@@ -229,5 +231,21 @@ func (h *Hub) BroadcastToSheetExceptClientID(sheetID int64, data []byte, exclude
 		SheetID:         sheetID,
 		Data:            data,
 		ExcludeClientID: excludeClientID,
+	}
+}
+
+func (h *Hub) BroadcastAll(data []byte) {
+	h.mu.RLock()
+	targets := make([]*Client, 0, len(h.clients))
+	for client := range h.clients {
+		targets = append(targets, client)
+	}
+	h.mu.RUnlock()
+	for _, client := range targets {
+		select {
+		case client.Send <- data:
+		default:
+			go func(c *Client) { h.unregister <- c }(client)
+		}
 	}
 }
