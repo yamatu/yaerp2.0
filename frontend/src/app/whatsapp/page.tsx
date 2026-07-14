@@ -117,6 +117,7 @@ export default function WhatsAppWorkspacePage() {
   }, [chats, search])
 
   const connected = account?.status === 'ready'
+  const canStart = !account || ['disconnected', 'error', 'auth_failure'].includes(account.status)
 
   return (
     <AuthGuard>
@@ -153,9 +154,9 @@ export default function WhatsAppWorkspacePage() {
                 {(account?.status === 'loading' || account?.status === 'initializing') && <div className="mt-5"><div className="mb-2 flex justify-between text-xs text-slate-500"><span>{account.loading_message || '正在加载 WhatsApp Web'}</span><span>{account.loading_percent || 0}%</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-[#25d366]" style={{ width: `${account.loading_percent || 0}%` }} /></div></div>}
 
                 <div className="mt-5 flex flex-wrap gap-2">
-                  {!connected && <button type="button" onClick={() => void runAction('start')} disabled={Boolean(acting)} className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-lg bg-[#008069] px-4 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-50"><Smartphone className="h-4 w-4" />绑定账号</button>}
+                  {canStart && <button type="button" onClick={() => void runAction('start')} disabled={Boolean(acting)} className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-lg bg-[#008069] px-4 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-50"><Smartphone className="h-4 w-4" />绑定账号</button>}
                   <button type="button" onClick={() => void runAction('restart')} disabled={Boolean(acting)} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"><RefreshCw className={`h-4 w-4 ${acting === 'restart' ? 'animate-spin' : ''}`} />重启</button>
-                  {connected && <button type="button" onClick={() => void runAction('logout')} disabled={Boolean(acting)} className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50"><LogOut className="h-4 w-4" />退出</button>}
+                  <button type="button" onClick={() => void runAction('logout')} disabled={Boolean(acting)} className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50" title="停止当前会话并清除本地 WhatsApp 登录状态"><LogOut className="h-4 w-4" />退出/清除</button>
                 </div>
 
                 <div className="mt-6 border-t border-slate-200 pt-5">

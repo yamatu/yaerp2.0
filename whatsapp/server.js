@@ -13,6 +13,11 @@ const WEBHOOK_URL = process.env.WHATSAPP_WEBHOOK_URL || ''
 const DATA_DIR = process.env.WHATSAPP_DATA_DIR || '/data'
 const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium'
 const MAX_WEBHOOK_MEDIA_BYTES = Number(process.env.WHATSAPP_MAX_MEDIA_BYTES || 25 * 1024 * 1024)
+const CLIENT_SHUTDOWN_TIMEOUT_MS = Number(process.env.WHATSAPP_CLIENT_SHUTDOWN_TIMEOUT_MS || 10000)
+const OPERATION_WAIT_TIMEOUT_MS = Number(process.env.WHATSAPP_OPERATION_WAIT_TIMEOUT_MS || 5000)
+const OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_OPERATION_TIMEOUT_MS || 30000)
+const STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_STARTUP_TIMEOUT_MS || 120000)
+const INITIALIZATION_CANCEL_GRACE_MS = Number(process.env.WHATSAPP_INITIALIZATION_CANCEL_GRACE_MS || 2000)
 
 const app = express()
 app.use(express.json({ limit: '40mb' }))
@@ -45,8 +50,10 @@ function getSession(value) {
     sessions.set(id, {
       id,
       client: null,
+      initialization: null,
       localProxyUrl: '',
       operation: Promise.resolve(),
+      startupTimer: null,
       state: createState(),
     })
   }
@@ -57,9 +64,60 @@ function updateState(session, patch) {
   Object.assign(session.state, patch, { updatedAt: new Date().toISOString() })
 }
 
-function queueOperation(session, task) {
-  session.operation = session.operation.then(task, task)
-  return session.operation
+function withTimeout(promise, timeoutMs, label) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+  })
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer))
+}
+
+function queueOperation(session, label, task) {
+  const previous = session.operation
+  const current = (async () => {
+    try {
+      await withTimeout(previous, OPERATION_WAIT_TIMEOUT_MS, `${label} queue wait`)
+    } catch (error) {
+      console.error(`Previous operation did not finish (${session.id}):`, error.message)
+    }
+    return withTimeout(Promise.resolve().then(task), OPERATION_TIMEOUT_MS, `${label} operation`)
+  })()
+  session.operation = current.catch(() => undefined)
+  return current
+}
+
+function clearStartupTimer(session) {
+  if (session.startupTimer) clearTimeout(session.startupTimer)
+  session.startupTimer = null
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+async function killProfileProcesses(session) {
+  const profileDir = path.join(DATA_DIR, 'auth', `session-${session.id}`)
+  let entries = []
+  try { entries = await fs.readdir('/proc') } catch { return }
+  await Promise.all(entries.filter((entry) => /^\d+$/.test(entry)).map(async (entry) => {
+    const pid = Number(entry)
+    if (!pid || pid === process.pid) return
+    try {
+      const commandLine = await fs.readFile(`/proc/${entry}/cmdline`, 'utf8')
+      if (!commandLine.includes(`--user-data-dir=${profileDir}`)) return
+      process.kill(pid, 'SIGKILL')
+    } catch { /* Processes can exit while /proc is being scanned. */ }
+  }))
+}
+
+function scheduleStartupTimer(session, client) {
+  clearStartupTimer(session)
+  session.startupTimer = setTimeout(() => {
+    if (session.client !== client || !['initializing', 'loading', 'authenticated'].includes(session.state.status)) return
+    updateState(session, { status: 'error', lastError: 'WhatsApp Web 启动超时，请重试或清除登录状态' })
+    void postWebhook(session, 'status', { ...session.state })
+    void destroyClient(session)
+  }, STARTUP_TIMEOUT_MS)
 }
 
 function requireInternalSecret(req, res, next) {
@@ -162,7 +220,7 @@ async function serializeMessage(session, message, includeMedia = false) {
 async function closeLocalProxy(session) {
   if (!session.localProxyUrl) return
   try {
-    await proxyChain.closeAnonymizedProxy(session.localProxyUrl, true)
+    await withTimeout(proxyChain.closeAnonymizedProxy(session.localProxyUrl, true), CLIENT_SHUTDOWN_TIMEOUT_MS, 'proxy shutdown')
   } catch (error) {
     console.error(`Failed to close proxy (${session.id}):`, error.message)
   } finally {
@@ -171,12 +229,39 @@ async function closeLocalProxy(session) {
 }
 
 async function destroyClient(session) {
+  clearStartupTimer(session)
   const active = session.client
+  const initialization = session.initialization
   session.client = null
+  session.initialization = null
   if (active) {
-    try { await active.destroy() } catch (error) { console.error(`Destroy failed (${session.id}):`, error.message) }
+    if (!active.pupBrowser && initialization) {
+      await Promise.race([initialization.catch(() => undefined), delay(INITIALIZATION_CANCEL_GRACE_MS)])
+    }
+    try {
+      await withTimeout(active.destroy(), CLIENT_SHUTDOWN_TIMEOUT_MS, 'client destroy')
+    } catch (error) {
+      console.error(`Destroy failed (${session.id}):`, error.message)
+      try {
+        const browserProcess = active.pupBrowser?.process?.()
+        if (browserProcess && !browserProcess.killed) browserProcess.kill('SIGKILL')
+      } catch (killError) {
+        console.error(`Force kill failed (${session.id}):`, killError.message)
+      }
+    }
   }
+  await killProfileProcesses(session)
   await closeLocalProxy(session)
+}
+
+async function clearAuthProfile(session) {
+  const profileDir = path.join(DATA_DIR, 'auth', `session-${session.id}`)
+  try {
+    await fs.rm(profileDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
+  } catch (error) {
+    console.error(`Auth profile cleanup failed (${session.id}):`, error.message)
+    throw error
+  }
 }
 
 async function migrateLegacyAdminSession(session) {
@@ -233,6 +318,8 @@ function bindClientEvents(session, client) {
   client.on('qr', async (qr) => {
     if (!active()) return
     const qrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 360 })
+    if (!active()) return
+    clearStartupTimer(session)
     updateState(session, { status: 'qr', qr, qrDataUrl, lastError: '' })
     void postWebhook(session, 'status', { ...session.state, qr: undefined })
   })
@@ -243,20 +330,25 @@ function bindClientEvents(session, client) {
   })
   client.on('auth_failure', (message) => {
     if (!active()) return
+    clearStartupTimer(session)
     updateState(session, { status: 'auth_failure', lastError: String(message || 'authentication failed') })
     void postWebhook(session, 'status', { ...session.state })
   })
   client.on('ready', async () => {
     if (!active()) return
+    const account = await accountSnapshot(session, client)
+    if (!active()) return
+    clearStartupTimer(session)
     updateState(session, {
       status: 'ready', qr: '', qrDataUrl: '', loadingPercent: 100, loadingMessage: '', lastError: '',
-      account: await accountSnapshot(session, client),
+      account,
     })
     void postWebhook(session, 'status', { ...session.state })
   })
   client.on('change_state', (state) => active() && void postWebhook(session, 'session_state', { state }))
   client.on('disconnected', (reason) => {
     if (!active()) return
+    clearStartupTimer(session)
     updateState(session, { status: 'disconnected', account: null, lastError: String(reason || '') })
     void postWebhook(session, 'status', { ...session.state })
   })
@@ -290,10 +382,18 @@ async function startSession(session) {
   })
   session.client = client
   bindClientEvents(session, client)
-  client.initialize().catch((error) => {
+  scheduleStartupTimer(session, client)
+  const initialization = client.initialize()
+  session.initialization = initialization
+  initialization.then(() => {
+    if (session.initialization === initialization) session.initialization = null
+  }).catch((error) => {
     if (session.client !== client) return
+    if (session.initialization === initialization) session.initialization = null
+    clearStartupTimer(session)
     updateState(session, { status: 'error', lastError: error.message })
     void postWebhook(session, 'status', { ...session.state })
+    void destroyClient(session)
   })
   return session.state
 }
@@ -369,22 +469,39 @@ app.post('/configure', async (req, res, next) => {
   } catch (error) { next(error) }
 })
 app.get('/sessions', (_req, res) => res.json(Array.from(sessions.values()).map((session) => ({ sessionId: session.id, ...session.state, qr: undefined }))))
-app.get('/sessions/:sessionId/status', requireSession, (req, res) => res.json({ ...req.whatsappSession.state, qr: undefined }))
+app.get('/sessions/:sessionId/status', requireSession, (req, res) => {
+  const session = req.whatsappSession
+  if (!session.client && ['initializing', 'loading', 'authenticated', 'ready', 'qr'].includes(session.state.status)) {
+    updateState(session, { status: 'disconnected', qr: '', qrDataUrl: '', account: null, lastError: '' })
+  }
+  res.json({ ...session.state, qr: undefined })
+})
 app.post('/sessions/:sessionId/start', requireSession, async (req, res, next) => {
-  try { res.json(await queueOperation(req.whatsappSession, () => startSession(req.whatsappSession))) } catch (error) { next(error) }
+  try { res.json(await queueOperation(req.whatsappSession, 'start', () => startSession(req.whatsappSession))) } catch (error) { next(error) }
 })
 app.post('/sessions/:sessionId/restart', requireSession, async (req, res, next) => {
-  try { res.json(await queueOperation(req.whatsappSession, () => startSession(req.whatsappSession))) } catch (error) { next(error) }
+  try { res.json(await queueOperation(req.whatsappSession, 'restart', () => startSession(req.whatsappSession))) } catch (error) { next(error) }
 })
 app.post('/sessions/:sessionId/logout', requireSession, async (req, res, next) => {
   const session = req.whatsappSession
   try {
-    await queueOperation(session, async () => {
-      if (session.client) {
-        try { await session.client.logout() } catch (error) { console.error(`Logout failed (${session.id}):`, error.message) }
+    await queueOperation(session, 'logout', async () => {
+      if (session.client?.pupPage && session.client?.pupBrowser) {
+        try {
+          await withTimeout(session.client.logout(), CLIENT_SHUTDOWN_TIMEOUT_MS, 'client logout')
+        } catch (error) {
+          console.error(`Logout failed (${session.id}):`, error.message)
+        }
       }
       await destroyClient(session)
+      await delay(300)
+      await killProfileProcesses(session)
+      await clearAuthProfile(session)
+      await delay(300)
+      await killProfileProcesses(session)
+      await clearAuthProfile(session)
       updateState(session, { status: 'disconnected', qr: '', qrDataUrl: '', account: null, lastError: '' })
+      void postWebhook(session, 'status', { ...session.state })
     })
     res.json(session.state)
   } catch (error) { next(error) }
