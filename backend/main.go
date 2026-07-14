@@ -84,6 +84,7 @@ func main() {
 		cfg.WhatsApp.ServiceURL, cfg.WhatsApp.InternalSecret, cfg.JWT.Secret,
 	)
 	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
+	channelService.SetImportService(importService)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
 	backupService := service.NewBackupService(cfg, db, minioClient)
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
@@ -108,6 +109,12 @@ func main() {
 		broadcastChannelMessage(message)
 		if err := whatsAppService.ForwardChannelMessage(userID, message.ChannelID, message.ID); err != nil {
 			log.Printf("forward channel message %d to WhatsApp: %v", message.ID, err)
+		}
+	})
+	channelService.SetMessageChangedHook(broadcastChannelMessage)
+	channelService.SetMessageEditedHook(func(userID int64, message *model.ChannelMessage) {
+		if err := whatsAppService.EditForwardedChannelMessage(userID, message.ChannelID, message.ID, message.Content); err != nil {
+			log.Printf("edit channel message %d on WhatsApp: %v", message.ID, err)
 		}
 	})
 	whatsAppService.SetInboundHook(broadcastChannelMessage)
@@ -220,6 +227,9 @@ func main() {
 		api.POST("/channels", channelHandler.CreateChannel)
 		api.POST("/channels/ai/private", channelHandler.OpenAIPrivateChannel)
 		api.GET("/channels/search/messages", channelHandler.SearchMessages)
+		api.GET("/channel-backups", channelHandler.ListBackups)
+		api.GET("/channel-backups/:backupId/restores", channelHandler.ListBackupRestores)
+		api.DELETE("/channel-backups/:backupId", channelHandler.DeleteBackup)
 		api.PUT("/channels/:id", channelHandler.UpdateChannel)
 		api.DELETE("/channels/:id", channelHandler.DeleteChannel)
 		api.GET("/channels/:id/members", channelHandler.ListMembers)
@@ -236,7 +246,11 @@ func main() {
 		api.POST("/channels/:id/messages", channelHandler.CreateMessage)
 		api.POST("/channels/:id/messages/:messageId/forward", channelHandler.ForwardMessage)
 		api.POST("/channels/:id/messages/:messageId/recall", channelHandler.RecallMessage)
+		api.PUT("/channels/:id/messages/:messageId", channelHandler.EditMessage)
+		api.POST("/channels/:id/messages/:messageId/import-workbook", channelHandler.ImportMessageWorkbook)
 		api.POST("/channels/:id/messages/:messageId/save-image", channelHandler.SaveMessageImage)
+		api.POST("/channels/:id/backups", channelHandler.CreateBackup)
+		api.POST("/channels/:id/backups/:backupId/restore", channelHandler.RestoreBackup)
 		api.GET("/channels/:id/whatsapp-link", whatsAppHandler.GetChannelLink)
 		api.PUT("/channels/:id/whatsapp-link", whatsAppHandler.UpdateChannelLink)
 		api.DELETE("/channels/:id/whatsapp-link", whatsAppHandler.DeleteChannelLink)

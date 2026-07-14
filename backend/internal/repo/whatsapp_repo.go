@@ -197,12 +197,36 @@ func (r *WhatsAppRepo) CreateExternalMessage(message *model.ChannelMessage) erro
 	return r.db.QueryRow(
 		`INSERT INTO channel_messages (
 		     channel_id, sender_id, sender_type, content, attachment_id, external_source, external_account_id,
-		     external_message_id, external_sender_name, external_sender_address, external_sender_avatar, created_at
-		 ) VALUES ($1,NULL,'whatsapp',$2,$3,'whatsapp',$4,$5,$6,$7,$8,NOW())
+		     external_message_id, external_sender_name, external_sender_address, external_sender_avatar,
+		     reply_to_message_id, reply_external_message_id, reply_snapshot_sender, reply_snapshot_content, created_at
+		 ) VALUES ($1,NULL,'whatsapp',$2,$3,'whatsapp',$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
 		 ON CONFLICT DO NOTHING RETURNING id, created_at`,
 		message.ChannelID, message.Content, message.AttachmentID, *message.ExternalAccountID, *message.ExternalMessageID,
-		*message.ExternalSenderName, message.ExternalSenderAddress, message.ExternalSenderAvatar,
+		*message.ExternalSenderName, message.ExternalSenderAddress, message.ExternalSenderAvatar, message.ReplyToMessageID,
+		message.ReplyExternalMessageID, message.ReplySnapshotSender, message.ReplySnapshotContent,
 	).Scan(&message.ID, &message.CreatedAt)
+}
+
+func (r *WhatsAppRepo) ChannelMessageID(accountID int64, whatsappMessageID string) (int64, error) {
+	var messageID int64
+	err := r.db.QueryRow(
+		`SELECT channel_message_id FROM whatsapp_message_links
+		  WHERE whatsapp_account_id = $1 AND whatsapp_message_id = $2
+		  ORDER BY id DESC LIMIT 1`, accountID, whatsappMessageID,
+	).Scan(&messageID)
+	return messageID, err
+}
+
+func (r *WhatsAppRepo) EditExternalMessage(accountID int64, whatsappMessageID, content string) (int64, error) {
+	var messageID int64
+	err := r.db.QueryRow(
+		`UPDATE channel_messages
+		    SET content = $1, edited_at = NOW()
+		  WHERE external_account_id = $2 AND external_source = 'whatsapp'
+		    AND external_message_id = $3 AND recalled_at IS NULL
+		  RETURNING id`, content, accountID, whatsappMessageID,
+	).Scan(&messageID)
+	return messageID, err
 }
 
 func (r *WhatsAppRepo) RecordMessageLink(accountID, channelMessageID int64, whatsappMessageID, direction string, ack *int) error {

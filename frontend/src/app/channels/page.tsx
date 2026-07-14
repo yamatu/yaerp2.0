@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import {
+  ArchiveRestore,
   ArrowLeft,
   ArrowRight,
   BarChart3,
@@ -13,6 +14,7 @@ import {
   ChevronRight,
   ClipboardPaste,
   Copy,
+  DatabaseBackup,
   Download,
   FileText,
   FileUp,
@@ -55,7 +57,7 @@ import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
 import { wsClient } from '@/lib/ws'
-import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, Workbook } from '@/types'
+import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, Workbook, WorkbookImportResult } from '@/types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -147,10 +149,25 @@ function messagePreview(message: ChannelMessage) {
 }
 
 function canRecallMessage(message: ChannelMessage, currentUserId: number | null) {
-  return message.sender_type !== 'ai'
+	return message.sender_type === 'user'
     && currentUserId === message.sender_id
     && !message.recalled_at
     && Date.now() - new Date(message.created_at).getTime() <= 3 * 60 * 1000
+}
+
+function canEditMessage(message: ChannelMessage, currentUserId: number | null) {
+  return message.sender_type === 'user'
+    && currentUserId === message.sender_id
+    && !message.recalled_at
+    && Boolean(message.content)
+    && Date.now() - new Date(message.created_at).getTime() <= 3 * 60 * 1000
+}
+
+function isXlsxMessage(message: ChannelMessage) {
+  return Boolean(message.attachment_url && (
+    message.attachment_filename?.toLowerCase().endsWith('.xlsx')
+    || message.attachment_mime_type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  ))
 }
 
 function sameMessages(left: ChannelMessage[], right: ChannelMessage[]) {
@@ -168,8 +185,12 @@ function sameMessages(left: ChannelMessage[], right: ChannelMessage[]) {
       && message.linked_summary_id === next.linked_summary_id
       && message.reply_to_message_id === next.reply_to_message_id
       && message.reply_content === next.reply_content
-      && message.reply_recalled_at === next.reply_recalled_at
-      && message.recalled_at === next.recalled_at
+	  && message.reply_external_message_id === next.reply_external_message_id
+	  && message.reply_snapshot_sender === next.reply_snapshot_sender
+	  && message.reply_snapshot_content === next.reply_snapshot_content
+	  && message.reply_recalled_at === next.reply_recalled_at
+	  && message.recalled_at === next.recalled_at
+	  && message.edited_at === next.edited_at
   })
 }
 
@@ -222,7 +243,9 @@ export default function ChannelsPage() {
   const [pendingTable, setPendingTable] = useState<PendingTable | null>(null)
   const [makePendingTablePublic, setMakePendingTablePublic] = useState(false)
   const [replyingToMessage, setReplyingToMessage] = useState<ChannelMessage | null>(null)
+  const [editingMessage, setEditingMessage] = useState<ChannelMessage | null>(null)
   const [recallingMessageId, setRecallingMessageId] = useState<number | null>(null)
+  const [importingWorkbookMessageId, setImportingWorkbookMessageId] = useState<number | null>(null)
 
   const [isTablePickerOpen, setIsTablePickerOpen] = useState(false)
   const [tableSearch, setTableSearch] = useState('')
@@ -279,6 +302,13 @@ export default function ChannelsPage() {
   const [syncWhatsAppOutbound, setSyncWhatsAppOutbound] = useState(true)
   const [loadingWhatsApp, setLoadingWhatsApp] = useState(false)
   const [savingWhatsApp, setSavingWhatsApp] = useState(false)
+  const [channelBackups, setChannelBackups] = useState<ChannelBackup[]>([])
+  const [backupRestores, setBackupRestores] = useState<ChannelBackupRestore[]>([])
+  const [selectedBackupId, setSelectedBackupId] = useState<number | null>(null)
+  const [loadingBackups, setLoadingBackups] = useState(false)
+  const [creatingBackup, setCreatingBackup] = useState(false)
+  const [restoringBackupId, setRestoringBackupId] = useState<number | null>(null)
+  const [deletingBackupId, setDeletingBackupId] = useState<number | null>(null)
 
   const [previewImageMessage, setPreviewImageMessage] = useState<ChannelMessage | null>(null)
   const [imageZoom, setImageZoom] = useState(1)
@@ -644,6 +674,7 @@ export default function ChannelsPage() {
     setPendingTable(null)
     setMakePendingTablePublic(false)
     setReplyingToMessage(null)
+    setEditingMessage(null)
     setSelectedAskAssistantId(null)
     setContextMenu(null)
     externalDragDepthRef.current = 0
@@ -896,6 +927,28 @@ export default function ChannelsPage() {
 
   const sendMessage = async () => {
     if (!activeChannelId || sending) return
+    if (editingMessage) {
+      const content = messageText.trim()
+      if (!content) return
+      setSending(true)
+      setError('')
+      try {
+        const response = await api.put<ChannelMessage>(`/channels/${activeChannelId}/messages/${editingMessage.id}`, { content })
+        if (response.code !== 0 || !response.data) {
+          setError(response.message || '编辑消息失败')
+          return
+        }
+        setMessages((current) => current.map((message) => message.id === response.data?.id ? response.data : message))
+        setEditingMessage(null)
+        setMessageText('')
+        setNotice('消息已编辑')
+      } catch {
+        setError('编辑消息失败')
+      } finally {
+        setSending(false)
+      }
+      return
+    }
     const hasMessage = messageText.trim() || pendingFile || pendingGalleryImage || pendingTable
     if (!hasMessage) return
     if (selectedAskAssistantId && !messageText.trim()) {
@@ -996,6 +1049,10 @@ export default function ChannelsPage() {
 
   const selectPendingFile = (file: File | null) => {
     if (!file) return
+    if (editingMessage) {
+      setError('编辑消息时不能添加附件')
+      return
+    }
     if (selectedAskAssistantId) {
       const isImage = file.type.startsWith('image/')
       if (isImage && !selectedAskAssistant?.supports_vision) {
@@ -1193,9 +1250,31 @@ export default function ChannelsPage() {
 
   const startReply = (message: ChannelMessage) => {
     if (message.recalled_at) return
+    setEditingMessage(null)
     setReplyingToMessage(message)
     setContextMenu(null)
     window.requestAnimationFrame(() => messageInputRef.current?.focus())
+  }
+
+  const startEditMessage = (message: ChannelMessage) => {
+    if (!canEditMessage(message, currentUserId)) return
+    setContextMenu(null)
+    setReplyingToMessage(null)
+    setSelectedAskAssistantId(null)
+    setPendingFile(null)
+    setPendingGalleryImage(null)
+    setPendingTable(null)
+    setEditingMessage(message)
+    setMessageText(message.content)
+    window.requestAnimationFrame(() => {
+      messageInputRef.current?.focus()
+      messageInputRef.current?.setSelectionRange(message.content.length, message.content.length)
+    })
+  }
+
+  const cancelEditMessage = () => {
+    setEditingMessage(null)
+    setMessageText('')
   }
 
   const handleRecallMessage = async (message: ChannelMessage) => {
@@ -1216,6 +1295,112 @@ export default function ChannelsPage() {
       setError('撤回消息失败')
     } finally {
       setRecallingMessageId(null)
+    }
+  }
+
+  const handleImportWorkbook = async (message: ChannelMessage) => {
+    if (!isXlsxMessage(message) || message.linked_workbook_id || importingWorkbookMessageId) return
+    setImportingWorkbookMessageId(message.id)
+    setContextMenu(null)
+    setError('')
+    try {
+      const response = await api.post<WorkbookImportResult>(`/channels/${message.channel_id}/messages/${message.id}/import-workbook`, {})
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || '保存工作簿失败')
+        return
+      }
+      notifyDataChanged({ source: 'ai', sheetIds: [], resourcesChanged: true })
+      await Promise.all([loadMessages(message.channel_id, true), loadChannels(true)])
+      setNotice(`已保存工作簿「${response.data.workbook.name}」`)
+    } catch {
+      setError('保存工作簿失败')
+    } finally {
+      setImportingWorkbookMessageId(null)
+    }
+  }
+
+  const loadBackups = async () => {
+    setLoadingBackups(true)
+    try {
+      const response = await api.get<ChannelBackup[]>('/channel-backups')
+      setChannelBackups(response.code === 0 && response.data ? response.data : [])
+    } catch {
+      setChannelBackups([])
+    } finally {
+      setLoadingBackups(false)
+    }
+  }
+
+  const loadBackupRestores = async (backupId: number) => {
+    setSelectedBackupId(backupId)
+    try {
+      const response = await api.get<ChannelBackupRestore[]>(`/channel-backups/${backupId}/restores`)
+      setBackupRestores(response.code === 0 && response.data ? response.data : [])
+    } catch {
+      setBackupRestores([])
+    }
+  }
+
+  const handleCreateBackup = async () => {
+    if (!activeChannel || creatingBackup) return
+    setCreatingBackup(true)
+    setError('')
+    try {
+      const response = await api.post<ChannelBackup>(`/channels/${activeChannel.id}/backups`)
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || '创建频道备份失败')
+        return
+      }
+      await loadBackups()
+      setNotice(`已备份 ${response.data.message_count} 条消息`)
+    } catch {
+      setError('创建频道备份失败')
+    } finally {
+      setCreatingBackup(false)
+    }
+  }
+
+  const handleRestoreBackup = async (backup: ChannelBackup) => {
+    if (!activeChannel || restoringBackupId) return
+    if (!window.confirm(`将备份「${backup.source_channel_name}」中的 ${backup.message_count} 条消息追加到当前频道，是否继续？`)) return
+    setRestoringBackupId(backup.id)
+    setError('')
+    try {
+      const response = await api.post<ChannelBackupRestore>(`/channels/${activeChannel.id}/backups/${backup.id}/restore`)
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || '恢复频道备份失败')
+        return
+      }
+      shouldStickToBottomRef.current = true
+      await Promise.all([loadBackups(), loadMessages(activeChannel.id, true), loadChannels(true)])
+      if (selectedBackupId === backup.id) await loadBackupRestores(backup.id)
+      setNotice(`已恢复 ${response.data.message_count} 条消息`)
+    } catch {
+      setError('恢复频道备份失败')
+    } finally {
+      setRestoringBackupId(null)
+    }
+  }
+
+  const handleDeleteBackup = async (backup: ChannelBackup) => {
+    if (deletingBackupId || !window.confirm(`确认删除备份「${backup.filename}」？`)) return
+    setDeletingBackupId(backup.id)
+    try {
+      const response = await api.delete(`/channel-backups/${backup.id}`)
+      if (response.code !== 0) {
+        setError(response.message || '删除备份失败')
+        return
+      }
+      if (selectedBackupId === backup.id) {
+        setSelectedBackupId(null)
+        setBackupRestores([])
+      }
+      await loadBackups()
+      setNotice('频道备份已删除')
+    } catch {
+      setError('删除备份失败')
+    } finally {
+      setDeletingBackupId(null)
     }
   }
 
@@ -1362,8 +1547,10 @@ export default function ChannelsPage() {
     setChannelAIMembers([])
     setSelectedChannelAssistantIds([])
     setWhatsAppChatSearch('')
+    setBackupRestores([])
+    setSelectedBackupId(null)
     setIsManageOpen(true)
-    void Promise.all([loadChannelMembers(activeChannel.id), loadShareableUsers(), loadAvailableAssistants(), loadChannelAIMembers(activeChannel.id), loadWhatsAppLink(activeChannel.id)])
+    void Promise.all([loadChannelMembers(activeChannel.id), loadShareableUsers(), loadAvailableAssistants(), loadChannelAIMembers(activeChannel.id), loadWhatsAppLink(activeChannel.id), loadBackups()])
   }
 
   const handleSaveAIMembers = async () => {
@@ -2009,24 +2196,27 @@ export default function ChannelsPage() {
                                   {isAI && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">AI</span>}
                                   {isWhatsApp && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">WhatsApp</span>}
                                   <span>{formatTime(message.created_at)}</span>
+                                  {message.edited_at && <span>已编辑</span>}
                                 </div>
                                 {message.forwarded_from_message_id && (
                                   <div className="mb-1 text-[11px] text-sky-600">转发的消息</div>
                                 )}
                                 <div className={`flex items-center gap-2 ${isMine ? 'flex-row-reverse' : ''}`}>
-                                  <div className={`min-w-0 space-y-2 ${(message.content || message.reply_to_message_id) ? `rounded-lg px-3 py-2 shadow-sm ${isMine ? 'bg-[#d9fdd3] text-slate-900' : isAI ? 'bg-[#e7fce8] text-slate-800' : 'bg-white text-slate-800'}` : ''}`}>
-                                    {message.reply_to_message_id && (
+                                  <div className={`min-w-0 space-y-2 ${(message.content || message.reply_to_message_id || message.reply_external_message_id) ? `rounded-lg px-3 py-2 shadow-sm ${isMine ? 'bg-[#d9fdd3] text-slate-900' : isAI ? 'bg-[#e7fce8] text-slate-800' : 'bg-white text-slate-800'}` : ''}`}>
+                                    {(message.reply_to_message_id || message.reply_external_message_id) && (
                                       <button
                                         type="button"
                                         onClick={() => {
-                                          setHighlightMessageId(message.reply_to_message_id || null)
-                                          const target = document.querySelector<HTMLElement>(`[data-message-id="${message.reply_to_message_id}"]`)
-                                          target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+                                          if (message.reply_to_message_id) {
+                                            setHighlightMessageId(message.reply_to_message_id)
+                                            const target = document.querySelector<HTMLElement>(`[data-message-id="${message.reply_to_message_id}"]`)
+                                            target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+                                          }
                                         }}
                                         className={`block w-full min-w-0 border-l-2 pl-2 text-left text-xs ${isMine ? 'border-[#008069] text-slate-600' : 'border-[#00a884] text-slate-500'}`}
                                       >
-                                        <span className={`block truncate font-semibold ${isMine ? 'text-[#006d59]' : 'text-[#008069]'}`}>{message.reply_sender_name || '成员'}</span>
-                                        <span className="mt-0.5 block max-w-md truncate">{message.reply_recalled_at ? '原消息已撤回' : (message.reply_content || message.reply_attachment_filename || '消息')}</span>
+                                        <span className={`block truncate font-semibold ${isMine ? 'text-[#006d59]' : 'text-[#008069]'}`}>{message.reply_sender_name || message.reply_snapshot_sender || 'WhatsApp 联系人'}</span>
+                                        <span className="mt-0.5 block max-w-md truncate">{message.reply_recalled_at ? '原消息已撤回' : (message.reply_content || message.reply_attachment_filename || message.reply_snapshot_content || '引用消息')}</span>
                                       </button>
                                     )}
                                     {message.content && (isAI
@@ -2057,16 +2247,24 @@ export default function ChannelsPage() {
                                 )}
 
                                 {message.attachment_url && !isImageMessage(message) && (
-                                  <a href={message.attachment_url} target="_blank" rel="noreferrer" className="mt-2 flex max-w-sm items-center gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-left shadow-sm transition hover:border-sky-200">
-                                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500">
-                                      <FileText className="h-4 w-4" />
-                                    </div>
-                                    <div className="min-w-0 flex-1">
-                                      <div className="truncate text-sm font-semibold text-slate-800">{message.attachment_filename || '下载附件'}</div>
-                                      <div className="mt-0.5 text-xs text-slate-400">{message.attachment_size ? formatFileSize(message.attachment_size) : '文件附件'}</div>
-                                    </div>
-                                    <ArrowRight className="h-4 w-4 shrink-0 text-slate-400" />
-                                  </a>
+                                  <div className="mt-2 max-w-sm overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+                                    <a href={message.attachment_url} target="_blank" rel="noreferrer" className="flex items-center gap-3 px-3 py-2.5 text-left transition hover:bg-slate-50">
+                                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500">
+                                        <FileText className="h-4 w-4" />
+                                      </div>
+                                      <div className="min-w-0 flex-1">
+                                        <div className="truncate text-sm font-semibold text-slate-800">{message.attachment_filename || '下载附件'}</div>
+                                        <div className="mt-0.5 text-xs text-slate-400">{message.attachment_size ? formatFileSize(message.attachment_size) : '文件附件'}</div>
+                                      </div>
+                                      <ArrowRight className="h-4 w-4 shrink-0 text-slate-400" />
+                                    </a>
+                                    {isXlsxMessage(message) && !message.linked_workbook_id && (
+                                      <button type="button" onClick={() => void handleImportWorkbook(message)} disabled={importingWorkbookMessageId === message.id} className="flex h-9 w-full items-center justify-center gap-2 border-t border-slate-100 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50">
+                                        {importingWorkbookMessageId === message.id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Table2 className="h-3.5 w-3.5" />}
+                                        {importingWorkbookMessageId === message.id ? '正在导入' : '保存为系统工作簿'}
+                                      </button>
+                                    )}
+                                  </div>
                                 )}
 
                                 {message.linked_workbook_id && (
@@ -2101,6 +2299,16 @@ export default function ChannelsPage() {
 
                   <div className="shrink-0 border-t border-slate-300 bg-[#f0f2f5] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:px-5 md:py-3">
                     <div className="mx-auto max-w-4xl overflow-hidden rounded-lg bg-white shadow-sm focus-within:ring-1 focus-within:ring-[#00a884]/30">
+                      {editingMessage && (
+                        <div className="flex items-center gap-3 border-b border-amber-100 bg-amber-50 px-3 py-2">
+                          <Pencil className="h-4 w-4 shrink-0 text-amber-600" />
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs font-semibold text-amber-800">编辑消息</div>
+                            <div className="mt-0.5 truncate text-xs text-amber-700/70">发送后三分钟内可以修改文字内容</div>
+                          </div>
+                          <button type="button" onClick={cancelEditMessage} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-amber-700 hover:bg-white" title="取消编辑"><X className="h-3.5 w-3.5" /></button>
+                        </div>
+                      )}
                       {selectedAskAssistantId && (
                         <div className="flex items-center gap-3 border-b border-emerald-100 bg-emerald-50 px-3 py-2">
                           <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-emerald-600 text-white"><Bot className="h-3.5 w-3.5" /></div>
@@ -2166,27 +2374,27 @@ export default function ChannelsPage() {
                         </div>
                       )}
 
-                      <textarea ref={messageInputRef} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={handleComposerKeyDown} onContextMenu={openComposerContextMenu} placeholder={selectedAskAssistantId ? `向 ${selectedAskAssistantName} 提问...` : replyingToMessage ? `回复 ${replyingToMessage.sender_name || '成员'}...` : '输入消息...'} className="block min-h-20 w-full resize-none px-3 py-3 text-sm text-slate-800 outline-none placeholder:text-slate-400" />
+                      <textarea ref={messageInputRef} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={handleComposerKeyDown} onContextMenu={openComposerContextMenu} placeholder={editingMessage ? '修改消息内容...' : selectedAskAssistantId ? `向 ${selectedAskAssistantName} 提问...` : replyingToMessage ? `回复 ${replyingToMessage.sender_name || '成员'}...` : '输入消息...'} className="block min-h-20 w-full resize-none px-3 py-3 text-sm text-slate-800 outline-none placeholder:text-slate-400" />
 
                       <div className="flex min-h-11 items-end justify-between gap-2 border-t border-slate-100 px-2 py-1.5 sm:items-center sm:gap-3">
                         <div className="flex min-w-0 flex-wrap items-center gap-1">
                           {channelAIMembers.length > 0 && (
                             <label className={`mr-1 flex h-8 max-w-52 items-center gap-1.5 rounded-lg border px-2 text-xs ${selectedAskAssistantId ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500'}`} title="选择频道机器人">
                               <Bot className="h-3.5 w-3.5 shrink-0" />
-                              <select value={selectedAskAssistantId || ''} onChange={(event) => handleAskAssistantSelection(event.target.value)} disabled={sending || activeChannel.channel_type === 'ai_private'} className="min-w-0 flex-1 bg-transparent outline-none disabled:opacity-100">
+                              <select value={selectedAskAssistantId || ''} onChange={(event) => handleAskAssistantSelection(event.target.value)} disabled={sending || Boolean(editingMessage) || activeChannel.channel_type === 'ai_private'} className="min-w-0 flex-1 bg-transparent outline-none disabled:opacity-100">
                                 {activeChannel.channel_type !== 'ai_private' && <option value="">普通消息</option>}
                                 {channelAIMembers.map((assistant) => <option key={assistant.assistant_id} value={assistant.assistant_id}>@{assistant.name}</option>)}
                               </select>
                             </label>
                           )}
                           <input ref={fileInputRef} type="file" className="hidden" onChange={(event) => selectPendingFile(event.target.files?.[0] || null)} />
-                          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_files && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加机器人可读取的图片或文件' : '发送文件'}>
+                          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_files && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加机器人可读取的图片或文件' : '发送文件'}>
                             <Paperclip className="h-4 w-4" />
                           </button>
-                          <button type="button" onClick={() => setIsTablePickerOpen(true)} disabled={sending || workbooks.length === 0} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '选择机器人需要读取的工作簿或工作表' : '发送工作簿或工作表'}>
+                          <button type="button" onClick={() => setIsTablePickerOpen(true)} disabled={sending || Boolean(editingMessage) || workbooks.length === 0} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '选择机器人需要读取的工作簿或工作表' : '发送工作簿或工作表'}>
                             <Table2 className="h-4 w-4" />
                           </button>
-                          <button type="button" onClick={() => { setGalleryPickerMode('message'); setIsGalleryPickerOpen(true) }} disabled={sending || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '从图库选择机器人需要查看的图片' : '从图库选择图片'}>
+                          <button type="button" onClick={() => { setGalleryPickerMode('message'); setIsGalleryPickerOpen(true) }} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '从图库选择机器人需要查看的图片' : '从图库选择图片'}>
                             <Images className="h-4 w-4" />
                           </button>
                           {pendingFile?.type.startsWith('image/') && (
@@ -2204,7 +2412,7 @@ export default function ChannelsPage() {
                             </>
                           )}
                         </div>
-                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && !pendingFile && !pendingGalleryImage && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : '发送'}>
+                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && !pendingFile && !pendingGalleryImage && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={editingMessage ? '保存修改' : askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : '发送'}>
                           {askingAI ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                         </button>
                       </div>
@@ -2704,6 +2912,55 @@ export default function ChannelsPage() {
                 </section>
 
                 <section className="border-b border-slate-200 p-5">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><DatabaseBackup className="h-4 w-4 text-sky-600" />聊天备份与恢复</div>
+                      <div className="mt-1 text-xs text-slate-500">备份包含频道消息、引用关系和附件，可下载，也可以恢复到当前频道。</div>
+                    </div>
+                    <button type="button" onClick={() => void handleCreateBackup()} disabled={creatingBackup} className="inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">
+                      {creatingBackup ? <RefreshCw className="h-4 w-4 animate-spin" /> : <DatabaseBackup className="h-4 w-4" />}
+                      {creatingBackup ? '备份中' : '立即备份'}
+                    </button>
+                  </div>
+                  {loadingBackups ? (
+                    <div className="flex items-center gap-2 py-6 text-sm text-slate-400"><RefreshCw className="h-4 w-4 animate-spin" />正在读取备份记录...</div>
+                  ) : channelBackups.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">暂无频道备份记录</div>
+                  ) : (
+                    <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+                      {channelBackups.map((backup) => (
+                        <div key={backup.id} className={`rounded-lg border p-3 ${backup.source_channel_id === activeChannel.id ? 'border-sky-200 bg-sky-50/50' : 'border-slate-200 bg-white'}`}>
+                          <div className="flex items-start gap-3">
+                            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-100 text-sky-700"><DatabaseBackup className="h-4 w-4" /></div>
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-sm font-semibold text-slate-800">{backup.source_channel_name}</div>
+                              <div className="mt-1 text-xs text-slate-400">{backup.message_count} 条消息 · {formatFileSize(backup.size)} · {formatTime(backup.created_at)}</div>
+                              <div className="mt-0.5 text-[11px] text-slate-400">创建人 {backup.created_by_name || '已删除账号'}{backup.restore_count > 0 ? ` · 已恢复 ${backup.restore_count} 次` : ''}</div>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <a href={backup.download_url} download={backup.filename} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="下载备份"><Download className="h-4 w-4" /></a>
+                              <button type="button" onClick={() => void handleRestoreBackup(backup)} disabled={restoringBackupId === backup.id} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-emerald-700 disabled:opacity-50" title="恢复到当前频道">{restoringBackupId === backup.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <ArchiveRestore className="h-4 w-4" />}</button>
+                              <button type="button" onClick={() => void loadBackupRestores(backup.id)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="查看恢复记录"><RotateCcw className="h-4 w-4" /></button>
+                              {currentUser && (isAdmin(currentUser) || backup.created_by === currentUser.id) && <button type="button" onClick={() => void handleDeleteBackup(backup)} disabled={deletingBackupId === backup.id} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50" title="删除备份"><Trash2 className="h-4 w-4" /></button>}
+                            </div>
+                          </div>
+                          {selectedBackupId === backup.id && (
+                            <div className="mt-3 border-t border-slate-200 pt-2">
+                              {backupRestores.length === 0 ? <div className="text-xs text-slate-400">该备份还没有恢复记录。</div> : backupRestores.map((restore) => (
+                                <div key={restore.id} className="flex items-center justify-between gap-3 py-1 text-xs text-slate-500">
+                                  <span className="truncate">恢复到 {restore.target_channel_name || '已删除频道'} · {restore.message_count} 条</span>
+                                  <span className="shrink-0">{restore.restored_by_name || '已删除账号'} · {formatTime(restore.created_at)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                <section className="border-b border-slate-200 p-5">
                   <div className="mb-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><MessageCircle className="h-4 w-4 text-emerald-600" />WhatsApp 联动</div>
                     {whatsAppLink && <span className="rounded-lg bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">已关联 {whatsAppLink.whatsapp_chat_name}</span>}
@@ -2896,6 +3153,9 @@ export default function ChannelsPage() {
                 {!contextMenu.message.recalled_at && (
                   <button type="button" onClick={() => { const message = contextMenu.message; if (message) startReply(message) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Reply className="h-4 w-4 text-slate-400" />回复消息</button>
                 )}
+                {canEditMessage(contextMenu.message, currentUserId) && (
+                  <button type="button" onClick={() => { const message = contextMenu.message; if (message) startEditMessage(message) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Pencil className="h-4 w-4 text-slate-400" />编辑消息</button>
+                )}
                 {!contextMenu.message.recalled_at && channelAIMembers.length > 0 && (
                   <div className="border-y border-slate-100 py-1">
                     <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">@机器人提问</div>
@@ -2916,6 +3176,9 @@ export default function ChannelsPage() {
                     <button type="button" onClick={() => void copyText(contextMenu.message?.attachment_url || '', '图片地址已复制')} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Copy className="h-4 w-4 text-slate-400" />复制图片地址</button>
                     <button type="button" onClick={() => { const message = contextMenu.message; setContextMenu(null); if (message) void handleSaveImage(message, '') }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Save className="h-4 w-4 text-slate-400" />保存到图库</button>
                   </>
+                )}
+                {!contextMenu.message.recalled_at && isXlsxMessage(contextMenu.message) && !contextMenu.message.linked_workbook_id && (
+                  <button type="button" onClick={() => { const message = contextMenu.message; if (message) void handleImportWorkbook(message) }} disabled={importingWorkbookMessageId === contextMenu.message.id} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"><Table2 className="h-4 w-4" />保存为系统工作簿</button>
                 )}
                 {!contextMenu.message.recalled_at && contextMenu.message.sender_type !== 'whatsapp' && (
                   <button type="button" onClick={() => { const message = contextMenu.message; if (message) void handleSendMessageToWhatsApp(message) }} className="flex h-9 w-full items-center gap-2.5 border-t border-slate-100 px-3 text-left text-sm text-slate-700 hover:bg-emerald-50 hover:text-emerald-800"><MessageCircle className="h-4 w-4 text-emerald-600" />发送到 WhatsApp</button>

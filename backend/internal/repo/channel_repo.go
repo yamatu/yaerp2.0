@@ -469,6 +469,53 @@ func (r *ChannelRepo) RecallMessage(messageID, userID int64) error {
 	return nil
 }
 
+func (r *ChannelRepo) EditMessage(messageID, userID int64, content string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var oldContent string
+	if err := tx.QueryRow(
+		`SELECT COALESCE(content, '') FROM channel_messages
+		  WHERE id = $1 AND sender_id = $2 AND sender_type = 'user' AND recalled_at IS NULL
+		    AND created_at >= NOW() - INTERVAL '3 minutes'
+		  FOR UPDATE`, messageID, userID,
+	).Scan(&oldContent); err != nil {
+		return err
+	}
+	if oldContent == content {
+		return tx.Commit()
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO channel_message_edits (message_id, edited_by, old_content, new_content, created_at)
+		 VALUES ($1,$2,$3,$4,NOW())`, messageID, userID, oldContent, content,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE channel_messages SET content = $1, edited_at = NOW() WHERE id = $2`, content, messageID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *ChannelRepo) LinkMessageWorkbook(messageID, workbookID int64) error {
+	result, err := r.db.Exec(
+		`UPDATE channel_messages SET linked_workbook_id = $1 WHERE id = $2 AND linked_workbook_id IS NULL`,
+		workbookID, messageID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *ChannelRepo) GetMessage(id int64) (*model.ChannelMessage, error) {
 	row := r.db.QueryRow(channelMessageSelectSQL()+` WHERE m.id = $1`, id)
 	return scanChannelMessage(row)
@@ -944,7 +991,8 @@ func channelMessageColumnsSQL() string {
 		    WHEN rm.sender_type = 'whatsapp' THEN COALESCE(NULLIF(rm.external_sender_name, ''), 'WhatsApp 联系人')
 		    ELSE ru.username
 		END, rm.content, ra.filename, rm.recalled_at,
-		m.recalled_at, m.recalled_by, m.created_at`
+		m.reply_external_message_id, m.reply_snapshot_sender, m.reply_snapshot_content,
+		m.recalled_at, m.recalled_by, m.edited_at, m.created_at`
 }
 
 func channelMessageSearchFromSQL() string {
@@ -1009,9 +1057,13 @@ func scanChannelMessageValues(scanner interface {
 	var replyContent sql.NullString
 	var replyAttachmentName sql.NullString
 	var replyRecalledAt sql.NullTime
+	var replyExternalMessageID sql.NullString
+	var replySnapshotSender sql.NullString
+	var replySnapshotContent sql.NullString
 	var recalledAt sql.NullTime
 	var recalledBy sql.NullInt64
-	destinations := make([]any, 0, 37)
+	var editedAt sql.NullTime
+	destinations := make([]any, 0, 41)
 	if channelName != nil {
 		destinations = append(destinations, channelName)
 	}
@@ -1022,7 +1074,8 @@ func scanChannelMessageValues(scanner interface {
 		&attachmentID, &attachmentFilename, &attachmentMimeType, &attachmentSize,
 		&workbookID, &workbookName, &sheetID, &sheetName, &summaryID, &summaryTitle, &forwardedFrom, &replyToMessageID,
 		&replySenderID, &replySenderName, &replyContent, &replyAttachmentName, &replyRecalledAt,
-		&recalledAt, &recalledBy, &message.CreatedAt,
+		&replyExternalMessageID, &replySnapshotSender, &replySnapshotContent,
+		&recalledAt, &recalledBy, &editedAt, &message.CreatedAt,
 	)
 	if err := scanner.Scan(destinations...); err != nil {
 		return nil, err
@@ -1105,11 +1158,23 @@ func scanChannelMessageValues(scanner interface {
 	if replyRecalledAt.Valid {
 		message.ReplyRecalledAt = &replyRecalledAt.Time
 	}
+	if replyExternalMessageID.Valid {
+		message.ReplyExternalMessageID = &replyExternalMessageID.String
+	}
+	if replySnapshotSender.Valid {
+		message.ReplySnapshotSender = &replySnapshotSender.String
+	}
+	if replySnapshotContent.Valid {
+		message.ReplySnapshotContent = &replySnapshotContent.String
+	}
 	if recalledAt.Valid {
 		message.RecalledAt = &recalledAt.Time
 	}
 	if recalledBy.Valid {
 		message.RecalledBy = &recalledBy.Int64
+	}
+	if editedAt.Valid {
+		message.EditedAt = &editedAt.Time
 	}
 	return &message, nil
 }

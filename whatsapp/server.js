@@ -136,6 +136,26 @@ async function serializeMessage(session, message, includeMedia = false) {
   } catch {
     payload.senderName = payload.author || payload.from
   }
+  if (message.hasQuotedMsg) {
+    try {
+      const quoted = await message.getQuotedMessage()
+      if (quoted) {
+        payload.quotedMessageId = serializeId(quoted.id)
+        payload.quotedMessageBody = quoted.body || quoted._data?.caption || ''
+        payload.quotedMessageFromMe = Boolean(quoted.fromMe)
+        try {
+          const quotedContact = await quoted.getContact()
+          payload.quotedMessageSenderName = quoted.fromMe
+            ? (session.state.account?.pushname || '你')
+            : (quotedContact.pushname || quotedContact.name || quotedContact.shortName || quotedContact.number || quoted.author || quoted.from)
+        } catch {
+          payload.quotedMessageSenderName = quoted.fromMe ? (session.state.account?.pushname || '你') : (quoted.author || quoted.from || '')
+        }
+      }
+    } catch (error) {
+      payload.quotedMessageError = error.message
+    }
+  }
   return payload
 }
 
@@ -245,6 +265,12 @@ function bindClientEvents(session, client) {
     if (active() && message.fromMe) void postWebhook(session, 'message_create', await serializeMessage(session, message, false))
   })
   client.on('message_ack', (message, ack) => active() && void postWebhook(session, 'message_ack', { id: serializeId(message.id), ack }))
+  client.on('message_edit', (message, newBody, previousBody) => {
+    if (!active()) return
+    void serializeMessage(session, message, false).then((payload) => postWebhook(session, 'message_edit', {
+      ...payload, body: String(newBody || ''), previousBody: String(previousBody || ''),
+    }))
+  })
   client.on('message_revoke_everyone', (after, before) => active() && void postWebhook(session, 'message_revoke', {
     id: serializeId(after?.id), beforeId: serializeId(before?.id), chatId: after?.from || before?.from || '',
   }))
@@ -426,6 +452,17 @@ app.post('/sessions/:sessionId/messages/:messageId/reaction', requireSession, re
   try {
     await req.whatsappSession.client.sendReaction(req.params.messageId, String(req.body.reaction || ''))
     res.json({ ok: true })
+  } catch (error) { next(error) }
+})
+app.put('/sessions/:sessionId/messages/:messageId', requireSession, requireReady, async (req, res, next) => {
+  try {
+    const content = String(req.body.content || '').trim()
+    if (!content) return res.status(400).json({ error: 'content is required' })
+    const message = await req.whatsappSession.client.getMessageById(req.params.messageId)
+    if (!message) return res.status(404).json({ error: 'message not found' })
+    const edited = await message.edit(content)
+    if (!edited) return res.status(409).json({ error: 'message can no longer be edited' })
+    res.json(await serializeMessage(req.whatsappSession, edited, false))
   } catch (error) { next(error) }
 })
 app.post('/sessions/:sessionId/chats/:chatId/action', requireSession, requireReady, async (req, res, next) => {

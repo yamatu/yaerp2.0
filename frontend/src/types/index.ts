@@ -393,9 +393,49 @@ export interface ChannelMessage {
   reply_content?: string
   reply_attachment_filename?: string
   reply_recalled_at?: string | null
+  reply_external_message_id?: string
+  reply_snapshot_sender?: string
+  reply_snapshot_content?: string
   recalled_at?: string | null
   recalled_by?: number | null
+  edited_at?: string | null
   created_at: string
+}
+
+export interface ChannelBackup {
+  id: number
+  source_channel_id?: number | null
+  source_channel_name: string
+  created_by?: number | null
+  created_by_name: string
+  filename: string
+  attachment_id: number
+  download_url: string
+  message_count: number
+  size: number
+  restore_count: number
+  last_restored_at?: string | null
+  created_at: string
+}
+
+export interface ChannelBackupRestore {
+  id: number
+  backup_id: number
+  target_channel_id?: number | null
+  target_channel_name: string
+  restored_by?: number | null
+  restored_by_name: string
+  message_count: number
+  created_at: string
+}
+
+export interface WorkbookImportResult {
+  workbook: Workbook
+  first_sheet_id: number
+  imported_rows: number
+  imported_sheets: number
+  attachment_id?: number
+  attachment_url?: string
 }
 
 export interface WhatsAppSettings {

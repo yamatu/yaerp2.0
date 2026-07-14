@@ -81,6 +81,10 @@ type whatsAppIncomingMessage struct {
 	SenderName          string             `json:"senderName"`
 	SenderNumber        string             `json:"senderNumber"`
 	SenderProfilePicURL string             `json:"senderProfilePicUrl"`
+	QuotedMessageID     string             `json:"quotedMessageId"`
+	QuotedMessageBody   string             `json:"quotedMessageBody"`
+	QuotedSenderName    string             `json:"quotedMessageSenderName"`
+	QuotedMessageFromMe bool               `json:"quotedMessageFromMe"`
 	Media               *whatsappSendMedia `json:"media"`
 }
 
@@ -456,6 +460,30 @@ func (s *WhatsAppService) HandleWebhook(body []byte) error {
 			return err
 		}
 		return s.handleIncomingMessage(account, &incoming)
+	case "message_edit":
+		var incoming whatsAppIncomingMessage
+		if err := json.Unmarshal(event.Payload, &incoming); err != nil {
+			return err
+		}
+		if incoming.FromMe || strings.TrimSpace(incoming.ID) == "" {
+			return nil
+		}
+		messageID, err := s.repo.EditExternalMessage(account.ID, incoming.ID, strings.TrimSpace(incoming.Body))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		updated, err := s.channelRepo.GetMessage(messageID)
+		if err != nil {
+			return err
+		}
+		s.attachChannelMessageURL(updated)
+		if s.inboundHook != nil {
+			s.inboundHook(updated)
+		}
+		return nil
 	case "message_ack":
 		var ack struct {
 			ID  string `json:"id"`
@@ -535,6 +563,23 @@ func (s *WhatsAppService) handleIncomingMessage(account *model.WhatsAppAccount, 
 		ExternalSource: &externalSource, ExternalAccountID: &account.ID, ExternalMessageID: &externalID,
 		ExternalSenderName: &senderName, ExternalSenderAddress: &senderAddress,
 	}
+	if quotedID := strings.TrimSpace(incoming.QuotedMessageID); quotedID != "" {
+		message.ReplyExternalMessageID = &quotedID
+		if internalID, lookupErr := s.repo.ChannelMessageID(account.ID, quotedID); lookupErr == nil {
+			message.ReplyToMessageID = &internalID
+		}
+		quotedSender := strings.TrimSpace(incoming.QuotedSenderName)
+		if quotedSender == "" && incoming.QuotedMessageFromMe {
+			quotedSender = account.DisplayName
+		}
+		if quotedSender != "" {
+			message.ReplySnapshotSender = &quotedSender
+		}
+		quotedContent := strings.TrimSpace(incoming.QuotedMessageBody)
+		if quotedContent != "" {
+			message.ReplySnapshotContent = &quotedContent
+		}
+	}
 	if avatar != "" {
 		message.ExternalSenderAvatar = &avatar
 	}
@@ -597,6 +642,28 @@ func (s *WhatsAppService) sendStoredChannelMessage(userID int64, link *model.Wha
 		_ = s.repo.RecordMessageLink(link.WhatsAppAccountID, message.ID, sent.ID, "outbound", nil)
 	}
 	return sent, nil
+}
+
+func (s *WhatsAppService) EditForwardedChannelMessage(userID, channelID, messageID int64, content string) error {
+	link, err := s.repo.GetChannelLink(channelID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !link.SyncOutbound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.requireChannelAccess(userID, channelID); err != nil {
+		return err
+	}
+	externalID, err := s.repo.ExternalMessageID(link.WhatsAppAccountID, messageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	payload := map[string]string{"content": strings.TrimSpace(content)}
+	return s.callSidecar(http.MethodPut, s.sessionPath(link.WhatsAppUserID)+"/messages/"+url.PathEscape(externalID), payload, nil)
 }
 
 func (s *WhatsAppService) sendPayload(accountUserID int64, payload *whatsappSendPayload) (*whatsappSentMessage, error) {

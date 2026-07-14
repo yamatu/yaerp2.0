@@ -84,6 +84,32 @@ func (s *SheetImportService) ImportWorkbookXLSX(userID int64, file multipart.Fil
 	if len(data) == 0 {
 		return nil, fmt.Errorf("导入文件为空")
 	}
+	return s.importWorkbookXLSXData(userID, data, filename, requestedWorkbookName, folderID)
+}
+
+func (s *SheetImportService) ImportStoredWorkbookXLSX(userID, attachmentID int64, requestedWorkbookName string, folderID *int64) (*WorkbookImportResult, error) {
+	attachment, reader, err := s.uploadSvc.OpenStoredFile(attachmentID)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	if !strings.EqualFold(filepath.Ext(attachment.Filename), ".xlsx") {
+		return nil, fmt.Errorf("只有 XLSX 附件可以保存为工作簿")
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, (20<<20)+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取附件失败: %w", err)
+	}
+	if len(data) > 20<<20 {
+		return nil, fmt.Errorf("XLSX 附件不能超过 20MB")
+	}
+	return s.importWorkbookXLSXData(userID, data, attachment.Filename, requestedWorkbookName, folderID)
+}
+
+func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, filename, requestedWorkbookName string, folderID *int64) (*WorkbookImportResult, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("导入文件为空")
+	}
 
 	xlsx, err := excelize.OpenReader(bytes.NewReader(data))
 	if err != nil {

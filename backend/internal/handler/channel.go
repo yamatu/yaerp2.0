@@ -386,6 +386,123 @@ func (h *ChannelHandler) RecallMessage(c *gin.Context) {
 	response.OK(c, message)
 }
 
+func (h *ChannelHandler) EditMessage(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	messageID, err := parseIDParam(c, "messageId")
+	if err != nil {
+		response.BadRequest(c, "invalid message id")
+		return
+	}
+	var req model.ChannelMessageEditRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	message, err := h.channelService.EditMessage(c.GetInt64("user_id"), channelID, messageID, req.Content)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, message)
+}
+
+func (h *ChannelHandler) ImportMessageWorkbook(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	messageID, err := parseIDParam(c, "messageId")
+	if err != nil {
+		response.BadRequest(c, "invalid message id")
+		return
+	}
+	var req model.ChannelWorkbookImportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.channelService.ImportMessageWorkbook(c.GetInt64("user_id"), channelID, messageID, &req)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
+func (h *ChannelHandler) ListBackups(c *gin.Context) {
+	backups, err := h.channelService.ListBackups(c.GetInt64("user_id"))
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, backups)
+}
+
+func (h *ChannelHandler) CreateBackup(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	backup, err := h.channelService.CreateBackup(c.GetInt64("user_id"), channelID)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, backup)
+}
+
+func (h *ChannelHandler) RestoreBackup(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	backupID, err := parseIDParam(c, "backupId")
+	if err != nil {
+		response.BadRequest(c, "invalid backup id")
+		return
+	}
+	restore, err := h.channelService.RestoreBackup(c.GetInt64("user_id"), channelID, backupID)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, restore)
+}
+
+func (h *ChannelHandler) ListBackupRestores(c *gin.Context) {
+	backupID, err := parseIDParam(c, "backupId")
+	if err != nil {
+		response.BadRequest(c, "invalid backup id")
+		return
+	}
+	restores, err := h.channelService.ListBackupRestores(c.GetInt64("user_id"), backupID)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, restores)
+}
+
+func (h *ChannelHandler) DeleteBackup(c *gin.Context) {
+	backupID, err := parseIDParam(c, "backupId")
+	if err != nil {
+		response.BadRequest(c, "invalid backup id")
+		return
+	}
+	if err := h.channelService.DeleteBackup(c.GetInt64("user_id"), backupID); err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OKMsg(c, "channel backup deleted")
+}
+
 func (h *ChannelHandler) ForwardMessage(c *gin.Context) {
 	channelID, err := parseIDParam(c, "id")
 	if err != nil {
@@ -551,7 +668,7 @@ func (h *ChannelHandler) RenameGalleryImage(c *gin.Context) {
 
 func respondChannelError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, service.ErrChannelAccessDenied), errors.Is(err, service.ErrChannelManageDenied), errors.Is(err, service.ErrGalleryImageRenameDenied), errors.Is(err, service.ErrMessageRecallDenied):
+	case errors.Is(err, service.ErrChannelAccessDenied), errors.Is(err, service.ErrChannelManageDenied), errors.Is(err, service.ErrGalleryImageRenameDenied), errors.Is(err, service.ErrMessageRecallDenied), errors.Is(err, service.ErrMessageEditDenied):
 		response.Forbidden(c, err.Error())
 	default:
 		response.Error(c, http.StatusBadRequest, err.Error())

@@ -83,9 +83,40 @@ type ChannelMessage struct {
 	ReplyContent           *string    `json:"reply_content,omitempty" db:"reply_content"`
 	ReplyAttachmentName    *string    `json:"reply_attachment_filename,omitempty" db:"reply_attachment_filename"`
 	ReplyRecalledAt        *time.Time `json:"reply_recalled_at,omitempty" db:"reply_recalled_at"`
+	ReplyExternalMessageID *string    `json:"reply_external_message_id,omitempty" db:"reply_external_message_id"`
+	ReplySnapshotSender    *string    `json:"reply_snapshot_sender,omitempty" db:"reply_snapshot_sender"`
+	ReplySnapshotContent   *string    `json:"reply_snapshot_content,omitempty" db:"reply_snapshot_content"`
 	RecalledAt             *time.Time `json:"recalled_at,omitempty" db:"recalled_at"`
 	RecalledBy             *int64     `json:"recalled_by,omitempty" db:"recalled_by"`
+	EditedAt               *time.Time `json:"edited_at,omitempty" db:"edited_at"`
 	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
+}
+
+type ChannelBackup struct {
+	ID                int64      `json:"id"`
+	SourceChannelID   *int64     `json:"source_channel_id,omitempty"`
+	SourceChannelName string     `json:"source_channel_name"`
+	CreatedBy         *int64     `json:"created_by,omitempty"`
+	CreatedByName     string     `json:"created_by_name"`
+	Filename          string     `json:"filename"`
+	AttachmentID      int64      `json:"attachment_id"`
+	DownloadURL       string     `json:"download_url"`
+	MessageCount      int        `json:"message_count"`
+	Size              int64      `json:"size"`
+	RestoreCount      int        `json:"restore_count"`
+	LastRestoredAt    *time.Time `json:"last_restored_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+}
+
+type ChannelBackupRestore struct {
+	ID              int64     `json:"id"`
+	BackupID        int64     `json:"backup_id"`
+	TargetChannelID *int64    `json:"target_channel_id,omitempty"`
+	TargetName      string    `json:"target_channel_name"`
+	RestoredBy      *int64    `json:"restored_by,omitempty"`
+	RestoredByName  string    `json:"restored_by_name"`
+	MessageCount    int       `json:"message_count"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type ChannelMessageSearchResult struct {
@@ -164,6 +195,15 @@ type AttachmentAvatarRequest struct {
 type ChannelForwardRequest struct {
 	TargetChannelID int64  `json:"target_channel_id" binding:"required"`
 	Content         string `json:"content"`
+}
+
+type ChannelMessageEditRequest struct {
+	Content string `json:"content" binding:"required"`
+}
+
+type ChannelWorkbookImportRequest struct {
+	WorkbookName string `json:"workbook_name"`
+	FolderID     *int64 `json:"folder_id"`
 }
 
 type ChannelImageSaveRequest struct {

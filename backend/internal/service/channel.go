@@ -21,6 +21,8 @@ var (
 	ErrGalleryImageRenameDenied = errors.New("没有权限重命名这张图片")
 	ErrMessageRecallDenied      = errors.New("只能撤回自己发送的消息")
 	ErrMessageRecallExpired     = errors.New("消息发送超过 3 分钟，无法撤回")
+	ErrMessageEditDenied        = errors.New("只能编辑自己发送的消息")
+	ErrMessageEditExpired       = errors.New("消息发送超过 3 分钟，无法编辑")
 )
 
 type ChannelService struct {
@@ -30,15 +32,30 @@ type ChannelService struct {
 	permSvc            *PermissionService
 	userRepo           *repo.UserRepo
 	aiSvc              *AIService
+	importSvc          *SheetImportService
 	messageCreatedHook func(userID int64, message *model.ChannelMessage)
+	messageChangedHook func(message *model.ChannelMessage)
+	messageEditedHook  func(userID int64, message *model.ChannelMessage)
 }
 
 func (s *ChannelService) SetAIService(aiSvc *AIService) {
 	s.aiSvc = aiSvc
 }
 
+func (s *ChannelService) SetImportService(importSvc *SheetImportService) {
+	s.importSvc = importSvc
+}
+
 func (s *ChannelService) SetMessageCreatedHook(hook func(userID int64, message *model.ChannelMessage)) {
 	s.messageCreatedHook = hook
+}
+
+func (s *ChannelService) SetMessageChangedHook(hook func(message *model.ChannelMessage)) {
+	s.messageChangedHook = hook
+}
+
+func (s *ChannelService) SetMessageEditedHook(hook func(userID int64, message *model.ChannelMessage)) {
+	s.messageEditedHook = hook
 }
 
 func (s *ChannelService) notifyMessageCreated(userID int64, message *model.ChannelMessage) {
@@ -47,6 +64,25 @@ func (s *ChannelService) notifyMessageCreated(userID int64, message *model.Chann
 	}
 	copyOfMessage := *message
 	go s.messageCreatedHook(userID, &copyOfMessage)
+}
+
+func (s *ChannelService) notifyMessageChanged(message *model.ChannelMessage) {
+	if s.messageChangedHook == nil || message == nil {
+		return
+	}
+	copyOfMessage := *message
+	go s.messageChangedHook(&copyOfMessage)
+}
+
+func (s *ChannelService) notifyMessageEdited(userID int64, message *model.ChannelMessage) {
+	if message == nil {
+		return
+	}
+	s.notifyMessageChanged(message)
+	if s.messageEditedHook != nil {
+		copyOfMessage := *message
+		go s.messageEditedHook(userID, &copyOfMessage)
+	}
 }
 
 type ChannelAIAskResult struct {
@@ -741,7 +777,76 @@ func (s *ChannelService) RecallMessage(userID, channelID, messageID int64) (*mod
 		return nil, err
 	}
 	s.attachMessageURL(recalled)
+	s.notifyMessageChanged(recalled)
 	return recalled, nil
+}
+
+func (s *ChannelService) EditMessage(userID, channelID, messageID int64, content string) (*model.ChannelMessage, error) {
+	if _, err := s.requireChannelAccess(userID, channelID); err != nil {
+		return nil, err
+	}
+	message, err := s.channelRepo.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	if message.ChannelID != channelID || message.SenderID != userID || message.SenderType != "user" {
+		return nil, ErrMessageEditDenied
+	}
+	if message.RecalledAt != nil {
+		return nil, fmt.Errorf("已撤回的消息不能编辑")
+	}
+	if time.Since(message.CreatedAt) > 3*time.Minute {
+		return nil, ErrMessageEditExpired
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, fmt.Errorf("消息内容不能为空")
+	}
+	if err := s.channelRepo.EditMessage(messageID, userID, content); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrMessageEditExpired
+		}
+		return nil, err
+	}
+	updated, err := s.channelRepo.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	s.attachMessageURL(updated)
+	s.notifyMessageEdited(userID, updated)
+	return updated, nil
+}
+
+func (s *ChannelService) ImportMessageWorkbook(userID, channelID, messageID int64, request *model.ChannelWorkbookImportRequest) (*WorkbookImportResult, error) {
+	if _, err := s.requireChannelAccess(userID, channelID); err != nil {
+		return nil, err
+	}
+	if s.importSvc == nil {
+		return nil, fmt.Errorf("Excel 导入服务尚未初始化")
+	}
+	message, err := s.channelRepo.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	if message.ChannelID != channelID || message.RecalledAt != nil || message.AttachmentID == nil {
+		return nil, fmt.Errorf("该消息不包含可保存的 Excel 附件")
+	}
+	if message.LinkedWorkbookID != nil {
+		return nil, fmt.Errorf("该表格已经保存为系统工作簿")
+	}
+	result, err := s.importSvc.ImportStoredWorkbookXLSX(userID, *message.AttachmentID, request.WorkbookName, request.FolderID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.channelRepo.LinkMessageWorkbook(messageID, result.Workbook.ID); err != nil {
+		return nil, err
+	}
+	updated, err := s.channelRepo.GetMessage(messageID)
+	if err == nil {
+		s.attachMessageURL(updated)
+		s.notifyMessageChanged(updated)
+	}
+	return result, nil
 }
 
 func (s *ChannelService) SaveMessageImage(userID, channelID, messageID int64, directoryID *int64) error {
