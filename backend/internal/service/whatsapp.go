@@ -309,7 +309,7 @@ func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *m
 		limit = 500
 	}
 	var history []whatsAppIncomingMessage
-	path := s.sessionPath(account.UserID) + "/chats/" + url.PathEscape(link.WhatsAppChatID) + "/messages?limit=" + strconv.Itoa(limit)
+	path := s.sessionPath(account.UserID) + "/chats/" + url.PathEscape(link.WhatsAppChatID) + "/messages?limit=" + strconv.Itoa(limit) + "&includeMedia=1"
 	if err := s.callSidecarWithTimeout(http.MethodGet, path, nil, &history, 60*time.Second); err != nil {
 		return nil, err
 	}
@@ -330,6 +330,33 @@ func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *m
 			continue
 		}
 		content := strings.TrimSpace(incoming.Body)
+		var attachmentID *int64
+		uploaderID := account.UserID
+		if !incoming.FromMe && link.CreatedBy > 0 {
+			uploaderID = link.CreatedBy
+		}
+		if incoming.Media != nil && incoming.Media.Data != "" {
+			data, decodeErr := base64.StdEncoding.DecodeString(incoming.Media.Data)
+			if decodeErr != nil {
+				return nil, decodeErr
+			}
+			if len(data) > whatsappMaxSendBytes {
+				content = strings.TrimSpace(content + "\n[WhatsApp 历史附件超过 25MB，未自动保存]")
+			} else {
+				filename := sanitizeWhatsAppFilename(incoming.Media.Filename)
+				attachment, _, uploadErr := s.uploadSvc.UploadBytes(filename, incoming.Media.Mimetype, data, uploaderID)
+				if uploadErr != nil {
+					return nil, uploadErr
+				}
+				attachmentID = &attachment.ID
+				if strings.HasPrefix(strings.ToLower(incoming.Media.Mimetype), "image/") {
+					_ = s.saveIncomingImageToGallery(link, attachment.ID, uploaderID)
+				}
+				if content == "" {
+					content = filename
+				}
+			}
+		}
 		if content == "" && incoming.HasMedia {
 			content = whatsAppHistoryMediaLabel(incoming.Type)
 		}
@@ -340,7 +367,7 @@ func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *m
 		if incoming.Timestamp > 0 {
 			createdAt = time.Unix(incoming.Timestamp, 0)
 		}
-		message := &model.ChannelMessage{ChannelID: channelID, Content: content, CreatedAt: createdAt}
+		message := &model.ChannelMessage{ChannelID: channelID, Content: content, AttachmentID: attachmentID, CreatedAt: createdAt}
 		direction := "inbound"
 		if incoming.FromMe {
 			direction = "outbound"

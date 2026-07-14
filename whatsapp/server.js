@@ -632,7 +632,16 @@ app.get('/sessions/:sessionId/chats/:chatId/messages', requireSession, requireRe
   try {
     const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 50)))
-    res.json(await Promise.all((await chat.fetchMessages({ limit })).map((message) => serializeMessage(req.whatsappSession, message, false, false))))
+    const includeMedia = req.query.includeMedia === '1' || req.query.includeMedia === 'true'
+    const messages = await chat.fetchMessages({ limit })
+    if (!includeMedia) {
+      return res.json(await Promise.all(messages.map((message) => serializeMessage(req.whatsappSession, message, false, false))))
+    }
+    const serialized = []
+    for (const message of messages) {
+      serialized.push(await serializeMessage(req.whatsappSession, message, true, false))
+    }
+    res.json(serialized)
   } catch (error) { next(error) }
 })
 app.post('/sessions/:sessionId/messages/send', requireSession, requireReady, async (req, res, next) => {
