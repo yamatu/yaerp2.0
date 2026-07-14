@@ -1,8 +1,8 @@
 'use client'
 
-import { useEffect, useRef, useState, useCallback } from 'react'
-import { AlertCircle, ChevronUp, Columns3, Download, FileOutput, Filter, FilterX, ImagePlus, Lock, Printer, Rows3, Save, Shield, Square, Unlock, Wrench, X } from 'lucide-react'
-import type { IWorkbookData, IWorksheetData } from '@univerjs/core'
+import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
+import { AlertCircle, ChevronDown, ChevronUp, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, ImagePlus, LocateFixed, Lock, Printer, Rows3, Save, Search, Shield, Square, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import type { ICellData, IWorkbookData, IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
@@ -12,17 +12,22 @@ import UniverPresetSheetsFilterZhCN from '@univerjs/preset-sheets-filter/locales
 import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-replace'
 import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
+import { CellAlertType, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
+import { getRealtimeClientId } from '@/lib/realtimeClient'
+import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
 import ImportXlsxButton, { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
-import type { AuthUser, ColumnDef, ProtectionInfo, ProtectionSnapshot, Row, Sheet } from '@/types'
+import type { AuthUser, CellUpdate, ColumnDef, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
 
 interface Props {
   workbookId: string | number
+  workbookName?: string
+  workbookSheets?: Array<Pick<Sheet, 'id' | 'name'>>
   sheet: Sheet
   reloadToken?: string
   onExternalReload?: () => Promise<void> | void
@@ -35,6 +40,27 @@ interface GalleryImage {
   filename: string
   url: string
   size: number
+}
+
+interface PDFPreviewState {
+  url: string
+  filename: string
+  blob: Blob
+}
+
+type PDFExportScope = 'current' | 'selected' | 'workbook'
+type PDFPaperSize = 'a4' | 'a3' | 'letter' | 'legal'
+type PDFOrientation = 'portrait' | 'landscape'
+
+function FloatingToolHint({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="group relative">
+      <span className="pointer-events-none absolute right-12 top-1/2 z-10 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100">
+        {label}
+      </span>
+      {children}
+    </div>
+  )
 }
 
 interface SelectionState {
@@ -62,6 +88,116 @@ interface PrintableRow {
   cells: string[]
 }
 
+interface UniverViewportWorksheet {
+  getZoom?: () => number
+  zoom?: (zoomRatio: number) => unknown
+  getSheetId?: () => string
+}
+
+interface UniverViewportWorkbook {
+  getId?: () => string
+  getActiveSheet?: () => UniverViewportWorksheet | null
+}
+
+interface UniverViewportApi {
+  getActiveWorkbook?: () => UniverViewportWorkbook | null
+  executeCommand?: <P extends object = object>(id: string, params?: P) => Promise<unknown>
+}
+
+interface UniverDisposable {
+  dispose: () => void
+}
+
+interface ProtectionVisual {
+  stroke: string
+  fill: string
+  soft: string
+}
+
+const MIN_UNIVER_ZOOM = 0.1
+const MAX_UNIVER_ZOOM = 4
+const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
+  'sheet.contextMenu.permission': { title: 'YAERP 保护' },
+  'sheet.command.add-range-protection-from-context-menu': { title: '保护当前选择' },
+  'sheet.command.set-range-protection-from-context-menu': { title: '编辑当前保护' },
+  'sheet.command.delete-range-protection-from-context-menu': { title: '解除当前保护' },
+  'sheet.command.view-sheet-permission-from-context-menu': { title: '显示保护区域与记录' },
+} as const
+const YAERP_PROTECTION_CONTEXT_MENU_LABELS = [
+  '保护当前选择',
+  '编辑当前保护',
+  '解除当前保护',
+  '显示保护区域与记录',
+]
+
+const PROTECTION_VISUALS: ProtectionVisual[] = [
+  { stroke: '#0284c7', fill: 'rgba(14, 165, 233, 0.08)', soft: '#e0f2fe' },
+  { stroke: '#059669', fill: 'rgba(16, 185, 129, 0.08)', soft: '#d1fae5' },
+  { stroke: '#d97706', fill: 'rgba(245, 158, 11, 0.08)', soft: '#fef3c7' },
+  { stroke: '#dc2626', fill: 'rgba(239, 68, 68, 0.07)', soft: '#fee2e2' },
+  { stroke: '#7c3aed', fill: 'rgba(139, 92, 246, 0.07)', soft: '#ede9fe' },
+  { stroke: '#0f766e', fill: 'rgba(20, 184, 166, 0.08)', soft: '#ccfbf1' },
+  { stroke: '#c026d3', fill: 'rgba(217, 70, 239, 0.07)', soft: '#fae8ff' },
+  { stroke: '#4f46e5', fill: 'rgba(99, 102, 241, 0.07)', soft: '#e0e7ff' },
+]
+
+function visualForUser(userId: number) {
+  const safeId = Number.isFinite(userId) ? Math.abs(userId) : 0
+  return PROTECTION_VISUALS[safeId % PROTECTION_VISUALS.length]
+}
+
+function clampUniverZoom(zoomRatio: number) {
+  return Math.min(MAX_UNIVER_ZOOM, Math.max(MIN_UNIVER_ZOOM, zoomRatio))
+}
+
+function roundUniverZoom(zoomRatio: number) {
+  return Math.round(zoomRatio * 10) / 10
+}
+
+function getLargestVisibleElement(root: HTMLElement, selector: string) {
+  const candidates = Array.from(root.querySelectorAll<HTMLElement>(selector))
+  let selected: HTMLElement | null = null
+  let selectedArea = 0
+
+  for (const element of candidates) {
+    const rect = element.getBoundingClientRect()
+    const area = rect.width * rect.height
+    if (rect.width <= 0 || rect.height <= 0 || area <= selectedArea) continue
+    selected = element
+    selectedArea = area
+  }
+
+  return selected
+}
+
+function getWheelPointerOffset(root: HTMLElement, event: WheelEvent) {
+  const viewport =
+    getLargestVisibleElement(root, '.univer-render-canvas') ||
+    getLargestVisibleElement(root, '.univer-sheet-container') ||
+    root
+  const rect = viewport.getBoundingClientRect()
+  const x = Math.min(rect.width, Math.max(0, event.clientX - rect.left))
+  const y = Math.min(rect.height, Math.max(0, event.clientY - rect.top))
+
+  return { x, y }
+}
+
+function cloneJsonSnapshot<T>(value: T): T {
+  try {
+    if (typeof structuredClone === 'function') {
+      return structuredClone(value)
+    }
+  } catch {
+    // Fall back to JSON cloning below.
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(value)) as T
+  } catch {
+    return value
+  }
+}
+
 function wrapWorksheetData(
   workbookId: string | number,
   sheet: Sheet,
@@ -69,19 +205,20 @@ function wrapWorksheetData(
   locale: IWorkbookData['locale'],
   savedStyles?: Record<string, unknown>
 ): IWorkbookData {
-  const sheetKey = worksheetData.id || `sheet-${sheet.id}`
+  const worksheetSnapshot = cloneJsonSnapshot(worksheetData)
+  const sheetKey = worksheetSnapshot.id || `sheet-${sheet.id}`
   return {
     id: `workbook-${workbookId}-sheet-${sheet.id}`,
     name: sheet.name || 'Workbook',
     appVersion: '0.5.0',
     locale,
-    styles: (savedStyles || {}) as IWorkbookData['styles'],
+    styles: cloneJsonSnapshot((savedStyles || {}) as IWorkbookData['styles']),
     sheetOrder: [sheetKey],
     sheets: {
       [sheetKey]: {
-        ...worksheetData,
+        ...worksheetSnapshot,
         id: sheetKey,
-        name: worksheetData.name || sheet.name || 'Sheet1',
+        name: sheet.name || worksheetSnapshot.name || 'Sheet1',
       },
     },
   }
@@ -408,7 +545,231 @@ function mergeUniverStyleMap(base: Record<string, unknown> | undefined, next: Re
   }
 }
 
-export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload, optimisticCanEdit = false, canImportWorkbook = false }: Props) {
+function jsonSnapshot(value: unknown) {
+  try {
+    return JSON.stringify(value ?? null)
+  } catch {
+    return ''
+  }
+}
+
+function areJsonSnapshotsEqual(left: unknown, right: unknown) {
+  return jsonSnapshot(left) === jsonSnapshot(right)
+}
+
+function getUniverPatchCellValue(cell: unknown): unknown {
+  if (!cell || typeof cell !== 'object') return ''
+  const data = cell as { f?: unknown; v?: unknown }
+  if (typeof data.f === 'string' && data.f.trim()) return data.f
+  if (typeof data.v === 'string' || typeof data.v === 'number' || typeof data.v === 'boolean') return data.v
+  return ''
+}
+
+function getWorksheetCell(sheetData: Partial<IWorksheetData> | undefined, worksheetRow: number, columnIndex: number) {
+  const cellData = sheetData?.cellData as Record<string, Record<string, unknown> | undefined> | undefined
+  return cellData?.[String(worksheetRow)]?.[String(columnIndex)]
+}
+
+function collectWorksheetCellPositions(sheetData: Partial<IWorksheetData> | undefined) {
+  const positions = new Set<string>()
+  const cellData = sheetData?.cellData as Record<string, Record<string, unknown> | undefined> | undefined
+  if (!cellData) return positions
+
+  Object.entries(cellData).forEach(([rowKey, row]) => {
+    const worksheetRow = Number(rowKey)
+    if (!Number.isInteger(worksheetRow) || worksheetRow <= 0 || !row || typeof row !== 'object') return
+
+    Object.keys(row).forEach((columnKey) => {
+      const columnIndex = Number(columnKey)
+      if (!Number.isInteger(columnIndex) || columnIndex < 0) return
+      positions.add(`${worksheetRow}:${columnIndex}`)
+    })
+  })
+
+  return positions
+}
+
+function buildRealtimeCellChanges(
+  sheetId: number,
+  previousSheet: Partial<IWorksheetData> | undefined,
+  nextSheet: Partial<IWorksheetData>,
+  columns: ColumnDef[]
+): CellUpdate[] {
+  const positions = collectWorksheetCellPositions(previousSheet)
+  collectWorksheetCellPositions(nextSheet).forEach((position) => positions.add(position))
+
+  const changes: CellUpdate[] = []
+  positions.forEach((position) => {
+    const [rowPart, columnPart] = position.split(':')
+    const worksheetRow = Number(rowPart)
+    const columnIndex = Number(columnPart)
+    const column = columns[columnIndex]
+    if (!Number.isInteger(worksheetRow) || !Number.isInteger(columnIndex) || !column?.key) return
+
+    const previousValue = getUniverPatchCellValue(getWorksheetCell(previousSheet, worksheetRow, columnIndex))
+    const nextValue = getUniverPatchCellValue(getWorksheetCell(nextSheet, worksheetRow, columnIndex))
+    if (areJsonSnapshotsEqual(previousValue, nextValue)) return
+
+    changes.push({
+      sheet_id: sheetId,
+      row: worksheetRow - 1,
+      col: column.key,
+      value: nextValue ?? '',
+    })
+  })
+
+  return changes
+}
+
+function getRealtimeCellData(value: unknown) {
+  if (typeof value === 'string' && value.startsWith('=')) return { f: value }
+  return { v: value ?? '' }
+}
+
+function applyRealtimeCellChangesToWorksheetSnapshot(
+  sheetData: Partial<IWorksheetData> | null,
+  changes: Array<{ row: number; col: string; value: unknown }>,
+  columns: ColumnDef[]
+) {
+  const nextSheet = cloneJsonSnapshot(sheetData || {})
+  const cellData = ((nextSheet.cellData || {}) as Record<string, Record<string, unknown>>)
+  nextSheet.cellData = cellData as IWorksheetData['cellData']
+
+  changes.forEach((change) => {
+    const columnIndex = columns.findIndex((column) => column.key === change.col)
+    if (columnIndex < 0 || change.row < 0) return
+
+    const rowKey = String(change.row + 1)
+    cellData[rowKey] = cellData[rowKey] || {}
+    cellData[rowKey][String(columnIndex)] = getRealtimeCellData(change.value)
+  })
+
+  return nextSheet
+}
+
+function getWorksheetSyncCell(cell: unknown): ICellData {
+  if (!cell || typeof cell !== 'object') return { v: '' }
+  const data = cell as { f?: unknown; v?: unknown }
+  if (typeof data.f === 'string' && data.f.trim()) return { f: data.f }
+  if (typeof data.v === 'string' || typeof data.v === 'number' || typeof data.v === 'boolean') return { v: data.v }
+  return { v: '' }
+}
+
+function getWorksheetSnapshotExtent(...snapshots: Array<Partial<IWorksheetData> | null | undefined>) {
+  let rowCount = 1
+  let columnCount = 1
+
+  snapshots.forEach((snapshot) => {
+    const cellData = snapshot?.cellData as Record<string, Record<string, unknown> | undefined> | undefined
+    if (!cellData) return
+    Object.entries(cellData).forEach(([rowKey, row]) => {
+      const rowIndex = Number(rowKey)
+      if (!Number.isInteger(rowIndex) || rowIndex < 0 || !row) return
+      rowCount = Math.max(rowCount, rowIndex + 1)
+      Object.keys(row).forEach((columnKey) => {
+        const columnIndex = Number(columnKey)
+        if (Number.isInteger(columnIndex) && columnIndex >= 0) {
+          columnCount = Math.max(columnCount, columnIndex + 1)
+        }
+      })
+    })
+  })
+
+  return { rowCount, columnCount }
+}
+
+function buildWorksheetSyncMatrix(snapshot: Partial<IWorksheetData>, rowCount: number, columnCount: number) {
+  const matrix: ICellData[][] = Array.from(
+    { length: rowCount },
+    () => Array.from({ length: columnCount }, () => ({ v: '' }))
+  )
+  const cellData = snapshot.cellData as Record<string, Record<string, unknown> | undefined> | undefined
+
+  Object.entries(cellData || {}).forEach(([rowKey, row]) => {
+    const rowIndex = Number(rowKey)
+    if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= rowCount || !row) return
+    Object.entries(row).forEach(([columnKey, cell]) => {
+      const columnIndex = Number(columnKey)
+      if (!Number.isInteger(columnIndex) || columnIndex < 0 || columnIndex >= columnCount) return
+      matrix[rowIndex][columnIndex] = getWorksheetSyncCell(cell)
+    })
+  })
+
+  return matrix
+}
+
+function resolveSnapshotCellStyle(rawStyle: unknown, styles: Record<string, unknown> | undefined) {
+  if (rawStyle && typeof rawStyle === 'object') return rawStyle as Record<string, unknown>
+  if (typeof rawStyle === 'string' && styles?.[rawStyle] && typeof styles[rawStyle] === 'object') {
+    return styles[rawStyle] as Record<string, unknown>
+  }
+  return null
+}
+
+function applyWorksheetSnapshotPresentation(
+  worksheet: unknown,
+  snapshot: Partial<IWorksheetData>,
+  styles: Record<string, unknown> | undefined,
+  previousSnapshot?: Partial<IWorksheetData> | null
+) {
+  const sheetFacade = worksheet as {
+    getRange: (row: number, column: number, rowCount: number, columnCount: number) => { setValue: (value: ICellData) => unknown }
+    setRowHeight: (row: number, height: number) => unknown
+  }
+  const cellData = snapshot.cellData as Record<string, Record<string, unknown> | undefined> | undefined
+  const previousCellData = previousSnapshot?.cellData as Record<string, Record<string, unknown> | undefined> | undefined
+  let applied = 0
+  Object.entries(cellData || {}).forEach(([rowKey, row]) => {
+    const rowIndex = Number(rowKey)
+    if (!Number.isInteger(rowIndex) || rowIndex < 0 || !row) return
+    Object.entries(row).forEach(([columnKey, rawCell]) => {
+      if (applied >= 20000 || !rawCell || typeof rawCell !== 'object') return
+      const columnIndex = Number(columnKey)
+      if (!Number.isInteger(columnIndex) || columnIndex < 0) return
+      const style = resolveSnapshotCellStyle((rawCell as { s?: unknown }).s, styles)
+      const previousCell = previousCellData?.[rowKey]?.[columnKey]
+      const hadPreviousStyle = Boolean(previousCell && typeof previousCell === 'object' && (previousCell as { s?: unknown }).s)
+      if (!style && !hadPreviousStyle) return
+      const nextCell = cloneJsonSnapshot(rawCell as ICellData)
+      if (style) nextCell.s = style
+      else delete nextCell.s
+      sheetFacade.getRange(rowIndex, columnIndex, 1, 1).setValue(nextCell)
+      applied += 1
+    })
+  })
+
+  const rowData = snapshot.rowData as Record<string, { h?: unknown } | undefined> | undefined
+  Object.entries(rowData || {}).forEach(([rowKey, row]) => {
+    const rowIndex = Number(rowKey)
+    if (Number.isInteger(rowIndex) && rowIndex >= 0 && typeof row?.h === 'number') {
+      sheetFacade.setRowHeight(rowIndex, row.h)
+    }
+  })
+}
+
+function getYaerpProtectionContextMenuItem(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return null
+
+  const menuItem = target.closest<HTMLElement>('[role="menuitem"], .univer-menu-item')
+  if (!menuItem) return null
+  if (!String(menuItem.className || '').includes('univer') && !menuItem.closest('[class*="univer"]')) return null
+
+  const text = (menuItem.textContent || '').replace(/\s+/g, '')
+  return YAERP_PROTECTION_CONTEXT_MENU_LABELS.some((label) => text.includes(label)) ? menuItem : null
+}
+
+function getVisibleUniverCellEditor(root: HTMLElement | null) {
+  const editor = root?.querySelector<HTMLElement>('.univer-editor-container')
+  if (!editor) return null
+
+  const rect = editor.getBoundingClientRect()
+  if (rect.width <= 4 || rect.height <= 4) return null
+  if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth || rect.top > window.innerHeight) return null
+
+  return editor
+}
+
+export default function UniverSheetEditor({ workbookId, workbookName, workbookSheets = [], sheet, reloadToken, onExternalReload, optimisticCanEdit = false, canImportWorkbook = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const persistInFlightRef = useRef<Promise<void> | null>(null)
@@ -418,9 +779,22 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const workbookApiRef = useRef<{ setEditable: (editable: boolean) => void } | null>(null)
   const persistRef = useRef<(() => Promise<void>) | null>(null)
   const reloadTokenRef = useRef(reloadToken)
+  const pdfPreviewUrlRef = useRef<string | null>(null)
+  const applyingRemotePatchRef = useRef(false)
+  const remotePatchResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const silentSyncInFlightRef = useRef<Promise<void> | null>(null)
+  const silentSyncQueuedRef = useRef(false)
+  const persistedWorksheetDataRef = useRef<Partial<IWorksheetData> | null>(null)
+  const protectionHighlightDisposablesRef = useRef<UniverDisposable[]>([])
+  const presenceDisposablesRef = useRef<UniverDisposable[]>([])
+  const protectionFocusDisposableRef = useRef<UniverDisposable | null>(null)
+  const protectionFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const protectionHighlightRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sheetPresenceRef = useRef<SheetPresenceEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showImagePicker, setShowImagePicker] = useState(false)
+  const [lockInsertedImageCell, setLockInsertedImageCell] = useState(true)
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([])
   const [loadingGallery, setLoadingGallery] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
@@ -434,21 +808,58 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   const [dragImportProgress, setDragImportProgress] = useState(0)
   const dragDepthRef = useRef(0)
   const [showProtectionPanel, setShowProtectionPanel] = useState(false)
+  const [showAllProtections, setShowAllProtections] = useState(false)
   const [selectionState, setSelectionState] = useState<SelectionState | null>(null)
   const [protectionSnapshot, setProtectionSnapshot] = useState<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
   const [protectionLoading, setProtectionLoading] = useState(false)
   const [protectionAction, setProtectionAction] = useState('')
-  const [exportAction, setExportAction] = useState<'' | 'download' | 'print' | 'pdf'>('')
+  const [protectionUsers, setProtectionUsers] = useState<User[]>([])
+  const [protectionUsersLoading, setProtectionUsersLoading] = useState(false)
+  const [protectionUsersError, setProtectionUsersError] = useState('')
+  const [protectionUsersLoadToken, setProtectionUsersLoadToken] = useState(0)
+  const [protectionUserSearch, setProtectionUserSearch] = useState('')
+  const [selectedProtectionEditableUserIds, setSelectedProtectionEditableUserIds] = useState<number[]>([])
+  const [showProtectionHighlights, setShowProtectionHighlights] = useState(false)
+  const [protectionHighlightVersion, setProtectionHighlightVersion] = useState(0)
+  const [protectionFocusNotice, setProtectionFocusNotice] = useState('')
+  const [sheetPresence, setSheetPresence] = useState<SheetPresenceEntry[]>([])
+  const [presenceExpanded, setPresenceExpanded] = useState(false)
+  const [exportAction, setExportAction] = useState<'' | 'download' | 'workbook' | 'print' | 'pdf' | 'source'>('')
+  const [pdfPreview, setPdfPreview] = useState<PDFPreviewState | null>(null)
+  const [showPdfExportPanel, setShowPdfExportPanel] = useState(false)
+  const [pdfExportScope, setPdfExportScope] = useState<PDFExportScope>('current')
+  const [selectedPdfSheetIds, setSelectedPdfSheetIds] = useState<number[]>([])
+  const [pdfPaperSize, setPdfPaperSize] = useState<PDFPaperSize>('a4')
+  const [pdfOrientation, setPdfOrientation] = useState<PDFOrientation>('portrait')
+  const [pdfFitToWidth, setPdfFitToWidth] = useState(true)
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const adminMode = isAdmin(profile)
   const sheetId = sheet.id
   const { permissions, loading: permissionLoading } = usePermission(sheetId)
+  const canViewSheet = permissions?.sheet.canView ?? false
   const canEditSheet = permissions?.sheet.canEdit ?? false
   const canExportSheet = permissions?.sheet.canExport ?? false
   const hasPermissionSnapshot = permissions !== null
+  const effectiveCanViewSheet = hasPermissionSnapshot ? canViewSheet : true
   const effectiveCanEditSheet = hasPermissionSnapshot ? canEditSheet : optimisticCanEdit
   const effectiveCanExportSheet = hasPermissionSnapshot ? canExportSheet : optimisticCanEdit
+  const canInitializeEditor = optimisticCanEdit || !permissionLoading
   const editLocked = !effectiveCanEditSheet
+  const activeSheetConfig = parseSheetConfig(sheet.config)
+  const importSource = activeSheetConfig.importSource
+  const originalWorkbookXlsxAvailable = Boolean(importSource?.attachment_id)
+  const originalWorkbookXlsxFilename = typeof importSource?.filename === 'string' ? importSource.filename : ''
+  const workbookSheetOptions = workbookSheets.length > 0 ? workbookSheets : [{ id: sheet.id, name: sheet.name }]
+  const workbookExportName = workbookName || '工作簿'
+
+  const commitActiveCellEditor = useCallback(() => {
+    const root = containerRef.current
+    if (!getVisibleUniverCellEditor(root)) return false
+
+    const confirmButton = root?.querySelector<HTMLElement>('.univer-formula-icon .univer-icon-container-success')
+    confirmButton?.click()
+    return Boolean(confirmButton)
+  }, [])
 
   const syncFilterState = useCallback(() => {
     try {
@@ -472,8 +883,13 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         return null
       }
 
-      const column = columns[range.getColumn()]
-      const endColumn = columns[range.getLastColumn()]
+      const maxColumnIndex = Math.max(columns.length - 1, 0)
+      const rawStartColumn = range.getColumn()
+      const rawEndColumn = range.getLastColumn()
+      const startColumnIndex = Math.min(maxColumnIndex, Math.max(0, rawStartColumn))
+      const endColumnIndex = Math.min(maxColumnIndex, Math.max(0, rawEndColumn))
+      const column = columns[startColumnIndex]
+      const endColumn = columns[endColumnIndex] || column
       if (!column) {
         setSelectionState(null)
         return null
@@ -488,7 +904,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       const displayEndRow = rawEndRow + 1
       const rowLabel = `第 ${displayStartRow} 行`
       const rangeLabel =
-        startRow === endRow && range.getColumn() === range.getLastColumn()
+        startRow === endRow && startColumnIndex === endColumnIndex
           ? `${column.name || column.key} / 第 ${displayStartRow} 行`
           : `第 ${displayStartRow}-${displayEndRow} 行 / ${column.name || column.key} 到 ${endColumn?.name || endColumn?.key || column.key}`
 
@@ -532,6 +948,163 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     }
   }, [sheetId])
 
+  const clearProtectionHighlights = useCallback(() => {
+    protectionHighlightDisposablesRef.current.forEach((item) => item.dispose())
+    protectionHighlightDisposablesRef.current = []
+  }, [])
+
+  const requestProtectionHighlightRefresh = useCallback(() => {
+    if (protectionHighlightRefreshTimerRef.current) {
+      clearTimeout(protectionHighlightRefreshTimerRef.current)
+    }
+    protectionHighlightRefreshTimerRef.current = setTimeout(() => {
+      setProtectionHighlightVersion((current) => current + 1)
+      protectionHighlightRefreshTimerRef.current = null
+    }, 60)
+  }, [])
+
+  const clearPresenceVisuals = useCallback(() => {
+    presenceDisposablesRef.current.forEach((item) => item.dispose())
+    presenceDisposablesRef.current = []
+  }, [])
+
+  const getProtectionRange = useCallback((item: ProtectionInfo) => {
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    if (!worksheet) return null
+    const columns = latestSheetRef.current.columns || []
+    const columnKey = item.column_key || item.key
+    const columnIndex = columns.findIndex((column) => column.key === columnKey)
+    const maxRows = Math.max(worksheet.getMaxRows?.() || 1, 1)
+    const maxColumns = Math.max(worksheet.getMaxColumns?.() || columns.length || 1, 1)
+
+    if (item.scope === 'row' && typeof item.row_index === 'number') {
+      const row = Math.max(0, item.row_index + 1)
+      return { worksheet, range: worksheet.getRange(row, 0, 1, maxColumns), row, column: 0 }
+    }
+    if (item.scope === 'column' && columnIndex >= 0) {
+      return { worksheet, range: worksheet.getRange(1, columnIndex, Math.max(maxRows - 1, 1), 1), row: 1, column: columnIndex }
+    }
+    if (item.scope === 'cell' && typeof item.row_index === 'number' && columnIndex >= 0) {
+      const row = Math.max(0, item.row_index + 1)
+      return { worksheet, range: worksheet.getRange(row, columnIndex, 1, 1), row, column: columnIndex }
+    }
+    return null
+  }, [])
+
+  const focusProtection = useCallback((item: ProtectionInfo) => {
+    const target = getProtectionRange(item)
+    if (!target) return
+    setShowProtectionHighlights(true)
+    setProtectionFocusNotice(`${item.owner_name} 保护了 ${item.scope === 'row' ? `第 ${(item.row_index ?? 0) + 2} 行` : item.scope === 'column' ? `列 ${item.column_key || item.key}` : `${item.column_key || item.key}${(item.row_index ?? 0) + 2}`}`)
+    target.range.activate?.()
+    target.worksheet.scrollToCell?.(target.row, target.column)
+    protectionFocusDisposableRef.current?.dispose()
+    protectionFocusDisposableRef.current = target.range.highlight({
+      stroke: visualForUser(item.owner_id).stroke,
+      strokeWidth: 3,
+      strokeDash: 6,
+      isAnimationDash: true,
+      fill: 'rgba(255, 255, 255, 0.01)',
+    })
+    if (protectionFocusTimerRef.current) clearTimeout(protectionFocusTimerRef.current)
+    protectionFocusTimerRef.current = setTimeout(() => {
+      protectionFocusDisposableRef.current?.dispose()
+      protectionFocusDisposableRef.current = null
+      protectionFocusTimerRef.current = null
+    }, 3200)
+    window.setTimeout(() => syncSelectionState(), 0)
+  }, [getProtectionRange, syncSelectionState])
+
+  useEffect(() => {
+    clearProtectionHighlights()
+    if (!showProtectionHighlights || loading) return
+    const items = [...protectionSnapshot.rows, ...protectionSnapshot.columns, ...protectionSnapshot.cells]
+    items.forEach((item) => {
+      try {
+        const target = getProtectionRange(item)
+        if (!target) return
+        const visual = visualForUser(item.owner_id)
+        protectionHighlightDisposablesRef.current.push(target.range.highlight({
+          stroke: visual.stroke,
+          strokeWidth: item.scope === 'cell' ? 2 : 1.25,
+          strokeDash: item.scope === 'cell' ? 0 : 4,
+          fill: visual.fill,
+          rowHeaderFill: item.scope === 'row' ? visual.fill : undefined,
+          rowHeaderStroke: item.scope === 'row' ? visual.stroke : undefined,
+          columnHeaderFill: item.scope === 'column' ? visual.fill : undefined,
+          columnHeaderStroke: item.scope === 'column' ? visual.stroke : undefined,
+        }))
+      } catch (highlightError) {
+        console.error('Failed to highlight protected range:', highlightError)
+      }
+    })
+    return clearProtectionHighlights
+  }, [clearProtectionHighlights, getProtectionRange, loading, protectionHighlightVersion, protectionSnapshot.cells, protectionSnapshot.columns, protectionSnapshot.rows, showProtectionHighlights])
+
+  useEffect(() => {
+    if (!showProtectionHighlights) return
+    const root = containerRef.current
+    const refresh = () => requestProtectionHighlightRefresh()
+    root?.addEventListener('scroll', refresh, true)
+    root?.addEventListener('wheel', refresh, { passive: true, capture: true })
+    window.addEventListener('resize', refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      root?.removeEventListener('scroll', refresh, true)
+      root?.removeEventListener('wheel', refresh, true)
+      window.removeEventListener('resize', refresh)
+      window.removeEventListener('focus', refresh)
+    }
+  }, [requestProtectionHighlightRefresh, showProtectionHighlights])
+
+  useEffect(() => {
+    clearPresenceVisuals()
+    if (loading) return
+    const currentClientId = getRealtimeClientId()
+    const columns = latestSheetRef.current.columns || []
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    if (!worksheet) return
+
+    sheetPresence.forEach((entry) => {
+      if (entry.clientId === currentClientId || entry.state === 'viewing' || typeof entry.row !== 'number' || !entry.col) return
+      const columnIndex = columns.findIndex((column) => column.key === entry.col)
+      if (columnIndex < 0) return
+      const visual = visualForUser(entry.userId)
+      try {
+        const range = worksheet.getRange(entry.row + 1, columnIndex, 1, 1)
+        presenceDisposablesRef.current.push(range.highlight({
+          stroke: visual.stroke,
+          strokeWidth: entry.state === 'editing' ? 3 : 2,
+          strokeDash: entry.state === 'editing' ? 0 : 5,
+          isAnimationDash: entry.state !== 'editing',
+          fill: entry.state === 'editing' ? visual.fill : 'rgba(255, 255, 255, 0.01)',
+        }))
+        presenceDisposablesRef.current.push(range.attachAlertPopup({
+          key: `yaerp-presence-${sheetId}-${entry.clientId || entry.userId}`,
+          type: entry.state === 'editing' ? CellAlertType.WARNING : CellAlertType.INFO,
+          title: `${entry.username}${entry.state === 'editing' ? '正在编辑' : '已选中'}此单元格`,
+          message: entry.state === 'editing' ? '请等待对方结束编辑，避免同时覆盖内容。' : '对方可能准备编辑此单元格。',
+          width: 260,
+          height: 88,
+        }))
+      } catch (presenceError) {
+        console.error('Failed to render collaborator presence:', presenceError)
+      }
+    })
+    return clearPresenceVisuals
+  }, [clearPresenceVisuals, loading, sheetId, sheetPresence])
+
+  useEffect(() => () => {
+    clearProtectionHighlights()
+    clearPresenceVisuals()
+    protectionFocusDisposableRef.current?.dispose()
+    protectionFocusDisposableRef.current = null
+    if (protectionFocusTimerRef.current) clearTimeout(protectionFocusTimerRef.current)
+    if (protectionHighlightRefreshTimerRef.current) clearTimeout(protectionHighlightRefreshTimerRef.current)
+  }, [clearPresenceVisuals, clearProtectionHighlights])
+
   // Hide global FABs when image picker or blocking Univer dialogs are open
   useEffect(() => {
     if (showImagePicker || univerHasOverlay || showProtectionPanel) {
@@ -568,12 +1141,22 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   useEffect(() => { latestSheetRef.current = sheet }, [sheet])
 
   useEffect(() => {
+    sheetPresenceRef.current = sheetPresence
+  }, [sheetPresence])
+
+  useEffect(() => {
     setLoading(true)
     setError('')
     setActionError('')
     setSelectionState(null)
     setProtectionSnapshot({ rows: [], columns: [], cells: [] })
     setShowProtectionPanel(false)
+    setShowAllProtections(false)
+    setShowProtectionHighlights(false)
+    setProtectionFocusNotice('')
+    setProtectionUserSearch('')
+    setSheetPresence([])
+    setPresenceExpanded(false)
     setToolbarExpanded(false)
     setHasFilter(false)
   }, [sheetId])
@@ -581,6 +1164,33 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   useEffect(() => {
     void refreshProtectionSnapshot()
   }, [refreshProtectionSnapshot])
+
+  useEffect(() => {
+    if (!showProtectionPanel || protectionUsers.length > 0) return
+
+    let active = true
+    setProtectionUsersLoading(true)
+    setProtectionUsersError('')
+    api.get<User[]>('/users/shareable')
+      .then((res) => {
+        if (!active) return
+        setProtectionUsers(res.code === 0 && Array.isArray(res.data) ? res.data : [])
+      })
+      .catch((err) => {
+        console.error('Failed to load protection users:', err)
+        if (active) {
+          setProtectionUsers([])
+          setProtectionUsersError('员工列表加载失败，请检查网络后重试。')
+        }
+      })
+      .finally(() => {
+        if (active) setProtectionUsersLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [protectionUsers.length, protectionUsersLoadToken, showProtectionPanel])
 
   // Manual save handler — triggers immediate persist
   const persistCurrentSheet = useCallback(async () => {
@@ -687,6 +1297,64 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     void handleDroppedXlsxImport(xlsxFile)
   }, [canImportWorkbook, dragImportUploading, handleDroppedXlsxImport])
 
+  const openCustomProtectionPanel = useCallback((options?: { showAll?: boolean }) => {
+    syncSelectionState()
+    setShowAllProtections(Boolean(options?.showAll))
+    setShowProtectionPanel(true)
+  }, [syncSelectionState])
+
+  const handleSheetContextMenu = useCallback(() => {
+    window.setTimeout(() => {
+      syncSelectionState()
+    }, 0)
+  }, [syncSelectionState])
+
+  useEffect(() => {
+    const handleProtectionMenuClick = (event: Event) => {
+      const menuItem = getYaerpProtectionContextMenuItem(event.target)
+      if (!menuItem) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      if (typeof (event as { stopImmediatePropagation?: () => void }).stopImmediatePropagation === 'function') {
+        ;(event as { stopImmediatePropagation: () => void }).stopImmediatePropagation()
+      }
+
+      const menuText = (menuItem.textContent || '').replace(/\s+/g, '')
+      const showAll = menuText.includes('显示保护区域与记录')
+      if (showAll) setShowProtectionHighlights(true)
+      openCustomProtectionPanel({ showAll })
+      window.setTimeout(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
+      }, 0)
+    }
+
+    document.addEventListener('pointerdown', handleProtectionMenuClick, true)
+    document.addEventListener('click', handleProtectionMenuClick, true)
+    return () => {
+      document.removeEventListener('pointerdown', handleProtectionMenuClick, true)
+      document.removeEventListener('click', handleProtectionMenuClick, true)
+    }
+  }, [openCustomProtectionPanel])
+
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root) return
+
+    const syncAfterPointerAction = () => {
+      window.setTimeout(() => {
+        syncSelectionState()
+      }, 0)
+    }
+
+    root.addEventListener('pointerup', syncAfterPointerAction, true)
+    root.addEventListener('keyup', syncAfterPointerAction, true)
+    return () => {
+      root.removeEventListener('pointerup', syncAfterPointerAction, true)
+      root.removeEventListener('keyup', syncAfterPointerAction, true)
+    }
+  }, [sheetId, syncSelectionState])
+
   const handleEnableFilter = useCallback(async () => {
     if (editLocked) {
       setActionError('当前账号只有查看权限，不能修改筛选。')
@@ -755,7 +1423,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     setProtectionAction(`${scope}:${action}`)
 
     try {
-      const payload: { scope: string; action: string; row_index?: number; column_key?: string } = {
+      const payload: { scope: string; action: string; row_index?: number; column_key?: string; editable_user_ids?: number[] } = {
         scope,
         action,
       }
@@ -764,6 +1432,9 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       }
       if (scope === 'column' || scope === 'cell') {
         payload.column_key = selection.columnKey
+      }
+      if (action === 'lock') {
+        payload.editable_user_ids = selectedProtectionEditableUserIds
       }
 
       const res = await api.post<{ sheet?: Sheet; protections?: ProtectionSnapshot }>(`/sheets/${sheetId}/protections`, payload)
@@ -785,11 +1456,11 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       }
     } catch (err) {
       console.error('Failed to update protection:', err)
-      setActionError('更新保护状态失败，请稍后再试。')
+      setActionError(err instanceof Error ? err.message : '更新保护状态失败，请稍后再试。')
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshProtectionSnapshot, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
 
   const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock') => {
     if (editLocked) {
@@ -804,12 +1475,12 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     const columns = latestSheetRef.current.columns || []
     const startColumnIndex = columns.findIndex((column) => column.key === selection.columnKey)
     const endColumnIndex = columns.findIndex((column) => column.key === selection.endColumnKey)
-    if (startColumnIndex < 0 || endColumnIndex < 0) {
+    if (scope !== 'row' && (startColumnIndex < 0 || endColumnIndex < 0)) {
       setActionError('当前选择的列信息无效，请重新选择。')
       return
     }
 
-    const requests: Array<{ scope: 'row' | 'column' | 'cell'; row_index?: number; column_key?: string }> = []
+    const requests: Array<{ scope: 'row' | 'column' | 'cell'; row_index?: number; column_key?: string; editable_user_ids?: number[] }> = []
     if (scope === 'row') {
       for (let row = selection.rowIndex; row <= selection.endRowIndex; row += 1) {
         requests.push({ scope: 'row', row_index: row })
@@ -839,7 +1510,11 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
     try {
       const res = await api.post(`/sheets/${sheetId}/protections/batch`, {
-        items: requests.map((request) => ({ ...request, action })),
+        items: requests.map((request) => ({
+          ...request,
+          action,
+          ...(action === 'lock' ? { editable_user_ids: selectedProtectionEditableUserIds } : {}),
+        })),
       })
       if (res.code !== 0) {
         throw new Error(res.message || '批量保护失败')
@@ -851,7 +1526,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshProtectionSnapshot, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
 
   const applyIncomingChanges = useCallback((changes: Array<{ row: number; col: string; value: unknown }>) => {
     if (changes.length === 0) return
@@ -861,6 +1536,12 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       const worksheet = workbook?.getActiveSheet?.()
       const columns = latestSheetRef.current.columns || []
       if (!worksheet) return
+
+      if (remotePatchResetTimerRef.current) {
+        clearTimeout(remotePatchResetTimerRef.current)
+        remotePatchResetTimerRef.current = null
+      }
+      applyingRemotePatchRef.current = true
 
       changes.forEach((change) => {
         const columnIndex = columns.findIndex((column) => column.key === change.col)
@@ -874,14 +1555,179 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         }
       })
 
+      persistedWorksheetDataRef.current = applyRealtimeCellChangesToWorksheetSnapshot(
+        persistedWorksheetDataRef.current,
+        changes,
+        columns
+      )
       syncSelectionState()
+      requestProtectionHighlightRefresh()
     } catch (err) {
       console.error('Failed to apply incoming sheet updates:', err)
+    } finally {
+      remotePatchResetTimerRef.current = setTimeout(() => {
+        applyingRemotePatchRef.current = false
+        remotePatchResetTimerRef.current = null
+      }, 200)
     }
-  }, [syncSelectionState])
+  }, [requestProtectionHighlightRefresh, syncSelectionState])
+
+  const syncSheetSilently = useCallback(async () => {
+    if (silentSyncInFlightRef.current) {
+      silentSyncQueuedRef.current = true
+      return silentSyncInFlightRef.current
+    }
+
+    const runSync = async () => {
+      do {
+        silentSyncQueuedRef.current = false
+
+        if (saveTimerRef.current) {
+          clearTimeout(saveTimerRef.current)
+          saveTimerRef.current = null
+        }
+        await persistInFlightRef.current
+
+        const result = univerApiRef.current
+        const workbook = result?.univerAPI.getActiveWorkbook?.()
+        const worksheet = workbook?.getActiveSheet?.()
+        if (!workbook || !worksheet) return
+
+        const previousSheet = latestSheetRef.current
+        const previousColumns = previousSheet.columns || []
+        const savedWorkbook = workbook.save()
+        const savedSheetId = savedWorkbook.sheetOrder[0]
+        const localSnapshot = cloneJsonSnapshot(savedWorkbook.sheets[savedSheetId] as Partial<IWorksheetData>)
+        const baselineSnapshot = persistedWorksheetDataRef.current
+          ? cloneJsonSnapshot(persistedWorksheetDataRef.current)
+          : cloneJsonSnapshot(localSnapshot)
+        const localChanges = buildRealtimeCellChanges(sheetId, baselineSnapshot, localSnapshot, previousColumns)
+
+        const [sheetResponse, rowsResponse] = await Promise.all([
+          api.get<Sheet>(`/sheets/${sheetId}`),
+          api.get<Row[]>(`/sheets/${sheetId}/data`),
+        ])
+        if (sheetResponse.code !== 0 || !sheetResponse.data) {
+          throw new Error(sheetResponse.message || '同步工作表信息失败')
+        }
+        if (rowsResponse.code !== 0) {
+          throw new Error(rowsResponse.message || '同步工作表数据失败')
+        }
+
+        const nextSheet = sheetResponse.data
+        const nextColumns = nextSheet.columns || []
+        const nextConfig = parseSheetConfig(nextSheet.config)
+        let serverSnapshot: Partial<IWorksheetData>
+        if (nextConfig.univerSheetData && typeof nextConfig.univerSheetData === 'object') {
+          serverSnapshot = cloneJsonSnapshot(nextConfig.univerSheetData as Partial<IWorksheetData>)
+        } else {
+          const nextWorkbook = buildUniverWorkbookData(
+            workbookId,
+            nextSheet,
+            Array.isArray(rowsResponse.data) ? rowsResponse.data : [],
+            'zh-CN' as IWorkbookData['locale']
+          )
+          serverSnapshot = cloneJsonSnapshot(nextWorkbook.sheets[nextWorkbook.sheetOrder[0]] as Partial<IWorksheetData>)
+        }
+
+        if (remotePatchResetTimerRef.current) {
+          clearTimeout(remotePatchResetTimerRef.current)
+          remotePatchResetTimerRef.current = null
+        }
+        applyingRemotePatchRef.current = true
+
+        const sameColumnLayout = previousColumns.length === nextColumns.length && previousColumns.every(
+          (column, index) => column.key === nextColumns[index]?.key
+        )
+        const serverChanges = sameColumnLayout
+          ? buildRealtimeCellChanges(sheetId, baselineSnapshot, serverSnapshot, nextColumns)
+          : []
+
+        if (sameColumnLayout && serverChanges.length <= 100) {
+          serverChanges.forEach((change) => {
+            const columnIndex = nextColumns.findIndex((column) => column.key === change.col)
+            if (columnIndex < 0) return
+            worksheet.getRange(change.row + 1, columnIndex, 1, 1).setValue(
+              typeof change.value === 'string' && change.value.startsWith('=')
+                ? { f: change.value }
+                : (change.value ?? '') as string | number | boolean
+            )
+          })
+        } else {
+          const extent = getWorksheetSnapshotExtent(baselineSnapshot, serverSnapshot)
+          const targetColumnCount = Math.max(extent.columnCount, previousColumns.length, nextColumns.length, 1)
+          const targetRowCount = Math.max(extent.rowCount, 1)
+          if (worksheet.getMaxRows() < targetRowCount) worksheet.setRowCount(targetRowCount)
+          if (worksheet.getMaxColumns() < targetColumnCount) worksheet.setColumnCount(targetColumnCount)
+          worksheet.getRange(0, 0, targetRowCount, targetColumnCount).setValues(
+            buildWorksheetSyncMatrix(serverSnapshot, targetRowCount, targetColumnCount)
+          )
+        }
+
+        applyWorksheetSnapshotPresentation(
+          worksheet,
+          serverSnapshot,
+          nextConfig.univerStyles as Record<string, unknown> | undefined,
+          baselineSnapshot
+        )
+
+        nextColumns.forEach((column, index) => {
+          if (column.width && worksheet.getColumnWidth(index) !== column.width) {
+            worksheet.setColumnWidth(index, column.width)
+          }
+        })
+        if (nextSheet.name && nextSheet.name !== previousSheet.name) {
+          worksheet.setName(nextSheet.name)
+        }
+
+        localChanges.forEach((change) => {
+          const columnIndex = nextColumns.findIndex((column) => column.key === change.col)
+          if (columnIndex < 0) return
+          worksheet.getRange(change.row + 1, columnIndex, 1, 1).setValue(
+            typeof change.value === 'string' && change.value.startsWith('=')
+              ? { f: change.value }
+              : (change.value ?? '') as string | number | boolean
+          )
+        })
+
+        latestSheetRef.current = nextSheet
+        persistedWorksheetDataRef.current = cloneJsonSnapshot(serverSnapshot)
+        syncSelectionState()
+        requestProtectionHighlightRefresh()
+        await onExternalReload?.()
+
+        remotePatchResetTimerRef.current = setTimeout(() => {
+          applyingRemotePatchRef.current = false
+          remotePatchResetTimerRef.current = null
+          if (localChanges.length > 0) {
+            void persistRef.current?.().catch((syncError) => {
+              console.error('Failed to preserve local changes after AI sync:', syncError)
+            })
+          }
+        }, 200)
+      } while (silentSyncQueuedRef.current)
+    }
+
+    const request = runSync()
+      .catch((syncError) => {
+        if (remotePatchResetTimerRef.current) {
+          clearTimeout(remotePatchResetTimerRef.current)
+          remotePatchResetTimerRef.current = null
+        }
+        applyingRemotePatchRef.current = false
+        console.error('Failed to sync AI sheet updates:', syncError)
+        setActionError(syncError instanceof Error ? syncError.message : '同步 AI 表格修改失败，请稍后重试。')
+      })
+      .finally(() => {
+        silentSyncInFlightRef.current = null
+      })
+    silentSyncInFlightRef.current = request
+    return request
+  }, [onExternalReload, requestProtectionHighlightRefresh, sheetId, syncSelectionState, workbookId])
 
   useEffect(() => {
     wsClient.connect()
+    wsClient.joinSheet(sheetId)
 
     const unsubscribeBatch = wsClient.on('batch_update', (msg) => {
       if (msg.sheetId !== sheetId || !Array.isArray(msg.changes)) return
@@ -896,10 +1742,46 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       applyIncomingChanges(changes)
     })
 
+    const unsubscribePresence = wsClient.on('sheet_presence', (msg) => {
+      if (msg.sheetId !== sheetId || !Array.isArray(msg.presence)) return
+      setSheetPresence(msg.presence)
+    })
+
+    const unsubscribeProtection = wsClient.on('protection_updated', (msg) => {
+      if (msg.sheetId !== sheetId) return
+      void refreshProtectionSnapshot()
+    })
+
+    const unsubscribeSheetSync = wsClient.on('sheet_sync', (msg) => {
+      if (msg.sheetId !== sheetId) return
+      void syncSheetSilently()
+    })
+
     return () => {
       unsubscribeBatch()
+      unsubscribePresence()
+      unsubscribeProtection()
+      unsubscribeSheetSync()
+      wsClient.leaveSheet(sheetId)
+      setSheetPresence([])
     }
-  }, [applyIncomingChanges, sheetId])
+  }, [applyIncomingChanges, refreshProtectionSnapshot, sheetId, syncSheetSilently])
+
+  useEffect(() => subscribeDataChanged((detail) => {
+    if (!detail.sheetIds.includes(sheetId)) return
+    void syncSheetSilently()
+  }), [sheetId, syncSheetSilently])
+
+  useEffect(() => subscribePrepareDataMutation(async () => {
+    if (!editLocked && commitActiveCellEditor()) {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
+    }
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
+    await persistRef.current?.()
+  }), [commitActiveCellEditor, editLocked])
 
   // Ctrl+S shortcut
   useEffect(() => {
@@ -915,8 +1797,104 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
   }, [handleManualSave])
 
   useEffect(() => {
+    const root = containerRef.current
+    if (!root) return
+
+    const handlePointerCenteredZoom = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return
+
+      const result = univerApiRef.current
+      const univerAPI = result?.univerAPI as UniverViewportApi | undefined
+      const workbook = univerAPI?.getActiveWorkbook?.()
+      const worksheet = workbook?.getActiveSheet?.()
+      const currentZoom = worksheet?.getZoom?.() || 1
+      if (!univerAPI || !workbook || !worksheet || !Number.isFinite(currentZoom) || currentZoom <= 0) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation()
+
+      const direction = event.deltaY > 0 ? -1 : 1
+      const step = Math.abs(event.deltaY) < 40 ? 0.05 : 0.1
+      const nextZoom = clampUniverZoom(roundUniverZoom(currentZoom + direction * step))
+      if (nextZoom === currentZoom) return
+
+      const pointer = getWheelPointerOffset(root, event)
+      const scaleChange = nextZoom / currentZoom - 1
+      const scrollOffsetX = pointer.x * scaleChange
+      const scrollOffsetY = pointer.y * scaleChange
+
+      if (commitActiveCellEditor() && !editLocked) {
+        window.setTimeout(() => {
+          persistRef.current?.().catch((err) => {
+            console.error('Failed to persist Univer editor before zoom:', err)
+            setActionError(err instanceof Error ? err.message : '保存失败，请稍后再试。')
+          })
+        }, 0)
+      }
+
+      const zoomResult = typeof worksheet.zoom === 'function'
+        ? worksheet.zoom(nextZoom)
+        : univerAPI.executeCommand?.(SetZoomRatioCommand.id, {
+          unitId: workbook.getId?.() || '',
+          subUnitId: worksheet.getSheetId?.() || '',
+          zoomRatio: nextZoom,
+        })
+
+      Promise.resolve(zoomResult).finally(() => {
+        window.requestAnimationFrame(() => {
+          void univerAPI.executeCommand?.(SetScrollRelativeCommand.id, {
+            offsetX: scrollOffsetX,
+            offsetY: scrollOffsetY,
+          })
+        })
+      })
+    }
+
+    root.addEventListener('wheel', handlePointerCenteredZoom, { capture: true, passive: false })
+    return () => root.removeEventListener('wheel', handlePointerCenteredZoom, true)
+  }, [commitActiveCellEditor, editLocked])
+
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root) return
+
+    let lastCommitAt = 0
+
+    const commitBeforeScroll = (event?: Event) => {
+      if (event instanceof WheelEvent && (event.ctrlKey || event.metaKey)) return
+      if (!getVisibleUniverCellEditor(root)) return
+
+      const now = Date.now()
+      if (now - lastCommitAt < 120) return
+      lastCommitAt = now
+
+      if (!commitActiveCellEditor() || editLocked) return
+
+      window.setTimeout(() => {
+        persistRef.current?.().catch((err) => {
+          console.error('Failed to persist Univer editor before scroll:', err)
+          setActionError(err instanceof Error ? err.message : '保存失败，请稍后再试。')
+        })
+      }, 0)
+    }
+
+    root.addEventListener('wheel', commitBeforeScroll, { capture: true, passive: true })
+    window.addEventListener('scroll', commitBeforeScroll, true)
+
+    return () => {
+      root.removeEventListener('wheel', commitBeforeScroll, true)
+      window.removeEventListener('scroll', commitBeforeScroll, true)
+    }
+  }, [commitActiveCellEditor, editLocked])
+
+  useEffect(() => {
     const el = containerRef.current
     if (!el) return
+    if (!canInitializeEditor) {
+      setLoading(true)
+      return
+    }
 
     let disposed = false
     let cleanup: (() => void) | null = null
@@ -925,8 +1903,8 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       setLoading(true)
       setError('')
       try {
-        // On reload (triggered by WebSocket sheet_reload), always fetch fresh
-        // data from the API instead of using the possibly-stale snapshot.
+        // On reload (triggered by WebSocket sheet_reload), refresh sheet
+        // metadata first, then prefer the latest Univer snapshot in config.
         const isReload = reloadTokenRef.current !== reloadToken
         reloadTokenRef.current = reloadToken
 
@@ -949,10 +1927,11 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         const localeCode = 'zh-CN' as IWorkbookData['locale']
         let workbookData: IWorkbookData
 
-        if (!isReload && config.univerSheetData && typeof config.univerSheetData === 'object') {
+        if (config.univerSheetData && typeof config.univerSheetData === 'object') {
+          const worksheetSnapshot = cloneJsonSnapshot(config.univerSheetData as Partial<IWorksheetData>)
           workbookData = wrapWorksheetData(
             workbookId, currentSheet,
-            config.univerSheetData as Partial<IWorksheetData>,
+            worksheetSnapshot,
             localeCode,
             config.univerStyles as Record<string, unknown> | undefined
           )
@@ -965,6 +1944,8 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
           const rows = Array.isArray(rowsRes.data) ? rowsRes.data : []
           workbookData = buildUniverWorkbookData(workbookId, currentSheet, rows, localeCode)
         }
+        const initialSheetId = workbookData.sheetOrder[0]
+        persistedWorksheetDataRef.current = cloneJsonSnapshot(workbookData.sheets[initialSheetId] as Partial<IWorksheetData>)
 
         if (disposed || !containerRef.current) return
 
@@ -986,7 +1967,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         await ensureHeight()
         if (disposed || !containerRef.current) return
 
-		const localeKey = LocaleType.ZH_CN
+        const localeKey = LocaleType.ZH_CN
         const univerResult = createUniver({
           locale: localeKey,
           theme: defaultTheme,
@@ -1005,6 +1986,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               toolbar: true,
               formulaBar: true,
               contextMenu: true,
+              menu: UNIVER_PROTECTION_CONTEXT_MENU_CONFIG,
               footer: false,
             }),
             UniverSheetsDrawingPreset(),
@@ -1036,25 +2018,51 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               const snap = latestSheetRef.current
               const saved = workbookApi.save()
               const savedSheetId = saved.sheetOrder[0]
-              const savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData>
+              const savedSheet = cloneJsonSnapshot(saved.sheets[savedSheetId] as Partial<IWorksheetData>)
               if (!savedSheet) continue
 
               const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [])
               const currentConfig = parseSheetConfig(snap.config)
+              const previousSheet = persistedWorksheetDataRef.current ||
+                (currentConfig.univerSheetData && typeof currentConfig.univerSheetData === 'object'
+                  ? cloneJsonSnapshot(currentConfig.univerSheetData as Partial<IWorksheetData>)
+                  : undefined)
+              const cellChanges = buildRealtimeCellChanges(snap.id, previousSheet, savedSheet, nextColumns)
               const nextConfig = {
                 ...currentConfig,
                 univerSheetData: savedSheet,
                 univerStyles: mergeUniverStyleMap(
                   currentConfig.univerStyles as Record<string, unknown> | undefined,
-                  saved.styles as Record<string, unknown> | undefined
+                  cloneJsonSnapshot(saved.styles as Record<string, unknown> | undefined)
                 ),
               }
+              const nextSheetName = snap.name || savedSheet.name || 'Sheet1'
+              const nextFrozen = snap.frozen || { row: 0, col: 0 }
+              const hasSnapshotChanged =
+                nextSheetName !== snap.name ||
+                !areJsonSnapshotsEqual(nextColumns, snap.columns || []) ||
+                !areJsonSnapshotsEqual(nextFrozen, snap.frozen || { row: 0, col: 0 }) ||
+                !areJsonSnapshotsEqual(nextConfig, currentConfig)
+
+              if (!hasSnapshotChanged && cellChanges.length === 0) {
+                latestSheetRef.current = {
+                  ...snap,
+                  name: nextSheetName,
+                  columns: nextColumns,
+                  frozen: nextFrozen,
+                  config: cloneJsonSnapshot(nextConfig),
+                }
+                persistedWorksheetDataRef.current = cloneJsonSnapshot(savedSheet)
+                continue
+              }
+
               const res = await api.put(`/sheets/${snap.id}`, {
-                name: savedSheet.name || snap.name,
+                name: nextSheetName,
                 sort_order: snap.sort_order,
                 columns: nextColumns,
-                frozen: snap.frozen || { row: 0, col: 0 },
+                frozen: nextFrozen,
                 config: nextConfig,
+                cell_changes: cellChanges,
               })
 
               if (res.code !== 0) {
@@ -1063,10 +2071,12 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
 
               latestSheetRef.current = {
                 ...snap,
-                name: savedSheet.name || snap.name,
+                name: nextSheetName,
                 columns: nextColumns,
-                config: nextConfig,
+                frozen: nextFrozen,
+                config: cloneJsonSnapshot(nextConfig),
               }
+              persistedWorksheetDataRef.current = cloneJsonSnapshot(savedSheet)
             }
           }
 
@@ -1091,18 +2101,76 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         }
 
         const disposable = workbookApi.onCommandExecuted(() => {
+          if (applyingRemotePatchRef.current) {
+            syncFilterState()
+            syncSelectionState()
+            requestProtectionHighlightRefresh()
+            return
+          }
+
           schedulePersist()
           syncFilterState()
           syncSelectionState()
+          requestProtectionHighlightRefresh()
+        })
+
+        const sendPresenceForCell = (state: 'selected' | 'editing', row: number, column: number) => {
+          const columnKey = latestSheetRef.current.columns?.[column]?.key
+          const dataRow = row - 1
+          if (!columnKey || dataRow < 0) {
+            wsClient.sendCellPresence(sheetId, 'viewing')
+            return
+          }
+          wsClient.sendCellPresence(sheetId, state, dataRow, columnKey)
+        }
+
+        const selectionPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SelectionChanged, () => {
+          const selection = syncSelectionState()
+          if (!selection || selection.includesHeaderRow || selection.rowIndex < 0) {
+            wsClient.sendCellPresence(sheetId, 'viewing')
+            return
+          }
+          const columnIndex = latestSheetRef.current.columns?.findIndex((column) => column.key === selection.columnKey) ?? -1
+          if (columnIndex >= 0) sendPresenceForCell('selected', selection.rowIndex + 1, columnIndex)
+        })
+
+        const beforeEditPresenceDisposable = univerAPI.addEvent(univerAPI.Event.BeforeSheetEditStart, (params) => {
+          const columnKey = latestSheetRef.current.columns?.[params.column]?.key
+          const dataRow = params.row - 1
+          if (!columnKey || dataRow < 0) return
+          const currentClientId = getRealtimeClientId()
+          const conflict = sheetPresenceRef.current.find((entry) => entry.clientId !== currentClientId
+            && entry.state === 'editing'
+            && entry.row === dataRow
+            && entry.col === columnKey)
+          if (conflict) {
+            params.cancel = true
+            setActionError(`${conflict.username} 正在编辑该单元格，请等待对方结束后再编辑。`)
+          }
+        })
+
+        const editStartedPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SheetEditStarted, (params) => {
+          sendPresenceForCell('editing', params.row, params.column)
+        })
+
+        const editEndedPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SheetEditEnded, (params) => {
+          sendPresenceForCell('selected', params.row, params.column)
         })
 
         cleanup = () => {
           disposable.dispose()
+          selectionPresenceDisposable.dispose()
+          beforeEditPresenceDisposable.dispose()
+          editStartedPresenceDisposable.dispose()
+          editEndedPresenceDisposable.dispose()
           persistRef.current = null
           workbookApiRef.current = null
           persistQueuedRef.current = false
           persistInFlightRef.current = null
           if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
+          if (remotePatchResetTimerRef.current) { clearTimeout(remotePatchResetTimerRef.current); remotePatchResetTimerRef.current = null }
+          applyingRemotePatchRef.current = false
+          persistedWorksheetDataRef.current = null
           univerApiRef.current = null
           setHasFilter(false)
           setSelectionState(null)
@@ -1126,7 +2194,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     mount()
     return () => { disposed = true; cleanup?.() }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
-  }, [sheetId, workbookId, reloadToken])
+  }, [sheetId, workbookId, reloadToken, canInitializeEditor, requestProtectionHighlightRefresh])
 
   useEffect(() => {
     try {
@@ -1158,6 +2226,33 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     }
   }, [editLocked])
 
+  const lockImageCell = useCallback(async (worksheetRow: number, worksheetColumn: number) => {
+    if (!lockInsertedImageCell || worksheetRow <= 0) return
+    const column = latestSheetRef.current.columns?.[worksheetColumn]
+    if (!column?.key) return
+    const rowIndex = worksheetRow - 1
+    const alreadyProtected = protectionSnapshot.cells.some((item) => item.row_index === rowIndex && item.column_key === column.key)
+    if (alreadyProtected) return
+
+    const response = await api.post<{ protections?: ProtectionSnapshot }>(`/sheets/${sheetId}/protections`, {
+      scope: 'cell',
+      action: 'lock',
+      row_index: rowIndex,
+      column_key: column.key,
+      editable_user_ids: selectedProtectionEditableUserIds,
+    })
+    if (response.code !== 0) {
+      throw new Error(response.message || '图片已插入，但锁定所在单元格失败。')
+    }
+    if (response.data?.protections) {
+      setProtectionSnapshot(response.data.protections)
+    } else {
+      await refreshProtectionSnapshot()
+    }
+    setShowProtectionHighlights(true)
+    requestProtectionHighlightRefresh()
+  }, [lockInsertedImageCell, protectionSnapshot.cells, refreshProtectionSnapshot, requestProtectionHighlightRefresh, selectedProtectionEditableUserIds, sheetId])
+
   const insertImageToCell = useCallback(async (img: GalleryImage) => {
     const result = univerApiRef.current
     if (!result) return
@@ -1172,6 +2267,8 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       }
 
       const imageFile = await toImageFile(img)
+      const imageRow = range.getRow()
+      const imageColumn = range.getColumn()
 
       const inserted = await (range as typeof range & {
         insertCellImageAsync?: (file: File | string) => Promise<boolean>
@@ -1181,13 +2278,14 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       }
 
       await persistCurrentSheet()
+      await lockImageCell(imageRow, imageColumn)
     } catch (e) {
       console.error('Failed to insert image to cell:', e)
       setActionError(e instanceof Error ? e.message : '插入图片失败，请稍后再试。')
     }
 
     setShowImagePicker(false)
-  }, [persistCurrentSheet])
+  }, [lockImageCell, persistCurrentSheet])
 
   // Handle direct file upload from picker
   const handleDirectUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1211,6 +2309,8 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
             throw new Error('请先选中要插入图片的单元格。')
           }
 
+          const imageRow = range.getRow()
+          const imageColumn = range.getColumn()
           const inserted = await (range as typeof range & {
             insertCellImageAsync?: (file: File | string) => Promise<boolean>
           }).insertCellImageAsync?.(file)
@@ -1219,6 +2319,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
           }
 
           await persistCurrentSheet()
+          await lockImageCell(imageRow, imageColumn)
           setShowImagePicker(false)
         }
       }
@@ -1226,7 +2327,7 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       console.error('Upload failed:', err)
       setActionError(err instanceof Error ? err.message : '上传图片失败，请稍后再试。')
     }
-  }, [editLocked, persistCurrentSheet])
+  }, [editLocked, lockImageCell, persistCurrentSheet])
 
   const getCurrentSheetSnapshot = useCallback(() => {
     const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
@@ -1247,6 +2348,28 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       columns: latestSheetRef.current.columns || [],
     }
   }, [])
+
+  const closePdfPreview = useCallback(() => {
+    if (pdfPreviewUrlRef.current) {
+      window.URL.revokeObjectURL(pdfPreviewUrlRef.current)
+      pdfPreviewUrlRef.current = null
+    }
+    setPdfPreview(null)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (pdfPreviewUrlRef.current) {
+        window.URL.revokeObjectURL(pdfPreviewUrlRef.current)
+        pdfPreviewUrlRef.current = null
+      }
+    }
+  }, [])
+
+  const handleDownloadPreviewPdf = useCallback(() => {
+    if (!pdfPreview) return
+    triggerBrowserDownload(pdfPreview.blob, pdfPreview.filename)
+  }, [pdfPreview])
 
   const handleDownloadSheet = useCallback(async () => {
     if (!effectiveCanExportSheet) {
@@ -1287,23 +2410,23 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     }
   }, [canEditSheet, effectiveCanExportSheet, persistCurrentSheet, sheetId])
 
-  const handleDownloadPdf = useCallback(async () => {
+  const handleDownloadWorkbookExcel = useCallback(async () => {
     if (!effectiveCanExportSheet) {
-      setActionError('当前账号没有导出权限，不能导出 PDF。')
+      setActionError('当前账号没有导出权限，不能下载工作簿。')
       return
     }
 
     setActionError('')
-    setExportAction('pdf')
+    setExportAction('workbook')
     try {
       if (canEditSheet) {
         await persistCurrentSheet()
       }
 
-      const fallbackFilename = `${sanitizeDownloadFilename(latestSheetRef.current.name || '工作表')}.pdf`
-      const response = await api.download(`/sheets/${sheetId}/export/pdf?filename=${encodeURIComponent(fallbackFilename)}`)
+      const fallbackFilename = `${sanitizeDownloadFilename(workbookExportName)}.xlsx`
+      const response = await api.download(`/workbooks/${workbookId}/export?filename=${encodeURIComponent(fallbackFilename)}`)
       if (!response.ok) {
-        let message = '导出 PDF 失败，请稍后再试。'
+        let message = '下载工作簿失败，请稍后再试。'
         try {
           const data = await response.json() as { message?: string }
           if (data?.message) {
@@ -1319,12 +2442,135 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       const filename = parseFilenameFromDisposition(response.headers.get('Content-Disposition'), fallbackFilename)
       triggerBrowserDownload(blob, filename)
     } catch (err) {
-      console.error('Failed to export PDF:', err)
-      setActionError(err instanceof Error ? err.message : '导出 PDF 失败，请稍后再试。')
+      console.error('Failed to download workbook:', err)
+      setActionError(err instanceof Error ? err.message : '下载工作簿失败，请稍后再试。')
     } finally {
       setExportAction('')
     }
-  }, [canEditSheet, effectiveCanExportSheet, persistCurrentSheet, sheetId])
+  }, [canEditSheet, effectiveCanExportSheet, persistCurrentSheet, workbookExportName, workbookId])
+
+  const handleDownloadOriginalWorkbook = useCallback(async () => {
+    if (!originalWorkbookXlsxAvailable) {
+      setActionError('当前工作簿没有可下载的原始 Excel 文件。')
+      return
+    }
+    if (!effectiveCanExportSheet) {
+      setActionError('当前账号没有下载原始 Excel 的权限，请联系管理员开启导出权限。')
+      return
+    }
+
+    setActionError('')
+    setExportAction('source')
+    try {
+      const rawFallbackName = originalWorkbookXlsxFilename || latestSheetRef.current.name || '工作簿'
+      const fallbackBase = sanitizeDownloadFilename(rawFallbackName)
+      const fallbackFilename = fallbackBase.toLowerCase().endsWith('.xlsx') ? fallbackBase : `${fallbackBase}.xlsx`
+      const response = await api.download(`/workbooks/${workbookId}/source/xlsx`)
+      if (!response.ok) {
+        let message = '下载原始 Excel 失败，请稍后再试。'
+        try {
+          const data = await response.json() as { message?: string }
+          if (data?.message) {
+            message = data.message
+          }
+        } catch {
+          // Ignore JSON parse errors for binary responses.
+        }
+        throw new Error(message)
+      }
+
+      const blob = await response.blob()
+      const filename = parseFilenameFromDisposition(response.headers.get('Content-Disposition'), fallbackFilename)
+      triggerBrowserDownload(blob, filename)
+    } catch (err) {
+      console.error('Failed to download source workbook:', err)
+      setActionError(err instanceof Error ? err.message : '下载原始 Excel 失败，请稍后再试。')
+    } finally {
+      setExportAction('')
+    }
+  }, [effectiveCanExportSheet, originalWorkbookXlsxAvailable, originalWorkbookXlsxFilename, workbookId])
+
+  const openPdfExportPanel = useCallback(() => {
+    const validIDs = new Set(workbookSheetOptions.map((item) => item.id))
+    const nextSelected = selectedPdfSheetIds.filter((id) => validIDs.has(id))
+    setSelectedPdfSheetIds(nextSelected.length > 0 ? nextSelected : [sheetId])
+    setPdfExportScope('current')
+    setShowPdfExportPanel(true)
+    setActionError('')
+  }, [selectedPdfSheetIds, sheetId, workbookSheetOptions])
+
+  const togglePdfSheetSelection = useCallback((targetSheetId: number) => {
+    setSelectedPdfSheetIds((current) => {
+      if (current.includes(targetSheetId)) {
+        return current.filter((id) => id !== targetSheetId)
+      }
+      return [...current, targetSheetId]
+    })
+  }, [])
+
+  const handlePreviewPdfExport = useCallback(async () => {
+    if (!effectiveCanViewSheet) {
+      setActionError('当前账号没有查看权限，不能预览 PDF。')
+      return
+    }
+
+    const selectedIDs = selectedPdfSheetIds.filter((id) => workbookSheetOptions.some((item) => item.id === id))
+    if (pdfExportScope === 'selected' && selectedIDs.length === 0) {
+      setActionError('请至少选择一个要导出的工作表。')
+      return
+    }
+
+    setActionError('')
+    setExportAction('pdf')
+    try {
+      if (canEditSheet) {
+        await persistCurrentSheet()
+      }
+
+      const fallbackBase =
+        pdfExportScope === 'current'
+          ? latestSheetRef.current.name || '工作表'
+          : pdfExportScope === 'selected'
+          ? `${workbookExportName}-选中工作表`
+          : workbookExportName
+      const fallbackFilename = `${sanitizeDownloadFilename(fallbackBase)}.pdf`
+      const pdfOptions = `paper_size=${encodeURIComponent(pdfPaperSize)}&orientation=${encodeURIComponent(pdfOrientation)}&fit_to_width=${pdfFitToWidth ? 'true' : 'false'}`
+      const endpoint =
+        pdfExportScope === 'current'
+          ? `/sheets/${sheetId}/export/pdf?filename=${encodeURIComponent(fallbackFilename)}&${pdfOptions}`
+          : `/workbooks/${workbookId}/export/pdf?filename=${encodeURIComponent(fallbackFilename)}&${pdfOptions}${
+              pdfExportScope === 'selected' ? `&sheet_ids=${encodeURIComponent(selectedIDs.join(','))}` : ''
+            }`
+      const response = await api.download(endpoint)
+      if (!response.ok) {
+        let message = '导出 PDF 失败，请稍后再试。'
+        try {
+          const data = await response.json() as { message?: string }
+          if (data?.message) {
+            message = data.message
+          }
+        } catch {
+          // Ignore JSON parse errors for binary responses.
+        }
+        throw new Error(message)
+      }
+
+      const blob = await response.blob()
+      const filename = parseFilenameFromDisposition(response.headers.get('Content-Disposition'), fallbackFilename)
+      if (pdfPreviewUrlRef.current) {
+        window.URL.revokeObjectURL(pdfPreviewUrlRef.current)
+      }
+      const url = window.URL.createObjectURL(blob)
+      pdfPreviewUrlRef.current = url
+      setPdfPreview({ url, filename, blob })
+      setShowPdfExportPanel(false)
+    } catch (err) {
+      console.error('Failed to export PDF:', err)
+      setActionError(err instanceof Error ? err.message : '生成 PDF 预览失败，请稍后再试。')
+    } finally {
+      setExportAction('')
+    }
+  }, [canEditSheet, effectiveCanViewSheet, pdfExportScope, pdfFitToWidth, pdfOrientation, pdfPaperSize, persistCurrentSheet, selectedPdfSheetIds, sheetId, workbookExportName, workbookId, workbookSheetOptions])
 
   const handlePrintSheet = useCallback(async () => {
     if (!effectiveCanExportSheet) {
@@ -1349,6 +2595,22 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     }
   }, [canEditSheet, effectiveCanExportSheet, getCurrentSheetSnapshot, persistCurrentSheet])
 
+  useEffect(() => {
+    if (!selectionState) {
+      setSelectedProtectionEditableUserIds([])
+      return
+    }
+
+    const currentCell = protectionSnapshot.cells.find(
+      (item) => item.row_index === selectionState.rowIndex && item.column_key === selectionState.columnKey
+    )
+    const currentRow = protectionSnapshot.rows.find((item) => item.row_index === selectionState.rowIndex)
+    const currentColumn = protectionSnapshot.columns.find((item) => item.column_key === selectionState.columnKey)
+    const activeProtection = currentCell || currentRow || currentColumn
+
+    setSelectedProtectionEditableUserIds(activeProtection?.editable_user_ids || [])
+  }, [protectionSnapshot.cells, protectionSnapshot.columns, protectionSnapshot.rows, selectionState])
+
   if (error) {
     return (
       <div className="flex h-full items-center justify-center px-6 text-center">
@@ -1372,11 +2634,61 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         (item) => item.row_index === selectionState.rowIndex && item.column_key === selectionState.columnKey
       ) || null
     : null
+  const columnLabelMap = new Map((latestSheetRef.current.columns || []).map((column) => [column.key, column.name || column.key]))
+  const getProtectionColumnLabel = (columnKey?: string | null) => {
+    if (!columnKey) return '未知列'
+    return columnLabelMap.get(columnKey) || columnKey
+  }
+  const formatProtectionTarget = (item: ProtectionInfo) => {
+    if (item.scope === 'row') return `第 ${(item.row_index ?? 0) + 2} 行`
+    if (item.scope === 'column') return `列 ${getProtectionColumnLabel(item.column_key || item.key)}`
+    return `${getProtectionColumnLabel(item.column_key || item.key)}${(item.row_index ?? 0) + 2}`
+  }
+  const formatProtectionBadge = (item: ProtectionInfo) => `${formatProtectionTarget(item)} - ${item.owner_name}`
+  const allProtectionItems = [
+    ...protectionSnapshot.rows,
+    ...protectionSnapshot.columns,
+    ...protectionSnapshot.cells,
+  ]
   const canReleaseProtection = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
-  const visibleProtectionBadges = [
-    ...protectionSnapshot.rows.slice(0, 3).map((item) => `行 ${(item.row_index || 0) + 2} - ${item.owner_name}`),
-    ...protectionSnapshot.columns.slice(0, 3).map((item) => `列 ${item.column_key || item.key} - ${item.owner_name}`),
-  ].slice(0, 6)
+  const canUpdateProtectionEditors = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
+  const protectionUserNameMap = new Map(protectionUsers.map((user) => [user.id, user.username]))
+  const normalizedProtectionUserSearch = protectionUserSearch.trim().toLocaleLowerCase('zh-CN')
+  const filteredProtectionUsers = normalizedProtectionUserSearch
+    ? protectionUsers.filter((user) => `${user.username} ${user.email}`.toLocaleLowerCase('zh-CN').includes(normalizedProtectionUserSearch))
+    : protectionUsers
+  const formatEditableUsers = (item: ProtectionInfo | null) => {
+    const ids = item?.editable_user_ids || []
+    if (ids.length === 0) return '未指定额外可编辑人员'
+    return ids.map((id) => protectionUserNameMap.get(id) || `用户 #${id}`).join('、')
+  }
+  const toggleProtectionEditableUser = (userId: number) => {
+    setSelectedProtectionEditableUserIds((prev) =>
+      prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId].sort((a, b) => a - b)
+    )
+  }
+  const currentProtectionItems = [currentRowProtection, currentColumnProtection, currentCellProtection]
+    .filter((item): item is ProtectionInfo => Boolean(item))
+  const protectionOwnerGroups = Array.from(allProtectionItems.reduce((groups, item) => {
+    const current = groups.get(item.owner_id) || { ownerId: item.owner_id, ownerName: item.owner_name, items: [] as ProtectionInfo[] }
+    current.items.push(item)
+    groups.set(item.owner_id, current)
+    return groups
+  }, new Map<number, { ownerId: number; ownerName: string; items: ProtectionInfo[] }>()).values())
+    .sort((left, right) => left.ownerName.localeCompare(right.ownerName, 'zh-CN'))
+  const onlineCollaborators = Array.from(sheetPresence.reduce((users, entry) => {
+    const current = users.get(entry.userId)
+    const priority = { viewing: 0, selected: 1, editing: 2 }
+    if (!current || priority[entry.state] > priority[current.state]) users.set(entry.userId, entry)
+    return users
+  }, new Map<number, SheetPresenceEntry>()).values())
+    .sort((left, right) => {
+      if (left.userId === profile?.id) return -1
+      if (right.userId === profile?.id) return 1
+      const priority = { editing: 0, selected: 1, viewing: 2 }
+      return priority[left.state] - priority[right.state] || left.username.localeCompare(right.username, 'zh-CN')
+    })
+  const displayedCollaborators = presenceExpanded ? onlineCollaborators : onlineCollaborators.slice(0, 4)
 
   return (
     <div
@@ -1385,8 +2697,51 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       onDragOver={handleContainerDragOver}
       onDragLeave={handleContainerDragLeave}
       onDrop={handleContainerDrop}
+      onContextMenu={handleSheetContextMenu}
     >
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
+
+      {onlineCollaborators.length > 0 && (
+        <div className="absolute right-3 top-14 z-[22] w-[min(20rem,calc(100%-1.5rem))]">
+          <button type="button" onClick={() => setPresenceExpanded((current) => !current)} className="ml-auto flex min-h-10 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
+            <UserRoundCheck className="h-4 w-4 shrink-0 text-emerald-600" />
+            <div className="flex -space-x-1.5">
+              {displayedCollaborators.slice(0, 4).map((entry) => {
+                const visual = visualForUser(entry.userId)
+                return <span key={entry.userId} className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white text-[10px] font-semibold" style={{ backgroundColor: visual.soft, color: visual.stroke }} title={`${entry.username} · ${entry.state === 'editing' ? '正在编辑' : entry.state === 'selected' ? '已选中单元格' : '在线查看'}`}>{entry.username.slice(0, 2).toUpperCase()}</span>
+              })}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-xs font-semibold text-slate-800">{onlineCollaborators.length} 人在线</div>
+              <div className="truncate text-[10px] text-slate-400">{onlineCollaborators.filter((entry) => entry.state === 'editing').length > 0 ? `${onlineCollaborators.filter((entry) => entry.state === 'editing').length} 人正在编辑` : '当前无编辑冲突'}</div>
+            </div>
+            {onlineCollaborators.length > 4 && <span className="shrink-0 text-[10px] font-semibold text-slate-500">+{onlineCollaborators.length - 4}</span>}
+            <ChevronDown className={`h-4 w-4 shrink-0 text-slate-400 transition-transform ${presenceExpanded ? 'rotate-180' : ''}`} />
+          </button>
+
+          {presenceExpanded && (
+            <div className="mt-2 max-h-72 overflow-y-auto rounded-lg border border-slate-200 bg-white p-2 shadow-2xl">
+              {onlineCollaborators.map((entry) => {
+                const visual = visualForUser(entry.userId)
+                const columnName = latestSheetRef.current.columns?.find((column) => column.key === entry.col)?.name || entry.col
+                return (
+                  <div key={`presence-${entry.userId}`} className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-slate-50">
+                    <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-xs font-semibold" style={{ backgroundColor: visual.soft, color: visual.stroke }}>
+                      {entry.username.slice(0, 2).toUpperCase()}
+                      <span className={`absolute -bottom-1 -right-1 h-3 w-3 rounded-full border-2 border-white ${entry.state === 'editing' ? 'bg-amber-500' : entry.state === 'selected' ? 'bg-sky-500' : 'bg-emerald-500'}`} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-semibold text-slate-800">{entry.userId === profile?.id ? `${entry.username}（我）` : entry.username}</div>
+                      <div className="mt-0.5 truncate text-xs text-slate-400">{entry.state === 'editing' ? `正在编辑 ${columnName || ''}${typeof entry.row === 'number' ? entry.row + 2 : ''}` : entry.state === 'selected' ? `已选中 ${columnName || ''}${typeof entry.row === 'number' ? entry.row + 2 : ''}` : '正在查看此工作表'}</div>
+                    </div>
+                    <span className="shrink-0 rounded-lg px-2 py-1 text-[10px] font-medium" style={{ backgroundColor: visual.soft, color: visual.stroke }}>{entry.state === 'editing' ? '编辑中' : entry.state === 'selected' ? '准备编辑' : '在线'}</span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {(dragImportActive || dragImportUploading) && (
         <div className="absolute inset-0 z-[25] flex items-center justify-center bg-slate-950/18 backdrop-blur-[2px]">
@@ -1421,111 +2776,335 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
             <div className="flex flex-col items-end gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
-              <button
-                type="button"
-                onClick={() => {
-                  syncSelectionState()
-                  setShowProtectionPanel((current) => !current)
-                }}
-                className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
-                  showProtectionPanel
-                    ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
-                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                }`}
-                title="保护设置"
-              >
-                <Shield className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={hasFilter ? handleClearFilter : handleEnableFilter}
-                disabled={editLocked}
-                className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
-                  hasFilter
-                    ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
-                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                } disabled:cursor-not-allowed disabled:opacity-50`}
-                title={hasFilter ? '清除筛选' : '启用筛选'}
-              >
-                {hasFilter ? <FilterX className="h-4 w-4" /> : <Filter className="h-4 w-4" />}
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleDownloadSheet()}
-                disabled={!effectiveCanExportSheet || exportAction !== ''}
-                className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
-                title="下载当前表"
-              >
-                <Download className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => void handlePrintSheet()}
-                disabled={!effectiveCanExportSheet || exportAction !== ''}
-                className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                title="打印当前表"
-              >
-                <Printer className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleDownloadPdf()}
-                disabled={!effectiveCanExportSheet || exportAction !== ''}
-                className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                title="导出 PDF"
-              >
-                <FileOutput className="h-4 w-4" />
-              </button>
+              <FloatingToolHint label="保护设置">
+                <button
+                  type="button"
+                  onClick={() => {
+                    syncSelectionState()
+                    setShowAllProtections(false)
+                    setShowProtectionPanel((current) => !current)
+                  }}
+                  className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
+                    showProtectionPanel
+                      ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                  }`}
+                  title="保护设置"
+                  aria-label="保护设置"
+                >
+                  <Shield className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label={hasFilter ? '清除筛选' : '启用筛选'}>
+                <button
+                  type="button"
+                  onClick={hasFilter ? handleClearFilter : handleEnableFilter}
+                  disabled={editLocked}
+                  className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
+                    hasFilter
+                      ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
+                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                  } disabled:cursor-not-allowed disabled:opacity-50`}
+                  title={hasFilter ? '清除筛选' : '启用筛选'}
+                  aria-label={hasFilter ? '清除筛选' : '启用筛选'}
+                >
+                  {hasFilter ? <FilterX className="h-4 w-4" /> : <Filter className="h-4 w-4" />}
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label="下载当前表 Excel">
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadSheet()}
+                  disabled={!effectiveCanExportSheet || exportAction !== ''}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="下载当前表 Excel"
+                  aria-label="下载当前表 Excel"
+                >
+                  <Download className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label="下载工作簿 Excel">
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadWorkbookExcel()}
+                  disabled={!effectiveCanExportSheet || exportAction !== ''}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 shadow-lg transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="下载工作簿 Excel"
+                  aria-label="下载工作簿 Excel"
+                >
+                  <Files className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              {originalWorkbookXlsxAvailable && (
+                <FloatingToolHint label="下载原始 Excel">
+                  <button
+                    type="button"
+                    onClick={() => void handleDownloadOriginalWorkbook()}
+                    disabled={!effectiveCanExportSheet || exportAction !== ''}
+                    className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 shadow-lg transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    title="下载原始 Excel"
+                    aria-label="下载原始 Excel"
+                  >
+                    <FileSpreadsheet className="h-4 w-4" />
+                  </button>
+                </FloatingToolHint>
+              )}
+              <FloatingToolHint label="打印当前表">
+                <button
+                  type="button"
+                  onClick={() => void handlePrintSheet()}
+                  disabled={!effectiveCanExportSheet || exportAction !== ''}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="打印当前表"
+                  aria-label="打印当前表"
+                >
+                  <Printer className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label="PDF 导出与预览">
+                <button
+                  type="button"
+                  onClick={openPdfExportPanel}
+                  disabled={!effectiveCanViewSheet || exportAction !== ''}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="PDF 导出与预览"
+                  aria-label="PDF 导出与预览"
+                >
+                  <FileOutput className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
               <ImportXlsxButton
                 workbookId={workbookId}
                 canImport={canImportWorkbook}
                 onImported={onExternalReload}
                 onError={setActionError}
               />
-              <button
-                type="button"
-                onClick={openImagePicker}
-                disabled={editLocked}
-                className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                title="插入图片"
-              >
-                <ImagePlus className="h-4 w-4" />
-              </button>
+              <FloatingToolHint label="插入图片">
+                <button
+                  type="button"
+                  onClick={openImagePicker}
+                  disabled={editLocked}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="插入图片"
+                  aria-label="插入图片"
+                >
+                  <ImagePlus className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
             </div>
           )}
           {/* Always visible: Save + Toolbar toggle */}
-          <button
-            type="button"
-            onClick={handleManualSave}
-            disabled={editLocked}
-            className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg transition ${
-              saveStatus === 'saving'
-                ? 'bg-amber-500 text-white'
-                : saveStatus === 'saved'
-                ? 'bg-emerald-500 text-white'
-                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-            } disabled:cursor-not-allowed disabled:opacity-50`}
-            title="保存 (Ctrl+S)"
-          >
-            <Save className="h-4 w-4" />
-          </button>
-          <button
-            type="button"
-            onClick={() => setToolbarExpanded((v) => !v)}
-            className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg transition ${
-              toolbarExpanded
-                ? 'bg-slate-700 text-white hover:bg-slate-600'
-                : 'bg-slate-900 text-white hover:bg-slate-800'
-            }`}
-            title={toolbarExpanded ? '收起工具栏' : '展开工具栏'}
-          >
-            {toolbarExpanded ? <ChevronUp className="h-5 w-5" /> : <Wrench className="h-5 w-5" />}
-          </button>
+          <FloatingToolHint label={saveStatus === 'saving' ? '正在保存' : saveStatus === 'saved' ? '已保存' : '保存表格 (Ctrl+S)'}>
+            <button
+              type="button"
+              onClick={handleManualSave}
+              disabled={editLocked}
+              className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg transition ${
+                saveStatus === 'saving'
+                  ? 'bg-amber-500 text-white'
+                  : saveStatus === 'saved'
+                  ? 'bg-emerald-500 text-white'
+                  : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+              } disabled:cursor-not-allowed disabled:opacity-50`}
+              title="保存表格 (Ctrl+S)"
+              aria-label="保存表格"
+            >
+              <Save className="h-4 w-4" />
+            </button>
+          </FloatingToolHint>
+          <div className="group relative">
+            <span className="pointer-events-none absolute right-12 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100">
+              {toolbarExpanded ? '收起表格工具' : '展开表格工具'}
+            </span>
+            <button
+              type="button"
+              onClick={() => setToolbarExpanded((v) => !v)}
+              className={`flex h-10 w-10 items-center justify-center rounded-full shadow-lg transition ${
+                toolbarExpanded
+                  ? 'bg-slate-700 text-white hover:bg-slate-600'
+                  : 'bg-slate-900 text-white hover:bg-slate-800'
+              }`}
+              title={toolbarExpanded ? '收起表格工具' : '展开表格工具'}
+              aria-label={toolbarExpanded ? '收起表格工具' : '展开表格工具'}
+            >
+              {toolbarExpanded ? <ChevronUp className="h-5 w-5" /> : <Wrench className="h-5 w-5" />}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showPdfExportPanel && (
+        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-4 py-6">
+          <div className="w-[min(560px,96vw)] overflow-hidden rounded-xl bg-white shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-slate-900">
+                <FileOutput className="h-4 w-4 text-sky-600" />
+                <span>PDF 导出范围</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPdfExportPanel(false)}
+                className="ui-tooltip flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                title="关闭"
+                aria-label="关闭 PDF 导出设置"
+                data-tooltip="关闭"
+                data-tooltip-side="left"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="space-y-4 p-4">
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  ['current', '当前表'],
+                  ['selected', '多张表'],
+                  ['workbook', '整本工作簿'],
+                ] as Array<[PDFExportScope, string]>).map(([scope, label]) => (
+                  <button
+                    key={scope}
+                    type="button"
+                    onClick={() => setPdfExportScope(scope)}
+                    className={`h-10 rounded-lg border px-3 text-sm font-medium transition ${
+                      pdfExportScope === scope
+                        ? 'border-sky-300 bg-sky-50 text-sky-700'
+                        : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {pdfExportScope === 'current' && (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-600">
+                  将导出当前工作表：<span className="font-semibold text-slate-900">{latestSheetRef.current.name || '工作表'}</span>
+                </div>
+              )}
+
+              {pdfExportScope === 'selected' && (
+                <div className="rounded-lg border border-slate-200">
+                  <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2 text-xs font-semibold text-slate-500">
+                    <span>选择工作表</span>
+                    <span>已选 {selectedPdfSheetIds.length}</span>
+                  </div>
+                  <div className="max-h-56 overflow-y-auto p-2">
+                    {workbookSheetOptions.map((item) => (
+                      <label key={item.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-sm text-slate-700 transition hover:bg-slate-50">
+                        <input
+                          type="checkbox"
+                          checked={selectedPdfSheetIds.includes(item.id)}
+                          onChange={() => togglePdfSheetSelection(item.id)}
+                          className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                        />
+                        <span className="truncate">{item.name || `工作表 #${item.id}`}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {pdfExportScope === 'workbook' && (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-600">
+                  将按当前工作簿顺序导出全部 {workbookSheetOptions.length} 张工作表。
+                </div>
+              )}
+
+              <div className="grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:grid-cols-2">
+                <label className="space-y-1.5 text-xs font-semibold text-slate-600">
+                  <span>纸张大小</span>
+                  <select value={pdfPaperSize} onChange={(event) => setPdfPaperSize(event.target.value as PDFPaperSize)} className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-sm font-medium text-slate-700 outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100">
+                    <option value="a4">A4</option>
+                    <option value="a3">A3</option>
+                    <option value="letter">Letter</option>
+                    <option value="legal">Legal</option>
+                  </select>
+                </label>
+                <label className="space-y-1.5 text-xs font-semibold text-slate-600">
+                  <span>页面方向</span>
+                  <select value={pdfOrientation} onChange={(event) => setPdfOrientation(event.target.value as PDFOrientation)} className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-sm font-medium text-slate-700 outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100">
+                    <option value="portrait">纵向</option>
+                    <option value="landscape">横向</option>
+                  </select>
+                </label>
+                <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2.5 sm:col-span-2">
+                  <input type="checkbox" checked={pdfFitToWidth} onChange={(event) => setPdfFitToWidth(event.target.checked)} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-slate-700">适应一页宽度</span>
+                    <span className="mt-0.5 block text-xs leading-5 text-slate-500">自动缩小超宽表格，避免内容超出所选纸张；高度仍可分页。</span>
+                  </span>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-slate-100 pt-4">
+                <button
+                  type="button"
+                  onClick={() => setShowPdfExportPanel(false)}
+                  className="inline-flex h-9 items-center justify-center rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handlePreviewPdfExport()}
+                  disabled={exportAction !== '' || (pdfExportScope === 'selected' && selectedPdfSheetIds.length === 0)}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <FileOutput className="h-4 w-4" />
+                  生成预览
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pdfPreview && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/50 px-4 py-6">
+          <div className="flex h-[min(900px,92vh)] w-[min(1120px,96vw)] flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+            <div className="flex min-h-16 items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                  <FileOutput className="h-4 w-4 text-sky-600" />
+                  <span>PDF 预览</span>
+                </div>
+                <div className="mt-1 truncate text-xs text-slate-500" title={pdfPreview.filename}>
+                  {pdfPreview.filename}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadPreviewPdf}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 text-sm font-medium text-sky-700 transition hover:bg-sky-100"
+                >
+                  <Download className="h-4 w-4" />
+                  下载
+                </button>
+                <button
+                  type="button"
+                  onClick={closePdfPreview}
+                  className="ui-tooltip flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+                  title="关闭"
+                  aria-label="关闭 PDF 预览"
+                  data-tooltip="关闭预览"
+                  data-tooltip-side="left"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <iframe
+              title="PDF 预览"
+              src={pdfPreview.url}
+              className="min-h-0 flex-1 bg-slate-100"
+            />
+          </div>
         </div>
       )}
 
       {showProtectionPanel && (
-        <div className="absolute right-20 bottom-20 z-20 w-[340px] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
+        <div className="absolute inset-x-3 bottom-3 z-30 max-h-[min(780px,calc(100vh-5rem))] overflow-y-auto rounded-lg border border-slate-200 bg-white p-4 shadow-2xl sm:inset-x-auto sm:bottom-20 sm:right-20 sm:w-[420px]">
           <div className="mb-4 flex items-start justify-between gap-3">
             <div>
               <div className="text-sm font-semibold text-slate-900">保护设置</div>
@@ -1533,13 +3112,15 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 当前选择：{selectionState ? selectionState.rangeLabel : '未选中单元格'}
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => setShowProtectionPanel(false)}
-              className="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <div className="flex shrink-0 items-center gap-1">
+              <button type="button" onClick={() => setShowProtectionHighlights((current) => !current)} className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition ${showProtectionHighlights ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title={showProtectionHighlights ? '隐藏保护区域颜色' : '显示保护区域颜色'}>
+                {showProtectionHighlights ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                {showProtectionHighlights ? '隐藏标记' : '显示标记'}
+              </button>
+              <button type="button" onClick={() => setShowProtectionPanel(false)} className="ui-tooltip inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600" title="关闭保护设置" aria-label="关闭保护设置" data-tooltip="关闭" data-tooltip-side="left">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
           <div className="space-y-3">
@@ -1548,6 +3129,86 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 当前账号只有查看权限，可以查看保护状态，但不能加锁、解锁或保存表格。
               </div>
             )}
+            {protectionFocusNotice && (
+              <div className="flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-medium text-sky-800">
+                <LocateFixed className="h-4 w-4 shrink-0" />
+                <span className="min-w-0 flex-1">{protectionFocusNotice}</span>
+              </div>
+            )}
+            {protectionOwnerGroups.length > 0 && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                <div className="mb-2 text-xs font-semibold text-slate-700">保护颜色图例</div>
+                <div className="flex flex-wrap gap-2">
+                  {protectionOwnerGroups.map((group) => {
+                    const visual = visualForUser(group.ownerId)
+                    return <span key={group.ownerId} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600"><span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: visual.fill, border: `2px solid ${visual.stroke}` }} />{group.ownerName}<span className="text-slate-400">{group.items.length}</span></span>
+                  })}
+                </div>
+              </div>
+            )}
+            <div className="rounded-xl border border-slate-200 bg-white p-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                  <Users className="h-4 w-4 text-sky-600" />
+                  允许编辑人员
+                </div>
+                <span className="shrink-0 rounded-lg bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-700">
+                  已选 {selectedProtectionEditableUserIds.length} 人
+                </span>
+              </div>
+              <div className="mb-3 text-xs leading-5 text-slate-500">
+                新增保护或更新当前保护时，这些员工可以编辑被保护的行、列或单元格。
+              </div>
+              {protectionUsersLoading ? (
+                <div className="text-xs text-slate-400">正在加载员工...</div>
+              ) : protectionUsersError ? (
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                  <span>{protectionUsersError}</span>
+                  <button type="button" onClick={() => setProtectionUsersLoadToken((current) => current + 1)} className="shrink-0 font-semibold text-rose-800 hover:underline">重试</button>
+                </div>
+              ) : protectionUsers.length === 0 ? (
+                <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-400">暂无可选择员工，请先创建并启用员工账号。</div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <label className="relative min-w-0 flex-1">
+                      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                      <input
+                        type="search"
+                        value={protectionUserSearch}
+                        onChange={(event) => setProtectionUserSearch(event.target.value)}
+                        placeholder="搜索姓名或邮箱"
+                        className="h-8 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-2 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
+                      />
+                    </label>
+                    {selectedProtectionEditableUserIds.length > 0 && (
+                      <button type="button" onClick={() => setSelectedProtectionEditableUserIds([])} disabled={editLocked} className="h-8 shrink-0 rounded-lg border border-slate-200 px-2 text-xs font-medium text-slate-500 transition hover:bg-slate-50 disabled:opacity-50">
+                        清空
+                      </button>
+                    )}
+                  </div>
+                  <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-slate-100 p-1 pr-1.5">
+                    {filteredProtectionUsers.length === 0 ? (
+                      <div className="px-2 py-4 text-center text-xs text-slate-400">没有匹配的员工</div>
+                    ) : filteredProtectionUsers.map((user) => (
+                      <label key={user.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-xs text-slate-600 transition hover:bg-slate-50">
+                        <input
+                          type="checkbox"
+                          checked={selectedProtectionEditableUserIds.includes(user.id)}
+                          onChange={() => toggleProtectionEditableUser(user.id)}
+                          disabled={editLocked}
+                          className="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-medium text-slate-700">{user.username}</span>
+                          <span className="block truncate text-[11px] text-slate-400">{user.email}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
             {selectionState && (selectionState.endRowIndex > selectionState.rowIndex || selectionState.endColumnKey !== selectionState.columnKey) && (
               <div className="rounded-xl border border-sky-200 bg-sky-50/80 p-3">
                 <div className="mb-2 text-sm font-semibold text-sky-800">批量保护所选范围</div>
@@ -1618,6 +3279,9 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <div className="text-xs leading-5 text-slate-500">
                 {currentRowProtection ? `已由 ${currentRowProtection.owner_name} 于 ${new Date(currentRowProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前行未加保护'}
               </div>
+              {currentRowProtection && (
+                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑：{formatEditableUsers(currentRowProtection)}</div>
+              )}
               <button
                 type="button"
                 onClick={() => void handleProtectionChange('row', currentRowProtection ? 'unlock' : 'lock')}
@@ -1627,6 +3291,17 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 {currentRowProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                 {currentRowProtection ? '解除当前行保护' : '保护当前行'}
               </button>
+              {currentRowProtection && (
+                <button
+                  type="button"
+                  onClick={() => void handleProtectionChange('row', 'lock')}
+                  disabled={protectionAction === 'row:lock' || !canUpdateProtectionEditors(currentRowProtection)}
+                  className="ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Users className="h-4 w-4" />
+                  保存允许人员
+                </button>
+              )}
             </div>
 
             <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
@@ -1637,6 +3312,9 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <div className="text-xs leading-5 text-slate-500">
                 {currentColumnProtection ? `已由 ${currentColumnProtection.owner_name} 于 ${new Date(currentColumnProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前列未加保护'}
               </div>
+              {currentColumnProtection && (
+                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑：{formatEditableUsers(currentColumnProtection)}</div>
+              )}
               <button
                 type="button"
                 onClick={() => void handleProtectionChange('column', currentColumnProtection ? 'unlock' : 'lock')}
@@ -1646,6 +3324,17 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 {currentColumnProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                 {currentColumnProtection ? '解除当前列保护' : '保护当前列'}
               </button>
+              {currentColumnProtection && (
+                <button
+                  type="button"
+                  onClick={() => void handleProtectionChange('column', 'lock')}
+                  disabled={protectionAction === 'column:lock' || !canUpdateProtectionEditors(currentColumnProtection)}
+                  className="ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Users className="h-4 w-4" />
+                  保存允许人员
+                </button>
+              )}
             </div>
 
             <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
@@ -1656,6 +3345,9 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
               <div className="text-xs leading-5 text-slate-500">
                 {currentCellProtection ? `已由 ${currentCellProtection.owner_name} 于 ${new Date(currentCellProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前单元格未加保护'}
               </div>
+              {currentCellProtection && (
+                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑：{formatEditableUsers(currentCellProtection)}</div>
+              )}
               <button
                 type="button"
                 onClick={() => void handleProtectionChange('cell', currentCellProtection ? 'unlock' : 'lock')}
@@ -1665,26 +3357,75 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 {currentCellProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                 {currentCellProtection ? '解除当前单元格保护' : '保护当前单元格'}
               </button>
+              {currentCellProtection && (
+                <button
+                  type="button"
+                  onClick={() => void handleProtectionChange('cell', 'lock')}
+                  disabled={protectionAction === 'cell:lock' || !canUpdateProtectionEditors(currentCellProtection)}
+                  className="ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Users className="h-4 w-4" />
+                  保存允许人员
+                </button>
+              )}
             </div>
 
             <div className="rounded-xl border border-slate-200 bg-white p-3">
-              <div className="mb-2 text-sm font-semibold text-slate-800">最近的保护记录</div>
+              <button
+                type="button"
+                onClick={() => setShowAllProtections((value) => !value)}
+                disabled={protectionLoading || allProtectionItems.length === 0}
+                className="flex w-full items-center justify-between gap-3 text-left disabled:cursor-default"
+              >
+                <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                  <Shield className="h-4 w-4 text-amber-600" />
+                  全部保护记录
+                </span>
+                <span className="flex items-center gap-2 text-xs text-slate-500">
+                  共 {allProtectionItems.length} 项
+                  {allProtectionItems.length > 0 && (
+                    <ChevronUp className={`h-4 w-4 transition-transform ${showAllProtections ? '' : 'rotate-180'}`} />
+                  )}
+                </span>
+              </button>
               {protectionLoading ? (
-                <div className="text-xs text-slate-400">正在加载...</div>
-              ) : protectionSnapshot.rows.length + protectionSnapshot.columns.length + protectionSnapshot.cells.length === 0 ? (
-                <div className="text-xs text-slate-400">当前工作表还没有行/列保护记录。</div>
+                <div className="mt-3 text-xs text-slate-400">正在加载...</div>
+              ) : allProtectionItems.length === 0 ? (
+                <div className="mt-3 text-xs text-slate-400">当前工作表还没有保护记录。</div>
+              ) : showAllProtections ? (
+                <div className="mt-3 max-h-80 space-y-3 overflow-y-auto pr-1 text-xs">
+                  {protectionOwnerGroups.map((group) => {
+                    const visual = visualForUser(group.ownerId)
+                    return (
+                      <section key={group.ownerId} className="overflow-hidden rounded-lg border border-slate-200">
+                        <div className="flex items-center justify-between px-3 py-2" style={{ backgroundColor: visual.soft }}>
+                          <span className="flex min-w-0 items-center gap-2 font-semibold" style={{ color: visual.stroke }}><span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: visual.stroke }} />{group.ownerName}</span>
+                          <span className="shrink-0 text-[10px]" style={{ color: visual.stroke }}>{group.items.length} 个区域</span>
+                        </div>
+                        <div className="divide-y divide-slate-100 bg-white">
+                          {group.items.map((item, index) => (
+                            <button key={`${item.scope}-${item.key}-${index}`} type="button" onClick={() => focusProtection(item)} className="block w-full px-3 py-2.5 text-left transition hover:bg-slate-50">
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="flex min-w-0 items-center gap-2 font-semibold text-slate-700">
+                                  {item.scope === 'row' ? <Rows3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : item.scope === 'column' ? <Columns3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : <Square className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} />}
+                                  <span className="truncate">{formatProtectionTarget(item)}</span>
+                                </div>
+                                <LocateFixed className="h-3.5 w-3.5 shrink-0 text-slate-300" />
+                              </div>
+                              <div className="mt-1 leading-5 text-slate-500">{new Date(item.protected_at).toLocaleString('zh-CN')}</div>
+                              <div className="mt-1 truncate leading-5 text-slate-500">允许编辑：{formatEditableUsers(item)}</div>
+                            </button>
+                          ))}
+                        </div>
+                      </section>
+                    )
+                  })}
+                </div>
               ) : (
-                <div className="space-y-2 text-xs text-slate-500">
-                  {[...protectionSnapshot.rows.slice(0, 2), ...protectionSnapshot.columns.slice(0, 2), ...protectionSnapshot.cells.slice(0, 2)].map((item) => (
-                    <div key={`${item.scope}-${item.key}`} className="rounded-lg bg-slate-50 px-3 py-2">
-                      {item.scope === 'row'
-                        ? `第 ${(item.row_index || 0) + 2} 行`
-                        : item.scope === 'column'
-                        ? `${item.column_key || item.key} 列`
-                        : `${item.column_key || item.key}${(item.row_index || 0) + 2}`}
-                      {' '} - {item.owner_name}
-                    </div>
-                  ))}
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-500">
+                  <span className="rounded-full bg-slate-100 px-2 py-1">行 {protectionSnapshot.rows.length}</span>
+                  <span className="rounded-full bg-slate-100 px-2 py-1">列 {protectionSnapshot.columns.length}</span>
+                  <span className="rounded-full bg-slate-100 px-2 py-1">单元格 {protectionSnapshot.cells.length}</span>
                 </div>
               )}
             </div>
@@ -1705,15 +3446,14 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         </div>
       )}
 
-      {visibleProtectionBadges.length > 0 && (
+      {currentProtectionItems.length > 0 && (
         <div className="absolute left-3 top-3 z-20 flex max-w-[60%] flex-wrap gap-2">
-          {visibleProtectionBadges.map((badge) => (
-            <div key={badge} className="rounded-full border border-amber-200 bg-amber-50/95 px-3 py-1 text-[11px] font-semibold text-amber-700 shadow-sm">
-              {badge}
-            </div>
-          ))}
-        </div>
-      )}
+	          {currentProtectionItems.map((item) => {
+                const visual = visualForUser(item.owner_id)
+                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title="点击定位保护区域"><Shield className="h-3 w-3" />{formatProtectionBadge(item)}</button>
+              })}
+	        </div>
+	      )}
 
       {/* Image picker modal */}
       {showImagePicker && (
@@ -1742,12 +3482,24 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                 <button
                   type="button"
                   onClick={() => setShowImagePicker(false)}
-                  className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                  className="ui-tooltip flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                  title="关闭图片选择"
+                  aria-label="关闭图片选择"
+                  data-tooltip="关闭"
+                  data-tooltip-side="left"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
             </div>
+
+            <label className="mx-4 mt-3 flex cursor-pointer items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <input type="checkbox" checked={lockInsertedImageCell} onChange={(event) => setLockInsertedImageCell(event.target.checked)} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+              <span className="min-w-0">
+                <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><Lock className="h-3.5 w-3.5" />插入后锁定所在单元格</span>
+                <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">防止图片被移动、覆盖或删除；可在保护设置中解除。</span>
+              </span>
+            </label>
 
             {/* Gallery grid */}
             <div className="flex-1 overflow-y-auto p-4">

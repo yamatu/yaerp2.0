@@ -11,7 +11,7 @@ type User struct {
 	Status    int       `json:"status" db:"status"`
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
-	Roles     []Role    `json:"roles,omitempty"`
+	Roles     []Role    `json:"roles"`
 }
 
 type LoginRequest struct {
@@ -23,6 +23,13 @@ type RegisterRequest struct {
 	Username string `json:"username" binding:"required,min=3,max=64"`
 	Email    string `json:"email" binding:"required,email"`
 	Password string `json:"password" binding:"required,min=6"`
+}
+
+type CreateUserRequest struct {
+	Username string  `json:"username" binding:"required,min=3,max=64"`
+	Email    string  `json:"email" binding:"required,email"`
+	Password string  `json:"password" binding:"required,min=6"`
+	RoleIDs  []int64 `json:"role_ids"`
 }
 
 type TokenResponse struct {
@@ -44,4 +51,8 @@ type ChangePasswordRequest struct {
 
 type ResetPasswordRequest struct {
 	NewPassword string `json:"new_password" binding:"required,min=6"`
+}
+
+type UserAvatarRequest struct {
+	AttachmentID int64 `json:"attachment_id" binding:"required"`
 }

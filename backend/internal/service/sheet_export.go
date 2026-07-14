@@ -89,7 +89,7 @@ type exportSnapshotMatrix struct {
 }
 
 func (s *SheetService) BuildSheetExportFile(userID, sheetID int64, filename string) (*sheetExportFile, error) {
-	ctx, err := s.loadSheetExportContext(userID, sheetID)
+	ctx, err := s.loadSheetExportContext(userID, sheetID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -104,22 +104,8 @@ func (s *SheetService) BuildSheetExportFile(userID, sheetID int64, filename stri
 	defaultSheet := file.GetSheetName(0)
 	file.SetSheetName(defaultSheet, excelSheetName)
 
-	snapshot, snapshotMatrix, writtenFromSnapshot, err := s.writeSheetExportSnapshot(file, excelSheetName, ctx.Matrix, ctx.Styles, ctx.Sheet.Config, ctx.Columns)
-	if err != nil {
+	if err := s.writeSheetExportContext(file, excelSheetName, ctx); err != nil {
 		return nil, err
-	}
-	if !writtenFromSnapshot {
-		rows, err := s.sheetRepo.GetRows(sheetID)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.writeSheetExportRows(file, excelSheetName, ctx.Matrix, ctx.Columns, rows); err != nil {
-			return nil, err
-		}
-		applySheetExportHeaderStyle(file, excelSheetName, maxSheetExportColumnCount(ctx.Columns))
-		applySheetExportFreeze(file, excelSheetName, nil, nil)
-	} else {
-		applySheetExportFreeze(file, excelSheetName, snapshot, snapshotMatrix)
 	}
 	if err := file.UpdateLinkedValue(); err != nil {
 		return nil, fmt.Errorf("update formula links: %w", err)
@@ -137,6 +123,69 @@ func (s *SheetService) BuildSheetExportFile(userID, sheetID int64, filename stri
 	}, nil
 }
 
+func (s *SheetService) BuildWorkbookExportFile(userID, workbookID int64, sheetIDs []int64, filename string) (*sheetExportFile, error) {
+	workbook, contexts, err := s.loadWorkbookExportContexts(userID, workbookID, sheetIDs, true)
+	if err != nil {
+		return nil, err
+	}
+
+	file := excelize.NewFile()
+	defer func() { _ = file.Close() }()
+	if err := applySheetExportWorkbookProps(file); err != nil {
+		return nil, err
+	}
+
+	usedSheetNames := map[string]int{}
+	for index, ctx := range contexts {
+		excelSheetName := uniqueExcelSheetName(ctx.Sheet.Name, usedSheetNames)
+		if index == 0 {
+			defaultSheet := file.GetSheetName(0)
+			file.SetSheetName(defaultSheet, excelSheetName)
+		} else if _, err := file.NewSheet(excelSheetName); err != nil {
+			return nil, fmt.Errorf("create export sheet %s: %w", excelSheetName, err)
+		}
+
+		if err := s.writeSheetExportContext(file, excelSheetName, ctx); err != nil {
+			return nil, err
+		}
+	}
+	if err := file.UpdateLinkedValue(); err != nil {
+		return nil, fmt.Errorf("update formula links: %w", err)
+	}
+
+	buffer := bytes.NewBuffer(nil)
+	if _, err := file.WriteTo(buffer); err != nil {
+		return nil, fmt.Errorf("stream export workbook: %w", err)
+	}
+
+	return &sheetExportFile{
+		Filename:    normalizeWorkbookExportFilename(filename, workbook.Name, workbookID, ".xlsx"),
+		ContentType: sheetExportContentType,
+		Data:        buffer.Bytes(),
+	}, nil
+}
+
+func (s *SheetService) writeSheetExportContext(file *excelize.File, excelSheetName string, ctx *sheetExportContext) error {
+	snapshot, snapshotMatrix, writtenFromSnapshot, err := s.writeSheetExportSnapshot(file, excelSheetName, ctx.Matrix, ctx.Styles, ctx.Sheet.Config, ctx.Columns)
+	if err != nil {
+		return err
+	}
+	if !writtenFromSnapshot {
+		rows, err := s.sheetRepo.GetRows(ctx.Sheet.ID)
+		if err != nil {
+			return err
+		}
+		if err := s.writeSheetExportRows(file, excelSheetName, ctx.Matrix, ctx.Columns, rows); err != nil {
+			return err
+		}
+		applySheetExportHeaderStyle(file, excelSheetName, maxSheetExportColumnCount(ctx.Columns))
+		applySheetExportFreeze(file, excelSheetName, nil, nil)
+	} else {
+		applySheetExportFreeze(file, excelSheetName, snapshot, snapshotMatrix)
+	}
+	return nil
+}
+
 func applySheetExportWorkbookProps(file *excelize.File) error {
 	filterPrivacy := true
 	date1904 := false
@@ -151,13 +200,16 @@ func applySheetExportWorkbookProps(file *excelize.File) error {
 	return nil
 }
 
-func (s *SheetService) loadSheetExportContext(userID, sheetID int64) (*sheetExportContext, error) {
+func (s *SheetService) loadSheetExportContext(userID, sheetID int64, requireExport bool) (*sheetExportContext, error) {
 	matrix, err := s.permService.GetPermissionMatrix(sheetID, userID)
 	if err != nil {
 		return nil, err
 	}
-	if !matrix.Sheet.CanExport {
+	if requireExport && !matrix.Sheet.CanExport {
 		return nil, fmt.Errorf("%w: 当前账号没有导出这个工作表的权限", ErrSheetExportDenied)
+	}
+	if !requireExport && !matrix.Sheet.CanView {
+		return nil, fmt.Errorf("%w: 当前账号没有查看这个工作表的权限", ErrWorkbookAccessDenied)
 	}
 
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
@@ -190,6 +242,78 @@ func (s *SheetService) loadSheetExportContext(userID, sheetID int64) (*sheetExpo
 	}
 
 	return &sheetExportContext{Sheet: sheet, Workbook: workbook, Columns: columns, Matrix: matrix, Styles: styles}, nil
+}
+
+func (s *SheetService) loadWorkbookExportContexts(userID, workbookID int64, sheetIDs []int64, requireExport bool) (*model.Workbook, []*sheetExportContext, error) {
+	workbook, err := s.sheetRepo.GetWorkbook(workbookID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := applyWorkbookLifecycleState(workbook); err != nil {
+		return nil, nil, err
+	}
+	if err := s.ensureWorkbookVisible(workbook, userID); err != nil {
+		return nil, nil, err
+	}
+
+	sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbookID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := applySheetLifecycleStates(sheets); err != nil {
+		return nil, nil, err
+	}
+
+	requestedIDs := normalizeExportSheetIDs(sheetIDs)
+	requestedIDSet := make(map[int64]struct{}, len(requestedIDs))
+	for _, id := range requestedIDs {
+		requestedIDSet[id] = struct{}{}
+	}
+
+	contexts := make([]*sheetExportContext, 0, len(sheets))
+	foundIDs := make(map[int64]struct{}, len(requestedIDSet))
+	for _, sheet := range sheets {
+		if len(requestedIDSet) > 0 {
+			if _, ok := requestedIDSet[sheet.ID]; !ok {
+				continue
+			}
+		}
+
+		ctx, err := s.loadSheetExportContext(userID, sheet.ID, requireExport)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ctx.Sheet.WorkbookID != workbookID {
+			return nil, nil, fmt.Errorf("%w: 工作表不属于当前工作簿", ErrWorkbookAccessDenied)
+		}
+		contexts = append(contexts, ctx)
+		foundIDs[sheet.ID] = struct{}{}
+	}
+
+	if len(requestedIDSet) > 0 && len(foundIDs) != len(requestedIDSet) {
+		return nil, nil, fmt.Errorf("%w: 部分工作表不存在或不属于当前工作簿", ErrWorkbookAccessDenied)
+	}
+	if len(contexts) == 0 {
+		return nil, nil, fmt.Errorf("当前工作簿没有可导出的工作表")
+	}
+
+	return workbook, contexts, nil
+}
+
+func normalizeExportSheetIDs(sheetIDs []int64) []int64 {
+	seen := make(map[int64]struct{}, len(sheetIDs))
+	result := make([]int64, 0, len(sheetIDs))
+	for _, id := range sheetIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
 }
 
 func (s *SheetService) writeSheetExportSnapshot(file *excelize.File, sheetName string, permMatrix *model.PermissionMatrix, styles map[string]univerStyleData, config json.RawMessage, columns []sheetColumnPayload) (*univerExportWorksheet, *exportSnapshotMatrix, bool, error) {
@@ -614,6 +738,20 @@ func normalizeSheetPDFFilename(filename, sheetName string, sheetID int64) string
 	return normalizeSheetExportFilenameWithExt(filename, sheetName, sheetID, ".pdf")
 }
 
+func normalizeWorkbookExportFilename(filename, workbookName string, workbookID int64, ext string) string {
+	base := sanitizeDownloadFilename(strings.TrimSpace(filename))
+	if base == "" {
+		base = sanitizeDownloadFilename(strings.TrimSpace(workbookName))
+	}
+	if base == "" {
+		base = fmt.Sprintf("workbook-%d", workbookID)
+	}
+	if !strings.HasSuffix(strings.ToLower(base), strings.ToLower(ext)) {
+		base += ext
+	}
+	return base
+}
+
 func normalizeSheetExportFilenameWithExt(filename, sheetName string, sheetID int64, ext string) string {
 	base := sanitizeDownloadFilename(strings.TrimSpace(filename))
 	if base == "" {
@@ -626,6 +764,32 @@ func normalizeSheetExportFilenameWithExt(filename, sheetName string, sheetID int
 		base += ext
 	}
 	return base
+}
+
+func uniqueExcelSheetName(name string, used map[string]int) string {
+	base := normalizeExcelSheetName(name)
+	key := strings.ToLower(base)
+	if _, exists := used[key]; !exists {
+		used[key] = 1
+		return base
+	}
+
+	for index := used[key] + 1; ; index++ {
+		suffix := fmt.Sprintf(" (%d)", index)
+		candidateBase := truncateRunes(base, 31-len([]rune(suffix)))
+		candidateBase = strings.TrimSpace(candidateBase)
+		if candidateBase == "" {
+			candidateBase = "Sheet"
+		}
+		candidate := candidateBase + suffix
+		candidateKey := strings.ToLower(candidate)
+		if _, exists := used[candidateKey]; exists {
+			continue
+		}
+		used[key] = index
+		used[candidateKey] = 1
+		return candidate
+	}
 }
 
 func sanitizeDownloadFilename(name string) string {
@@ -666,14 +830,23 @@ func normalizeExcelSheetName(name string) string {
 		"]", ")",
 	)
 	cleaned = replacer.Replace(cleaned)
-	if len(cleaned) > 31 {
-		cleaned = cleaned[:31]
-	}
+	cleaned = truncateRunes(cleaned, 31)
 	cleaned = strings.TrimSpace(cleaned)
 	if cleaned == "" {
 		return "Sheet1"
 	}
 	return cleaned
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
 }
 
 func columnIndexLabel(index int) string {

@@ -21,6 +21,132 @@
   --radius: 0.5rem;
 }
 
+.ai-markdown {
+  line-height: 1.75;
+}
+
+.ai-markdown > :first-child {
+  margin-top: 0;
+}
+
+.ai-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.ai-markdown p,
+.ai-markdown ul,
+.ai-markdown ol,
+.ai-markdown blockquote,
+.ai-markdown pre,
+.ai-markdown-table-wrap,
+.ai-markdown .katex-display {
+  margin: 0.65rem 0;
+}
+
+.ai-markdown h1,
+.ai-markdown h2,
+.ai-markdown h3,
+.ai-markdown h4 {
+  margin: 0.9rem 0 0.45rem;
+  color: #0f172a;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.ai-markdown h1 {
+  font-size: 1.125rem;
+}
+
+.ai-markdown h2 {
+  font-size: 1rem;
+}
+
+.ai-markdown h3,
+.ai-markdown h4 {
+  font-size: 0.925rem;
+}
+
+.ai-markdown ul,
+.ai-markdown ol {
+  padding-left: 1.35rem;
+}
+
+.ai-markdown ul {
+  list-style: disc;
+}
+
+.ai-markdown ol {
+  list-style: decimal;
+}
+
+.ai-markdown li + li {
+  margin-top: 0.2rem;
+}
+
+.ai-markdown blockquote {
+  border-left: 3px solid #94a3b8;
+  padding-left: 0.8rem;
+  color: #475569;
+}
+
+.ai-markdown a {
+  color: #0369a1;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ai-markdown code {
+  border-radius: 0.25rem;
+  background: #e2e8f0;
+  padding: 0.1rem 0.3rem;
+  font-size: 0.82em;
+}
+
+.ai-markdown pre {
+  overflow-x: auto;
+  border-radius: 0.5rem;
+  background: #0f172a;
+  padding: 0.75rem;
+  color: #f8fafc;
+}
+
+.ai-markdown pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.ai-markdown-table-wrap,
+.ai-markdown .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.ai-markdown table {
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.ai-markdown th,
+.ai-markdown td {
+  border: 1px solid #cbd5e1;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.ai-markdown th {
+  background: #e2e8f0;
+  font-weight: 600;
+}
+
+.ai-markdown hr {
+  margin: 0.9rem 0;
+  border: 0;
+  border-top: 1px solid #cbd5e1;
+}
+
 /* Univer CSS — imported AFTER tailwind so Univer's own styles win */
 @import "@univerjs/preset-sheets-core/lib/index.css";
 
@@ -28,10 +154,78 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   margin: 0;
   padding: 0;
+  min-width: 320px;
+  overflow-x: clip;
 }
 
 html, body {
   height: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
+img,
+video {
+  max-width: 100%;
+}
+
+@media (max-width: 640px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .ui-tooltip {
+    position: relative;
+  }
+
+  .ui-tooltip::after {
+    position: absolute;
+    left: 50%;
+    top: calc(100% + 0.45rem);
+    z-index: 200;
+    max-width: 16rem;
+    transform: translate(-50%, -2px);
+    border-radius: 0.375rem;
+    background: #0f172a;
+    color: #fff;
+    content: attr(data-tooltip);
+    font-size: 0.75rem;
+    font-weight: 500;
+    line-height: 1rem;
+    opacity: 0;
+    padding: 0.375rem 0.625rem;
+    pointer-events: none;
+    transition: opacity 120ms ease, transform 120ms ease;
+    visibility: hidden;
+    white-space: nowrap;
+  }
+
+  .ui-tooltip:hover::after,
+  .ui-tooltip:focus-visible::after {
+    opacity: 1;
+    transform: translate(-50%, 0);
+    visibility: visible;
+  }
+
+  .ui-tooltip[data-tooltip-side='top']::after {
+    bottom: calc(100% + 0.45rem);
+    top: auto;
+  }
+
+  .ui-tooltip[data-tooltip-side='left']::after {
+    left: auto;
+    right: calc(100% + 0.45rem);
+    top: 50%;
+    transform: translate(2px, -50%);
+  }
+
+  .ui-tooltip[data-tooltip-side='left']:hover::after,
+  .ui-tooltip[data-tooltip-side='left']:focus-visible::after {
+    transform: translate(0, -50%);
+  }
 }
 
 /*
@@ -51,4 +245,39 @@ html, body {
 .univer-app-layout {
   width: 100% !important;
   height: 100% !important;
+}
+
+/*
+ * Univer's inline cell editor is an absolutely-positioned canvas overlay.
+ * Long values can make the overlay taller than the source cell, while the
+ * inner canvas stays pinned to the top. Keep the draft text visually centered
+ * and prevent scroll chaining from leaving a stale editor over the page.
+ */
+.univer-theme,
+.univer-workbench-container,
+.univer-workbench-container-canvas {
+  overscroll-behavior: contain;
+}
+
+.univer-editor-container {
+  box-sizing: border-box !important;
+  align-items: center !important;
+}
+
+.univer-editor-container .univer-editor-input,
+.univer-editor-container .univer-sheet-embedding-formula-editor-wrap,
+.univer-editor-container .univer-sheet-embedding-formula-editor-text {
+  height: 100% !important;
+  min-height: 100% !important;
+}
+
+.univer-editor-container .univer-sheet-embedding-formula-editor-wrap {
+  align-items: center !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+.univer-editor-container .univer-render-canvas {
+  top: 50% !important;
+  transform: translateY(-50%) !important;
 }

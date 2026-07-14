@@ -88,7 +88,7 @@ func (h *UploadHandler) ListImages(c *gin.Context) {
 		size = 20
 	}
 
-	list, total, err := h.uploadService.ListImages(page, size)
+	list, total, err := h.uploadService.ListImagesFiltered(c.GetInt64("user_id"), page, size, parseOptionalQueryInt64(c, "directory_id"), parseOptionalQueryInt64(c, "channel_id"))
 	if err != nil {
 		response.ServerError(c, err.Error())
 		return

@@ -25,26 +25,39 @@ func NewAuthService(userRepo *repo.UserRepo, jwt *jwtpkg.JWTUtil, rdb *redis.Cli
 }
 
 func (s *AuthService) Register(req *model.RegisterRequest) error {
-	existing, err := s.userRepo.GetByUsername(req.Username)
+	_, err := s.createUser(req.Username, req.Email, req.Password)
+	return err
+}
+
+func (s *AuthService) CreateUser(req *model.CreateUserRequest) (*model.User, error) {
+	return s.createUser(req.Username, req.Email, req.Password)
+}
+
+func (s *AuthService) createUser(username, email, password string) (*model.User, error) {
+	existing, err := s.userRepo.GetByUsername(username)
 	if err != nil {
-		return fmt.Errorf("failed to check user: %w", err)
+		return nil, fmt.Errorf("failed to check user: %w", err)
 	}
 	if existing != nil {
-		return errors.New("username already exists")
+		return nil, errors.New("username already exists")
 	}
 
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return fmt.Errorf("failed to hash password: %w", err)
+		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
 	user := &model.User{
-		Username: req.Username,
-		Email:    req.Email,
+		Username: username,
+		Email:    email,
 		Password: string(hashedPassword),
 	}
 
-	return s.userRepo.Create(user)
+	if err := s.userRepo.Create(user); err != nil {
+		return nil, err
+	}
+
+	return user, nil
 }
 
 func (s *AuthService) Login(req *model.LoginRequest) (*model.TokenResponse, error) {
@@ -54,6 +67,9 @@ func (s *AuthService) Login(req *model.LoginRequest) (*model.TokenResponse, erro
 	}
 	if user == nil {
 		return nil, errors.New("invalid username or password")
+	}
+	if user.Status != 1 {
+		return nil, errors.New("account is disabled")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {

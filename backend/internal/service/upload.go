@@ -12,6 +12,7 @@ import (
 	"io"
 	"mime/multipart"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"yaerp/internal/model"
@@ -22,15 +23,17 @@ import (
 type UploadService struct {
 	minioClient    *miniopkg.Client
 	attachmentRepo *repo.AttachmentRepo
+	channelRepo    *repo.ChannelRepo
 	fileURLSecret  string
 }
 
 var ErrInvalidFileSignature = errors.New("invalid file signature")
 
-func NewUploadService(minioClient *miniopkg.Client, attachmentRepo *repo.AttachmentRepo, fileURLSecret string) *UploadService {
+func NewUploadService(minioClient *miniopkg.Client, attachmentRepo *repo.AttachmentRepo, channelRepo *repo.ChannelRepo, fileURLSecret string) *UploadService {
 	return &UploadService{
 		minioClient:    minioClient,
 		attachmentRepo: attachmentRepo,
+		channelRepo:    channelRepo,
 		fileURLSecret:  fileURLSecret,
 	}
 }
@@ -101,8 +104,27 @@ type AttachmentWithURL struct {
 	URL string `json:"url"`
 }
 
-func (s *UploadService) ListImages(page, size int) ([]*AttachmentWithURL, int64, error) {
-	list, total, err := s.attachmentRepo.ListByMimePrefix("image/", page, size)
+func (s *UploadService) GetAttachment(id int64) (*model.Attachment, error) {
+	return s.attachmentRepo.GetByID(id)
+}
+
+func (s *UploadService) RenameAttachment(id int64, filename string) (*AttachmentWithURL, error) {
+	if err := s.attachmentRepo.UpdateFilename(id, filename); err != nil {
+		return nil, err
+	}
+	attachment, err := s.attachmentRepo.GetByID(id)
+	if err != nil {
+		return nil, err
+	}
+	return &AttachmentWithURL{Attachment: *attachment, URL: s.buildFileAccessURL(id)}, nil
+}
+
+func (s *UploadService) ListImages(userID int64, page, size int) ([]*AttachmentWithURL, int64, error) {
+	return s.ListImagesFiltered(userID, page, size, nil, nil)
+}
+
+func (s *UploadService) ListImagesFiltered(userID int64, page, size int, directoryID *int64, channelID *int64) ([]*AttachmentWithURL, int64, error) {
+	list, total, err := s.attachmentRepo.ListAccessibleByMimePrefixFiltered("image/", page, size, userID, directoryID, channelID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -112,6 +134,122 @@ func (s *UploadService) ListImages(page, size int) ([]*AttachmentWithURL, int64,
 		result = append(result, &AttachmentWithURL{Attachment: *a, URL: s.buildFileAccessURL(a.ID)})
 	}
 	return result, total, nil
+}
+
+func (s *UploadService) CreateGalleryDirectory(userID int64, name string, channelID *int64, visibility *string) (*model.GalleryDirectory, error) {
+	if s.channelRepo == nil {
+		return nil, fmt.Errorf("gallery directory service is unavailable")
+	}
+	directoryVisibility := "private"
+	if channelID != nil {
+		allowed, err := s.channelRepo.IsChannelMember(*channelID, userID)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			return nil, fmt.Errorf("channel access denied")
+		}
+		directoryVisibility = "channel"
+	}
+	if visibility != nil && strings.TrimSpace(*visibility) != "" {
+		directoryVisibility = strings.ToLower(strings.TrimSpace(*visibility))
+	}
+	if !isValidGalleryVisibility(directoryVisibility) {
+		return nil, fmt.Errorf("invalid gallery visibility")
+	}
+	directory := &model.GalleryDirectory{Name: strings.TrimSpace(name), OwnerID: userID, ChannelID: channelID, Visibility: directoryVisibility, CanManage: true, CanEdit: true}
+	if directory.Name == "" {
+		return nil, fmt.Errorf("directory name is required")
+	}
+	if err := s.channelRepo.CreateGalleryDirectory(directory); err != nil {
+		return nil, err
+	}
+	return directory, nil
+}
+
+func (s *UploadService) ListGalleryDirectories(userID int64, channelID *int64) ([]model.GalleryDirectory, error) {
+	if s.channelRepo == nil {
+		return nil, fmt.Errorf("gallery directory service is unavailable")
+	}
+	return s.channelRepo.ListGalleryDirectories(userID, channelID)
+}
+
+func (s *UploadService) SaveImageToGallery(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64) error {
+	if s.channelRepo == nil {
+		return nil
+	}
+	if channelID != nil {
+		allowed, err := s.channelRepo.IsChannelMember(*channelID, savedBy)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return fmt.Errorf("channel access denied")
+		}
+	}
+	if directoryID != nil {
+		directory, err := s.channelRepo.GetGalleryDirectory(*directoryID)
+		if err != nil {
+			return fmt.Errorf("gallery directory not found: %w", err)
+		}
+		canEdit, err := s.channelRepo.CanEditGalleryDirectory(*directoryID, savedBy)
+		if err != nil {
+			return err
+		}
+		if !canEdit {
+			return fmt.Errorf("gallery directory access denied")
+		}
+		if directory.ChannelID != nil && channelID != nil && *directory.ChannelID != *channelID {
+			return fmt.Errorf("gallery directory does not belong to selected channel")
+		}
+	}
+	return s.channelRepo.SaveGalleryImage(attachmentID, directoryID, channelID, savedBy)
+}
+
+func (s *UploadService) CanAccessGalleryImage(userID, attachmentID int64) (bool, error) {
+	if s.channelRepo == nil {
+		return false, nil
+	}
+	return s.channelRepo.CanAccessGalleryImage(attachmentID, userID)
+}
+
+func (s *UploadService) GetGalleryDirectoryAccess(userID, directoryID int64) (*model.GalleryDirectoryAccess, error) {
+	if s.channelRepo == nil {
+		return nil, fmt.Errorf("gallery directory service is unavailable")
+	}
+	allowed, err := s.channelRepo.CanManageGalleryDirectory(directoryID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("gallery directory manage denied")
+	}
+	return s.channelRepo.GetGalleryDirectoryAccess(directoryID)
+}
+
+func (s *UploadService) UpdateGalleryDirectoryAccess(userID, directoryID int64, req *model.GalleryDirectoryAccessRequest) (*model.GalleryDirectoryAccess, error) {
+	if s.channelRepo == nil {
+		return nil, fmt.Errorf("gallery directory service is unavailable")
+	}
+	visibility := strings.ToLower(strings.TrimSpace(req.Visibility))
+	if !isValidGalleryVisibility(visibility) {
+		return nil, fmt.Errorf("invalid gallery visibility")
+	}
+	allowed, err := s.channelRepo.CanManageGalleryDirectory(directoryID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("gallery directory manage denied")
+	}
+	if err := s.channelRepo.UpdateGalleryDirectoryAccess(directoryID, visibility, req.ViewUserIDs, req.EditUserIDs); err != nil {
+		return nil, err
+	}
+	return s.channelRepo.GetGalleryDirectoryAccess(directoryID)
+}
+
+func isValidGalleryVisibility(value string) bool {
+	return value == "private" || value == "channel" || value == "public"
 }
 
 func (s *UploadService) DeleteFile(id int64) error {
@@ -129,6 +267,10 @@ func (s *UploadService) OpenFile(attachmentID int64, signature string) (*model.A
 		return nil, nil, ErrInvalidFileSignature
 	}
 
+	return s.OpenStoredFile(attachmentID)
+}
+
+func (s *UploadService) OpenStoredFile(attachmentID int64) (*model.Attachment, io.ReadCloser, error) {
 	attachment, err := s.attachmentRepo.GetByID(attachmentID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("attachment not found: %w", err)

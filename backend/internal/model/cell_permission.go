@@ -31,6 +31,7 @@ type CellPermission struct {
 
 type PermissionMatrix struct {
 	Sheet   SheetPerm         `json:"sheet"`
+	Rows    map[string]string `json:"rows"`
 	Columns map[string]string `json:"columns"`
 	Cells   map[string]string `json:"cells"`
 }

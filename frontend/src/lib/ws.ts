@@ -1,5 +1,6 @@
 import type { WSMessage } from '@/types'
 import { getAccessToken } from './auth'
+import { getRealtimeClientId } from './realtimeClient'
 
 type MessageHandler = (msg: WSMessage) => void
 
@@ -40,7 +41,12 @@ class WSClient {
     if (!token) return
 
     const wsUrl = this.getWSUrl()
-    this.ws = new WebSocket(`${wsUrl}?token=${token}`)
+    const params = new URLSearchParams({ token })
+    const clientId = getRealtimeClientId()
+    if (clientId) {
+      params.set('client_id', clientId)
+    }
+    this.ws = new WebSocket(`${wsUrl}?${params.toString()}`)
 
     this.ws.onopen = () => {
       this.reconnectAttempts = 0
@@ -54,20 +60,21 @@ class WSClient {
     }
 
     this.ws.onmessage = (event) => {
-      try {
-        const msg: WSMessage = JSON.parse(event.data)
-        const typeHandlers = this.handlers.get(msg.type)
-        if (typeHandlers) {
-          typeHandlers.forEach((handler) => handler(msg))
+      String(event.data).split('\n').filter(Boolean).forEach((payload) => {
+        try {
+          const msg: WSMessage = JSON.parse(payload)
+          const typeHandlers = this.handlers.get(msg.type)
+          if (typeHandlers) {
+            typeHandlers.forEach((handler) => handler(msg))
+          }
+          const allHandlers = this.handlers.get('*')
+          if (allHandlers) {
+            allHandlers.forEach((handler) => handler(msg))
+          }
+        } catch (e) {
+          console.error('Failed to parse WS message:', e)
         }
-        // Also notify wildcard handlers
-        const allHandlers = this.handlers.get('*')
-        if (allHandlers) {
-          allHandlers.forEach((handler) => handler(msg))
-        }
-      } catch (e) {
-        console.error('Failed to parse WS message:', e)
-      }
+      })
     }
 
     this.ws.onclose = () => {
@@ -115,6 +122,20 @@ class WSClient {
     this.joinedSheetId = sheetId
     this.pendingMessages = this.pendingMessages.filter((message) => !message.includes('"type":"join_sheet"'))
     this.send({ type: 'join_sheet', sheetId })
+  }
+
+  leaveSheet(sheetId?: number) {
+    if (sheetId !== undefined && this.joinedSheetId !== sheetId) return
+    const currentSheetId = this.joinedSheetId
+    this.joinedSheetId = null
+    this.pendingMessages = this.pendingMessages.filter((message) => !message.includes('"type":"join_sheet"'))
+    if (currentSheetId !== null) {
+      this.send({ type: 'leave_sheet', sheetId: currentSheetId })
+    }
+  }
+
+  sendCellPresence(sheetId: number, state: 'viewing' | 'selected' | 'editing', row?: number, col?: string) {
+    this.send({ type: 'cell_presence', sheetId, state, row, col })
   }
 
   sendCellUpdate(sheetId: number, row: number, col: string, value: unknown) {

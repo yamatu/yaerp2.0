@@ -33,6 +33,7 @@ export interface Workbook {
   status: number
   is_locked?: boolean
   is_hidden?: boolean
+  is_public?: boolean
   locked_by_id?: number
   locked_by_name?: string
   locked_at?: string
@@ -54,21 +55,33 @@ export interface Sheet {
   config: SheetConfig
   is_locked?: boolean
   is_archived?: boolean
+  is_hidden?: boolean
   locked_by_id?: number
   locked_by_name?: string
   locked_at?: string
   archived_by_id?: number
   archived_by_name?: string
   archived_at?: string
+  hidden_by_id?: number
+  hidden_by_name?: string
+  hidden_at?: string
   created_at: string
   updated_at: string
 }
 
 export interface SheetConfig {
   zoom?: number
+  importSource?: {
+    filename?: string
+    imported_at?: string
+    attachment_id?: number | null
+    attachment_url?: string
+    mode?: string
+  }
   sheetState?: {
     locked?: { id: number; name: string; at: string }
     archived?: { id: number; name: string; at: string }
+    hidden?: { id: number; name: string; at: string }
   }
   lockedCells?: Record<string, boolean>
   protections?: {
@@ -85,6 +98,7 @@ export interface SheetConfig {
 export interface ProtectionOwner {
   ownerId: number
   ownerName: string
+  editableUserIds?: number[]
   protectedAt: string
 }
 
@@ -95,6 +109,7 @@ export interface ProtectionInfo {
   column_key?: string
   owner_id: number
   owner_name: string
+  editable_user_ids?: number[]
   protected_at: string
 }
 
@@ -192,6 +207,7 @@ export interface PermissionMatrix {
     canDelete: boolean
     canExport: boolean
   }
+  rows: Record<string, string>
   columns: Record<string, string>
   cells: Record<string, string>
 }
@@ -224,6 +240,19 @@ export interface WSMessage {
   changes?: CellUpdate[]
   afterRow?: number
   userId?: number
+  username?: string
+  clientId?: string
+  state?: 'viewing' | 'selected' | 'editing'
+  presence?: SheetPresenceEntry[]
+}
+
+export interface SheetPresenceEntry {
+  userId: number
+  username: string
+  clientId: string
+  state: 'viewing' | 'selected' | 'editing'
+  row?: number
+  col?: string
 }
 
 export interface Folder {
@@ -251,6 +280,131 @@ export interface FolderContents {
   workbooks: Workbook[]
 }
 
+export interface GalleryDirectory {
+  id: number
+  name: string
+  owner_id: number
+  owner_name?: string
+  channel_id?: number | null
+  visibility: 'private' | 'channel' | 'public'
+  can_manage: boolean
+  can_edit: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface GalleryDirectoryAccess {
+  directory_id: number
+  visibility: 'private' | 'channel' | 'public'
+  view_user_ids: number[]
+  edit_user_ids: number[]
+}
+
+export interface GalleryImage {
+  id: number
+  filename: string
+  mime_type: string
+  size: number
+  uploader_id: number
+  created_at: string
+  url: string
+}
+
+export interface Channel {
+  id: number
+  name: string
+  description?: string
+  owner_id: number
+  owner_name?: string
+  avatar_attachment_id?: number | null
+  avatar_url?: string
+  channel_type: 'group' | 'ai_private'
+  ai_assistant_id?: number | null
+  ai_assistant_name?: string
+  ai_assistant_count: number
+  member_count: number
+  is_pinned: boolean
+  pin_sort_order: number
+  unread_count: number
+  last_message_id?: number | null
+  last_message_sender_id?: number | null
+  last_message_at?: string | null
+  can_manage: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface ChannelMember {
+  channel_id: number
+  user_id: number
+  username: string
+  email: string
+  avatar?: string
+  role: 'owner' | 'member'
+  created_at: string
+}
+
+export interface ChannelAIMember {
+  channel_id: number
+  assistant_id: number
+  name: string
+  description: string
+  model: string
+  is_default: boolean
+  enabled: boolean
+  supports_vision: boolean
+  supports_files: boolean
+  created_at: string
+}
+
+export interface ChannelMessage {
+  id: number
+  channel_id: number
+  sender_id: number
+  sender_name?: string
+  sender_avatar?: string
+  sender_type: 'user' | 'ai'
+  assistant_id?: number | null
+  assistant_name?: string
+  content: string
+  attachment_id?: number | null
+  attachment_url?: string
+  attachment_filename?: string
+  attachment_mime_type?: string
+  attachment_size?: number
+  linked_workbook_id?: number | null
+  linked_workbook_name?: string
+  linked_sheet_id?: number | null
+  linked_sheet_name?: string
+  linked_summary_id?: number | null
+  linked_summary_title?: string
+  forwarded_from_message_id?: number | null
+  reply_to_message_id?: number | null
+  reply_sender_id?: number | null
+  reply_sender_name?: string
+  reply_content?: string
+  reply_attachment_filename?: string
+  reply_recalled_at?: string | null
+  recalled_at?: string | null
+  recalled_by?: number | null
+  created_at: string
+}
+
+export interface ChannelMessageSearchResult extends ChannelMessage {
+  channel_name: string
+}
+
+export interface ChannelAIAskResult {
+  user_message: ChannelMessage
+  assistant_message: ChannelMessage
+  assistant_id: number
+  assistant_name: string
+  touched_sheet_ids?: number[]
+  changed_sheet_ids?: number[]
+  resources_changed?: boolean
+  pending_operations?: AISpreadsheetOperation[]
+}
+
 export interface AIChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -265,9 +419,13 @@ export interface AIChatToolTrace {
 }
 
 export interface AIChatResponse {
+  assistant_id: number
+  assistant_name: string
   reply: string
   model: string
   touched_sheet_ids?: number[]
+  changed_sheet_ids?: number[]
+  resources_changed?: boolean
   pending_operations?: AISpreadsheetOperation[]
   tool_traces?: AIChatToolTrace[]
 }
@@ -276,6 +434,62 @@ export interface AIConfigStatus {
   configured: boolean
   endpoint: string
   model: string
+}
+
+export interface AIAssistant {
+  id: number
+  name: string
+  description: string
+  endpoint?: string
+  model: string
+  has_api_key: boolean
+  system_prompt?: string
+  enabled: boolean
+  is_default: boolean
+  supports_vision: boolean
+  supports_files: boolean
+  created_by?: number
+  created_at?: string
+  updated_at?: string
+}
+
+export interface AISummaryMetric {
+  label: string
+  value: string
+  hint?: string
+}
+
+export interface AISummarySection {
+  title: string
+  body: string
+  bullets?: string[]
+}
+
+export interface AISummarySource {
+  workbook_id: number
+  workbook_name: string
+  sheet_names: string[]
+}
+
+export interface AISummaryContent {
+  headline: string
+  overview: string
+  metrics: AISummaryMetric[]
+  sections: AISummarySection[]
+  sources: AISummarySource[]
+}
+
+export interface AISummaryPage {
+  id: number
+  title: string
+  owner_id: number
+  owner_name?: string
+  assistant_id?: number
+  assistant_name?: string
+  source_workbook_ids: number[]
+  content: AISummaryContent
+  created_at: string
+  updated_at: string
 }
 
 export interface AISpreadsheetOperation {

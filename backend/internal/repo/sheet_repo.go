@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"yaerp/internal/model"
@@ -126,6 +127,34 @@ func (r *SheetRepo) UpdateWorkbook(wb *model.Workbook) error {
 		return fmt.Errorf("workbook %d not found", wb.ID)
 	}
 	return nil
+}
+
+func (r *SheetRepo) ListWorkbooksInAssignmentGroup(sourceWorkbookID int64) ([]model.Workbook, error) {
+	rows, err := r.db.Query(
+		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+		 FROM workbooks w
+		 LEFT JOIN users u ON u.id = w.owner_id
+		 WHERE w.id = $1 OR w.metadata->>'source_workbook_id' = $2
+		 ORDER BY CASE WHEN w.id = $1 THEN 0 ELSE 1 END, w.id`,
+		sourceWorkbookID, strconv.FormatInt(sourceWorkbookID, 10),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list assignment workbooks: %w", err)
+	}
+	defer rows.Close()
+
+	workbooks := make([]model.Workbook, 0)
+	for rows.Next() {
+		var wb model.Workbook
+		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan assignment workbook: %w", err)
+		}
+		workbooks = append(workbooks, wb)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate assignment workbooks: %w", err)
+	}
+	return workbooks, nil
 }
 
 func (r *SheetRepo) DeleteWorkbook(id int64) error {

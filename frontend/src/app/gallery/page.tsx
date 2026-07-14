@@ -1,49 +1,76 @@
 'use client'
 
-import { useEffect, useState, useRef, useCallback } from 'react'
+import { useEffect, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react'
 import {
   ArrowLeft,
   Download,
+  FolderPlus,
+  Globe2,
   ImagePlus,
   Images,
+  LockKeyhole,
+  Pencil,
+  Search,
+  ShieldCheck,
   Trash2,
+  UsersRound,
   X,
   ZoomIn,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
-import type { AuthUser } from '@/types'
-
-interface ImageItem {
-  id: number
-  filename: string
-  mime_type: string
-  size: number
-  uploader_id: number
-  created_at: string
-  url: string
-}
+import type { AuthUser, GalleryDirectory, GalleryDirectoryAccess, GalleryImage, User } from '@/types'
 
 export default function GalleryPage() {
-  const [images, setImages] = useState<ImageItem[]>([])
+  const [images, setImages] = useState<GalleryImage[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
-  const [preview, setPreview] = useState<ImageItem | null>(null)
+  const [preview, setPreview] = useState<GalleryImage | null>(null)
   const [deleting, setDeleting] = useState<number | null>(null)
+  const [renaming, setRenaming] = useState<GalleryImage | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [savingRename, setSavingRename] = useState(false)
+  const [renameError, setRenameError] = useState('')
+  const [directories, setDirectories] = useState<GalleryDirectory[]>([])
+  const [selectedDirectoryId, setSelectedDirectoryId] = useState('')
+  const [newDirectoryName, setNewDirectoryName] = useState('')
+  const [creatingDirectory, setCreatingDirectory] = useState(false)
+  const [accessDirectory, setAccessDirectory] = useState<GalleryDirectory | null>(null)
+  const [directoryAccess, setDirectoryAccess] = useState<GalleryDirectoryAccess | null>(null)
+  const [accessUsers, setAccessUsers] = useState<User[]>([])
+  const [accessUserSearch, setAccessUserSearch] = useState('')
+  const [loadingAccess, setLoadingAccess] = useState(false)
+  const [savingAccess, setSavingAccess] = useState(false)
+  const [accessError, setAccessError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const admin = isAdmin(profile)
   const pageSize = 20
+  const selectedDirectory = directories.find((directory) => String(directory.id) === selectedDirectoryId) || null
+  const filteredAccessUsers = accessUsers.filter((user) => {
+    const keyword = accessUserSearch.trim().toLowerCase()
+    return !keyword || user.username.toLowerCase().includes(keyword) || user.email.toLowerCase().includes(keyword)
+  })
+
+  const fetchDirectories = useCallback(async () => {
+    try {
+      const res = await api.get<GalleryDirectory[]>('/gallery/directories')
+      setDirectories(res.code === 0 && res.data ? res.data : [])
+    } catch {
+      setDirectories([])
+    }
+  }, [])
 
   const fetchImages = useCallback(async (p: number) => {
     setLoading(true)
     try {
-      const res = await api.get<{ list: ImageItem[]; total: number; page: number; size: number }>(
-        `/attachments/images?page=${p}&size=${pageSize}`
+      const directoryParam = selectedDirectoryId ? `&directory_id=${selectedDirectoryId}` : ''
+      const res = await api.get<{ list: GalleryImage[]; total: number; page: number; size: number }>(
+        `/attachments/images?page=${p}&size=${pageSize}${directoryParam}`
       )
       if (res.code === 0 && res.data) {
         setImages(res.data.list || [])
@@ -54,11 +81,15 @@ export default function GalleryPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [selectedDirectoryId])
 
   useEffect(() => {
     fetchImages(page)
   }, [page, fetchImages])
+
+  useEffect(() => {
+    fetchDirectories()
+  }, [fetchDirectories])
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
@@ -66,7 +97,12 @@ export default function GalleryPage() {
     setUploading(true)
     try {
       for (let i = 0; i < files.length; i++) {
-        await api.upload(files[i])
+        const formData = new FormData()
+        formData.append('file', files[i])
+        if (selectedDirectoryId) {
+          formData.append('gallery_directory_id', selectedDirectoryId)
+        }
+        await api.download('/gallery/upload', { method: 'POST', body: formData })
       }
       await fetchImages(page)
     } catch (err) {
@@ -74,6 +110,22 @@ export default function GalleryPage() {
     } finally {
       setUploading(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  const handleCreateDirectory = async () => {
+    if (!newDirectoryName.trim() || creatingDirectory) return
+    setCreatingDirectory(true)
+    try {
+      const res = await api.post<GalleryDirectory>('/gallery/directories', { name: newDirectoryName.trim() })
+      if (res.code === 0 && res.data) {
+        setNewDirectoryName('')
+        setSelectedDirectoryId(String(res.data.id))
+        setPage(1)
+        await fetchDirectories()
+      }
+    } finally {
+      setCreatingDirectory(false)
     }
   }
 
@@ -90,6 +142,95 @@ export default function GalleryPage() {
     }
   }
 
+  const openDirectoryAccess = async (directory: GalleryDirectory) => {
+    setAccessDirectory(directory)
+    setDirectoryAccess(null)
+    setAccessUsers([])
+    setAccessUserSearch('')
+    setAccessError('')
+    setLoadingAccess(true)
+    try {
+      const [accessRes, usersRes] = await Promise.all([
+        api.get<GalleryDirectoryAccess>(`/gallery/directories/${directory.id}/access`),
+        api.get<User[]>('/users/shareable'),
+      ])
+      if (accessRes.code !== 0 || !accessRes.data) {
+        setAccessError(accessRes.message || '加载目录权限失败')
+        return
+      }
+      setDirectoryAccess(accessRes.data)
+      setAccessUsers(usersRes.code === 0 && usersRes.data ? usersRes.data : [])
+    } catch {
+      setAccessError('加载目录权限失败')
+    } finally {
+      setLoadingAccess(false)
+    }
+  }
+
+  const updateDirectoryUserAccess = (userId: number, level: 'none' | 'view' | 'edit') => {
+    setDirectoryAccess((current) => {
+      if (!current) return current
+      const viewIds = current.view_user_ids.filter((id) => id !== userId)
+      const editIds = current.edit_user_ids.filter((id) => id !== userId)
+      if (level === 'view') viewIds.push(userId)
+      if (level === 'edit') editIds.push(userId)
+      return { ...current, view_user_ids: viewIds, edit_user_ids: editIds }
+    })
+  }
+
+  const saveDirectoryAccess = async () => {
+    if (!accessDirectory || !directoryAccess || savingAccess) return
+    setSavingAccess(true)
+    setAccessError('')
+    try {
+      const res = await api.put<GalleryDirectoryAccess>(`/gallery/directories/${accessDirectory.id}/access`, {
+        visibility: directoryAccess.visibility,
+        view_user_ids: directoryAccess.view_user_ids,
+        edit_user_ids: directoryAccess.edit_user_ids,
+      })
+      if (res.code !== 0 || !res.data) {
+        setAccessError(res.message || '保存目录权限失败')
+        return
+      }
+      setDirectoryAccess(res.data)
+      await fetchDirectories()
+      setAccessDirectory(null)
+    } catch {
+      setAccessError('保存目录权限失败')
+    } finally {
+      setSavingAccess(false)
+    }
+  }
+
+  const openRename = (image: GalleryImage, event?: ReactMouseEvent) => {
+    event?.preventDefault()
+    event?.stopPropagation()
+    setRenaming(image)
+    setRenameValue(image.filename)
+    setRenameError('')
+  }
+
+  const handleRename = async () => {
+    if (!renaming || !renameValue.trim() || savingRename) return
+    setSavingRename(true)
+    setRenameError('')
+    try {
+      const res = await api.put<GalleryImage>(`/gallery/images/${renaming.id}/name`, { filename: renameValue.trim() })
+      if (res.code !== 0 || !res.data) {
+        setRenameError(res.message || '重命名失败')
+        return
+      }
+      const renamed = res.data
+      setImages((current) => current.map((image) => image.id === renamed.id ? renamed : image))
+      setPreview((current) => current?.id === renamed.id ? renamed : current)
+      setRenaming(null)
+    } catch {
+      setRenameError('重命名失败')
+    } finally {
+      setSavingRename(false)
+    }
+  }
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -103,7 +244,7 @@ export default function GalleryPage() {
       <div className="min-h-screen bg-[linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
         {/* Header */}
         <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
-          <div className="mb-8 flex items-center justify-between">
+          <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-4">
               <a
                 href="/"
@@ -145,6 +286,50 @@ export default function GalleryPage() {
             />
           </div>
 
+          <div className="mb-8 grid gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm md:grid-cols-[220px_minmax(0,1fr)_140px_auto]">
+            <select
+              value={selectedDirectoryId}
+              onChange={(event) => {
+                setSelectedDirectoryId(event.target.value)
+                setPage(1)
+              }}
+              className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300"
+            >
+              <option value="">全部图片</option>
+              {directories.map((directory) => (
+                <option key={directory.id} value={directory.id}>
+                  {directory.channel_id ? '频道 / ' : ''}{directory.name}
+                  {directory.visibility === 'private' ? ' / 私有' : directory.visibility === 'public' ? ' / 全员' : ' / 频道成员'}
+                </option>
+              ))}
+            </select>
+            <input
+              value={newDirectoryName}
+              onChange={(event) => setNewDirectoryName(event.target.value)}
+              placeholder="新建图库目录，例如：销售频道素材"
+              className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300"
+            />
+            <button
+              type="button"
+              onClick={() => void handleCreateDirectory()}
+              disabled={!newDirectoryName.trim() || creatingDirectory}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <FolderPlus className="h-4 w-4" />
+              新建目录
+            </button>
+            <button
+              type="button"
+              onClick={() => { if (selectedDirectory) void openDirectoryAccess(selectedDirectory) }}
+              disabled={!selectedDirectory?.can_manage}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              title={selectedDirectory?.can_manage ? '管理当前目录权限' : '选择你可以管理的目录'}
+            >
+              <ShieldCheck className="h-4 w-4" />
+              目录权限
+            </button>
+          </div>
+
           {/* Grid */}
           {loading && images.length === 0 ? (
             <div className="flex min-h-[400px] items-center justify-center">
@@ -175,19 +360,22 @@ export default function GalleryPage() {
                 {images.map((img) => (
                   <div
                     key={img.id}
-                    className="group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-white shadow-sm transition hover:shadow-md"
+                    className="group relative overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm transition hover:shadow-md"
                   >
-                    <div className="aspect-square overflow-hidden bg-slate-100">
+                    <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600" title="重命名图片">
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                    <button type="button" onClick={() => setPreview(img)} className="block aspect-square w-full overflow-hidden bg-slate-100 text-left" title="查看图片">
                       <img
                         src={img.url}
                         alt={img.filename}
                         className="h-full w-full object-cover transition group-hover:scale-105"
                         loading="lazy"
                       />
-                    </div>
+                    </button>
                     {/* Hover overlay */}
-                    <div className="absolute inset-0 flex items-end bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
-                      <div className="flex w-full items-center justify-between p-3">
+                    <div className="pointer-events-none absolute inset-0 flex items-end bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
+                      <div className="pointer-events-auto flex w-full items-center justify-between p-3">
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-xs font-medium text-white">
                             {img.filename}
@@ -261,6 +449,80 @@ export default function GalleryPage() {
           )}
         </div>
 
+        {accessDirectory && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/40 p-3 sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setAccessDirectory(null) }}>
+            <div className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
+                <div className="min-w-0">
+                  <div className="truncate text-base font-semibold text-slate-900">目录权限 · {accessDirectory.name}</div>
+                  <div className="mt-1 text-xs text-slate-400">管理员或目录所有者可以配置可见范围和编辑人员</div>
+                </div>
+                <button type="button" onClick={() => setAccessDirectory(null)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100" title="关闭"><X className="h-4 w-4" /></button>
+              </div>
+
+              <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
+                {loadingAccess ? (
+                  <div className="flex h-64 items-center justify-center text-sm text-slate-400">正在加载权限...</div>
+                ) : directoryAccess ? (
+                  <div className="space-y-5">
+                    <section>
+                      <div className="mb-2 text-sm font-semibold text-slate-800">默认可见范围</div>
+                      <div className={`grid gap-2 rounded-lg bg-slate-100 p-1 ${accessDirectory.channel_id ? 'grid-cols-3' : 'grid-cols-2'}`}>
+                        <button type="button" onClick={() => setDirectoryAccess((current) => current ? { ...current, visibility: 'private' } : current)} className={`flex min-h-10 items-center justify-center gap-2 rounded-lg px-2 text-sm font-medium transition ${directoryAccess.visibility === 'private' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}><LockKeyhole className="h-4 w-4" />仅指定人员</button>
+                        {accessDirectory.channel_id && <button type="button" onClick={() => setDirectoryAccess((current) => current ? { ...current, visibility: 'channel' } : current)} className={`flex min-h-10 items-center justify-center gap-2 rounded-lg px-2 text-sm font-medium transition ${directoryAccess.visibility === 'channel' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}><UsersRound className="h-4 w-4" />频道成员</button>}
+                        <button type="button" onClick={() => setDirectoryAccess((current) => current ? { ...current, visibility: 'public' } : current)} className={`flex min-h-10 items-center justify-center gap-2 rounded-lg px-2 text-sm font-medium transition ${directoryAccess.visibility === 'public' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}><Globe2 className="h-4 w-4" />全部员工</button>
+                      </div>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">指定人员权限优先；“可编辑”人员同时拥有查看、上传、保存和重命名权限。</p>
+                    </section>
+
+                    <section>
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <div className="text-sm font-semibold text-slate-800">指定员工权限</div>
+                        <span className="text-xs text-slate-400">{directoryAccess.view_user_ids.length + directoryAccess.edit_user_ids.length} 人已授权</span>
+                      </div>
+                      <label className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-sky-300 focus-within:bg-white">
+                        <Search className="h-4 w-4 shrink-0" />
+                        <input value={accessUserSearch} onChange={(event) => setAccessUserSearch(event.target.value)} placeholder="搜索员工姓名或邮箱" className="min-w-0 flex-1 bg-transparent outline-none" />
+                      </label>
+                      <div className="mt-3 max-h-72 overflow-y-auto rounded-lg border border-slate-200">
+                        {filteredAccessUsers.length === 0 ? (
+                          <div className="p-8 text-center text-sm text-slate-400">没有匹配的员工</div>
+                        ) : filteredAccessUsers.map((user) => {
+                          const level = directoryAccess.edit_user_ids.includes(user.id)
+                            ? 'edit'
+                            : directoryAccess.view_user_ids.includes(user.id) ? 'view' : 'none'
+                          return (
+                            <div key={user.id} className="flex items-center gap-3 border-b border-slate-100 px-3 py-2.5 last:border-b-0">
+                              <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-slate-100 text-xs font-semibold text-slate-600">{user.avatar ? <img src={user.avatar} alt="" className="h-full w-full object-cover" /> : user.username.slice(0, 2).toUpperCase()}</div>
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-sm font-medium text-slate-800">{user.username}</div>
+                                <div className="truncate text-xs text-slate-400">{user.email}</div>
+                              </div>
+                              <select value={level} onChange={(event) => updateDirectoryUserAccess(user.id, event.target.value as 'none' | 'view' | 'edit')} className="h-9 shrink-0 rounded-lg border border-slate-200 bg-white px-2 text-sm text-slate-600 outline-none focus:border-sky-300">
+                                <option value="none">不授权</option>
+                                <option value="view">可查看</option>
+                                <option value="edit">可编辑</option>
+                              </select>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </section>
+                  </div>
+                ) : (
+                  <div className="flex h-64 items-center justify-center text-sm text-rose-600">{accessError || '无法加载目录权限'}</div>
+                )}
+                {accessError && directoryAccess && <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{accessError}</div>}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-4 sm:px-5">
+                <button type="button" onClick={() => setAccessDirectory(null)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                <button type="button" onClick={() => void saveDirectoryAccess()} disabled={!directoryAccess || savingAccess} className="h-9 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50">{savingAccess ? '保存中...' : '保存权限'}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Preview Modal */}
         {preview && (
           <div
@@ -286,6 +548,32 @@ export default function GalleryPage() {
               <div className="mt-3 text-center">
                 <p className="text-sm font-medium text-white">{preview.filename}</p>
                 <p className="text-xs text-white/60">{formatSize(preview.size)}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {renaming && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setRenaming(null) }}>
+            <div className="w-full max-w-md rounded-lg bg-white shadow-2xl">
+              <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+                <div>
+                  <div className="text-base font-semibold text-slate-900">重命名图片</div>
+                  <div className="mt-1 text-xs text-slate-400">图库和频道消息中的文件名会同步更新</div>
+                </div>
+                <button type="button" onClick={() => setRenaming(null)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+              </div>
+              <div className="p-5">
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-slate-600">图片名称</span>
+                  <input autoFocus value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void handleRename() }} className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-300" />
+                </label>
+                <div className="mt-2 text-xs text-slate-400">不填写扩展名时会保留原图片扩展名。</div>
+                {renameError && <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{renameError}</div>}
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">
+                <button type="button" onClick={() => setRenaming(null)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                <button type="button" onClick={() => void handleRename()} disabled={savingRename || !renameValue.trim()} className="h-9 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">{savingRename ? '保存中...' : '保存名称'}</button>
               </div>
             </div>
           </div>

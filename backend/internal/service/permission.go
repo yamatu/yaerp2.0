@@ -60,6 +60,27 @@ func (s *PermissionService) SetCellPermission(req *model.SetCellPermissionReques
 	return s.permRepo.SetCellPermission(perm)
 }
 
+func (s *PermissionService) ValidateEditableUsers(userIDs []int64) error {
+	seen := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			return fmt.Errorf("invalid editable user id %d", userID)
+		}
+		if _, exists := seen[userID]; exists {
+			continue
+		}
+		seen[userID] = struct{}{}
+		user, err := s.userRepo.GetByID(userID)
+		if err != nil {
+			return fmt.Errorf("load editable user %d: %w", userID, err)
+		}
+		if user == nil || user.Status != 1 {
+			return fmt.Errorf("editable user %d does not exist or is disabled", userID)
+		}
+	}
+	return nil
+}
+
 func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*model.PermissionMatrix, error) {
 	roles, roleIDs, err := s.getUserRoles(userID)
 	if err != nil {
@@ -102,6 +123,11 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 	if err != nil {
 		return nil, err
 	}
+	if workbook.IsPublic {
+		matrix.Sheet.CanView = true
+		matrix.Sheet.CanEdit = true
+		matrix.Sheet.CanExport = true
+	}
 
 	userPerm, err := s.permRepo.GetUserSheetPermission(sheetID, userID)
 	if err != nil {
@@ -113,7 +139,7 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 		if err != nil {
 			return nil, fmt.Errorf("failed to check folder access: %w", err)
 		}
-		if !access.CanView && !hasAnyDirectUserSheetPermission(userPerm) {
+		if !workbook.IsPublic && !access.CanView && !hasAnyDirectUserSheetPermission(userPerm) {
 			return emptyPermissionMatrix(), nil
 		}
 		if access.CanView {
@@ -182,6 +208,9 @@ func (s *PermissionService) CanViewWorkbook(workbook *model.Workbook, userID int
 	}
 	if workbook.IsHidden {
 		return false, nil
+	}
+	if workbook.IsPublic {
+		return true, nil
 	}
 
 	canManage, err := s.CanManageWorkbook(workbook, userID)
@@ -282,6 +311,11 @@ func (s *PermissionService) CheckCellPermission(sheetID int64, userID int64, col
 	cellKey := fmt.Sprintf("%d:%s", row, col)
 	if cellPerm, ok := matrix.Cells[cellKey]; ok {
 		return permissionSatisfies(cellPerm, requiredPerm), nil
+	}
+
+	rowKey := fmt.Sprintf("%d", row)
+	if rowPerm, ok := matrix.Rows[rowKey]; ok {
+		return permissionSatisfies(rowPerm, requiredPerm), nil
 	}
 
 	if colPerm, ok := matrix.Columns[col]; ok {
@@ -389,6 +423,7 @@ func permissionSatisfies(has, needs string) bool {
 func emptyPermissionMatrix() *model.PermissionMatrix {
 	return &model.PermissionMatrix{
 		Sheet:   model.SheetPerm{},
+		Rows:    make(map[string]string),
 		Columns: make(map[string]string),
 		Cells:   make(map[string]string),
 	}
@@ -406,6 +441,13 @@ func applySheetStateToPermissionMatrix(sheet *model.Sheet, matrix *model.Permiss
 	if sheet == nil || matrix == nil {
 		return
 	}
+	if sheet.IsHidden {
+		matrix.Sheet.CanView = false
+		matrix.Sheet.CanEdit = false
+		matrix.Sheet.CanDelete = false
+		matrix.Sheet.CanExport = false
+		return
+	}
 	if sheet.IsLocked || sheet.IsArchived {
 		matrix.Sheet.CanEdit = false
 		matrix.Sheet.CanDelete = false
@@ -417,6 +459,7 @@ func fullAccessMatrix() *model.PermissionMatrix {
 		Sheet: model.SheetPerm{
 			CanView: true, CanEdit: true, CanDelete: true, CanExport: true,
 		},
+		Rows:    make(map[string]string),
 		Columns: make(map[string]string),
 		Cells:   make(map[string]string),
 	}

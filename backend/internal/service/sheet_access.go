@@ -73,7 +73,7 @@ func (c *sheetCellAccessCache) checkProtection(columnKey string, worksheetRowInd
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID {
+		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, dataRowIndex, columnKey)
@@ -95,6 +95,11 @@ func permissionMatrixAllowsCell(matrix *model.PermissionMatrix, columnKey string
 	cellKey := fmt.Sprintf("%d:%s", rowIndex, columnKey)
 	if cellPerm, ok := matrix.Cells[cellKey]; ok {
 		return permissionSatisfies(cellPerm, requiredPerm)
+	}
+
+	rowKey := fmt.Sprintf("%d", rowIndex)
+	if rowPerm, ok := matrix.Rows[rowKey]; ok {
+		return permissionSatisfies(rowPerm, requiredPerm)
 	}
 
 	if colPerm, ok := matrix.Columns[columnKey]; ok {

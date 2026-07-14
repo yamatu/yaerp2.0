@@ -17,11 +17,13 @@ type sheetStateUser struct {
 type sheetLifecycleState struct {
 	Locked   *sheetStateUser `json:"locked,omitempty"`
 	Archived *sheetStateUser `json:"archived,omitempty"`
+	Hidden   *sheetStateUser `json:"hidden,omitempty"`
 }
 
 type workbookLifecycleState struct {
 	Locked *sheetStateUser `json:"locked,omitempty"`
 	Hidden *sheetStateUser `json:"hidden,omitempty"`
+	Public *sheetStateUser `json:"public,omitempty"`
 }
 
 func parseSheetLifecycleState(config json.RawMessage) (map[string]interface{}, sheetLifecycleState, error) {
@@ -51,12 +53,16 @@ func applySheetLifecycleState(sheet *model.Sheet) error {
 
 	sheet.IsLocked = state.Locked != nil
 	sheet.IsArchived = state.Archived != nil
+	sheet.IsHidden = state.Hidden != nil
 	sheet.LockedByID = nil
 	sheet.LockedByName = nil
 	sheet.LockedAt = nil
 	sheet.ArchivedByID = nil
 	sheet.ArchivedByName = nil
 	sheet.ArchivedAt = nil
+	sheet.HiddenByID = nil
+	sheet.HiddenByName = nil
+	sheet.HiddenAt = nil
 
 	if state.Locked != nil {
 		sheet.LockedByID = &state.Locked.ID
@@ -71,6 +77,14 @@ func applySheetLifecycleState(sheet *model.Sheet) error {
 		sheet.ArchivedByName = &state.Archived.Name
 		if parsed, err := time.Parse(time.RFC3339, state.Archived.At); err == nil {
 			sheet.ArchivedAt = &parsed
+		}
+	}
+
+	if state.Hidden != nil {
+		sheet.HiddenByID = &state.Hidden.ID
+		sheet.HiddenByName = &state.Hidden.Name
+		if parsed, err := time.Parse(time.RFC3339, state.Hidden.At); err == nil {
+			sheet.HiddenAt = &parsed
 		}
 	}
 
@@ -113,6 +127,7 @@ func applyWorkbookLifecycleState(workbook *model.Workbook) error {
 
 	workbook.IsLocked = state.Locked != nil
 	workbook.IsHidden = state.Hidden != nil
+	workbook.IsPublic = state.Public != nil
 	workbook.LockedByID = nil
 	workbook.LockedByName = nil
 	workbook.LockedAt = nil
@@ -201,6 +216,9 @@ func (s *SheetService) ensureSheetModificationAllowed(sheet *model.Sheet, userID
 	}
 	if isAdmin {
 		return nil
+	}
+	if sheet.IsHidden {
+		return fmt.Errorf("%w: 当前工作表已隐藏，仅管理员可以修改", ErrSheetStateDenied)
 	}
 	if sheet.IsArchived {
 		return fmt.Errorf("%w: 当前工作表已归档，仅管理员可以修改", ErrSheetArchived)

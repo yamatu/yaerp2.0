@@ -1,7 +1,6 @@
 'use client'
 
 import {
-  ArrowLeft,
   BadgeCheck,
   Mail,
   PencilLine,
@@ -12,7 +11,7 @@ import {
   UserRoundPlus,
 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-import { AuthGuard } from '@/components/auth/AuthGuard'
+import { AdminShell } from '@/components/admin/AdminShell'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
 import type { AuthUser, PageData, Role } from '@/types'
@@ -77,7 +76,7 @@ export default function UsersManagementPage() {
   const handleEdit = (user: AuthUser) => {
     setEditingUser(user)
     setEditForm({ email: user.email || '', isActive: user.status === 1 })
-    setSelectedRoles(user.roles.map((role) => role.id))
+    setSelectedRoles((user.roles || []).map((role) => role.id))
     setResetPassword('')
   }
 
@@ -113,23 +112,16 @@ export default function UsersManagementPage() {
     setSubmitting(true)
     setError('')
     try {
-      const registerRes = await api.post('/auth/register', {
+      const createRes = await api.post<AuthUser>('/users', {
         username: createForm.username.trim(),
         email: createForm.email.trim(),
         password: createForm.password,
+        role_ids: createForm.roleIds,
       })
 
-      if (registerRes.code !== 0) {
-        setError(registerRes.message || '创建员工账号失败')
+      if (createRes.code !== 0) {
+        setError(createRes.message || '创建员工账号失败')
         return
-      }
-
-      const usersRes = await api.get<PageData<AuthUser>>('/users?page=1&size=100')
-      const createdUsers = usersRes.code === 0 && usersRes.data ? usersRes.data.list : []
-      const createdUser = createdUsers.find((user) => user.username === createForm.username.trim())
-
-      if (createdUser && createForm.roleIds.length > 0) {
-        await api.post(`/users/${createdUser.id}/roles`, { roles: createForm.roleIds })
       }
 
       setCreateForm({ username: '', email: '', password: '', roleIds: [] })
@@ -203,60 +195,37 @@ export default function UsersManagementPage() {
   }
 
   return (
-    <AuthGuard requireRole="admin">
-      <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(56,189,248,0.16),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(251,191,36,0.18),_transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
-        <div className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-4 p-3 md:p-6">
-          <header className="overflow-hidden rounded-[32px] border border-white/70 bg-white/80 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.7)] backdrop-blur">
-            <div className="flex flex-col gap-6 px-4 py-5 md:px-6 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-4">
-                <a
-                  href="/"
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-900"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  返回工作台
-                </a>
-                <div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-sky-100 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700">
-                    <ShieldCheck className="h-3.5 w-3.5" />
-                    Admin Users
-                  </div>
-                  <h1 className="mt-4 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
-                    员工账号管理
-                  </h1>
-                  <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">
-                    管理员可以在这里统一创建员工账号、停用账号、分配角色，并为后续权限矩阵配置做好基础准备。
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid gap-3 sm:grid-cols-3 lg:min-w-[460px]">
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+    <AdminShell
+      title="员工账号管理"
+      description="创建员工账号、维护状态、分配角色和重置密码"
+      summary={(
+        <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-900 text-white">
                     <UserRound className="h-4 w-4" />
                   </div>
                   <div className="text-sm text-slate-500">员工总数</div>
                   <div className="mt-1 text-2xl font-semibold text-slate-950">{users.length}</div>
                 </div>
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700">
                     <BadgeCheck className="h-4 w-4" />
                   </div>
                   <div className="text-sm text-slate-500">启用账号</div>
                   <div className="mt-1 text-2xl font-semibold text-slate-950">{activeUsers}</div>
                 </div>
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700">
                     <ShieldCheck className="h-4 w-4" />
                   </div>
                   <div className="text-sm text-slate-500">可分配角色</div>
                   <div className="mt-1 text-2xl font-semibold text-slate-950">{roles.length}</div>
                 </div>
-              </div>
-            </div>
-          </header>
+        </div>
+      )}
+    >
 
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
@@ -347,7 +316,7 @@ export default function UsersManagementPage() {
             )}
           </section>
 
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
@@ -413,8 +382,8 @@ export default function UsersManagementPage() {
                           </td>
                           <td className="px-4 py-4">
                             <div className="flex flex-wrap gap-2">
-                              {user.roles.length > 0 ? (
-                                user.roles.map((role) => (
+                              {(user.roles || []).length > 0 ? (
+                                (user.roles || []).map((role) => (
                                   <span
                                     key={role.id}
                                     className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-600"
@@ -566,8 +535,6 @@ export default function UsersManagementPage() {
               </div>
             </div>
           )}
-        </div>
-      </div>
-    </AuthGuard>
+    </AdminShell>
   )
 }

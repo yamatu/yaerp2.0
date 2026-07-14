@@ -4,7 +4,7 @@ import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Download, Upload } from 'lucide-react'
 import api from '@/lib/api'
-import type { ApiResponse, Sheet } from '@/types'
+import type { ApiResponse, Sheet, Workbook } from '@/types'
 
 export interface ImportResponse {
   sheet: Sheet
@@ -14,8 +14,19 @@ export interface ImportResponse {
   attachment_url?: string
 }
 
+export interface WorkbookImportResponse {
+  workbook: Workbook
+  first_sheet_id: number
+  imported_rows: number
+  imported_sheets: number
+  attachment_id?: number
+  attachment_url?: string
+}
+
 interface UploadWorkbookXlsxOptions {
   onProgress?: (progress: number) => void
+  folderId?: number | null
+  workbookName?: string
 }
 
 interface Props {
@@ -99,6 +110,58 @@ export async function uploadWorkbookXlsx(
   return payload.data
 }
 
+export async function uploadNewWorkbookXlsx(
+  file: File,
+  options: UploadWorkbookXlsxOptions = {}
+) {
+  if (!file.name.toLowerCase().endsWith('.xlsx')) {
+    throw new Error('Only .xlsx files are supported.')
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    throw new Error('File size must be 20MB or smaller.')
+  }
+
+  const token = typeof window === 'undefined' ? null : localStorage.getItem('access_token')
+  const formData = new FormData()
+  formData.append('file', file)
+  if (options.folderId !== undefined && options.folderId !== null) {
+    formData.append('folder_id', String(options.folderId))
+  }
+  if (options.workbookName?.trim()) {
+    formData.append('workbook_name', options.workbookName.trim())
+  }
+  options.onProgress?.(0)
+
+  const responseText = await new Promise<string>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/workbooks/import/xlsx')
+    if (token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    }
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return
+      options.onProgress?.(Math.round((event.loaded / event.total) * 100))
+    }
+
+    xhr.onload = () => resolve(xhr.responseText)
+    xhr.onerror = () => reject(new Error('Upload failed. Check your network connection and try again.'))
+    xhr.onabort = () => reject(new Error('Upload was cancelled.'))
+    xhr.send(formData)
+  })
+
+  const payload = JSON.parse(responseText) as ApiResponse<WorkbookImportResponse> & { data?: WorkbookImportResponse & { row?: number } }
+  if (payload.code !== 0 || !payload.data?.workbook?.id) {
+    const rowMessage = payload.data && 'row' in payload.data && payload.data.row
+      ? ` (error row: ${payload.data.row})`
+      : ''
+    throw new Error(`${payload.message || 'Import failed. Please try again later.'}${rowMessage}`)
+  }
+
+  options.onProgress?.(100)
+  return payload.data
+}
+
 export default function ImportXlsxButton({ workbookId, canImport, onImported, onError }: Props) {
   const router = useRouter()
   const inputRef = useRef<HTMLInputElement | null>(null)
@@ -167,36 +230,44 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
 
   return (
     <>
-      <button
-        type="button"
-        onClick={handleTemplateDownload}
-        disabled={downloadingTemplate || uploading}
-        className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-        title="Download Import Template"
-      >
-        <Download className="h-4 w-4" />
-      </button>
-      <button
-        type="button"
-        onClick={() => inputRef.current?.click()}
-        disabled={!canImport || uploading || downloadingTemplate}
-        className="relative flex h-10 w-10 items-center justify-center rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 shadow-lg transition hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
-        title="Import XLSX"
-      >
-        <Upload className="h-4 w-4" />
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-          className="hidden"
-          onChange={(event) => {
-            const file = event.target.files?.[0]
-            if (file) {
-              void handleFileUpload(file)
-            }
-          }}
-        />
-      </button>
+      <div className="group relative">
+        <span className="pointer-events-none absolute right-12 top-1/2 z-10 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100">下载 Excel 导入模板</span>
+        <button
+          type="button"
+          onClick={handleTemplateDownload}
+          disabled={downloadingTemplate || uploading}
+          className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+          title="下载 Excel 导入模板"
+          aria-label="下载 Excel 导入模板"
+        >
+          <Download className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="group relative">
+        <span className="pointer-events-none absolute right-12 top-1/2 z-10 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100">导入 Excel 工作表</span>
+        <button
+          type="button"
+          onClick={() => inputRef.current?.click()}
+          disabled={!canImport || uploading || downloadingTemplate}
+          className="relative flex h-10 w-10 items-center justify-center rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 shadow-lg transition hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
+          title="导入 Excel 工作表"
+          aria-label="导入 Excel 工作表"
+        >
+          <Upload className="h-4 w-4" />
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) {
+                void handleFileUpload(file)
+              }
+            }}
+          />
+        </button>
+      </div>
       {uploading && (
         <div className="w-40 rounded-2xl border border-slate-200 bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
           <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600">

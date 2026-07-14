@@ -59,6 +59,7 @@ func (r *UserRepo) Create(user *model.User) error {
 	}
 	user.CreatedAt = now
 	user.UpdatedAt = now
+	user.Status = 1
 	return nil
 }
 
@@ -188,7 +189,7 @@ func (r *UserRepo) GetUserRoles(userID int64) ([]model.Role, error) {
 	}
 	defer rows.Close()
 
-	var roles []model.Role
+	roles := make([]model.Role, 0)
 	for rows.Next() {
 		var role model.Role
 		if err := rows.Scan(&role.ID, &role.Name, &role.Code, &role.Description, &role.CreatedAt); err != nil {

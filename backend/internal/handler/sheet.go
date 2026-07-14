@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -16,12 +19,159 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type SheetHandler struct {
-	sheetService *service.SheetService
+type sheetBroadcaster interface {
+	BroadcastToSheetExceptClientID(sheetID int64, data []byte, excludeClientID string)
 }
 
-func NewSheetHandler(sheetService *service.SheetService) *SheetHandler {
-	return &SheetHandler{sheetService: sheetService}
+type SheetHandler struct {
+	sheetService *service.SheetService
+	broadcaster  sheetBroadcaster
+}
+
+func NewSheetHandler(sheetService *service.SheetService, broadcaster ...sheetBroadcaster) *SheetHandler {
+	var b sheetBroadcaster
+	if len(broadcaster) > 0 {
+		b = broadcaster[0]
+	}
+	return &SheetHandler{sheetService: sheetService, broadcaster: b}
+}
+
+func (h *SheetHandler) broadcastSheetReload(c *gin.Context, sheetIDs ...int64) {
+	if h.broadcaster == nil {
+		return
+	}
+
+	excludeClientID := c.GetHeader("X-Client-Id")
+	if excludeClientID == "" {
+		return
+	}
+	userID := c.GetInt64("user_id")
+	seen := make(map[int64]struct{}, len(sheetIDs))
+	for _, sheetID := range sheetIDs {
+		if sheetID <= 0 {
+			continue
+		}
+		if _, ok := seen[sheetID]; ok {
+			continue
+		}
+		seen[sheetID] = struct{}{}
+
+		payload, err := json.Marshal(gin.H{
+			"type":    "sheet_reload",
+			"sheetId": sheetID,
+			"userId":  userID,
+		})
+		if err != nil {
+			log.Printf("failed to marshal sheet reload payload for sheet %d: %v", sheetID, err)
+			continue
+		}
+		h.broadcaster.BroadcastToSheetExceptClientID(sheetID, payload, excludeClientID)
+	}
+}
+
+func (h *SheetHandler) broadcastProtectionUpdated(c *gin.Context, sheetIDs ...int64) {
+	if h.broadcaster == nil {
+		return
+	}
+	excludeClientID := c.GetHeader("X-Client-Id")
+	userID := c.GetInt64("user_id")
+	seen := make(map[int64]struct{}, len(sheetIDs))
+	for _, sheetID := range sheetIDs {
+		if sheetID <= 0 {
+			continue
+		}
+		if _, exists := seen[sheetID]; exists {
+			continue
+		}
+		seen[sheetID] = struct{}{}
+		payload, err := json.Marshal(gin.H{
+			"type":    "protection_updated",
+			"sheetId": sheetID,
+			"userId":  userID,
+		})
+		if err != nil {
+			continue
+		}
+		h.broadcaster.BroadcastToSheetExceptClientID(sheetID, payload, excludeClientID)
+	}
+}
+
+func (h *SheetHandler) broadcastSheetCellChanges(c *gin.Context, sheetIDs []int64, changes []model.CellUpdate) {
+	if h.broadcaster == nil || len(changes) == 0 {
+		return
+	}
+
+	excludeClientID := c.GetHeader("X-Client-Id")
+	if excludeClientID == "" {
+		return
+	}
+	userID := c.GetInt64("user_id")
+	seen := make(map[int64]struct{}, len(sheetIDs))
+	for _, sheetID := range sheetIDs {
+		if sheetID <= 0 {
+			continue
+		}
+		if _, ok := seen[sheetID]; ok {
+			continue
+		}
+		seen[sheetID] = struct{}{}
+
+		targetChanges := make([]model.CellUpdate, 0, len(changes))
+		for _, change := range changes {
+			if change.Row < 0 || strings.TrimSpace(change.Col) == "" {
+				continue
+			}
+			targetChange := change
+			targetChange.SheetID = sheetID
+			targetChanges = append(targetChanges, targetChange)
+		}
+		if len(targetChanges) == 0 {
+			continue
+		}
+
+		payload, err := json.Marshal(gin.H{
+			"type":    "batch_update",
+			"sheetId": sheetID,
+			"userId":  userID,
+			"changes": targetChanges,
+		})
+		if err != nil {
+			log.Printf("failed to marshal sheet cell changes payload for sheet %d: %v", sheetID, err)
+			continue
+		}
+		h.broadcaster.BroadcastToSheetExceptClientID(sheetID, payload, excludeClientID)
+	}
+}
+
+func sheetChanged(existing, next *model.Sheet) bool {
+	return existing.Name != next.Name ||
+		existing.SortOrder != next.SortOrder ||
+		!jsonRawEqual(existing.Columns, next.Columns) ||
+		!jsonRawEqual(existing.Frozen, next.Frozen) ||
+		!jsonRawEqual(existing.Config, next.Config)
+}
+
+func sheetStructureChanged(existing, next *model.Sheet) bool {
+	return existing.Name != next.Name ||
+		existing.SortOrder != next.SortOrder ||
+		!jsonRawEqual(existing.Columns, next.Columns) ||
+		!jsonRawEqual(existing.Frozen, next.Frozen)
+}
+
+func jsonRawEqual(left, right json.RawMessage) bool {
+	if bytes.Equal(left, right) {
+		return true
+	}
+
+	var leftValue any
+	var rightValue any
+	if err := json.Unmarshal(left, &leftValue); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(right, &rightValue); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 func (h *SheetHandler) ListWorkbooks(c *gin.Context) {
@@ -223,6 +373,22 @@ func (h *SheetHandler) CreateSheet(c *gin.Context) {
 	response.OK(c, sheet)
 }
 
+func (h *SheetHandler) GetSheet(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	sheet, err := h.sheetService.GetSheet(id)
+	if err != nil {
+		response.NotFound(c, err.Error())
+		return
+	}
+
+	response.OK(c, sheet)
+}
+
 func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -267,6 +433,10 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	if req.Config != nil {
 		sheet.Config = *req.Config
 	}
+	if !sheetChanged(existing, sheet) {
+		response.OKMsg(c, "sheet updated")
+		return
+	}
 	if err := h.sheetService.UpdateSheetForUser(userID, existing, sheet); err != nil {
 		if errors.Is(err, service.ErrProtectionDenied) {
 			response.Forbidden(c, err.Error())
@@ -282,6 +452,18 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		}
 		response.ServerError(c, err.Error())
 		return
+	}
+	affectedSheetIDs := []int64{id}
+	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(id)
+	if syncErr != nil {
+		log.Printf("failed to sync assigned sheet group for sheet %d: %v", id, syncErr)
+	} else {
+		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
+	}
+	if len(req.CellChanges) > 0 {
+		h.broadcastSheetCellChanges(c, affectedSheetIDs, req.CellChanges)
+	} else if sheetStructureChanged(existing, sheet) {
+		h.broadcastSheetReload(c, affectedSheetIDs...)
 	}
 	response.OKMsg(c, "sheet updated")
 }
@@ -361,6 +543,14 @@ func (h *SheetHandler) UpdateProtection(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
+	affectedSheetIDs := []int64{id}
+	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(id)
+	if syncErr != nil {
+		log.Printf("failed to sync assigned protections for sheet %d: %v", id, syncErr)
+	} else {
+		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
+	}
+	h.broadcastProtectionUpdated(c, affectedSheetIDs...)
 
 	response.OK(c, gin.H{
 		"sheet":       updatedSheet,
@@ -392,6 +582,14 @@ func (h *SheetHandler) UpdateProtectionBatch(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
+	affectedSheetIDs := []int64{id}
+	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(id)
+	if syncErr != nil {
+		log.Printf("failed to sync assigned protection batch for sheet %d: %v", id, syncErr)
+	} else {
+		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
+	}
+	h.broadcastProtectionUpdated(c, affectedSheetIDs...)
 
 	response.OK(c, gin.H{
 		"sheet":       updatedSheet,
@@ -423,6 +621,7 @@ func (h *SheetHandler) UpdateSheetState(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
+	h.broadcastSheetReload(c, id)
 
 	response.OK(c, updatedSheet)
 }
@@ -472,7 +671,13 @@ func (h *SheetHandler) ExportSheetPDF(c *gin.Context) {
 		return
 	}
 
-	exportFile, err := h.sheetService.BuildSheetPDFFile(userID, id, c.Query("filename"))
+	options, err := service.ParsePDFExportOptions(c.Query("paper_size"), c.Query("orientation"), c.Query("fit_to_width"))
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	exportFile, err := h.sheetService.BuildSheetPDFFile(userID, id, c.Query("filename"), options)
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrSheetExportDenied), errors.Is(err, service.ErrWorkbookAccessDenied):
@@ -485,6 +690,92 @@ func (h *SheetHandler) ExportSheetPDF(c *gin.Context) {
 
 	setExportDownloadHeaders(c, exportFile.Filename, exportFile.ContentType, len(exportFile.Data))
 	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
+}
+
+func (h *SheetHandler) ExportWorkbook(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid workbook id")
+		return
+	}
+
+	sheetIDs, err := parseSheetIDQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	exportFile, err := h.sheetService.BuildWorkbookExportFile(userID, id, sheetIDs, c.Query("filename"))
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSheetExportDenied), errors.Is(err, service.ErrWorkbookAccessDenied):
+			response.Forbidden(c, err.Error())
+		default:
+			response.ServerError(c, err.Error())
+		}
+		return
+	}
+
+	setExportDownloadHeaders(c, exportFile.Filename, exportFile.ContentType, len(exportFile.Data))
+	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
+}
+
+func (h *SheetHandler) ExportWorkbookPDF(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid workbook id")
+		return
+	}
+
+	sheetIDs, err := parseSheetIDQuery(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	options, err := service.ParsePDFExportOptions(c.Query("paper_size"), c.Query("orientation"), c.Query("fit_to_width"))
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	exportFile, err := h.sheetService.BuildWorkbookPDFFile(userID, id, sheetIDs, c.Query("filename"), options)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSheetExportDenied), errors.Is(err, service.ErrWorkbookAccessDenied):
+			response.Forbidden(c, err.Error())
+		default:
+			response.ServerError(c, err.Error())
+		}
+		return
+	}
+
+	setExportDownloadHeaders(c, exportFile.Filename, exportFile.ContentType, len(exportFile.Data))
+	c.Data(http.StatusOK, exportFile.ContentType, exportFile.Data)
+}
+
+func parseSheetIDQuery(c *gin.Context) ([]int64, error) {
+	values := make([]string, 0)
+	if raw := strings.TrimSpace(c.Query("sheet_ids")); raw != "" {
+		values = append(values, strings.Split(raw, ",")...)
+	}
+	values = append(values, c.QueryArray("sheet_id")...)
+
+	ids := make([]int64, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid sheet id: %s", value)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func setExportDownloadHeaders(c *gin.Context, filename, contentType string, contentLength int) {

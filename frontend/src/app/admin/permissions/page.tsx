@@ -1,20 +1,21 @@
 'use client'
 
 import {
-  ArrowLeft,
   Columns3,
   Eye,
   FileSpreadsheet,
   Lock,
   PencilLine,
+  Rows3,
   Save,
   Settings2,
   Share2,
   Shield,
+  Square,
   Trash2,
 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-import { AuthGuard } from '@/components/auth/AuthGuard'
+import { AdminShell } from '@/components/admin/AdminShell'
 import api from '@/lib/api'
 import type { PageData, User, Workbook } from '@/types'
 
@@ -42,6 +43,17 @@ interface ColumnPerm {
   permission: 'read' | 'write' | 'none'
 }
 
+interface RowPerm {
+  row_index: number
+  permission: 'read' | 'write' | 'none'
+}
+
+interface CellPerm {
+  row_index: number
+  column_key: string
+  permission: 'read' | 'write' | 'none'
+}
+
 interface UserSheetPermission {
   user_id: number
   can_view: boolean
@@ -64,6 +76,15 @@ const sheetPermissionLabels: { key: keyof SheetPermission; label: string; icon: 
   { key: 'can_export', label: '导出', icon: Share2 },
 ]
 
+const permissionOptions: Array<{ value: 'none' | 'read' | 'write'; label: string }> = [
+  { value: 'none', label: '禁止访问' },
+  { value: 'read', label: '只读' },
+  { value: 'write', label: '可编辑' },
+]
+
+const dataRowToDisplayRow = (rowIndex: number) => Math.max(1, rowIndex + 2)
+const displayRowToDataRow = (displayRow: number) => Math.max(0, displayRow - 2)
+
 export default function PermissionsPage() {
   const [sheetOptions, setSheetOptions] = useState<SheetOption[]>([])
   const [roles, setRoles] = useState<Role[]>([])
@@ -72,6 +93,10 @@ export default function PermissionsPage() {
   const [selectedRole, setSelectedRole] = useState<number | null>(null)
   const [sheetPermission, setSheetPermission] = useState<SheetPermission>(defaultSheetPermission)
   const [columnPerms, setColumnPerms] = useState<ColumnPerm[]>([])
+  const [rowPerms, setRowPerms] = useState<RowPerm[]>([])
+  const [cellPerms, setCellPerms] = useState<CellPerm[]>([])
+  const [rowPermDraft, setRowPermDraft] = useState<RowPerm>({ row_index: 0, permission: 'read' })
+  const [cellPermDraft, setCellPermDraft] = useState<CellPerm>({ row_index: 0, column_key: '', permission: 'read' })
   const [userPerms, setUserPerms] = useState<UserSheetPermission[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -135,6 +160,7 @@ export default function PermissionsPage() {
       const [roleRes, userRes] = await Promise.all([
         api.get<{
           sheet: { canView: boolean; canEdit: boolean; canDelete: boolean; canExport: boolean }
+          rows?: Record<string, string>
           columns: Record<string, string>
           cells: Record<string, string>
         }>(`/permissions/sheets/${selectedSheet}/roles/${selectedRole}`),
@@ -156,9 +182,34 @@ export default function PermissionsPage() {
             permission: (roleRes.data?.columns?.[key] as 'read' | 'write' | 'none' | undefined) || 'none',
           }))
         )
+        setRowPerms(
+          Object.entries(roleRes.data.rows || {})
+            .map(([row, permission]) => ({
+              row_index: Number(row),
+              permission: permission as 'read' | 'write' | 'none',
+            }))
+            .filter((item) => Number.isFinite(item.row_index))
+            .sort((a, b) => a.row_index - b.row_index)
+        )
+        setCellPerms(
+          Object.entries(roleRes.data.cells || {})
+            .map(([key, permission]) => {
+              const [row, columnKey] = key.split(':')
+              return {
+                row_index: Number(row),
+                column_key: columnKey || '',
+                permission: permission as 'read' | 'write' | 'none',
+              }
+            })
+            .filter((item) => Number.isFinite(item.row_index) && item.column_key)
+            .sort((a, b) => a.row_index - b.row_index || a.column_key.localeCompare(b.column_key))
+        )
+        setCellPermDraft((prev) => ({ ...prev, column_key: prev.column_key || availableColumns[0] || '' }))
       } else {
         setSheetPermission(defaultSheetPermission)
         setColumnPerms([])
+        setRowPerms([])
+        setCellPerms([])
       }
 
       const directPerms = userRes.code === 0 && userRes.data ? userRes.data : []
@@ -177,11 +228,21 @@ export default function PermissionsPage() {
     } catch {
       setSheetPermission(defaultSheetPermission)
       setColumnPerms([])
+      setRowPerms([])
+      setCellPerms([])
       setUserPerms([])
     }
   }, [selectedSheet, selectedRole, sheetOptions, users])
 
   useEffect(() => { fetchPermissions() }, [fetchPermissions])
+
+  useEffect(() => {
+    if (!selectedSheet) return
+    const columns = sheetOptions.find((item) => item.id === selectedSheet)?.columns || []
+    if (columns.length > 0 && !columns.includes(cellPermDraft.column_key)) {
+      setCellPermDraft((prev) => ({ ...prev, column_key: columns[0] }))
+    }
+  }, [cellPermDraft.column_key, selectedSheet, sheetOptions])
 
   const handleSaveSheetPermission = async () => {
     if (!selectedSheet || !selectedRole) return
@@ -261,6 +322,74 @@ export default function PermissionsPage() {
     }
   }
 
+  const handleSaveRowPermission = async (perm: RowPerm) => {
+    if (!selectedSheet || !selectedRole) return
+    setSaving(true)
+    setError('')
+    setSuccess('')
+    try {
+      await api.post('/permissions/cell', {
+        sheet_id: selectedSheet,
+        role_id: selectedRole,
+        row_index: perm.row_index,
+        column_key: '',
+        permission: perm.permission,
+      })
+      await fetchPermissions()
+      setSuccess(`第 ${dataRowToDisplayRow(perm.row_index)} 行权限已保存`)
+      setTimeout(() => setSuccess(''), 2000)
+    } catch (err) {
+      console.error('Failed to save row permission:', err)
+      setError('保存行权限失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleAddRowPermission = async () => {
+    await handleSaveRowPermission(rowPermDraft)
+  }
+
+  const handleRowPermissionChange = (rowIndex: number, permission: 'read' | 'write' | 'none') => {
+    setRowPerms((prev) => prev.map((item) => (item.row_index === rowIndex ? { ...item, permission } : item)))
+  }
+
+  const handleSaveCellPermission = async (perm: CellPerm) => {
+    if (!selectedSheet || !selectedRole || !perm.column_key) return
+    setSaving(true)
+    setError('')
+    setSuccess('')
+    try {
+      await api.post('/permissions/cell', {
+        sheet_id: selectedSheet,
+        role_id: selectedRole,
+        row_index: perm.row_index,
+        column_key: perm.column_key,
+        permission: perm.permission,
+      })
+      await fetchPermissions()
+      setSuccess(`${perm.column_key}${dataRowToDisplayRow(perm.row_index)} 权限已保存`)
+      setTimeout(() => setSuccess(''), 2000)
+    } catch (err) {
+      console.error('Failed to save cell permission:', err)
+      setError('保存单元格权限失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleAddCellPermission = async () => {
+    await handleSaveCellPermission(cellPermDraft)
+  }
+
+  const handleCellPermissionChange = (rowIndex: number, columnKey: string, permission: 'read' | 'write' | 'none') => {
+    setCellPerms((prev) =>
+      prev.map((item) =>
+        item.row_index === rowIndex && item.column_key === columnKey ? { ...item, permission } : item
+      )
+    )
+  }
+
   const handleUserPermissionChange = (userId: number, key: keyof SheetPermission, value: boolean) => {
 	setUserPerms((prev) =>
 	  prev.map((perm) =>
@@ -322,54 +451,39 @@ export default function PermissionsPage() {
 
   const selectedSheetName = sheetOptions.find((s) => s.id === selectedSheet)?.name
   const selectedRoleName = roles.find((r) => r.id === selectedRole)?.name
+  const selectedSheetColumns = sheetOptions.find((s) => s.id === selectedSheet)?.columns || []
 
   return (
-    <AuthGuard requireRole="admin">
-      <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(56,189,248,0.16),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(251,191,36,0.18),_transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
-        <div className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-4 p-3 md:p-6">
-          {/* Header */}
-          <header className="overflow-hidden rounded-[32px] border border-white/70 bg-white/80 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.7)] backdrop-blur">
-            <div className="flex flex-col gap-6 px-4 py-5 md:px-6 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-4">
-                <a href="/" className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-900">
-                  <ArrowLeft className="h-4 w-4" />
-                  返回工作台
-                </a>
-                <div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-sky-100 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700">
-                    <Settings2 className="h-3.5 w-3.5" />
-                    Admin Permissions
-                  </div>
-                  <h1 className="mt-4 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">权限矩阵配置</h1>
-                  <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">为每个角色精确控制工作表和列级别的访问权限。</p>
-                </div>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-3 lg:min-w-[460px]">
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+    <AdminShell
+      title="权限矩阵配置"
+      description="为角色配置工作表、行列和字段级访问权限"
+      summary={(
+        <div className="grid gap-3 sm:grid-cols-3">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-900 text-white"><FileSpreadsheet className="h-4 w-4" /></div>
                   <div className="text-sm text-slate-500">工作表</div>
                   <div className="mt-1 text-2xl font-semibold text-slate-950">{sheetOptions.length}</div>
                 </div>
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700"><Shield className="h-4 w-4" /></div>
                   <div className="text-sm text-slate-500">角色</div>
                   <div className="mt-1 text-2xl font-semibold text-slate-950">{roles.length}</div>
                 </div>
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-100 text-amber-700"><Lock className="h-4 w-4" /></div>
                   <div className="text-sm text-slate-500">配置状态</div>
                   <div className="mt-1 text-lg font-semibold text-slate-950">{selectedSheet && selectedRole ? '配置中' : '待选择'}</div>
                 </div>
-              </div>
-            </div>
-          </header>
+        </div>
+      )}
+    >
 
           {/* Feedback */}
           {error && <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">{error}</div>}
           {success && <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-700">{success}</div>}
 
           {/* Selector */}
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-5">
               <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Selector</div>
               <h2 className="mt-2 text-2xl font-semibold text-slate-950">选择配置目标</h2>
@@ -410,7 +524,7 @@ export default function PermissionsPage() {
           {selectedSheet && selectedRole ? (
             <>
               {/* Sheet Permissions */}
-              <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+              <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
                 <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
                   <div>
                     <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Sheet Permissions</div>
@@ -441,7 +555,7 @@ export default function PermissionsPage() {
               </section>
 
               {/* Column Permissions */}
-              <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+              <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
                 <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
                   <div>
                     <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Column Permissions</div>
@@ -506,7 +620,183 @@ export default function PermissionsPage() {
                 )}
               </section>
 
-              <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+              <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+                <div className="mb-5">
+                  <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Row Permissions</div>
+                  <h2 className="mt-2 text-2xl font-semibold text-slate-950">行级别权限</h2>
+                  <p className="mt-2 text-sm text-slate-500">按工作表显示行号控制整行权限；单元格权限优先级高于行权限。</p>
+                </div>
+                <div className="mb-4 grid gap-3 rounded-[24px] border border-slate-200 bg-slate-50/80 p-4 md:grid-cols-[1fr_1fr_auto]">
+                  <label className="block">
+                    <span className="mb-2 block text-xs font-semibold text-slate-600">显示行号</span>
+                    <input
+                      type="number"
+                      min={2}
+                      value={dataRowToDisplayRow(rowPermDraft.row_index)}
+                      onChange={(event) => setRowPermDraft((prev) => ({ ...prev, row_index: displayRowToDataRow(Number(event.target.value) || 2) }))}
+                      className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-2 block text-xs font-semibold text-slate-600">权限</span>
+                    <select
+                      value={rowPermDraft.permission}
+                      onChange={(event) => setRowPermDraft((prev) => ({ ...prev, permission: event.target.value as RowPerm['permission'] }))}
+                      className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                    >
+                      {permissionOptions.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleAddRowPermission}
+                    disabled={saving}
+                    className="self-end rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    保存行权限
+                  </button>
+                </div>
+                {rowPerms.length === 0 ? (
+                  <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-10 text-center">
+                    <Rows3 className="mx-auto mb-3 h-8 w-8 text-slate-300" />
+                    <h3 className="text-lg font-semibold text-slate-600">暂无行级权限</h3>
+                    <p className="mt-2 text-sm text-slate-400">添加后会覆盖该行的工作表/列级权限。</p>
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-[24px] border border-slate-200 bg-white shadow-sm">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-slate-50 text-slate-500">
+                        <tr>
+                          <th className="px-4 py-3 text-left font-semibold">行</th>
+                          <th className="px-4 py-3 text-center font-semibold">权限</th>
+                          <th className="px-4 py-3 text-right font-semibold">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {rowPerms.map((perm) => (
+                          <tr key={perm.row_index} className="hover:bg-slate-50/80">
+                            <td className="px-4 py-4 font-medium text-slate-900">第 {dataRowToDisplayRow(perm.row_index)} 行</td>
+                            <td className="px-4 py-4 text-center">
+                              <select
+                                value={perm.permission}
+                                onChange={(event) => handleRowPermissionChange(perm.row_index, event.target.value as RowPerm['permission'])}
+                                className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                              >
+                                {permissionOptions.map((option) => (
+                                  <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                              </select>
+                            </td>
+                            <td className="px-4 py-4 text-right">
+                              <button type="button" onClick={() => handleSaveRowPermission(perm)} disabled={saving} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50">
+                                保存
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+
+              <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+                <div className="mb-5">
+                  <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">Cell Permissions</div>
+                  <h2 className="mt-2 text-2xl font-semibold text-slate-950">单元格级别权限</h2>
+                  <p className="mt-2 text-sm text-slate-500">单元格权限优先级最高，可覆盖工作表、列和行级规则。</p>
+                </div>
+                <div className="mb-4 grid gap-3 rounded-[24px] border border-slate-200 bg-slate-50/80 p-4 md:grid-cols-[1fr_1fr_1fr_auto]">
+                  <label className="block">
+                    <span className="mb-2 block text-xs font-semibold text-slate-600">显示行号</span>
+                    <input
+                      type="number"
+                      min={2}
+                      value={dataRowToDisplayRow(cellPermDraft.row_index)}
+                      onChange={(event) => setCellPermDraft((prev) => ({ ...prev, row_index: displayRowToDataRow(Number(event.target.value) || 2) }))}
+                      className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-2 block text-xs font-semibold text-slate-600">列</span>
+                    <select
+                      value={cellPermDraft.column_key || selectedSheetColumns[0] || ''}
+                      onChange={(event) => setCellPermDraft((prev) => ({ ...prev, column_key: event.target.value }))}
+                      className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                    >
+                      {selectedSheetColumns.map((columnKey) => (
+                        <option key={columnKey} value={columnKey}>{columnKey}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="mb-2 block text-xs font-semibold text-slate-600">权限</span>
+                    <select
+                      value={cellPermDraft.permission}
+                      onChange={(event) => setCellPermDraft((prev) => ({ ...prev, permission: event.target.value as CellPerm['permission'] }))}
+                      className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                    >
+                      {permissionOptions.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleAddCellPermission}
+                    disabled={saving || selectedSheetColumns.length === 0}
+                    className="self-end rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    保存单元格权限
+                  </button>
+                </div>
+                {cellPerms.length === 0 ? (
+                  <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-10 text-center">
+                    <Square className="mx-auto mb-3 h-8 w-8 text-slate-300" />
+                    <h3 className="text-lg font-semibold text-slate-600">暂无单元格权限</h3>
+                    <p className="mt-2 text-sm text-slate-400">添加后会优先覆盖其它级别的权限。</p>
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-[24px] border border-slate-200 bg-white shadow-sm">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-slate-50 text-slate-500">
+                        <tr>
+                          <th className="px-4 py-3 text-left font-semibold">单元格</th>
+                          <th className="px-4 py-3 text-center font-semibold">权限</th>
+                          <th className="px-4 py-3 text-right font-semibold">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {cellPerms.map((perm) => (
+                          <tr key={`${perm.row_index}:${perm.column_key}`} className="hover:bg-slate-50/80">
+                            <td className="px-4 py-4 font-medium text-slate-900">{perm.column_key}{dataRowToDisplayRow(perm.row_index)}</td>
+                            <td className="px-4 py-4 text-center">
+                              <select
+                                value={perm.permission}
+                                onChange={(event) => handleCellPermissionChange(perm.row_index, perm.column_key, event.target.value as CellPerm['permission'])}
+                                className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-1 focus:ring-sky-100"
+                              >
+                                {permissionOptions.map((option) => (
+                                  <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                              </select>
+                            </td>
+                            <td className="px-4 py-4 text-right">
+                              <button type="button" onClick={() => handleSaveCellPermission(perm)} disabled={saving} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50">
+                                保存
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+
+              <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
                 <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
                   <div>
                     <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">User Permissions</div>
@@ -582,7 +872,7 @@ export default function PermissionsPage() {
               </section>
             </>
           ) : !loading ? (
-            <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+            <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
               <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-14 text-center">
                 <Settings2 className="mx-auto mb-3 h-10 w-10 text-slate-300" />
                 <h3 className="text-2xl font-semibold text-slate-950">请先选择配置目标</h3>
@@ -590,8 +880,6 @@ export default function PermissionsPage() {
               </div>
             </section>
           ) : null}
-        </div>
-      </div>
-    </AuthGuard>
+    </AdminShell>
   )
 }

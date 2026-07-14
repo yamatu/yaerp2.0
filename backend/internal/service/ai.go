@@ -54,13 +54,25 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Messages []ChatMessage `json:"messages" binding:"required"`
+	AssistantID *int64        `json:"assistant_id"`
+	Messages    []ChatMessage `json:"messages" binding:"required"`
+	Context     *ChatContext  `json:"context"`
+}
+
+type ChatContext struct {
+	WorkbookID    *int64  `json:"workbook_id"`
+	SheetIDs      []int64 `json:"sheet_ids"`
+	AttachmentIDs []int64 `json:"attachment_ids"`
 }
 
 type ChatResponse struct {
+	AssistantID       int64                  `json:"assistant_id"`
+	AssistantName     string                 `json:"assistant_name"`
 	Reply             string                 `json:"reply"`
 	Model             string                 `json:"model"`
 	TouchedSheetIDs   []int64                `json:"touched_sheet_ids,omitempty"`
+	ChangedSheetIDs   []int64                `json:"changed_sheet_ids,omitempty"`
+	ResourcesChanged  bool                   `json:"resources_changed,omitempty"`
 	PendingOperations []SpreadsheetOperation `json:"pending_operations,omitempty"`
 	ToolTraces        []ChatToolTrace        `json:"tool_traces,omitempty"`
 }
@@ -148,25 +160,41 @@ func (s *AIService) UpdateConfig(endpoint, apiKey, model string) error {
 }
 
 // Chat sends messages to the OpenAI-compatible API and returns the response.
-func (s *AIService) Chat(userID int64, messages []ChatMessage) (*ChatResponse, error) {
-	return s.chatWithTools(userID, messages)
+func (s *AIService) Chat(userID, assistantID int64, messages []ChatMessage) (*ChatResponse, error) {
+	return s.ChatWithContext(userID, assistantID, messages, nil)
 }
 
-func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*SpreadsheetPlanResponse, error) {
+func (s *AIService) ChatWithContext(userID, assistantID int64, messages []ChatMessage, context *ChatContext) (*ChatResponse, error) {
+	return s.chatWithTools(userID, assistantID, messages, context)
+}
+
+func (s *AIService) PreviewSpreadsheetPlan(userID, assistantID int64, req *SpreadsheetPlanRequest) (*SpreadsheetPlanResponse, error) {
+	workbook, err := s.sheetService.GetWorkbook(req.WorkbookID, userID)
+	if err != nil {
+		return nil, err
+	}
+	visibleSheets := make(map[int64]struct{}, len(workbook.Sheets))
+	for _, sheet := range workbook.Sheets {
+		visibleSheets[sheet.ID] = struct{}{}
+	}
+	for _, sheetID := range req.SheetIDs {
+		if _, ok := visibleSheets[sheetID]; !ok {
+			return nil, fmt.Errorf("工作表 %d 不可访问", sheetID)
+		}
+	}
+
 	if localPlan, ok, err := s.tryBuildLocalRandomDataPlan(req); err != nil {
 		return nil, err
 	} else if ok {
 		return localPlan, nil
 	}
 
-	endpoint, model := s.getActiveConfig()
-	apiKey := s.getAPIKey()
-
-	if endpoint == "" || apiKey == "" {
-		return nil, fmt.Errorf("AI is not configured. Please set the API endpoint and key in admin settings")
+	assistant, err := s.resolveAIAssistant(assistantID)
+	if err != nil {
+		return nil, err
 	}
 
-	contextPayload, sheetMeta, err := s.buildSpreadsheetContext(req.WorkbookID, req.SheetIDs)
+	contextPayload, sheetMeta, err := s.buildSpreadsheetContext(userID, req.WorkbookID, req.SheetIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +218,7 @@ func (s *AIService) PreviewSpreadsheetPlan(req *SpreadsheetPlanRequest) (*Spread
 		},
 	}
 
-	apiResp, err := s.callChatCompletion(endpoint, apiKey, model, messages)
+	apiResp, err := s.callChatCompletion(assistant.Endpoint, assistant.APIKey, assistant.Model, messages)
 	if err != nil {
 		if fallbackPlan, ok, fallbackErr := s.tryBuildLocalRandomDataPlan(req); fallbackErr == nil && ok {
 			fallbackPlan.Model = "local-rules-fallback"
@@ -398,7 +426,9 @@ func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	client := &http.Client{Timeout: aiRequestTimeout}
 	resp, err := client.Do(req)
@@ -436,13 +466,8 @@ func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages 
 	return &ChatResponse{Reply: apiResp.Choices[0].Message.Content, Model: apiResp.Model}, nil
 }
 
-func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) (string, map[int64]sheetPreviewMeta, error) {
-	workbook, err := s.sheetRepo.GetWorkbook(workbookID)
-	if err != nil {
-		return "", nil, err
-	}
-
-	allSheets, err := s.sheetRepo.GetSheetsByWorkbook(workbookID)
+func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs []int64) (string, map[int64]sheetPreviewMeta, error) {
+	workbook, err := s.sheetService.GetWorkbook(workbookID, userID)
 	if err != nil {
 		return "", nil, err
 	}
@@ -462,7 +487,7 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 	}
 
 	sheetsPayload := make([]map[string]interface{}, 0, len(sheetIDs))
-	for _, sheet := range allSheets {
+	for _, sheet := range workbook.Sheets {
 		if _, ok := selected[sheet.ID]; !ok {
 			continue
 		}
@@ -481,7 +506,10 @@ func (s *AIService) buildSpreadsheetContext(workbookID int64, sheetIDs []int64) 
 		if err != nil {
 			return "", nil, err
 		}
-		previewRows := buildAIPreviewRows(&sheet, parsedColumns, rows)
+		previewRows, err := s.buildVisiblePreviewRows(userID, &sheet, parsedColumns, rows)
+		if err != nil {
+			return "", nil, fmt.Errorf("filter rows for sheet %d: %w", sheet.ID, err)
+		}
 		rowItems := make([]map[string]interface{}, 0, len(previewRows))
 		currentValues := make(map[string]interface{})
 		for index, row := range previewRows {
@@ -559,10 +587,30 @@ func parseSpreadsheetPlan(reply string) (*SpreadsheetPlanResponse, error) {
 }
 
 func normalizeSpreadsheetOperation(operation SpreadsheetOperation) SpreadsheetOperation {
-	if strings.TrimSpace(operation.Kind) == "" {
-		operation.Kind = "update_cell"
-	}
+	operation.Kind = normalizeSpreadsheetOperationKind(operation.Kind)
 	return operation
+}
+
+func normalizeSpreadsheetOperationKind(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+	switch normalized {
+	case "update", "set_cell", "write_cell", "cell_update":
+		return "update_cell"
+	case "add_row", "append_row", "create_row", "row_insert":
+		return "insert_row"
+	case "update_row", "set_row", "upsert_row", "batch_update":
+		return normalized
+	case "remove_row", "row_delete":
+		return "delete_row"
+	case "add_column", "append_column", "create_column", "column_insert":
+		return "insert_column"
+	case "autofill", "auto_fill", "fill_column", "formula_fill":
+		return "fill_formula"
+	default:
+		return normalized
+	}
 }
 
 func getSheetRowBase(rows []model.Row) int {
@@ -592,11 +640,29 @@ func parseSheetColumns(raw json.RawMessage) ([]sheetColumnPayload, error) {
 	return columns, nil
 }
 
-func expandFormulaTemplate(template string, rowIndex int) string {
+func expandFormulaTemplate(template string, rowIndex int, columns ...[]sheetColumnPayload) string {
 	rowNumber := strconv.Itoa(rowIndex + 2)
 	dataRowNumber := strconv.Itoa(rowIndex + 1)
 	result := strings.ReplaceAll(template, "{{row}}", rowNumber)
 	result = strings.ReplaceAll(result, "{{data_row}}", dataRowNumber)
+	if len(columns) > 0 {
+		for index, column := range columns[0] {
+			letter := spreadsheetColumnLetter(index)
+			result = strings.ReplaceAll(result, "{{"+column.Key+"}}", letter+rowNumber)
+		}
+	}
+	return result
+}
+
+func spreadsheetColumnLetter(index int) string {
+	if index < 0 {
+		return ""
+	}
+	var result string
+	for index >= 0 {
+		result = string(rune('A'+index%26)) + result
+		index = index/26 - 1
+	}
 	return result
 }
 
@@ -847,7 +913,7 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 		}
 
 		if operation.FormulaTemplate != "" {
-			data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, row.RowIndex)
+			data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, row.RowIndex, columns)
 		} else if operation.Value != nil {
 			data[operation.ColumnKey] = operation.Value
 		}
@@ -872,6 +938,14 @@ func (s *AIService) applyFillFormulaOperation(userID int64, operation Spreadshee
 	rows, err := s.sheetRepo.GetRows(operation.SheetID)
 	if err != nil {
 		return fmt.Errorf("load rows for formula fill: %w", err)
+	}
+	sheet, err := s.sheetRepo.GetSheet(operation.SheetID)
+	if err != nil {
+		return fmt.Errorf("load sheet for formula fill: %w", err)
+	}
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return err
 	}
 
 	startRow := 0
@@ -906,7 +980,7 @@ func (s *AIService) applyFillFormulaOperation(userID int64, operation Spreadshee
 		if data == nil {
 			data = make(map[string]interface{})
 		}
-		data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, rowIndex)
+		data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, rowIndex, columns)
 		encoded, err := json.Marshal(data)
 		if err != nil {
 			return fmt.Errorf("marshal formula fill row data: %w", err)

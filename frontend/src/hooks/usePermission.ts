@@ -59,6 +59,10 @@ export function usePermission(sheetId: number) {
       const cellKey = `${row}:${col}`
       if (permissions.cells[cellKey] === 'read') return false
       if (permissions.cells[cellKey] === 'none') return false
+
+      const rowKey = `${row}`
+      if (permissions.rows[rowKey] === 'read') return false
+      if (permissions.rows[rowKey] === 'none') return false
     }
 
     // Check column permission

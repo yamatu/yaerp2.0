@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import api from '@/lib/api'
+import { subscribeDataChanged } from '@/lib/dataEvents'
 import type { Folder, FolderContents } from '@/types'
 
 export function useFileManager() {
@@ -11,8 +12,8 @@ export function useFileManager() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  const loadContents = useCallback(async (folderId: number | null) => {
-    setLoading(true)
+  const loadContents = useCallback(async (folderId: number | null, silent = false) => {
+    if (!silent) setLoading(true)
     setError('')
     try {
       const params = folderId !== null ? `?parent_id=${folderId}` : ''
@@ -23,7 +24,7 @@ export function useFileManager() {
       setContents({ folders: [], workbooks: [] })
       setError('加载文件夹内容失败')
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [])
 
@@ -55,6 +56,11 @@ export function useFileManager() {
   useEffect(() => {
     navigateTo(null)
   }, [navigateTo])
+
+  useEffect(() => subscribeDataChanged((detail) => {
+    if (!detail.resourcesChanged) return
+    void loadContents(currentFolderId, true)
+  }), [currentFolderId, loadContents])
 
   const createFolder = useCallback(
     async (name: string) => {

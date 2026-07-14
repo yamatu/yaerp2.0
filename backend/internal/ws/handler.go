@@ -64,6 +64,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		Hub:      h.Hub,
 		UserID:   claims.UserID,
 		Username: claims.Username,
+		ClientID: c.Query("client_id"),
 		Send:     make(chan []byte, 256),
 	}
 
@@ -102,6 +103,8 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 		}
 
 		msg.UserID = client.UserID
+		msg.Username = client.Username
+		msg.ClientID = client.ClientID
 
 		switch msg.Type {
 		case "join_sheet":
@@ -115,6 +118,32 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 				continue
 			}
 			h.Hub.JoinSheet(client, msg.SheetID)
+
+		case "leave_sheet":
+			h.Hub.LeaveSheet(client)
+
+		case "cell_presence":
+			if client.SheetID == 0 || msg.SheetID != client.SheetID {
+				continue
+			}
+			state := msg.State
+			if state != "viewing" && state != "selected" && state != "editing" {
+				continue
+			}
+			var row *int
+			if state != "viewing" && msg.Row >= 0 && msg.Col != "" {
+				value := msg.Row
+				row = &value
+			} else {
+				state = "viewing"
+				msg.Col = ""
+			}
+			if state == "editing" {
+				if row == nil || h.validateCellChange(client, *row, msg.Col) != nil {
+					continue
+				}
+			}
+			h.Hub.UpdatePresence(client, state, row, msg.Col)
 
 		case "cell_update", "batch_update", "row_insert", "row_delete":
 			if err := h.validateMutationMessage(client, &msg); err != nil {
@@ -228,13 +257,6 @@ func (h *WSHandler) writePump(conn *websocket.Conn, client *Client) {
 				return
 			}
 			w.Write(message)
-
-			// Drain queued messages
-			n := len(client.Send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte("\n"))
-				w.Write(<-client.Send)
-			}
 
 			if err := w.Close(); err != nil {
 				return

@@ -1,9 +1,8 @@
 'use client'
 
-import { AlertTriangle, Archive, ArrowLeft, Database, Download, FileJson, Upload } from 'lucide-react'
+import { AlertTriangle, Archive, Database, Download, FileJson, Upload } from 'lucide-react'
 import { useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
-import { AuthGuard } from '@/components/auth/AuthGuard'
+import { AdminShell } from '@/components/admin/AdminShell'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -52,7 +51,6 @@ const backupCards: BackupCard[] = [
 ]
 
 export default function BackupPage() {
-  const router = useRouter()
   const [loadingKey, setLoadingKey] = useState<string | null>(null)
   const [restoreFile, setRestoreFile] = useState<File | null>(null)
   const [restoreConfirmed, setRestoreConfirmed] = useState(false)
@@ -160,35 +158,7 @@ export default function BackupPage() {
   }
 
   return (
-    <AuthGuard requireRole="admin">
-      <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(56,189,248,0.16),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(251,191,36,0.18),_transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
-        <div className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-4 p-3 md:p-6">
-          <header className="overflow-hidden rounded-[32px] border border-white/70 bg-white/80 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.7)] backdrop-blur">
-            <div className="flex flex-col gap-6 px-4 py-5 md:px-6 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-4">
-                <button
-                  type="button"
-                  onClick={() => router.push('/')}
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-900"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  返回工作台
-                </button>
-                <div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-sky-100 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700">
-                    <Database className="h-3.5 w-3.5" />
-                    Admin Backup
-                  </div>
-                  <h1 className="mt-4 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
-                    数据库与配置备份
-                  </h1>
-                  <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">
-                    管理员可以在这里下载数据库备份、系统配置导出文件或完整备份包，确保数据安全和系统可恢复性。
-                  </p>
-                </div>
-              </div>
-            </div>
-          </header>
+    <AdminShell title="数据备份与还原" description="下载数据库、配置和完整备份，并执行受控还原">
 
           {error && (
             <div className="rounded-[28px] border border-rose-200 bg-rose-50/90 px-5 py-4 text-sm font-medium text-rose-700 backdrop-blur">
@@ -202,7 +172,7 @@ export default function BackupPage() {
             </div>
           )}
 
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-6">
               <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
                 Download Center
@@ -247,7 +217,7 @@ export default function BackupPage() {
             </div>
           </section>
 
-          <section className="rounded-[28px] border border-rose-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-rose-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-6">
               <div className="inline-flex items-center gap-2 rounded-full border border-rose-100 bg-rose-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-rose-700">
                 <AlertTriangle className="h-3.5 w-3.5" />
@@ -322,8 +292,6 @@ export default function BackupPage() {
               </div>
             </div>
           </section>
-        </div>
-      </div>
-    </AuthGuard>
+    </AdminShell>
   )
 }

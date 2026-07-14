@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"yaerp/internal/model"
 	"yaerp/internal/repo"
@@ -13,12 +14,50 @@ import (
 )
 
 type UserHandler struct {
-	userRepo    *repo.UserRepo
-	authService *service.AuthService
+	userRepo      *repo.UserRepo
+	authService   *service.AuthService
+	uploadService *service.UploadService
 }
 
-func NewUserHandler(userRepo *repo.UserRepo, authService *service.AuthService) *UserHandler {
-	return &UserHandler{userRepo: userRepo, authService: authService}
+func NewUserHandler(userRepo *repo.UserRepo, authService *service.AuthService, uploadService *service.UploadService) *UserHandler {
+	return &UserHandler{userRepo: userRepo, authService: authService, uploadService: uploadService}
+}
+
+func (h *UserHandler) UpdateOwnAvatar(c *gin.Context) {
+	var req model.UserAvatarRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	userID := c.GetInt64("user_id")
+	attachment, err := h.uploadService.GetAttachment(req.AttachmentID)
+	if err != nil {
+		response.BadRequest(c, "avatar image not found")
+		return
+	}
+	if attachment.UploaderID != userID {
+		response.Forbidden(c, "只能使用自己上传的图片作为头像")
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(attachment.MimeType), "image/") {
+		response.BadRequest(c, "头像必须是图片")
+		return
+	}
+	avatarURL, err := h.uploadService.GetFileURL(attachment.ID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	if err := h.userRepo.Update(userID, &model.UpdateUserRequest{Avatar: &avatarURL}); err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	profile, err := h.authService.GetProfile(userID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, profile)
 }
 
 func (h *UserHandler) ListUsers(c *gin.Context) {
@@ -58,11 +97,42 @@ func (h *UserHandler) ListShareableUsers(c *gin.Context) {
 			ID:       user.ID,
 			Username: user.Username,
 			Email:    user.Email,
+			Avatar:   user.Avatar,
 			Status:   user.Status,
 		})
 	}
 
 	response.OK(c, shareable)
+}
+
+func (h *UserHandler) CreateUser(c *gin.Context) {
+	var req model.CreateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	user, err := h.authService.CreateUser(&req)
+	if err != nil {
+		response.Error(c, http.StatusConflict, err.Error())
+		return
+	}
+
+	if len(req.RoleIDs) > 0 {
+		if err := h.userRepo.AssignRoles(user.ID, req.RoleIDs); err != nil {
+			response.Error(c, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	roles, err := h.userRepo.GetUserRoles(user.ID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	user.Roles = roles
+
+	response.OK(c, user)
 }
 
 func (h *UserHandler) UpdateUser(c *gin.Context) {

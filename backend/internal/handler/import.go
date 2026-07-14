@@ -23,6 +23,88 @@ func NewImportHandler(importService *service.SheetImportService) *ImportHandler 
 	return &ImportHandler{importService: importService}
 }
 
+func (h *ImportHandler) ImportWorkbookXLSX(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "file is required")
+		return
+	}
+	defer file.Close()
+
+	if header.Size <= 0 {
+		response.BadRequest(c, "file is empty")
+		return
+	}
+	if header.Size > 20<<20 {
+		response.BadRequest(c, "file size must be <= 20MB")
+		return
+	}
+	if !strings.EqualFold(filepath.Ext(header.Filename), ".xlsx") {
+		response.BadRequest(c, "only .xlsx files are supported")
+		return
+	}
+
+	var folderID *int64
+	if rawFolderID := strings.TrimSpace(c.PostForm("folder_id")); rawFolderID != "" {
+		parsedFolderID, err := strconv.ParseInt(rawFolderID, 10, 64)
+		if err != nil {
+			response.BadRequest(c, "invalid folder id")
+			return
+		}
+		folderID = &parsedFolderID
+	}
+
+	result, err := h.importService.ImportWorkbookXLSX(userID, file, header.Filename, c.PostForm("workbook_name"), folderID)
+	if err != nil {
+		var importErr *service.SheetImportError
+		if errors.As(err, &importErr) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    -1,
+				"message": importErr.Error(),
+				"data": gin.H{
+					"row": importErr.Row,
+				},
+			})
+			return
+		}
+		response.Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	response.OK(c, result)
+}
+
+func (h *ImportHandler) DownloadWorkbookSourceXLSX(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	workbookID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid workbook id")
+		return
+	}
+
+	file, err := h.importService.BuildWorkbookSourceXLSXFile(userID, workbookID)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrSheetExportDenied), errors.Is(err, service.ErrWorkbookAccessDenied):
+			response.Forbidden(c, err.Error())
+		default:
+			response.Error(c, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+	defer file.Reader.Close()
+
+	escapedFilename := strings.ReplaceAll(url.QueryEscape(file.Filename), "+", "%20")
+	asciiFallback := buildASCIIFilename(file.Filename)
+	c.Header("Content-Type", file.ContentType)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", asciiFallback, escapedFilename))
+	c.Header("Content-Length", strconv.FormatInt(file.Size, 10))
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.DataFromReader(http.StatusOK, file.Size, file.ContentType, file.Reader, nil)
+}
+
 func (h *ImportHandler) ImportXLSX(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	workbookID, err := strconv.ParseInt(c.Param("id"), 10, 64)

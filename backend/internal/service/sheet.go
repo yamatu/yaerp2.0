@@ -23,9 +23,10 @@ var ErrSheetArchived = errors.New("sheet is archived")
 var ErrSheetStateDenied = errors.New("sheet state change denied")
 
 type protectionOwner struct {
-	OwnerID     int64  `json:"ownerId"`
-	OwnerName   string `json:"ownerName"`
-	ProtectedAt string `json:"protectedAt"`
+	OwnerID         int64   `json:"ownerId"`
+	OwnerName       string  `json:"ownerName"`
+	EditableUserIDs []int64 `json:"editableUserIds,omitempty"`
+	ProtectedAt     string  `json:"protectedAt"`
 }
 
 type protectionMaps struct {
@@ -82,7 +83,11 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 	if err != nil {
 		return nil, err
 	}
-	if canManageWorkbook {
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if isAdmin {
 		wb.Sheets = sheets
 		return wb, nil
 	}
@@ -101,6 +106,13 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 
 	visibleSheets := make([]model.Sheet, 0, len(sheets))
 	for _, sheet := range sheets {
+		if sheet.IsHidden {
+			continue
+		}
+		if canManageWorkbook {
+			visibleSheets = append(visibleSheets, sheet)
+			continue
+		}
 		matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
 		if err != nil {
 			return nil, fmt.Errorf("check sheet %d permission: %w", sheet.ID, err)
@@ -255,13 +267,21 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 	if err != nil {
 		return nil, err
 	}
-	if !isAdmin {
-		return nil, fmt.Errorf("%w: only admins can change workbook state", ErrWorkbookAccessDenied)
-	}
 
 	workbook, err := s.sheetRepo.GetWorkbook(id)
 	if err != nil {
 		return nil, err
+	}
+	canManage, err := s.permService.CanManageWorkbook(workbook, userID)
+	if err != nil {
+		return nil, err
+	}
+	if action == "publish" || action == "unpublish" {
+		if !canManage {
+			return nil, fmt.Errorf("%w: only the owner or an admin can change public access", ErrWorkbookAccessDenied)
+		}
+	} else if !isAdmin {
+		return nil, fmt.Errorf("%w: only admins can change workbook state", ErrWorkbookAccessDenied)
 	}
 	payload, state, err := parseWorkbookLifecycleState(workbook.Metadata)
 	if err != nil {
@@ -278,11 +298,15 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 		state.Hidden = actor
 	case "unhide":
 		state.Hidden = nil
+	case "publish":
+		state.Public = actor
+	case "unpublish":
+		state.Public = nil
 	default:
 		return nil, fmt.Errorf("unsupported workbook state action")
 	}
 
-	if state.Locked == nil && state.Hidden == nil {
+	if state.Locked == nil && state.Hidden == nil && state.Public == nil {
 		delete(payload, "workbookState")
 	} else {
 		payload["workbookState"] = state
@@ -403,6 +427,130 @@ func (s *SheetService) GetSheet(id int64) (*model.Sheet, error) {
 		return nil, err
 	}
 	return sheet, nil
+}
+
+func (s *SheetService) SyncAssignedSheetGroup(sheetID int64) ([]int64, error) {
+	sourceSheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceWorkbook, err := s.sheetRepo.GetWorkbook(sourceSheet.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceWorkbookID := assignmentSourceWorkbookID(sourceWorkbook)
+	workbooks, err := s.sheetRepo.ListWorkbooksInAssignmentGroup(sourceWorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	if len(workbooks) <= 1 {
+		return nil, nil
+	}
+
+	affectedSheetIDs := make([]int64, 0, len(workbooks)-1)
+	for _, workbook := range workbooks {
+		if workbook.ID == sourceSheet.WorkbookID {
+			continue
+		}
+
+		sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbook.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		targetSheet := findAssignedGroupSheet(sourceSheet, sheets)
+		if targetSheet == nil {
+			continue
+		}
+
+		targetSheet.Name = sourceSheet.Name
+		targetSheet.SortOrder = sourceSheet.SortOrder
+		targetSheet.Columns = sourceSheet.Columns
+		targetSheet.Frozen = sourceSheet.Frozen
+		config, err := mergeAssignedSheetConfig(sourceSheet.Config, targetSheet.Config)
+		if err != nil {
+			return nil, err
+		}
+		targetSheet.Config = config
+		if err := s.sheetRepo.UpdateSheet(targetSheet); err != nil {
+			return nil, err
+		}
+
+		affectedSheetIDs = append(affectedSheetIDs, targetSheet.ID)
+	}
+
+	return affectedSheetIDs, nil
+}
+
+func assignmentSourceWorkbookID(workbook *model.Workbook) int64 {
+	if workbook == nil {
+		return 0
+	}
+	if len(workbook.Metadata) == 0 {
+		return workbook.ID
+	}
+
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(workbook.Metadata, &metadata); err != nil {
+		return workbook.ID
+	}
+
+	switch value := metadata["source_workbook_id"].(type) {
+	case float64:
+		if value > 0 {
+			return int64(value)
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+
+	return workbook.ID
+}
+
+func mergeAssignedSheetConfig(sourceConfig, targetConfig json.RawMessage) (json.RawMessage, error) {
+	sourcePayload := make(map[string]interface{})
+	if len(sourceConfig) > 0 {
+		if err := json.Unmarshal(sourceConfig, &sourcePayload); err != nil {
+			return nil, fmt.Errorf("parse source assigned sheet config: %w", err)
+		}
+	}
+
+	if len(targetConfig) == 0 {
+		return json.Marshal(sourcePayload)
+	}
+
+	var targetPayload map[string]interface{}
+	if err := json.Unmarshal(targetConfig, &targetPayload); err != nil {
+		return nil, fmt.Errorf("parse target assigned sheet config: %w", err)
+	}
+
+	if sheetState, ok := targetPayload["sheetState"]; ok {
+		sourcePayload["sheetState"] = sheetState
+	} else {
+		delete(sourcePayload, "sheetState")
+	}
+
+	return json.Marshal(sourcePayload)
+}
+
+func findAssignedGroupSheet(sourceSheet *model.Sheet, candidates []model.Sheet) *model.Sheet {
+	for i := range candidates {
+		if candidates[i].SortOrder == sourceSheet.SortOrder {
+			return &candidates[i]
+		}
+	}
+
+	for i := range candidates {
+		if candidates[i].Name == sourceSheet.Name {
+			return &candidates[i]
+		}
+	}
+
+	return nil
 }
 
 func (s *SheetService) DeleteSheet(id int64) error {
@@ -622,6 +770,11 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 	if err != nil {
 		return nil, nil, err
 	}
+	if req.Action == "lock" {
+		if err := s.permService.ValidateEditableUsers(req.EditableUserIDs); err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
+		}
+	}
 
 	if err := applyProtectionRequest(&protections, payload, legacyLocks, req, userID, username, isAdmin); err != nil {
 		return nil, nil, err
@@ -677,8 +830,26 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 		return nil, nil, err
 	}
 
-	for i := range items {
-		if err := applyProtectionRequest(&protections, payload, legacyLocks, &items[i], userID, username, isAdmin); err != nil {
+	editableUserIDs := make([]int64, 0)
+	seenEditableUserIDs := make(map[int64]struct{})
+	for index := range items {
+		if items[index].Action != "lock" {
+			continue
+		}
+		for _, editableUserID := range items[index].EditableUserIDs {
+			if _, exists := seenEditableUserIDs[editableUserID]; exists {
+				continue
+			}
+			seenEditableUserIDs[editableUserID] = struct{}{}
+			editableUserIDs = append(editableUserIDs, editableUserID)
+		}
+	}
+	if err := s.permService.ValidateEditableUsers(editableUserIDs); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
+	}
+
+	for index := range items {
+		if err := applyProtectionRequest(&protections, payload, legacyLocks, &items[index], userID, username, isAdmin); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -739,11 +910,15 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 		state.Archived = actor
 	case "unarchive":
 		state.Archived = nil
+	case "hide":
+		state.Hidden = actor
+	case "unhide":
+		state.Hidden = nil
 	default:
 		return nil, fmt.Errorf("unsupported sheet state action")
 	}
 
-	if state.Locked == nil && state.Archived == nil {
+	if state.Locked == nil && state.Archived == nil && state.Hidden == nil {
 		delete(payload, "sheetState")
 	} else {
 		payload["sheetState"] = state
@@ -799,7 +974,7 @@ func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey strin
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID {
+		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, rowIndex, colKey), nil
@@ -883,6 +1058,33 @@ func resolveProtectionTarget(scope string, rowIndex *int, columnKey *string, pro
 	}
 }
 
+func normalizeProtectionEditableUsers(userIDs []int64, ownerID int64) []int64 {
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	seen := map[int64]bool{}
+	result := make([]int64, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 || userID == ownerID || seen[userID] {
+			continue
+		}
+		seen[userID] = true
+		result = append(result, userID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+func protectionAllowsUser(info protectionOwner, userID int64) bool {
+	for _, editableUserID := range info.EditableUserIDs {
+		if editableUserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
 func applyProtectionRequest(protections *protectionMaps, payload map[string]interface{}, legacyLocks map[string]bool, req *model.UpdateProtectionRequest, userID int64, username string, isAdmin bool) error {
 	mapRef, key, info, err := resolveProtectionTarget(req.Scope, req.RowIndex, req.ColumnKey, *protections)
 	if err != nil {
@@ -893,10 +1095,22 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 		if info.OwnerID != 0 && info.OwnerID != userID && !isAdmin {
 			return fmt.Errorf("%w: 此保护已由 %s 添加", ErrProtectionDenied, info.OwnerName)
 		}
+		ownerID := userID
+		ownerName := username
+		protectedAt := time.Now().Format(time.RFC3339)
+		if info.OwnerID != 0 {
+			ownerID = info.OwnerID
+			ownerName = info.OwnerName
+			protectedAt = info.ProtectedAt
+			if protectedAt == "" {
+				protectedAt = time.Now().Format(time.RFC3339)
+			}
+		}
 		(*mapRef)[key] = protectionOwner{
-			OwnerID:     userID,
-			OwnerName:   username,
-			ProtectedAt: time.Now().Format(time.RFC3339),
+			OwnerID:         ownerID,
+			OwnerName:       ownerName,
+			EditableUserIDs: normalizeProtectionEditableUsers(req.EditableUserIDs, ownerID),
+			ProtectedAt:     protectedAt,
 		}
 		return nil
 	}
@@ -939,10 +1153,11 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner) []mode
 		}
 
 		entry := model.ProtectionInfo{
-			Scope:     scope,
-			Key:       key,
-			OwnerID:   info.OwnerID,
-			OwnerName: info.OwnerName,
+			Scope:           scope,
+			Key:             key,
+			OwnerID:         info.OwnerID,
+			OwnerName:       info.OwnerName,
+			EditableUserIDs: append([]int64(nil), info.EditableUserIDs...),
 		}
 		if parsedTime, err := time.Parse(time.RFC3339, info.ProtectedAt); err == nil {
 			entry.ProtectedAt = parsedTime
@@ -1147,7 +1362,7 @@ func (s *SheetService) checkProtectionByWorksheetRow(config json.RawMessage, wor
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID {
+		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, dataRowIndex, colKey), nil

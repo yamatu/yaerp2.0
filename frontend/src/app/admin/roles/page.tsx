@@ -1,7 +1,6 @@
 'use client'
 
 import {
-  ArrowLeft,
   PencilLine,
   Plus,
   Shield,
@@ -9,7 +8,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-import { AuthGuard } from '@/components/auth/AuthGuard'
+import { AdminShell } from '@/components/admin/AdminShell'
 import api from '@/lib/api'
 
 interface Role {
@@ -129,43 +128,19 @@ export default function RolesManagementPage() {
   }
 
   return (
-    <AuthGuard requireRole="admin">
-      <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(56,189,248,0.16),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(251,191,36,0.18),_transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
-        <div className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-4 p-3 md:p-6">
-          {/* Header */}
-          <header className="overflow-hidden rounded-[32px] border border-white/70 bg-white/80 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.7)] backdrop-blur">
-            <div className="flex flex-col gap-6 px-4 py-5 md:px-6 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-4">
-                <a
-                  href="/"
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-900"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  返回工作台
-                </a>
-                <div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-sky-100 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700">
-                    <ShieldCheck className="h-3.5 w-3.5" />
-                    Admin Roles
-                  </div>
-                  <h1 className="mt-4 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
-                    角色管理
-                  </h1>
-                  <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">
-                    管理系统中的角色定义，角色创建后可在员工账号管理中分配给用户，再通过权限矩阵控制各角色的数据访问能力。
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid gap-3 sm:grid-cols-2 lg:min-w-[340px]">
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+    <AdminShell
+      title="角色管理"
+      description="维护角色定义，并与员工账号和权限矩阵联动"
+      summary={(
+        <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-900 text-white">
                     <Shield className="h-4 w-4" />
                   </div>
                   <div className="text-sm text-slate-500">角色总数</div>
                   <div className="mt-1 text-2xl font-semibold text-slate-950">{roles.length}</div>
                 </div>
-                <div className="rounded-[24px] border border-slate-200 bg-white/95 p-4 shadow-sm">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                   <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700">
                     <ShieldCheck className="h-4 w-4" />
                   </div>
@@ -174,12 +149,12 @@ export default function RolesManagementPage() {
                     {roles.filter((r) => r.code === 'admin').length}
                   </div>
                 </div>
-              </div>
-            </div>
-          </header>
+        </div>
+      )}
+    >
 
           {/* Create Section */}
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
@@ -251,7 +226,7 @@ export default function RolesManagementPage() {
           </section>
 
           {/* Roles List */}
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
@@ -406,8 +381,6 @@ export default function RolesManagementPage() {
               </div>
             </div>
           )}
-        </div>
-      </div>
-    </AuthGuard>
+    </AdminShell>
   )
 }

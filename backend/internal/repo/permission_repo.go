@@ -55,14 +55,38 @@ func (r *PermissionRepo) GetSheetPermissions(sheetID, roleID int64) (*model.Shee
 }
 
 func (r *PermissionRepo) SetCellPermission(perm *model.CellPermission) error {
-	_, err := r.db.Exec(
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	columnKey := strings.TrimSpace(perm.ColumnKey)
+	rowIndexKey := -1
+	if perm.RowIndex != nil {
+		rowIndexKey = *perm.RowIndex
+	}
+
+	if _, err := tx.Exec(
+		`DELETE FROM cell_permissions
+		 WHERE sheet_id = $1
+		   AND role_id = $2
+		   AND COALESCE(column_key, '') = $3
+		   AND COALESCE(row_index, -1) = $4`,
+		perm.SheetID, perm.RoleID, columnKey, rowIndexKey,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(
 		`INSERT INTO cell_permissions (sheet_id, role_id, column_key, row_index, permission)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (sheet_id, role_id, column_key, row_index)
-		 DO UPDATE SET permission = $5`,
-		perm.SheetID, perm.RoleID, perm.ColumnKey, perm.RowIndex, perm.Permission,
-	)
-	return err
+		 VALUES ($1, $2, $3, $4, $5)`,
+		perm.SheetID, perm.RoleID, columnKey, perm.RowIndex, perm.Permission,
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (r *PermissionRepo) GetCellPermissions(sheetID, roleID int64) ([]model.CellPermission, error) {
@@ -132,6 +156,7 @@ func (r *PermissionRepo) ListUserSheetPermissions(sheetID int64) ([]model.UserSh
 func (r *PermissionRepo) GetPermissionMatrix(sheetID int64, roleIDs []int64) (*model.PermissionMatrix, error) {
 	matrix := &model.PermissionMatrix{
 		Sheet:   model.SheetPerm{},
+		Rows:    make(map[string]string),
 		Columns: make(map[string]string),
 		Cells:   make(map[string]string),
 	}
@@ -190,19 +215,25 @@ func (r *PermissionRepo) GetPermissionMatrix(sheetID int64, roleIDs []int64) (*m
 	defer cellRows.Close()
 
 	for cellRows.Next() {
-		var colKey string
+		var colKey sql.NullString
 		var rowIndex *int
 		var perm string
 		if err := cellRows.Scan(&colKey, &rowIndex, &perm); err != nil {
 			return nil, err
 		}
+		normalizedColKey := strings.TrimSpace(colKey.String)
 		if rowIndex != nil {
-			// Cell-specific permission
-			key := fmt.Sprintf("%d:%s", *rowIndex, colKey)
-			matrix.Cells[key] = bestPermission(matrix.Cells[key], perm)
-		} else {
+			if normalizedColKey == "" {
+				key := fmt.Sprintf("%d", *rowIndex)
+				matrix.Rows[key] = bestPermission(matrix.Rows[key], perm)
+			} else {
+				// Cell-specific permission
+				key := fmt.Sprintf("%d:%s", *rowIndex, normalizedColKey)
+				matrix.Cells[key] = bestPermission(matrix.Cells[key], perm)
+			}
+		} else if normalizedColKey != "" {
 			// Column-level permission
-			matrix.Columns[colKey] = bestPermission(matrix.Columns[colKey], perm)
+			matrix.Columns[normalizedColKey] = bestPermission(matrix.Columns[normalizedColKey], perm)
 		}
 	}
 

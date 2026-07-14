@@ -17,6 +17,7 @@ type Workbook struct {
 	Status       int             `json:"status" db:"status"`
 	IsLocked     bool            `json:"is_locked,omitempty"`
 	IsHidden     bool            `json:"is_hidden,omitempty"`
+	IsPublic     bool            `json:"is_public,omitempty"`
 	LockedByID   *int64          `json:"locked_by_id,omitempty"`
 	LockedByName *string         `json:"locked_by_name,omitempty"`
 	LockedAt     *time.Time      `json:"locked_at,omitempty"`
@@ -38,12 +39,16 @@ type Sheet struct {
 	Config         json.RawMessage `json:"config" db:"config"`
 	IsLocked       bool            `json:"is_locked,omitempty"`
 	IsArchived     bool            `json:"is_archived,omitempty"`
+	IsHidden       bool            `json:"is_hidden,omitempty"`
 	LockedByID     *int64          `json:"locked_by_id,omitempty"`
 	LockedByName   *string         `json:"locked_by_name,omitempty"`
 	LockedAt       *time.Time      `json:"locked_at,omitempty"`
 	ArchivedByID   *int64          `json:"archived_by_id,omitempty"`
 	ArchivedByName *string         `json:"archived_by_name,omitempty"`
 	ArchivedAt     *time.Time      `json:"archived_at,omitempty"`
+	HiddenByID     *int64          `json:"hidden_by_id,omitempty"`
+	HiddenByName   *string         `json:"hidden_by_name,omitempty"`
+	HiddenAt       *time.Time      `json:"hidden_at,omitempty"`
 	CreatedAt      time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at" db:"updated_at"`
 }
@@ -72,12 +77,12 @@ type UpdateWorkbookRequest struct {
 }
 
 type UpdateWorkbookStateRequest struct {
-	Action string `json:"action" binding:"required,oneof=lock unlock hide unhide"`
+	Action string `json:"action" binding:"required,oneof=lock unlock hide unhide publish unpublish"`
 }
 
 type BatchUpdateWorkbookStateRequest struct {
 	WorkbookIDs []int64 `json:"workbook_ids" binding:"required,min=1"`
-	Action      string  `json:"action" binding:"required,oneof=lock unlock hide unhide"`
+	Action      string  `json:"action" binding:"required,oneof=lock unlock hide unhide publish unpublish"`
 }
 
 type AssignWorkbookRequest struct {
@@ -85,10 +90,11 @@ type AssignWorkbookRequest struct {
 }
 
 type UpdateProtectionRequest struct {
-	Scope     string  `json:"scope" binding:"required,oneof=row column cell"`
-	Action    string  `json:"action" binding:"required,oneof=lock unlock"`
-	RowIndex  *int    `json:"row_index,omitempty"`
-	ColumnKey *string `json:"column_key,omitempty"`
+	Scope           string  `json:"scope" binding:"required,oneof=row column cell"`
+	Action          string  `json:"action" binding:"required,oneof=lock unlock"`
+	RowIndex        *int    `json:"row_index,omitempty"`
+	ColumnKey       *string `json:"column_key,omitempty"`
+	EditableUserIDs []int64 `json:"editable_user_ids,omitempty"`
 }
 
 type BatchUpdateProtectionRequest struct {
@@ -96,17 +102,18 @@ type BatchUpdateProtectionRequest struct {
 }
 
 type UpdateSheetStateRequest struct {
-	Action string `json:"action" binding:"required,oneof=lock unlock archive unarchive"`
+	Action string `json:"action" binding:"required,oneof=lock unlock archive unarchive hide unhide"`
 }
 
 type ProtectionInfo struct {
-	Scope       string    `json:"scope"`
-	Key         string    `json:"key"`
-	RowIndex    *int      `json:"row_index,omitempty"`
-	ColumnKey   *string   `json:"column_key,omitempty"`
-	OwnerID     int64     `json:"owner_id"`
-	OwnerName   string    `json:"owner_name"`
-	ProtectedAt time.Time `json:"protected_at"`
+	Scope           string    `json:"scope"`
+	Key             string    `json:"key"`
+	RowIndex        *int      `json:"row_index,omitempty"`
+	ColumnKey       *string   `json:"column_key,omitempty"`
+	OwnerID         int64     `json:"owner_id"`
+	OwnerName       string    `json:"owner_name"`
+	EditableUserIDs []int64   `json:"editable_user_ids,omitempty"`
+	ProtectedAt     time.Time `json:"protected_at"`
 }
 
 type ProtectionSnapshot struct {
@@ -121,11 +128,12 @@ type CreateSheetRequest struct {
 }
 
 type UpdateSheetRequest struct {
-	Name      *string          `json:"name"`
-	Columns   *json.RawMessage `json:"columns"`
-	SortOrder *int             `json:"sort_order"`
-	Frozen    *json.RawMessage `json:"frozen"`
-	Config    *json.RawMessage `json:"config"`
+	Name        *string          `json:"name"`
+	Columns     *json.RawMessage `json:"columns"`
+	SortOrder   *int             `json:"sort_order"`
+	Frozen      *json.RawMessage `json:"frozen"`
+	Config      *json.RawMessage `json:"config"`
+	CellChanges []CellUpdate     `json:"cell_changes"`
 }
 
 type CellUpdate struct {

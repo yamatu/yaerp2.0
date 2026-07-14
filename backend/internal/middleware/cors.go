@@ -21,6 +21,7 @@ func CORSMiddleware(allowedOrigins []string) gin.HandlerFunc {
 			"Accept-Encoding",
 			"Authorization",
 			"X-Requested-With",
+			"X-Client-Id",
 		},
 		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
 		AllowCredentials: true,

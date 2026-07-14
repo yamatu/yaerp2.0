@@ -53,8 +53,50 @@ type sheetPDFLayout struct {
 	TotalWidth  float64
 }
 
-func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string) (*sheetExportFile, error) {
-	ctx, err := s.loadSheetExportContext(userID, sheetID)
+type PDFExportOptions struct {
+	PaperSize   string
+	Orientation string
+	FitToWidth  bool
+}
+
+func ParsePDFExportOptions(paperSize, orientation, fitToWidth string) (PDFExportOptions, error) {
+	options := PDFExportOptions{
+		PaperSize:   strings.ToLower(strings.TrimSpace(paperSize)),
+		Orientation: strings.ToLower(strings.TrimSpace(orientation)),
+		FitToWidth:  true,
+	}
+	if options.PaperSize == "" {
+		options.PaperSize = "a4"
+	}
+	if options.Orientation == "" {
+		options.Orientation = "portrait"
+	}
+	if fit := strings.ToLower(strings.TrimSpace(fitToWidth)); fit != "" {
+		switch fit {
+		case "1", "true", "yes", "on":
+			options.FitToWidth = true
+		case "0", "false", "no", "off":
+			options.FitToWidth = false
+		default:
+			return PDFExportOptions{}, fmt.Errorf("invalid fit_to_width value")
+		}
+	}
+
+	switch options.PaperSize {
+	case "a4", "a3", "letter", "legal":
+	default:
+		return PDFExportOptions{}, fmt.Errorf("unsupported paper size")
+	}
+	switch options.Orientation {
+	case "portrait", "landscape":
+	default:
+		return PDFExportOptions{}, fmt.Errorf("unsupported page orientation")
+	}
+	return options, nil
+}
+
+func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string, options PDFExportOptions) (*sheetExportFile, error) {
+	ctx, err := s.loadSheetExportContext(userID, sheetID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +105,7 @@ func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string)
 	if err != nil {
 		return nil, err
 	}
-	layout := buildSheetPDFLayout(grid)
+	layout := buildSheetPDFLayoutWithOptions(grid, options)
 	htmlDoc := renderSheetPDFHTML(grid, layout)
 
 	pdfBytes, err := renderSheetPDFWithChromium(htmlDoc, layout)
@@ -73,6 +115,35 @@ func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string)
 
 	return &sheetExportFile{
 		Filename:    normalizeSheetPDFFilename(filename, ctx.Sheet.Name, sheetID),
+		ContentType: sheetPDFContentType,
+		Data:        pdfBytes,
+	}, nil
+}
+
+func (s *SheetService) BuildWorkbookPDFFile(userID, workbookID int64, sheetIDs []int64, filename string, options PDFExportOptions) (*sheetExportFile, error) {
+	workbook, contexts, err := s.loadWorkbookExportContexts(userID, workbookID, sheetIDs, false)
+	if err != nil {
+		return nil, err
+	}
+
+	grids := make([]*sheetPDFGrid, 0, len(contexts))
+	for _, ctx := range contexts {
+		grid, err := s.buildSheetPDFGrid(ctx)
+		if err != nil {
+			return nil, err
+		}
+		grids = append(grids, grid)
+	}
+
+	layout := buildWorkbookPDFLayoutWithOptions(grids, options)
+	htmlDoc := renderWorkbookPDFHTML(grids, layout)
+	pdfBytes, err := renderSheetPDFWithChromium(htmlDoc, layout)
+	if err != nil {
+		return nil, err
+	}
+
+	return &sheetExportFile{
+		Filename:    normalizeWorkbookExportFilename(filename, workbook.Name, workbookID, ".pdf"),
 		ContentType: sheetPDFContentType,
 		Data:        pdfBytes,
 	}, nil
@@ -509,6 +580,88 @@ func buildSheetPDFLayout(grid *sheetPDFGrid) sheetPDFLayout {
 	for _, column := range grid.Columns {
 		totalWidth += grid.ColumnWidths[column]
 	}
+	return buildSheetPDFLayoutForWidth(totalWidth)
+}
+
+func buildSheetPDFLayoutWithOptions(grid *sheetPDFGrid, options PDFExportOptions) sheetPDFLayout {
+	totalWidth := 0.0
+	for _, column := range grid.Columns {
+		totalWidth += grid.ColumnWidths[column]
+	}
+	return buildSheetPDFLayoutForWidthWithOptions(totalWidth, options)
+}
+
+func buildWorkbookPDFLayout(grids []*sheetPDFGrid) sheetPDFLayout {
+	maxWidth := 0.0
+	for _, grid := range grids {
+		totalWidth := 0.0
+		for _, column := range grid.Columns {
+			totalWidth += grid.ColumnWidths[column]
+		}
+		if totalWidth > maxWidth {
+			maxWidth = totalWidth
+		}
+	}
+	return buildSheetPDFLayoutForWidth(maxWidth)
+}
+
+func buildWorkbookPDFLayoutWithOptions(grids []*sheetPDFGrid, options PDFExportOptions) sheetPDFLayout {
+	maxWidth := 0.0
+	for _, grid := range grids {
+		totalWidth := 0.0
+		for _, column := range grid.Columns {
+			totalWidth += grid.ColumnWidths[column]
+		}
+		if totalWidth > maxWidth {
+			maxWidth = totalWidth
+		}
+	}
+	return buildSheetPDFLayoutForWidthWithOptions(maxWidth, options)
+}
+
+func buildSheetPDFLayoutForWidthWithOptions(totalWidth float64, options PDFExportOptions) sheetPDFLayout {
+	if totalWidth <= 0 {
+		totalWidth = 120
+	}
+	pageDimensions := map[string][2]float64{
+		"a4":     {210, 297},
+		"a3":     {297, 420},
+		"letter": {215.9, 279.4},
+		"legal":  {215.9, 355.6},
+	}
+	dimensions, ok := pageDimensions[options.PaperSize]
+	if !ok {
+		dimensions = pageDimensions["a4"]
+		options.PaperSize = "a4"
+	}
+	if options.Orientation == "landscape" {
+		dimensions[0], dimensions[1] = dimensions[1], dimensions[0]
+	} else {
+		options.Orientation = "portrait"
+	}
+
+	margin := 8.0
+	scale := 1.0
+	if options.FitToWidth {
+		scale = (dimensions[0] - margin*2) / totalWidth
+		if scale > 1 {
+			scale = 1
+		}
+		if scale < 0.1 {
+			scale = 0.1
+		}
+	}
+
+	return sheetPDFLayout{
+		CSSPageSize: fmt.Sprintf("%s %s", strings.ToUpper(options.PaperSize), options.Orientation),
+		PageWidthMM: dimensions[0],
+		MarginMM:    margin,
+		Scale:       scale,
+		TotalWidth:  totalWidth,
+	}
+}
+
+func buildSheetPDFLayoutForWidth(totalWidth float64) sheetPDFLayout {
 	if totalWidth <= 0 {
 		totalWidth = 120
 	}
@@ -559,6 +712,49 @@ func renderSheetPDFHTML(grid *sheetPDFGrid, layout sheetPDFLayout) string {
 	var builder strings.Builder
 	builder.Grow(64 * 1024)
 
+	appendSheetPDFDocumentStart(&builder, layout, false)
+
+	if len(grid.Rows) == 0 || len(grid.Columns) == 0 {
+		builder.WriteString("<div class=\"empty\">当前工作表暂无可导出的内容</div></body></html>")
+		return builder.String()
+	}
+
+	appendSheetPDFTableHTML(&builder, grid)
+	builder.WriteString("</body></html>")
+	return builder.String()
+}
+
+func renderWorkbookPDFHTML(grids []*sheetPDFGrid, layout sheetPDFLayout) string {
+	var builder strings.Builder
+	builder.Grow(128 * 1024)
+
+	appendSheetPDFDocumentStart(&builder, layout, true)
+	if len(grids) == 0 {
+		builder.WriteString("<div class=\"empty\">当前工作簿没有可导出的工作表</div></body></html>")
+		return builder.String()
+	}
+
+	for index, grid := range grids {
+		builder.WriteString("<section class=\"sheet-section\">")
+		builder.WriteString("<div class=\"sheet-title\">")
+		builder.WriteString(html.EscapeString(grid.SheetName))
+		builder.WriteString("</div>")
+		if len(grid.Rows) == 0 || len(grid.Columns) == 0 {
+			builder.WriteString("<div class=\"empty\">当前工作表暂无可导出的内容</div>")
+		} else {
+			appendSheetPDFTableHTML(&builder, grid)
+		}
+		builder.WriteString("</section>")
+		if index < len(grids)-1 {
+			builder.WriteString("<div class=\"page-break\"></div>")
+		}
+	}
+
+	builder.WriteString("</body></html>")
+	return builder.String()
+}
+
+func appendSheetPDFDocumentStart(builder *strings.Builder, layout sheetPDFLayout, multiSheet bool) {
 	builder.WriteString("<!DOCTYPE html><html><head><meta charset=\"utf-8\" /><style>")
 	builder.WriteString("@font-face{font-family:'" + sheetPDFBaseFontFamily + "';src:url(data:font/ttf;base64,")
 	builder.WriteString(sheetPDFFontBase64)
@@ -566,17 +762,27 @@ func renderSheetPDFHTML(grid *sheetPDFGrid, layout sheetPDFLayout) string {
 	builder.WriteString(fmt.Sprintf("@page{size:%s;margin:%.2fmm;}\n", layout.CSSPageSize, layout.MarginMM))
 	builder.WriteString("html,body{margin:0;padding:0;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;}\n")
 	builder.WriteString("body{font-family:'" + sheetPDFBaseFontFamily + "','Noto Sans SC','Microsoft YaHei',sans-serif;color:#0f172a;}\n")
-	builder.WriteString(fmt.Sprintf("table{border-collapse:collapse;table-layout:fixed;width:%.2fmm;}\n", layout.TotalWidth))
+	builder.WriteString("table{border-collapse:collapse;table-layout:fixed;}\n")
 	builder.WriteString("td{box-sizing:border-box;overflow:hidden;line-height:1.35;}\n")
 	builder.WriteString(".empty{padding:12mm 8mm;border:1px solid #cbd5e1;border-radius:3mm;background:#f8fafc;text-align:center;color:#475569;font-size:12px;}\n")
+	if multiSheet {
+		builder.WriteString(".sheet-section{break-inside:auto;page-break-inside:auto;}\n")
+		builder.WriteString(".page-break{break-after:page;page-break-after:always;height:0;}\n")
+		builder.WriteString(".sheet-title{margin:0 0 5mm 0;font-size:13px;font-weight:700;color:#0f172a;}\n")
+	}
 	builder.WriteString("</style></head><body>")
+}
 
-	if len(grid.Rows) == 0 || len(grid.Columns) == 0 {
-		builder.WriteString("<div class=\"empty\">当前工作表暂无可导出的内容</div></body></html>")
-		return builder.String()
+func appendSheetPDFTableHTML(builder *strings.Builder, grid *sheetPDFGrid) {
+	totalWidth := 0.0
+	for _, column := range grid.Columns {
+		totalWidth += grid.ColumnWidths[column]
+	}
+	if totalWidth <= 0 {
+		totalWidth = 120
 	}
 
-	builder.WriteString("<table><colgroup>")
+	builder.WriteString(fmt.Sprintf("<table style=\"width:%.2fmm\"><colgroup>", totalWidth))
 	for _, column := range grid.Columns {
 		builder.WriteString(fmt.Sprintf("<col style=\"width:%.2fmm\" />", grid.ColumnWidths[column]))
 	}
@@ -614,8 +820,7 @@ func renderSheetPDFHTML(grid *sheetPDFGrid, layout sheetPDFLayout) string {
 		builder.WriteString("</tr>")
 	}
 
-	builder.WriteString("</tbody></table></body></html>")
-	return builder.String()
+	builder.WriteString("</tbody></table>")
 }
 
 func buildSheetPDFCellCSS(style *univerStyleData, showGridlines bool, defaultFontSize float64) string {
