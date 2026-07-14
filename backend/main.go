@@ -78,6 +78,15 @@ func main() {
 	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo)
 	sheetService := service.NewSheetService(sheetRepo, permService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, channelRepo, cfg.JWT.Secret)
+	go func() {
+		updated, removed, err := uploadService.BackfillGalleryContentHashes()
+		if err != nil {
+			log.Printf("backfill gallery content hashes: %v", err)
+		}
+		if updated > 0 || removed > 0 {
+			log.Printf("gallery hash maintenance completed: hashed=%d duplicate_links_removed=%d", updated, removed)
+		}
+	}()
 	channelService := service.NewChannelService(channelRepo, uploadService, sheetService, permService, userRepo)
 	whatsAppService := service.NewWhatsAppService(
 		whatsAppRepo, channelRepo, uploadService, sheetService, permService,

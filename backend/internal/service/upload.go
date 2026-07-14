@@ -43,19 +43,22 @@ func (s *UploadService) Upload(file multipart.File, header *multipart.FileHeader
 	ext := filepath.Ext(header.Filename)
 	objectKey := fmt.Sprintf("uploads/%d/%d%s", userID, time.Now().UnixNano(), ext)
 	contentType := header.Header.Get("Content-Type")
+	hasher := sha256.New()
+	reader := io.TeeReader(file, hasher)
 
 	ctx := context.Background()
-	if err := s.minioClient.Upload(ctx, objectKey, file, header.Size, contentType); err != nil {
+	if err := s.minioClient.Upload(ctx, objectKey, reader, header.Size, contentType); err != nil {
 		return nil, fmt.Errorf("failed to upload file: %w", err)
 	}
 
 	attachment := &model.Attachment{
-		Filename:   header.Filename,
-		MimeType:   contentType,
-		Size:       header.Size,
-		Bucket:     "yaerp",
-		ObjectKey:  objectKey,
-		UploaderID: userID,
+		Filename:    header.Filename,
+		MimeType:    contentType,
+		Size:        header.Size,
+		Bucket:      "yaerp",
+		ObjectKey:   objectKey,
+		ContentHash: hex.EncodeToString(hasher.Sum(nil)),
+		UploaderID:  userID,
 	}
 
 	if err := s.attachmentRepo.Create(attachment); err != nil {
@@ -69,6 +72,7 @@ func (s *UploadService) Upload(file multipart.File, header *multipart.FileHeader
 func (s *UploadService) UploadBytes(filename, contentType string, data []byte, userID int64) (*model.Attachment, string, error) {
 	objectKey := fmt.Sprintf("uploads/%d/%d%s", userID, time.Now().UnixNano(), filepath.Ext(filename))
 	reader := bytes.NewReader(data)
+	contentHash := sha256.Sum256(data)
 
 	ctx := context.Background()
 	if err := s.minioClient.Upload(ctx, objectKey, reader, int64(len(data)), contentType); err != nil {
@@ -76,12 +80,13 @@ func (s *UploadService) UploadBytes(filename, contentType string, data []byte, u
 	}
 
 	attachment := &model.Attachment{
-		Filename:   filename,
-		MimeType:   contentType,
-		Size:       int64(len(data)),
-		Bucket:     "yaerp",
-		ObjectKey:  objectKey,
-		UploaderID: userID,
+		Filename:    filename,
+		MimeType:    contentType,
+		Size:        int64(len(data)),
+		Bucket:      "yaerp",
+		ObjectKey:   objectKey,
+		ContentHash: hex.EncodeToString(contentHash[:]),
+		UploaderID:  userID,
 	}
 
 	if err := s.attachmentRepo.Create(attachment); err != nil {
@@ -189,35 +194,87 @@ func (s *UploadService) DeleteGalleryDirectory(directoryID int64) error {
 }
 
 func (s *UploadService) SaveImageToGallery(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64) error {
+	_, _, err := s.SaveImageToGalleryDeduplicated(attachmentID, directoryID, channelID, savedBy)
+	return err
+}
+
+func (s *UploadService) SaveImageToGalleryDeduplicated(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64) (int64, bool, error) {
 	if s.channelRepo == nil {
-		return nil
+		return attachmentID, false, nil
 	}
 	if channelID != nil {
 		allowed, err := s.channelRepo.IsChannelMember(*channelID, savedBy)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 		if !allowed {
-			return fmt.Errorf("channel access denied")
+			return 0, false, fmt.Errorf("channel access denied")
 		}
 	}
 	if directoryID != nil {
 		directory, err := s.channelRepo.GetGalleryDirectory(*directoryID)
 		if err != nil {
-			return fmt.Errorf("gallery directory not found: %w", err)
+			return 0, false, fmt.Errorf("gallery directory not found: %w", err)
 		}
 		canEdit, err := s.channelRepo.CanEditGalleryDirectory(*directoryID, savedBy)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 		if !canEdit {
-			return fmt.Errorf("gallery directory access denied")
+			return 0, false, fmt.Errorf("gallery directory access denied")
 		}
 		if directory.ChannelID != nil && channelID != nil && *directory.ChannelID != *channelID {
-			return fmt.Errorf("gallery directory does not belong to selected channel")
+			return 0, false, fmt.Errorf("gallery directory does not belong to selected channel")
 		}
 	}
-	return s.channelRepo.SaveGalleryImage(attachmentID, directoryID, channelID, savedBy)
+	attachment, err := s.ensureContentHash(attachmentID)
+	if err != nil {
+		return 0, false, err
+	}
+	return s.channelRepo.SaveGalleryImage(attachmentID, directoryID, channelID, savedBy, attachment.ContentHash)
+}
+
+func (s *UploadService) BackfillGalleryContentHashes() (int, int64, error) {
+	attachments, err := s.attachmentRepo.ListGalleryAttachmentsMissingHash()
+	if err != nil {
+		return 0, 0, err
+	}
+	updated := 0
+	var firstErr error
+	for _, attachment := range attachments {
+		if _, err := s.ensureContentHash(attachment.ID); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("hash gallery attachment %d: %w", attachment.ID, err)
+			}
+			continue
+		}
+		updated++
+	}
+	removed, err := s.channelRepo.DeleteDuplicateGalleryImages()
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return updated, removed, firstErr
+}
+
+func (s *UploadService) ensureContentHash(attachmentID int64) (*model.Attachment, error) {
+	attachment, err := s.attachmentRepo.GetByID(attachmentID)
+	if err != nil {
+		return nil, err
+	}
+	if attachment.ContentHash != "" {
+		return attachment, nil
+	}
+	data, err := s.minioClient.GetObjectBytes(context.Background(), attachment.ObjectKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash attachment: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	attachment.ContentHash = hex.EncodeToString(sum[:])
+	if err := s.attachmentRepo.UpdateContentHash(attachment.ID, attachment.ContentHash); err != nil {
+		return nil, err
+	}
+	return attachment, nil
 }
 
 func (s *UploadService) CanAccessGalleryImage(userID, attachmentID int64) (bool, error) {

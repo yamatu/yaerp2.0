@@ -639,12 +639,24 @@ func (h *ChannelHandler) UploadGalleryImage(c *gin.Context) {
 	}
 	directoryID := parseOptionalFormInt64(c, "gallery_directory_id")
 	channelID := parseOptionalFormInt64(c, "channel_id")
-	if err := h.uploadService.SaveImageToGallery(attachment.ID, directoryID, channelID, userID); err != nil {
+	effectiveAttachmentID, duplicate, err := h.uploadService.SaveImageToGalleryDeduplicated(attachment.ID, directoryID, channelID, userID)
+	if err != nil {
 		response.Error(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if duplicate && effectiveAttachmentID != attachment.ID {
+		if err := h.uploadService.DeleteFile(attachment.ID); err != nil {
+			response.ServerError(c, err.Error())
+			return
+		}
+		attachment, err = h.uploadService.GetAttachment(effectiveAttachmentID)
+		if err != nil {
+			response.ServerError(c, err.Error())
+			return
+		}
+	}
 	url, _ := h.uploadService.GetFileURL(attachment.ID)
-	response.OK(c, gin.H{"attachment": attachment, "url": url})
+	response.OK(c, gin.H{"attachment": attachment, "url": url, "duplicate": duplicate})
 }
 
 func (h *ChannelHandler) RenameGalleryImage(c *gin.Context) {

@@ -24,6 +24,7 @@ type Attachment struct {
 	Size         int64     `json:"size" db:"size"`
 	Bucket       string    `json:"bucket" db:"bucket"`
 	ObjectKey    string    `json:"object_key" db:"object_key"`
+	ContentHash  string    `json:"-" db:"content_hash"`
 	UploaderID   int64     `json:"uploader_id" db:"uploader_id"`
 	UploaderName string    `json:"uploader_name,omitempty" db:"uploader_name"`
 	CreatedAt    time.Time `json:"created_at" db:"created_at"`

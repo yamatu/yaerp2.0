@@ -2,6 +2,7 @@ package repo
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -845,14 +846,89 @@ func (r *ChannelRepo) UpdateGalleryDirectoryAccess(directoryID int64, visibility
 	return tx.Commit()
 }
 
-func (r *ChannelRepo) SaveGalleryImage(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64) error {
-	_, err := r.db.Exec(
+func (r *ChannelRepo) SaveGalleryImage(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64, contentHash string) (int64, bool, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback()
+
+	scopeType, scopeID := "personal", savedBy
+	if directoryID != nil {
+		scopeType, scopeID = "directory", *directoryID
+	} else if channelID != nil {
+		scopeType, scopeID = "channel", *channelID
+	}
+	lockKey := fmt.Sprintf("gallery:%s:%d:%s", scopeType, scopeID, contentHash)
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		return 0, false, err
+	}
+
+	var existingID int64
+	query := `SELECT gi.attachment_id
+		          FROM gallery_images gi
+		          JOIN attachments a ON a.id = gi.attachment_id
+		         WHERE a.content_hash = $1`
+	args := []any{contentHash}
+	switch scopeType {
+	case "directory":
+		query += ` AND gi.directory_id = $2`
+		args = append(args, scopeID)
+	case "channel":
+		query += ` AND gi.directory_id IS NULL AND gi.channel_id = $2`
+		args = append(args, scopeID)
+	default:
+		query += ` AND gi.directory_id IS NULL AND gi.channel_id IS NULL AND gi.saved_by = $2`
+		args = append(args, scopeID)
+	}
+	query += ` ORDER BY gi.id LIMIT 1`
+	if err := tx.QueryRow(query, args...).Scan(&existingID); err == nil {
+		if err := tx.Commit(); err != nil {
+			return 0, false, err
+		}
+		return existingID, existingID != attachmentID, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, err
+	}
+
+	if _, err := tx.Exec(
 		`INSERT INTO gallery_images (attachment_id, directory_id, channel_id, saved_by, created_at)
-		 VALUES ($1, $2, $3, $4, NOW())
-		 ON CONFLICT (attachment_id, directory_id, channel_id) DO NOTHING`,
+		 VALUES ($1, $2, $3, $4, NOW())`,
 		attachmentID, directoryID, channelID, savedBy,
+	); err != nil {
+		return 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return attachmentID, false, nil
+}
+
+func (r *ChannelRepo) DeleteDuplicateGalleryImages() (int64, error) {
+	result, err := r.db.Exec(
+		`WITH ranked AS (
+		    SELECT gi.id,
+		           ROW_NUMBER() OVER (
+		               PARTITION BY
+		                   CASE WHEN gi.directory_id IS NOT NULL THEN 'directory'
+		                        WHEN gi.channel_id IS NOT NULL THEN 'channel'
+		                        ELSE 'personal' END,
+		                   COALESCE(gi.directory_id, gi.channel_id, gi.saved_by),
+		                   a.content_hash
+		               ORDER BY gi.created_at, gi.id
+		           ) AS duplicate_rank
+		      FROM gallery_images gi
+		      JOIN attachments a ON a.id = gi.attachment_id
+		     WHERE COALESCE(a.content_hash, '') <> ''
+		)
+		DELETE FROM gallery_images gi
+		 USING ranked r
+		 WHERE gi.id = r.id AND r.duplicate_rank > 1`,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (r *ChannelRepo) IsGalleryImage(attachmentID int64) (bool, error) {
