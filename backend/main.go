@@ -265,6 +265,7 @@ func main() {
 
 			// Attachments (admin)
 			admin.DELETE("/attachments/:id", uploadHandler.DeleteFile)
+			admin.DELETE("/gallery/directories/:id", channelHandler.DeleteGalleryDirectory)
 
 			// Folder visibility (admin)
 			admin.POST("/folders/:id/visibility", folderHandler.SetVisibility)

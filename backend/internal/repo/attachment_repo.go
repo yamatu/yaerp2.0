@@ -26,9 +26,12 @@ func (r *AttachmentRepo) Create(a *model.Attachment) error {
 func (r *AttachmentRepo) GetByID(id int64) (*model.Attachment, error) {
 	a := &model.Attachment{}
 	err := r.db.QueryRow(
-		`SELECT id, filename, mime_type, size, bucket, object_key, uploader_id, created_at
-		 FROM attachments WHERE id = $1`, id,
-	).Scan(&a.ID, &a.Filename, &a.MimeType, &a.Size, &a.Bucket, &a.ObjectKey, &a.UploaderID, &a.CreatedAt)
+		`SELECT a.id, a.filename, a.mime_type, a.size, a.bucket, a.object_key, a.uploader_id,
+		        COALESCE(u.username, ''), a.created_at
+		 FROM attachments a
+		 LEFT JOIN users u ON u.id = a.uploader_id
+		 WHERE a.id = $1`, id,
+	).Scan(&a.ID, &a.Filename, &a.MimeType, &a.Size, &a.Bucket, &a.ObjectKey, &a.UploaderID, &a.UploaderName, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -91,8 +94,10 @@ func (r *AttachmentRepo) ListAccessibleByMimePrefixFiltered(prefix string, page,
 	offset := (page - 1) * size
 	args = append(args, size, offset)
 	rows, err := r.db.Query(
-		`SELECT a.id, a.filename, a.mime_type, a.size, a.bucket, a.object_key, a.uploader_id, a.created_at
-		 FROM attachments a`+where+fmt.Sprintf(` ORDER BY a.created_at DESC LIMIT $%d OFFSET $%d`, len(args)-1, len(args)),
+		`SELECT a.id, a.filename, a.mime_type, a.size, a.bucket, a.object_key, a.uploader_id,
+		        COALESCE(u.username, ''), a.created_at
+		 FROM attachments a
+		 LEFT JOIN users u ON u.id = a.uploader_id`+where+fmt.Sprintf(` ORDER BY a.created_at DESC LIMIT $%d OFFSET $%d`, len(args)-1, len(args)),
 		args...,
 	)
 	if err != nil {
@@ -103,7 +108,7 @@ func (r *AttachmentRepo) ListAccessibleByMimePrefixFiltered(prefix string, page,
 	var list []*model.Attachment
 	for rows.Next() {
 		a := &model.Attachment{}
-		if err := rows.Scan(&a.ID, &a.Filename, &a.MimeType, &a.Size, &a.Bucket, &a.ObjectKey, &a.UploaderID, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Filename, &a.MimeType, &a.Size, &a.Bucket, &a.ObjectKey, &a.UploaderID, &a.UploaderName, &a.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		list = append(list, a)

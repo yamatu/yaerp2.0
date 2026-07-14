@@ -38,6 +38,8 @@ export default function GalleryPage() {
   const [selectedDirectoryId, setSelectedDirectoryId] = useState('')
   const [newDirectoryName, setNewDirectoryName] = useState('')
   const [creatingDirectory, setCreatingDirectory] = useState(false)
+  const [deletingDirectory, setDeletingDirectory] = useState(false)
+  const [directoryError, setDirectoryError] = useState('')
   const [accessDirectory, setAccessDirectory] = useState<GalleryDirectory | null>(null)
   const [directoryAccess, setDirectoryAccess] = useState<GalleryDirectoryAccess | null>(null)
   const [accessUsers, setAccessUsers] = useState<User[]>([])
@@ -116,6 +118,7 @@ export default function GalleryPage() {
   const handleCreateDirectory = async () => {
     if (!newDirectoryName.trim() || creatingDirectory) return
     setCreatingDirectory(true)
+    setDirectoryError('')
     try {
       const res = await api.post<GalleryDirectory>('/gallery/directories', { name: newDirectoryName.trim() })
       if (res.code === 0 && res.data) {
@@ -126,6 +129,27 @@ export default function GalleryPage() {
       }
     } finally {
       setCreatingDirectory(false)
+    }
+  }
+
+  const handleDeleteDirectory = async () => {
+    if (!admin || !selectedDirectory || deletingDirectory) return
+    if (!window.confirm(`确定删除图库目录“${selectedDirectory.name}”吗？目录中的图片不会被删除，会继续保留在“全部图片”中。`)) return
+    setDeletingDirectory(true)
+    setDirectoryError('')
+    try {
+      const res = await api.delete(`/gallery/directories/${selectedDirectory.id}`)
+      if (res.code !== 0) {
+        setDirectoryError(res.message || '删除图库目录失败')
+        return
+      }
+      setSelectedDirectoryId('')
+      setPage(1)
+      await fetchDirectories()
+    } catch {
+      setDirectoryError('删除图库目录失败')
+    } finally {
+      setDeletingDirectory(false)
     }
   }
 
@@ -237,6 +261,8 @@ export default function GalleryPage() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   }
 
+  const downloadURL = (image: GalleryImage) => `${image.url}${image.url.includes('?') ? '&' : '?'}download=1`
+
   const totalPages = Math.ceil(total / pageSize)
 
   return (
@@ -286,12 +312,13 @@ export default function GalleryPage() {
             />
           </div>
 
-          <div className="mb-8 grid gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm md:grid-cols-[220px_minmax(0,1fr)_140px_auto]">
+          <div className="mb-8 grid gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm md:grid-cols-[220px_minmax(0,1fr)_140px_auto_auto]">
             <select
               value={selectedDirectoryId}
               onChange={(event) => {
                 setSelectedDirectoryId(event.target.value)
                 setPage(1)
+                setDirectoryError('')
               }}
               className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300"
             >
@@ -328,6 +355,19 @@ export default function GalleryPage() {
               <ShieldCheck className="h-4 w-4" />
               目录权限
             </button>
+            {admin && (
+              <button
+                type="button"
+                onClick={() => void handleDeleteDirectory()}
+                disabled={!selectedDirectory || deletingDirectory}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+                title={selectedDirectory ? '删除当前图库目录，图片会保留' : '请先选择要删除的目录'}
+              >
+                <Trash2 className="h-4 w-4" />
+                {deletingDirectory ? '删除中...' : '删除目录'}
+              </button>
+            )}
+            {directoryError && <div className="md:col-span-full rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{directoryError}</div>}
           </div>
 
           {/* Grid */}
@@ -360,7 +400,7 @@ export default function GalleryPage() {
                 {images.map((img) => (
                   <div
                     key={img.id}
-                    className="group relative overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm transition hover:shadow-md"
+                    className="group relative overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm transition hover:border-sky-200 hover:shadow-md"
                   >
                     <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600" title="重命名图片">
                       <Pencil className="h-3.5 w-3.5" />
@@ -373,47 +413,15 @@ export default function GalleryPage() {
                         loading="lazy"
                       />
                     </button>
-                    {/* Hover overlay */}
-                    <div className="pointer-events-none absolute inset-0 flex items-end bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
-                      <div className="pointer-events-auto flex w-full items-center justify-between p-3">
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs font-medium text-white">
-                            {img.filename}
-                          </p>
-                          <p className="text-[10px] text-white/70">
-                            {formatSize(img.size)}
-                          </p>
-                        </div>
+                    <div className="p-3">
+                      <p className="truncate text-xs font-semibold text-slate-800">{img.filename}</p>
+                      <p className="mt-1 truncate text-[11px] text-slate-500">上传者：{img.uploader_name || `用户 #${img.uploader_id}`}</p>
+                      <div className="mt-2 flex items-center justify-between gap-2">
+                        <span className="text-[10px] text-slate-400">{formatSize(img.size)}</span>
                         <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => setPreview(img)}
-                            className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/20 text-white backdrop-blur-sm transition hover:bg-white/30"
-                            title="预览"
-                          >
-                            <ZoomIn className="h-3.5 w-3.5" />
-                          </button>
-                          <a
-                            href={img.url}
-                            download={img.filename}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/20 text-white backdrop-blur-sm transition hover:bg-white/30"
-                            title="下载"
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                          </a>
-                          {admin && (
-                            <button
-                              type="button"
-                              onClick={() => handleDelete(img.id)}
-                              disabled={deleting === img.id}
-                              className="flex h-7 w-7 items-center justify-center rounded-lg bg-rose-500/80 text-white backdrop-blur-sm transition hover:bg-rose-600 disabled:opacity-50"
-                              title="删除"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
+                          <button type="button" onClick={() => setPreview(img)} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-600" title="查看大图" aria-label={`查看 ${img.filename}`}><ZoomIn className="h-3.5 w-3.5" /></button>
+                          <a href={downloadURL(img)} download={img.filename} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-600" title="下载图片" aria-label={`下载 ${img.filename}`}><Download className="h-3.5 w-3.5" /></a>
+                          {admin && <button type="button" onClick={() => handleDelete(img.id)} disabled={deleting === img.id} className="flex h-8 w-8 items-center justify-center rounded-lg border border-rose-200 text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50" title="删除图片" aria-label={`删除 ${img.filename}`}><Trash2 className="h-3.5 w-3.5" /></button>}
                         </div>
                       </div>
                     </div>
@@ -530,7 +538,7 @@ export default function GalleryPage() {
             onClick={() => setPreview(null)}
           >
             <div
-              className="relative max-h-[90vh] max-w-[90vw]"
+              className="relative flex max-h-[92vh] w-[min(94vw,1100px)] flex-col items-center"
               onClick={(e) => e.stopPropagation()}
             >
               <button
@@ -543,11 +551,14 @@ export default function GalleryPage() {
               <img
                 src={preview.url}
                 alt={preview.filename}
-                className="max-h-[85vh] max-w-full rounded-2xl object-contain shadow-2xl"
+                className="max-h-[72vh] max-w-full rounded-lg object-contain shadow-2xl"
               />
-              <div className="mt-3 text-center">
-                <p className="text-sm font-medium text-white">{preview.filename}</p>
-                <p className="text-xs text-white/60">{formatSize(preview.size)}</p>
+              <div className="mt-3 flex w-full max-w-2xl flex-wrap items-center justify-between gap-3 rounded-lg bg-black/35 px-3 py-2.5 text-left backdrop-blur-sm">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium text-white">{preview.filename}</p>
+                  <p className="mt-0.5 truncate text-xs text-white/60">上传者：{preview.uploader_name || `用户 #${preview.uploader_id}`} · {formatSize(preview.size)}</p>
+                </div>
+                <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"><Download className="h-4 w-4" />下载图片</a>
               </div>
             </div>
           </div>

@@ -18,12 +18,13 @@ type OperationLog struct {
 }
 
 type Attachment struct {
-	ID         int64     `json:"id" db:"id"`
-	Filename   string    `json:"filename" db:"filename"`
-	MimeType   string    `json:"mime_type" db:"mime_type"`
-	Size       int64     `json:"size" db:"size"`
-	Bucket     string    `json:"bucket" db:"bucket"`
-	ObjectKey  string    `json:"object_key" db:"object_key"`
-	UploaderID int64     `json:"uploader_id" db:"uploader_id"`
-	CreatedAt  time.Time `json:"created_at" db:"created_at"`
+	ID           int64     `json:"id" db:"id"`
+	Filename     string    `json:"filename" db:"filename"`
+	MimeType     string    `json:"mime_type" db:"mime_type"`
+	Size         int64     `json:"size" db:"size"`
+	Bucket       string    `json:"bucket" db:"bucket"`
+	ObjectKey    string    `json:"object_key" db:"object_key"`
+	UploaderID   int64     `json:"uploader_id" db:"uploader_id"`
+	UploaderName string    `json:"uploader_name,omitempty" db:"uploader_name"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
 }

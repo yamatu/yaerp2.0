@@ -605,6 +605,18 @@ func (r *ChannelRepo) CreateGalleryDirectory(directory *model.GalleryDirectory) 
 	).Scan(&directory.ID, &directory.CreatedAt, &directory.UpdatedAt)
 }
 
+func (r *ChannelRepo) DeleteGalleryDirectory(directoryID int64) error {
+	result, err := r.db.Exec(`DELETE FROM gallery_directories WHERE id = $1`, directoryID)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *ChannelRepo) ListGalleryDirectories(userID int64, channelID *int64) ([]model.GalleryDirectory, error) {
 	query := `SELECT gd.id, gd.name, gd.owner_id, COALESCE(u.username, ''), gd.channel_id, gd.visibility,
 	                  (gd.owner_id = $1 OR EXISTS (

@@ -2422,7 +2422,7 @@ export default function ChannelsPage() {
                             </div>
                             <div className="px-2 py-2 pr-9">
                               <div className="truncate text-xs font-semibold text-slate-700">{image.filename}</div>
-                              <div className="mt-0.5 text-[11px] text-slate-400">{formatFileSize(image.size)}</div>
+                              <div className="mt-0.5 truncate text-[11px] text-slate-400">{image.uploader_name || `用户 #${image.uploader_id}`} · {formatFileSize(image.size)}</div>
                             </div>
                           </button>
                           <button type="button" onClick={(event) => openGalleryImageRename(image, event)} className="absolute bottom-1.5 right-1.5 inline-flex h-7 w-7 items-center justify-center rounded-lg bg-white/95 text-slate-500 shadow-sm transition hover:text-emerald-600" title="重命名图片">

@@ -306,6 +306,7 @@ export interface GalleryImage {
   mime_type: string
   size: number
   uploader_id: number
+  uploader_name?: string
   created_at: string
   url: string
 }

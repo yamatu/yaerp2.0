@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -172,6 +173,19 @@ func (s *UploadService) ListGalleryDirectories(userID int64, channelID *int64) (
 		return nil, fmt.Errorf("gallery directory service is unavailable")
 	}
 	return s.channelRepo.ListGalleryDirectories(userID, channelID)
+}
+
+func (s *UploadService) DeleteGalleryDirectory(directoryID int64) error {
+	if s.channelRepo == nil {
+		return fmt.Errorf("gallery directory service is unavailable")
+	}
+	if err := s.channelRepo.DeleteGalleryDirectory(directoryID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("图库目录不存在")
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *UploadService) SaveImageToGallery(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64) error {

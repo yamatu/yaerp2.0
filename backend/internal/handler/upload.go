@@ -2,7 +2,7 @@ package handler
 
 import (
 	"errors"
-	"fmt"
+	"mime"
 	"net/http"
 	"strconv"
 
@@ -74,7 +74,11 @@ func (h *UploadHandler) ServeFile(c *gin.Context) {
 	}
 	defer reader.Close()
 
-	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", attachment.Filename))
+	disposition := "inline"
+	if c.Query("download") == "1" || c.Query("download") == "true" {
+		disposition = "attachment"
+	}
+	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": attachment.Filename}))
 	c.DataFromReader(http.StatusOK, attachment.Size, attachment.MimeType, reader, nil)
 }
 

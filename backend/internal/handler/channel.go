@@ -456,6 +456,19 @@ func (h *ChannelHandler) CreateGalleryDirectory(c *gin.Context) {
 	response.OK(c, directory)
 }
 
+func (h *ChannelHandler) DeleteGalleryDirectory(c *gin.Context) {
+	directoryID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid gallery directory id")
+		return
+	}
+	if err := h.uploadService.DeleteGalleryDirectory(directoryID); err != nil {
+		response.Error(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	response.OKMsg(c, "gallery directory deleted")
+}
+
 func (h *ChannelHandler) GetGalleryDirectoryAccess(c *gin.Context) {
 	directoryID, err := parseIDParam(c, "id")
 	if err != nil {
