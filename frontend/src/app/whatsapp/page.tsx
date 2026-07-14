@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, CheckCircle2, LogOut, MessageCircle, RefreshCw, Save, Search, Smartphone, Users, Wifi, WifiOff } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import api from '@/lib/api'
@@ -24,14 +24,20 @@ export default function WhatsAppWorkspacePage() {
   const [account, setAccount] = useState<WhatsAppAccount | null>(null)
   const [chats, setChats] = useState<WhatsAppChat[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadingChats, setLoadingChats] = useState(false)
   const [acting, setActing] = useState('')
   const [about, setAbout] = useState('')
   const [savingAbout, setSavingAbout] = useState(false)
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const accountRequestRef = useRef(false)
+  const chatsRequestRef = useRef(false)
+  const lastChatsLoadAtRef = useRef(0)
 
   const loadAccount = useCallback(async () => {
+    if (accountRequestRef.current) return null
+    accountRequestRef.current = true
     try {
       const response = await api.get<WhatsAppAccount>('/whatsapp/account')
       if (response.code === 0 && response.data) {
@@ -42,16 +48,25 @@ export default function WhatsAppWorkspacePage() {
       setError(response.message || '加载 WhatsApp 账号失败')
     } catch {
       setError('加载 WhatsApp 账号失败')
+    } finally {
+      accountRequestRef.current = false
     }
     return null
   }, [])
 
   const loadChats = useCallback(async () => {
+    if (chatsRequestRef.current) return
+    chatsRequestRef.current = true
+    setLoadingChats(true)
     try {
       const response = await api.get<WhatsAppChat[]>('/whatsapp/chats')
       setChats(response.code === 0 && response.data ? response.data : [])
+      if (response.code === 0) lastChatsLoadAtRef.current = Date.now()
     } catch {
       setChats([])
+    } finally {
+      chatsRequestRef.current = false
+      setLoadingChats(false)
     }
   }, [])
 
@@ -67,8 +82,13 @@ export default function WhatsAppWorkspacePage() {
   useEffect(() => {
     const timer = window.setInterval(async () => {
       const current = await loadAccount()
-      if (current?.status === 'ready') await loadChats()
-    }, 2500)
+      if (current?.status === 'ready' && Date.now() - lastChatsLoadAtRef.current >= 30000) {
+        await loadChats()
+      } else if (current && current.status !== 'ready') {
+        setChats([])
+        lastChatsLoadAtRef.current = 0
+      }
+    }, 3000)
     return () => window.clearInterval(timer)
   }, [loadAccount, loadChats])
 
@@ -171,11 +191,12 @@ export default function WhatsAppWorkspacePage() {
           </aside>
 
           <section className="flex min-h-0 flex-col bg-[#f7f8fa]">
-            <div className="border-b border-slate-200 bg-white p-3 sm:p-4">
-              <label className="flex h-10 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:ring-1 focus-within:ring-emerald-300"><Search className="h-4 w-4" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索 WhatsApp 联系人、群组或最近消息" className="min-w-0 flex-1 bg-transparent outline-none" /></label>
+            <div className="flex items-center gap-2 border-b border-slate-200 bg-white p-3 sm:p-4">
+              <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:ring-1 focus-within:ring-emerald-300"><Search className="h-4 w-4" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索 WhatsApp 联系人、群组或最近消息" className="min-w-0 flex-1 bg-transparent outline-none" /></label>
+              <button type="button" onClick={() => void loadChats()} disabled={!connected || loadingChats} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40" title="刷新 WhatsApp 会话"><RefreshCw className={`h-4 w-4 ${loadingChats ? 'animate-spin' : ''}`} /></button>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
-              {!connected ? <div className="flex h-full min-h-96 flex-col items-center justify-center text-center text-slate-400"><div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 text-emerald-700"><MessageCircle className="h-7 w-7" /></div><div className="mt-4 text-base font-semibold text-slate-700">绑定后显示 WhatsApp 会话</div><p className="mt-2 max-w-sm text-sm leading-6">员工只能管理自己的账号。系统代理由管理员统一配置，不会在这里显示。</p></div> : filteredChats.length === 0 ? <div className="p-10 text-center text-sm text-slate-400">没有匹配的 WhatsApp 会话</div> : filteredChats.map((chat) => (
+              {!connected ? <div className="flex h-full min-h-96 flex-col items-center justify-center text-center text-slate-400"><div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 text-emerald-700"><MessageCircle className="h-7 w-7" /></div><div className="mt-4 text-base font-semibold text-slate-700">绑定后显示 WhatsApp 会话</div><p className="mt-2 max-w-sm text-sm leading-6">员工只能管理自己的账号。系统代理由管理员统一配置，不会在这里显示。</p></div> : loadingChats && chats.length === 0 ? <div className="flex h-full min-h-72 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div> : filteredChats.length === 0 ? <div className="p-10 text-center text-sm text-slate-400">没有匹配的 WhatsApp 会话</div> : filteredChats.map((chat) => (
                 <div key={chat.id} className="flex items-center gap-3 border-b border-slate-100 bg-white px-4 py-3 transition hover:bg-slate-50">
                   <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500">{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />}</div>
                   <div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div>{chat.timestamp > 0 && <span className="shrink-0 text-[11px] text-slate-400">{new Date(chat.timestamp * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}</span>}</div><div className="mt-1 flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</span>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div></div>

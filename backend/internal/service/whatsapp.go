@@ -795,7 +795,7 @@ func (s *WhatsAppService) startAccount(account *model.WhatsAppAccount, enable bo
 
 func (s *WhatsAppService) listChatsForAccount(account *model.WhatsAppAccount) ([]model.WhatsAppChat, error) {
 	chats := make([]model.WhatsAppChat, 0)
-	if err := s.callSidecar(http.MethodGet, s.sessionPath(account.UserID)+"/chats", nil, &chats); err != nil {
+	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/chats", nil, &chats, 25*time.Second); err != nil {
 		return nil, err
 	}
 	return chats, nil
@@ -888,6 +888,10 @@ func (s *WhatsAppService) sessionPath(userID int64) string {
 }
 
 func (s *WhatsAppService) callSidecar(method, path string, input, output interface{}) error {
+	return s.callSidecarWithTimeout(method, path, input, output, 90*time.Second)
+}
+
+func (s *WhatsAppService) callSidecarWithTimeout(method, path string, input, output interface{}, timeout time.Duration) error {
 	if s.serviceURL == "" || s.internalSecret == "" {
 		return fmt.Errorf("WhatsApp 内部服务尚未配置")
 	}
@@ -899,7 +903,7 @@ func (s *WhatsAppService) callSidecar(method, path string, input, output interfa
 		}
 		body = bytes.NewReader(data)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, method, s.serviceURL+path, body)
 	if err != nil {

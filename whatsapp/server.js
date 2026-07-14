@@ -18,6 +18,10 @@ const OPERATION_WAIT_TIMEOUT_MS = Number(process.env.WHATSAPP_OPERATION_WAIT_TIM
 const OPERATION_TIMEOUT_MS = Number(process.env.WHATSAPP_OPERATION_TIMEOUT_MS || 30000)
 const STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_STARTUP_TIMEOUT_MS || 120000)
 const INITIALIZATION_CANCEL_GRACE_MS = Number(process.env.WHATSAPP_INITIALIZATION_CANCEL_GRACE_MS || 2000)
+const CHAT_LIST_CACHE_MS = Number(process.env.WHATSAPP_CHAT_LIST_CACHE_MS || 10000)
+const CHAT_METADATA_CACHE_MS = Number(process.env.WHATSAPP_CHAT_METADATA_CACHE_MS || 10 * 60 * 1000)
+const CHAT_METADATA_LIMIT = Number(process.env.WHATSAPP_CHAT_METADATA_LIMIT || 30)
+const CHAT_METADATA_TIMEOUT_MS = Number(process.env.WHATSAPP_CHAT_METADATA_TIMEOUT_MS || 8000)
 
 const app = express()
 app.use(express.json({ limit: '40mb' }))
@@ -54,6 +58,9 @@ function getSession(value) {
       localProxyUrl: '',
       operation: Promise.resolve(),
       startupTimer: null,
+      chatListPromise: null,
+      chatMetadataPromise: null,
+      chatCache: { items: [], loadedAt: 0, metadataLoadedAt: 0, metadata: new Map() },
       state: createState(),
     })
   }
@@ -118,6 +125,16 @@ function scheduleStartupTimer(session, client) {
     void postWebhook(session, 'status', { ...session.state })
     void destroyClient(session)
   }, STARTUP_TIMEOUT_MS)
+}
+
+function resetChatCache(session) {
+  session.chatListPromise = null
+  session.chatMetadataPromise = null
+  session.chatCache = { items: [], loadedAt: 0, metadataLoadedAt: 0, metadata: new Map() }
+}
+
+function invalidateChatList(session) {
+  session.chatCache.loadedAt = 0
 }
 
 function requireInternalSecret(req, res, next) {
@@ -234,6 +251,7 @@ async function destroyClient(session) {
   const initialization = session.initialization
   session.client = null
   session.initialization = null
+  resetChatCache(session)
   if (active) {
     if (!active.pupBrowser && initialization) {
       await Promise.race([initialization.catch(() => undefined), delay(INITIALIZATION_CANCEL_GRACE_MS)])
@@ -339,6 +357,7 @@ function bindClientEvents(session, client) {
     const account = await accountSnapshot(session, client)
     if (!active()) return
     clearStartupTimer(session)
+    resetChatCache(session)
     updateState(session, {
       status: 'ready', qr: '', qrDataUrl: '', loadingPercent: 100, loadingMessage: '', lastError: '',
       account,
@@ -352,9 +371,16 @@ function bindClientEvents(session, client) {
     updateState(session, { status: 'disconnected', account: null, lastError: String(reason || '') })
     void postWebhook(session, 'status', { ...session.state })
   })
-  client.on('message', async (message) => active() && void postWebhook(session, 'message', await serializeMessage(session, message, true)))
+  client.on('message', async (message) => {
+    if (!active()) return
+    invalidateChatList(session)
+    void postWebhook(session, 'message', await serializeMessage(session, message, true))
+  })
   client.on('message_create', async (message) => {
-    if (active() && message.fromMe) void postWebhook(session, 'message_create', await serializeMessage(session, message, false))
+    if (active() && message.fromMe) {
+      invalidateChatList(session)
+      void postWebhook(session, 'message_create', await serializeMessage(session, message, false))
+    }
   })
   client.on('message_ack', (message, ack) => active() && void postWebhook(session, 'message_ack', { id: serializeId(message.id), ack }))
   client.on('message_edit', (message, newBody, previousBody) => {
@@ -446,6 +472,62 @@ async function enrichChat(session, chat) {
   return basic
 }
 
+function mergeChatMetadata(session, items) {
+  return items.map((item) => ({ ...item, ...(session.chatCache.metadata.get(item.id) || {}) }))
+}
+
+function refreshChatMetadata(session, chats) {
+  if (session.chatMetadataPromise || session.state.status !== 'ready') return session.chatMetadataPromise
+  const client = session.client
+  const selected = chats.slice(0, Math.max(0, CHAT_METADATA_LIMIT))
+  session.chatMetadataPromise = mapWithConcurrency(selected, 2, async (chat) => {
+    if (session.client !== client || session.state.status !== 'ready') return
+    try {
+      const enriched = await withTimeout(enrichChat(session, chat), CHAT_METADATA_TIMEOUT_MS, `chat metadata ${serializeId(chat.id)}`)
+      const { id, name, isGroup, unreadCount, timestamp, pinned, archived, isMuted, lastMessage, ...metadata } = enriched
+      session.chatCache.metadata.set(id, metadata)
+    } catch (error) {
+      console.error(`Chat metadata refresh failed (${session.id}/${serializeId(chat.id)}):`, error.message)
+    }
+  }).then(() => {
+    if (session.client !== client) return
+    session.chatCache.metadataLoadedAt = Date.now()
+    session.chatCache.items = mergeChatMetadata(session, session.chatCache.items)
+  }).catch((error) => {
+    console.error(`Chat metadata batch failed (${session.id}):`, error.message)
+  }).finally(() => {
+    session.chatMetadataPromise = null
+  })
+  return session.chatMetadataPromise
+}
+
+async function getChatList(session, limit) {
+  const now = Date.now()
+  if (session.chatCache.items.length > 0 && now - session.chatCache.loadedAt < CHAT_LIST_CACHE_MS) {
+    return mergeChatMetadata(session, session.chatCache.items).slice(0, limit)
+  }
+  if (!session.chatListPromise) {
+    const client = session.client
+    session.chatListPromise = withTimeout(client.getChats(), 20000, 'get chats').then((chats) => {
+      if (session.client !== client) return []
+      const selected = chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, Math.max(limit, 200))
+      session.chatCache.items = mergeChatMetadata(session, selected.map(serializeChatBasic))
+      session.chatCache.loadedAt = Date.now()
+      if (Date.now() - session.chatCache.metadataLoadedAt >= CHAT_METADATA_CACHE_MS) void refreshChatMetadata(session, selected)
+      return session.chatCache.items
+    }).catch((error) => {
+      if (session.chatCache.items.length === 0) throw error
+      console.error(`Chat list refresh failed, serving cache (${session.id}):`, error.message)
+      session.chatCache.loadedAt = Date.now()
+      return session.chatCache.items
+    }).finally(() => {
+      session.chatListPromise = null
+    })
+  }
+  const items = await session.chatListPromise
+  return mergeChatMetadata(session, items).slice(0, limit)
+}
+
 async function mapWithConcurrency(items, limit, mapper) {
   const result = new Array(items.length)
   let cursor = 0
@@ -524,10 +606,8 @@ app.put('/sessions/:sessionId/profile/about', requireSession, requireReady, asyn
 
 app.get('/sessions/:sessionId/chats', requireSession, requireReady, async (req, res, next) => {
   try {
-    const chats = await req.whatsappSession.client.getChats()
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200)))
-    const selected = chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, limit)
-    res.json(await mapWithConcurrency(selected, 8, (chat) => enrichChat(req.whatsappSession, chat)))
+    res.json(await getChatList(req.whatsappSession, limit))
   } catch (error) { next(error) }
 })
 app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (req, res, next) => {

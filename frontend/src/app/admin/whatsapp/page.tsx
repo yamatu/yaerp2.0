@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { LogOut, MessageCircle, RefreshCw, Save, Search, Server, Smartphone, Users, Wifi, WifiOff } from 'lucide-react'
 import { AdminShell } from '@/components/admin/AdminShell'
 import api from '@/lib/api'
@@ -32,10 +32,12 @@ export default function WhatsAppAdminPage() {
   const [accountSearch, setAccountSearch] = useState('')
   const [chatSearch, setChatSearch] = useState('')
   const [loading, setLoading] = useState(true)
+  const [loadingChats, setLoadingChats] = useState(false)
   const [saving, setSaving] = useState(false)
   const [acting, setActing] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const chatRequestSequenceRef = useRef(0)
 
   const loadAccounts = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -50,11 +52,15 @@ export default function WhatsAppAdminPage() {
   }, [])
 
   const loadChats = useCallback(async (userId: number) => {
+    const requestSequence = ++chatRequestSequenceRef.current
+    setLoadingChats(true)
     try {
       const response = await api.get<WhatsAppChat[]>(`/admin/whatsapp/accounts/${userId}/chats`)
-      setChats(response.code === 0 && response.data ? response.data : [])
+      if (requestSequence === chatRequestSequenceRef.current) setChats(response.code === 0 && response.data ? response.data : [])
     } catch {
-      setChats([])
+      if (requestSequence === chatRequestSequenceRef.current) setChats([])
+    } finally {
+      if (requestSequence === chatRequestSequenceRef.current) setLoadingChats(false)
     }
   }, [])
 
@@ -69,7 +75,12 @@ export default function WhatsAppAdminPage() {
   const selectedAccount = accounts.find((account) => account.user_id === selectedUserId) || null
 
   useEffect(() => {
-    if (!selectedAccount || selectedAccount.status !== 'ready') { setChats([]); return }
+    if (!selectedAccount || selectedAccount.status !== 'ready') {
+      chatRequestSequenceRef.current += 1
+      setLoadingChats(false)
+      setChats([])
+      return
+    }
     void loadChats(selectedAccount.user_id)
   }, [loadChats, selectedAccount?.status, selectedAccount?.user_id])
 
@@ -139,8 +150,8 @@ export default function WhatsAppAdminPage() {
           </section>
 
           <section className="flex min-h-0 flex-col bg-[#f7f8fa]">
-            <div className="border-b border-slate-200 bg-white p-3"><label className="flex h-10 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500"><Search className="h-4 w-4" /><input value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} placeholder="搜索该员工的联系人和群组" className="min-w-0 flex-1 bg-transparent outline-none" /></label></div>
-            <div className="min-h-0 flex-1 overflow-y-auto">{selectedAccount?.status !== 'ready' ? <div className="flex h-full min-h-72 flex-col items-center justify-center text-center text-sm text-slate-400"><MessageCircle className="mb-3 h-10 w-10 text-slate-300" />员工账号连接后显示 WhatsApp 会话</div> : filteredChats.length === 0 ? <div className="p-10 text-center text-sm text-slate-400">没有匹配的会话</div> : filteredChats.map((chat) => <div key={chat.id} className="flex items-center gap-3 border-b border-slate-100 bg-white px-4 py-3"><div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500">{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />}</div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div><div className="mt-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || chat.id}</div></div>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div>)}</div>
+            <div className="flex items-center gap-2 border-b border-slate-200 bg-white p-3"><label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500"><Search className="h-4 w-4" /><input value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} placeholder="搜索该员工的联系人和群组" className="min-w-0 flex-1 bg-transparent outline-none" /></label><button type="button" onClick={() => selectedAccount && void loadChats(selectedAccount.user_id)} disabled={selectedAccount?.status !== 'ready' || loadingChats} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40" title="刷新该员工的 WhatsApp 会话"><RefreshCw className={`h-4 w-4 ${loadingChats ? 'animate-spin' : ''}`} /></button></div>
+            <div className="min-h-0 flex-1 overflow-y-auto">{selectedAccount?.status !== 'ready' ? <div className="flex h-full min-h-72 flex-col items-center justify-center text-center text-sm text-slate-400"><MessageCircle className="mb-3 h-10 w-10 text-slate-300" />员工账号连接后显示 WhatsApp 会话</div> : loadingChats && chats.length === 0 ? <div className="flex h-full min-h-72 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div> : filteredChats.length === 0 ? <div className="p-10 text-center text-sm text-slate-400">没有匹配的会话</div> : filteredChats.map((chat) => <div key={chat.id} className="flex items-center gap-3 border-b border-slate-100 bg-white px-4 py-3"><div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500">{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />}</div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div><div className="mt-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || chat.id}</div></div>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div>)}</div>
           </section>
         </div>
       </section>

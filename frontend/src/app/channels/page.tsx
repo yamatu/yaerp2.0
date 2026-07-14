@@ -336,6 +336,7 @@ export default function ChannelsPage() {
   const externalDragDepthRef = useRef(0)
   const soundEnabledRef = useRef(soundEnabled)
   const audioContextRef = useRef<AudioContext | null>(null)
+  const whatsAppRequestSequenceRef = useRef(0)
   const latestMessageIdsRef = useRef<Map<number, number>>(new Map())
   const channelsInitializedRef = useRef(false)
 
@@ -1426,6 +1427,7 @@ export default function ChannelsPage() {
   }
 
   const loadWhatsAppLink = async (channelId: number) => {
+    const requestSequence = ++whatsAppRequestSequenceRef.current
     setLoadingWhatsApp(true)
     try {
       const [linkResponse, accountsResponse] = await Promise.all([
@@ -1438,6 +1440,7 @@ export default function ChannelsPage() {
       const accounts = currentUser && isAdmin(currentUser)
         ? ((accountsResponse.data as WhatsAppAccount[] | undefined) || [])
         : (accountsResponse.data ? [accountsResponse.data as WhatsAppAccount] : [])
+      if (requestSequence !== whatsAppRequestSequenceRef.current) return
       setWhatsAppAccounts(accounts)
       setWhatsAppLink(link)
       const accountId = link?.whatsapp_account_id || accounts[0]?.id || 0
@@ -1450,32 +1453,38 @@ export default function ChannelsPage() {
         const chatsResponse = currentUser && isAdmin(currentUser)
           ? await api.get<WhatsAppChat[]>(`/admin/whatsapp/accounts/${account.user_id}/chats`)
           : await api.get<WhatsAppChat[]>('/whatsapp/chats')
-        setWhatsAppChats(chatsResponse.code === 0 && chatsResponse.data ? chatsResponse.data : [])
+        if (requestSequence === whatsAppRequestSequenceRef.current) setWhatsAppChats(chatsResponse.code === 0 && chatsResponse.data ? chatsResponse.data : [])
       } else {
         setWhatsAppChats([])
       }
     } catch {
-      setWhatsAppAccounts([])
-      setWhatsAppChats([])
+      if (requestSequence === whatsAppRequestSequenceRef.current) {
+        setWhatsAppAccounts([])
+        setWhatsAppChats([])
+      }
     } finally {
-      setLoadingWhatsApp(false)
+      if (requestSequence === whatsAppRequestSequenceRef.current) setLoadingWhatsApp(false)
     }
   }
 
   const handleWhatsAppAccountSelection = async (accountId: string) => {
+    const requestSequence = ++whatsAppRequestSequenceRef.current
     setSelectedWhatsAppAccountId(accountId)
     setSelectedWhatsAppChatId('')
     setWhatsAppChats([])
     const account = whatsAppAccounts.find((item) => String(item.id) === accountId)
-    if (!account || account.status !== 'ready') return
+    if (!account || account.status !== 'ready') {
+      setLoadingWhatsApp(false)
+      return
+    }
     setLoadingWhatsApp(true)
     try {
       const response = currentUser && isAdmin(currentUser)
         ? await api.get<WhatsAppChat[]>(`/admin/whatsapp/accounts/${account.user_id}/chats`)
         : await api.get<WhatsAppChat[]>('/whatsapp/chats')
-      setWhatsAppChats(response.code === 0 && response.data ? response.data : [])
+      if (requestSequence === whatsAppRequestSequenceRef.current) setWhatsAppChats(response.code === 0 && response.data ? response.data : [])
     } finally {
-      setLoadingWhatsApp(false)
+      if (requestSequence === whatsAppRequestSequenceRef.current) setLoadingWhatsApp(false)
     }
   }
 
