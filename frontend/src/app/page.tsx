@@ -13,6 +13,7 @@ import {
   FolderIcon,
   FolderKanban,
   FolderPlus,
+  FolderUp,
   Globe2,
   Layers3,
   Images,
@@ -126,8 +127,11 @@ export default function HomePage() {
   const [editingWorkbook, setEditingWorkbook] = useState<{ id: number; name: string } | null>(null)
   const [editWorkbookName, setEditWorkbookName] = useState('')
   const workbookImportInputRef = useRef<HTMLInputElement | null>(null)
+  const workbookFolderImportInputRef = useRef<HTMLInputElement | null>(null)
   const [importingWorkbook, setImportingWorkbook] = useState(false)
+  const [importingWorkbookFolder, setImportingWorkbookFolder] = useState(false)
   const [workbookImportProgress, setWorkbookImportProgress] = useState(0)
+  const [workbookFolderImportStatus, setWorkbookFolderImportStatus] = useState('')
   const [workbookImportError, setWorkbookImportError] = useState('')
   const [downloadingSourceWorkbookId, setDownloadingSourceWorkbookId] = useState<number | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
@@ -135,6 +139,7 @@ export default function HomePage() {
   const [workbookSortBy, setWorkbookSortBy] = useState<'updated_at' | 'created_at' | 'name'>('updated_at')
   const [workbookSortOrder, setWorkbookSortOrder] = useState<'asc' | 'desc'>('desc')
   const [groupByOwner, setGroupByOwner] = useState(true)
+  const [showOnlyOwnWorkbooks, setShowOnlyOwnWorkbooks] = useState(false)
   const [workbookPage, setWorkbookPage] = useState(1)
   const [assigningWorkbook, setAssigningWorkbook] = useState<Workbook | null>(null)
   const [assignableUsers, setAssignableUsers] = useState<User[]>([])
@@ -259,7 +264,12 @@ export default function HomePage() {
     return qi === q.length
   }
 
-  const directoryWorkbooks = contents.workbooks
+  const directoryWorkbooks = useMemo(
+    () => adminMode && showOnlyOwnWorkbooks
+      ? contents.workbooks.filter((workbook) => workbook.owner_id === profile?.id)
+      : contents.workbooks,
+    [adminMode, contents.workbooks, profile?.id, showOnlyOwnWorkbooks]
+  )
 
   const filteredWorkbooks = useMemo(() => {
     if (!searchQuery.trim()) return directoryWorkbooks
@@ -326,6 +336,7 @@ export default function HomePage() {
     return sharedFolders.filter((folder) => !existingIds.has(folder.id))
   }, [contents.folders, sharedFolders])
   useEffect(() => { setFolderPage(1) }, [folderSearchQuery])
+  useEffect(() => { setWorkbookPage(1) }, [showOnlyOwnWorkbooks])
   useEffect(() => {
     if (folderPage > totalFolderPages) setFolderPage(totalFolderPages)
   }, [folderPage, totalFolderPages])
@@ -425,7 +436,7 @@ export default function HomePage() {
   }
 
   const handleImportWorkbookXlsx = async (file: File) => {
-    if (!canWriteCurrentFolder || importingWorkbook) return
+    if (!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder) return
 
     setImportingWorkbook(true)
     setWorkbookImportProgress(0)
@@ -451,6 +462,73 @@ export default function HomePage() {
       if (workbookImportInputRef.current) {
         workbookImportInputRef.current.value = ''
       }
+    }
+  }
+
+  const handleImportWorkbookFolder = async (selectedFiles: FileList) => {
+    if (!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder) return
+    const files = Array.from(selectedFiles).filter((file) => file.name.toLowerCase().endsWith('.xlsx'))
+    if (files.length === 0) {
+      setWorkbookImportError('所选文件夹中没有 XLSX 工作簿。')
+      if (workbookFolderImportInputRef.current) workbookFolderImportInputRef.current.value = ''
+      return
+    }
+
+    setImportingWorkbookFolder(true)
+    setWorkbookImportProgress(0)
+    setWorkbookImportError('')
+    setWorkbookFolderImportStatus(`正在分析 ${files.length} 个 Excel 工作簿`)
+
+    try {
+      const entries = files.map((file) => {
+        const relativePath = (file.webkitRelativePath || file.name).replaceAll('\\', '/')
+        const parts = relativePath.split('/').map((part) => part.trim()).filter(Boolean)
+        return { file, parts, directoryParts: parts.length > 1 ? parts.slice(0, -1) : [file.name.replace(/\.xlsx$/i, '')] }
+      })
+      const directoryPaths = Array.from(new Set(entries.flatMap((entry) => entry.directoryParts.map((_, index) => entry.directoryParts.slice(0, index + 1).join('/')))))
+        .sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right, 'zh-CN'))
+      const folderIDs = new Map<string, number>()
+
+      for (let index = 0; index < directoryPaths.length; index += 1) {
+        const directoryPath = directoryPaths[index]
+        const parts = directoryPath.split('/')
+        const parentPath = parts.slice(0, -1).join('/')
+        const parentID = parentPath ? folderIDs.get(parentPath) : currentFolderId
+        setWorkbookFolderImportStatus(`正在创建目录 ${directoryPath}`)
+        const response = await api.post<Folder>('/folders', { name: parts.at(-1), parent_id: parentID ?? null })
+        if (response.code !== 0 || !response.data?.id) throw new Error(response.message || `创建目录 ${directoryPath} 失败`)
+        folderIDs.set(directoryPath, response.data.id)
+        setWorkbookImportProgress(Math.round(((index + 1) / Math.max(1, directoryPaths.length + files.length)) * 100))
+      }
+
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index]
+        const directoryPath = entry.directoryParts.join('/')
+        const folderID = folderIDs.get(directoryPath)
+        if (!folderID) throw new Error(`找不到导入目录 ${directoryPath}`)
+        setWorkbookFolderImportStatus(`正在导入 ${index + 1}/${entries.length}：${entry.parts.join('/')}`)
+        await uploadNewWorkbookXlsx(entry.file, {
+          folderId: folderID,
+          onProgress: (fileProgress) => {
+            const completedUnits = directoryPaths.length + index + fileProgress / 100
+            setWorkbookImportProgress(Math.round((completedUnits / (directoryPaths.length + files.length)) * 100))
+          },
+        })
+      }
+
+      setWorkbookImportProgress(100)
+      setWorkbookFolderImportStatus(`已按原目录结构导入 ${files.length} 个 Excel 工作簿`)
+      await Promise.all([refresh(), refreshFolder()])
+      setWorkbookPage(1)
+    } catch (err) {
+      setWorkbookImportError(err instanceof Error ? err.message : 'Excel 文件夹批量导入失败。')
+    } finally {
+      setImportingWorkbookFolder(false)
+      window.setTimeout(() => {
+        setWorkbookImportProgress(0)
+        setWorkbookFolderImportStatus('')
+      }, 1200)
+      if (workbookFolderImportInputRef.current) workbookFolderImportInputRef.current.value = ''
     }
   }
 
@@ -875,6 +953,17 @@ export default function HomePage() {
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
+                {adminMode && (
+                  <button
+                    type="button"
+                    onClick={() => setShowOnlyOwnWorkbooks((current) => !current)}
+                    className={`order-3 inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition ${showOnlyOwnWorkbooks ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+                    title={showOnlyOwnWorkbooks ? '恢复查看所有员工的工作簿' : '隐藏其他员工的工作簿'}
+                  >
+                    {showOnlyOwnWorkbooks ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                    {showOnlyOwnWorkbooks ? '只看我的' : '仅看自己的表'}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setCreatingFolder(true)}
@@ -887,7 +976,7 @@ export default function HomePage() {
                 <button
                   type="button"
                   onClick={() => setCreating((prev) => !prev)}
-                  disabled={!canWriteCurrentFolder || importingWorkbook}
+                  disabled={!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder}
                   className="order-1 inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Plus className="h-4 w-4" />
@@ -896,7 +985,7 @@ export default function HomePage() {
                 <button
                   type="button"
                   onClick={() => workbookImportInputRef.current?.click()}
-                  disabled={!canWriteCurrentFolder || importingWorkbook}
+                  disabled={!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder}
                   className="order-2 inline-flex h-10 items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Upload className="h-4 w-4" />
@@ -914,10 +1003,30 @@ export default function HomePage() {
                     }
                   }}
                 />
+                <button
+                  type="button"
+                  onClick={() => workbookFolderImportInputRef.current?.click()}
+                  disabled={!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder}
+                  className="order-2 inline-flex h-10 items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 text-sm font-semibold text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <FolderUp className="h-4 w-4" />
+                  {importingWorkbookFolder ? `批量导入 ${workbookImportProgress}%` : '上传 Excel 文件夹'}
+                </button>
+                <input
+                  ref={workbookFolderImportInputRef}
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  multiple
+                  className="hidden"
+                  {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                  onChange={(event) => {
+                    if (event.target.files?.length) void handleImportWorkbookFolder(event.target.files)
+                  }}
+                />
               </div>
             </div>
 
-            {(importingWorkbook || workbookImportError) && (
+            {(importingWorkbook || importingWorkbookFolder || workbookFolderImportStatus || workbookImportError) && (
               <div className={`mb-4 rounded-2xl border px-4 py-3 text-sm ${
                 workbookImportError
                   ? 'border-rose-200 bg-rose-50 text-rose-700'
@@ -928,7 +1037,7 @@ export default function HomePage() {
                 ) : (
                   <div>
                     <div className="flex items-center justify-between font-semibold">
-                      <span>正在导入 Excel 工作簿</span>
+                      <span>{importingWorkbookFolder ? (workbookFolderImportStatus || '正在批量导入 Excel 文件夹') : '正在导入 Excel 工作簿'}</span>
                       <span>{workbookImportProgress}%</span>
                     </div>
                     <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white">

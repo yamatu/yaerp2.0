@@ -306,6 +306,15 @@ type WhatsAppChat struct {
 	LastMessage      string `json:"lastMessage"`
 }
 
+type WhatsAppContact struct {
+	ID            string `json:"id"`
+	Number        string `json:"number"`
+	Name          string `json:"name"`
+	IsBusiness    bool   `json:"isBusiness"`
+	IsMyContact   bool   `json:"isMyContact"`
+	ProfilePicURL string `json:"profilePicUrl"`
+}
+
 type WhatsAppChannelLink struct {
 	ChannelID                int64     `json:"channel_id"`
 	WhatsAppAccountID        int64     `json:"whatsapp_account_id"`
@@ -346,4 +355,28 @@ type WhatsAppSendRequest struct {
 	AttachmentID      *int64 `json:"attachment_id"`
 	WorkbookID        *int64 `json:"workbook_id"`
 	SheetID           *int64 `json:"sheet_id"`
+}
+
+type WhatsAppHistorySyncRequest struct {
+	Limit int `json:"limit"`
+}
+
+type WhatsAppHistorySyncResult struct {
+	Imported int `json:"imported"`
+	Skipped  int `json:"skipped"`
+	Total    int `json:"total"`
+}
+
+type WhatsAppContactSyncRequest struct {
+	WhatsAppAccountID int64 `json:"whatsapp_account_id"`
+	Limit             int   `json:"limit"`
+}
+
+type WhatsAppContactSyncResult struct {
+	Created  int      `json:"created"`
+	Skipped  int      `json:"skipped"`
+	Failed   int      `json:"failed"`
+	Total    int      `json:"total"`
+	Channels []int64  `json:"channel_ids"`
+	Errors   []string `json:"errors,omitempty"`
 }

@@ -109,6 +109,39 @@ func (h *WhatsAppHandler) MarkOwnChatRead(c *gin.Context) {
 	response.OKMsg(c, "WhatsApp conversation marked as read")
 }
 
+func (h *WhatsAppHandler) SyncChannelHistory(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	var request model.WhatsAppHistorySyncRequest
+	if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.service.SyncChannelHistory(c.GetInt64("user_id"), channelID, &request)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
+func (h *WhatsAppHandler) SyncContactsToChannels(c *gin.Context) {
+	var request model.WhatsAppContactSyncRequest
+	if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.service.SyncContactsToChannels(c.GetInt64("user_id"), &request)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *WhatsAppHandler) ListAccounts(c *gin.Context) {
 	accounts, err := h.service.ListAccounts(c.GetInt64("user_id"))
 	if err != nil {

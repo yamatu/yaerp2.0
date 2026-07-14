@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -79,6 +80,10 @@ type whatsAppIncomingMessage struct {
 	Author              string             `json:"author"`
 	FromMe              bool               `json:"fromMe"`
 	Body                string             `json:"body"`
+	Type                string             `json:"type"`
+	Timestamp           int64              `json:"timestamp"`
+	HasMedia            bool               `json:"hasMedia"`
+	Ack                 *int               `json:"ack,omitempty"`
 	SenderName          string             `json:"senderName"`
 	SenderNumber        string             `json:"senderNumber"`
 	SenderProfilePicURL string             `json:"senderProfilePicUrl"`
@@ -279,6 +284,170 @@ func (s *WhatsAppService) ListChats(requesterID, targetUserID int64) ([]model.Wh
 		return nil, err
 	}
 	return s.listChatsForAccount(account)
+}
+
+func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *model.WhatsAppHistorySyncRequest) (*model.WhatsAppHistorySyncResult, error) {
+	if err := s.requireChannelManage(userID, channelID); err != nil {
+		return nil, err
+	}
+	link, err := s.repo.GetChannelLink(channelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("当前频道尚未关联 WhatsApp 会话")
+	}
+	if err != nil {
+		return nil, err
+	}
+	account, err := s.repo.GetAccountByID(link.WhatsAppAccountID)
+	if err != nil {
+		return nil, err
+	}
+	limit := 200
+	if request != nil && request.Limit > 0 {
+		limit = request.Limit
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var history []whatsAppIncomingMessage
+	path := s.sessionPath(account.UserID) + "/chats/" + url.PathEscape(link.WhatsAppChatID) + "/messages?limit=" + strconv.Itoa(limit)
+	if err := s.callSidecarWithTimeout(http.MethodGet, path, nil, &history, 60*time.Second); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(history, func(i, j int) bool { return history[i].Timestamp < history[j].Timestamp })
+	result := &model.WhatsAppHistorySyncResult{Total: len(history)}
+	for _, incoming := range history {
+		externalID := strings.TrimSpace(incoming.ID)
+		if externalID == "" {
+			result.Skipped++
+			continue
+		}
+		exists, err := s.repo.HasWhatsAppMessage(account.ID, externalID)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			result.Skipped++
+			continue
+		}
+		content := strings.TrimSpace(incoming.Body)
+		if content == "" && incoming.HasMedia {
+			content = whatsAppHistoryMediaLabel(incoming.Type)
+		}
+		if content == "" {
+			content = "[WhatsApp 历史消息]"
+		}
+		createdAt := time.Now()
+		if incoming.Timestamp > 0 {
+			createdAt = time.Unix(incoming.Timestamp, 0)
+		}
+		message := &model.ChannelMessage{ChannelID: channelID, Content: content, CreatedAt: createdAt}
+		direction := "inbound"
+		if incoming.FromMe {
+			direction = "outbound"
+			message.SenderID = account.UserID
+			message.SenderType = "user"
+		} else {
+			message.SenderType = "whatsapp"
+			senderName := whatsAppFirstNonEmpty(incoming.SenderName, incoming.Author, incoming.From, link.WhatsAppChatName, "WhatsApp 联系人")
+			senderAddress := whatsAppFirstNonEmpty(incoming.SenderNumber, incoming.Author, incoming.From)
+			message.ExternalSenderName = &senderName
+			if senderAddress != "" {
+				message.ExternalSenderAddress = &senderAddress
+			}
+		}
+		if quotedID := strings.TrimSpace(incoming.QuotedMessageID); quotedID != "" {
+			message.ReplyExternalMessageID = &quotedID
+			if internalID, lookupErr := s.repo.ChannelMessageID(account.ID, quotedID); lookupErr == nil {
+				message.ReplyToMessageID = &internalID
+			}
+			if quotedSender := strings.TrimSpace(incoming.QuotedSenderName); quotedSender != "" {
+				message.ReplySnapshotSender = &quotedSender
+			}
+			if quotedContent := strings.TrimSpace(incoming.QuotedMessageBody); quotedContent != "" {
+				message.ReplySnapshotContent = &quotedContent
+			}
+		}
+		if err := s.repo.CreateSyncedMessage(message, account.ID, externalID, direction, incoming.Ack); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				result.Skipped++
+				continue
+			}
+			return nil, err
+		}
+		result.Imported++
+	}
+	if result.Imported > 0 {
+		_ = s.repo.TouchChannel(channelID)
+		if s.inboundHook != nil {
+			s.inboundHook(&model.ChannelMessage{ChannelID: channelID})
+		}
+	}
+	return result, nil
+}
+
+func (s *WhatsAppService) SyncContactsToChannels(userID int64, request *model.WhatsAppContactSyncRequest) (*model.WhatsAppContactSyncResult, error) {
+	accountID := int64(0)
+	limit := 500
+	if request != nil {
+		accountID = request.WhatsAppAccountID
+		if request.Limit > 0 {
+			limit = request.Limit
+		}
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	account, err := s.accountByIDForAccess(userID, accountID)
+	if err != nil {
+		return nil, err
+	}
+	contacts := make([]model.WhatsAppContact, 0)
+	path := s.sessionPath(account.UserID) + "/contacts?basic=1&limit=" + strconv.Itoa(limit)
+	if err := s.callSidecarWithTimeout(http.MethodGet, path, nil, &contacts, 60*time.Second); err != nil {
+		return nil, err
+	}
+	result := &model.WhatsAppContactSyncResult{Total: len(contacts), Channels: []int64{}, Errors: []string{}}
+	for _, contact := range contacts {
+		contactID := strings.TrimSpace(contact.ID)
+		if contactID == "" || contactID == account.WhatsAppID {
+			result.Skipped++
+			continue
+		}
+		if _, err := s.repo.FindChannelLink(account.ID, contactID); err == nil {
+			result.Skipped++
+			continue
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			result.Failed++
+			result.Errors = appendWhatsAppSyncError(result.Errors, contact.Name, err)
+			continue
+		}
+		channelName := truncateWhatsAppChannelName(whatsAppFirstNonEmpty(contact.Name, contact.Number, contactID))
+		descriptionText := "WhatsApp 客户"
+		if strings.TrimSpace(contact.Number) != "" {
+			descriptionText += " · " + strings.TrimSpace(contact.Number)
+		}
+		channel := &model.Channel{Name: channelName, Description: &descriptionText, OwnerID: account.UserID, ChannelType: "group"}
+		if err := s.channelRepo.CreateChannel(channel); err != nil {
+			result.Failed++
+			result.Errors = appendWhatsAppSyncError(result.Errors, channelName, err)
+			continue
+		}
+		link := &model.WhatsAppChannelLink{
+			ChannelID: channel.ID, WhatsAppAccountID: account.ID, WhatsAppUserID: account.UserID,
+			WhatsAppUsername: account.Username, WhatsAppDisplayName: account.DisplayName,
+			WhatsAppChatID: contactID, WhatsAppChatName: channelName, WhatsAppChatAvatarURL: contact.ProfilePicURL,
+			SyncInbound: true, SyncOutbound: true, CreatedBy: userID,
+		}
+		if err := s.repo.UpsertChannelLink(link); err != nil {
+			_ = s.channelRepo.DeleteChannel(channel.ID)
+			result.Failed++
+			result.Errors = appendWhatsAppSyncError(result.Errors, channelName, err)
+			continue
+		}
+		result.Created++
+		result.Channels = append(result.Channels, channel.ID)
+	}
+	return result, nil
 }
 
 func (s *WhatsAppService) UpdateAccountAbout(requesterID, targetUserID int64, about string) (*model.WhatsAppAccount, error) {
@@ -1089,4 +1258,38 @@ func whatsAppFirstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func whatsAppHistoryMediaLabel(messageType string) string {
+	switch strings.ToLower(strings.TrimSpace(messageType)) {
+	case "image", "sticker":
+		return "[WhatsApp 历史图片]"
+	case "video":
+		return "[WhatsApp 历史视频]"
+	case "audio", "ptt":
+		return "[WhatsApp 历史语音]"
+	case "document":
+		return "[WhatsApp 历史文件]"
+	default:
+		return "[WhatsApp 历史附件]"
+	}
+}
+
+func truncateWhatsAppChannelName(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		trimmed = "WhatsApp 客户"
+	}
+	runes := []rune(trimmed)
+	if len(runes) > 128 {
+		return string(runes[:128])
+	}
+	return trimmed
+}
+
+func appendWhatsAppSyncError(items []string, name string, err error) []string {
+	if len(items) >= 10 {
+		return items
+	}
+	return append(items, fmt.Sprintf("%s: %v", whatsAppFirstNonEmpty(name, "WhatsApp 联系人"), err))
 }

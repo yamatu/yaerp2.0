@@ -529,6 +529,21 @@ export interface WhatsAppChannelLink {
   updated_at: string
 }
 
+export interface WhatsAppHistorySyncResult {
+  imported: number
+  skipped: number
+  total: number
+}
+
+export interface WhatsAppContactSyncResult {
+  created: number
+  skipped: number
+  failed: number
+  total: number
+  channel_ids: number[]
+  errors?: string[]
+}
+
 export interface ChannelMessageSearchResult extends ChannelMessage {
   channel_name: string
 }

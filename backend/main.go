@@ -269,6 +269,7 @@ func main() {
 		api.GET("/channels/:id/whatsapp-link", whatsAppHandler.GetChannelLink)
 		api.PUT("/channels/:id/whatsapp-link", whatsAppHandler.UpdateChannelLink)
 		api.DELETE("/channels/:id/whatsapp-link", whatsAppHandler.DeleteChannelLink)
+		api.POST("/channels/:id/whatsapp/sync-history", whatsAppHandler.SyncChannelHistory)
 		api.POST("/channels/:id/messages/:messageId/whatsapp", whatsAppHandler.SendChannelMessage)
 		api.GET("/whatsapp/account", whatsAppHandler.GetOwnAccount)
 		api.PUT("/whatsapp/account/preferences", whatsAppHandler.UpdateOwnPreferences)
@@ -278,6 +279,7 @@ func main() {
 		api.POST("/whatsapp/account/logout", whatsAppHandler.LogoutOwnAccount)
 		api.GET("/whatsapp/chats", whatsAppHandler.ListOwnChats)
 		api.POST("/whatsapp/chats/:chatId/read", whatsAppHandler.MarkOwnChatRead)
+		api.POST("/whatsapp/contacts/sync-channels", whatsAppHandler.SyncContactsToChannels)
 		api.POST("/whatsapp/send", whatsAppHandler.SendResource)
 
 		// Folders

@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, MoveDiagonal2, RotateCcw, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
+import { BarChart3, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RotateCcw, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useWorkbooks } from '@/hooks/useSheet'
 import api from '@/lib/api'
@@ -248,6 +248,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [panelSize, setPanelSize] = useState<PanelSize>(DEFAULT_PANEL_SIZE)
   const [resizing, setResizing] = useState(false)
   const [contextPickerOpen, setContextPickerOpen] = useState(false)
+  const [composerExpanded, setComposerExpanded] = useState(false)
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
   const [loadingContextWorkbookId, setLoadingContextWorkbookId] = useState<number | null>(null)
@@ -270,6 +271,21 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     messagesEndRef.current?.scrollIntoView({ behavior })
   }, [])
+
+  const resizeComposer = useCallback(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    const minimumHeight = composerExpanded ? Math.min(220, Math.max(140, panelSize.height * 0.28)) : 46
+    const maximumHeight = composerExpanded ? Math.min(380, panelSize.height * 0.48) : Math.min(168, panelSize.height * 0.26)
+    textarea.style.height = 'auto'
+    const nextHeight = Math.min(maximumHeight, Math.max(minimumHeight, textarea.scrollHeight))
+    textarea.style.height = `${nextHeight}px`
+    textarea.style.overflowY = textarea.scrollHeight > maximumHeight ? 'auto' : 'hidden'
+  }, [composerExpanded, panelSize.height])
+
+  useEffect(() => {
+    resizeComposer()
+  }, [inputValue, open, resizeComposer])
 
   useEffect(() => {
     scrollToBottom('smooth')
@@ -830,9 +846,18 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             placeholder="输入消息，或拖入单元格内容..."
-            rows={3}
-            className="flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2.5 text-sm leading-6 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-100"
+            rows={1}
+            className="min-h-[46px] flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2.5 text-sm leading-6 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-100"
           />
+          <button
+            type="button"
+            onClick={() => setComposerExpanded((current) => !current)}
+            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border transition ${composerExpanded ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+            aria-label={composerExpanded ? '收起消息输入框' : '放大消息输入框'}
+            title={composerExpanded ? '收起输入框' : '放大输入框'}
+          >
+            {composerExpanded ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+          </button>
           <button
             type="button"
             onClick={() => void handleSend()}

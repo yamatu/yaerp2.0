@@ -190,6 +190,51 @@ func (r *WhatsAppRepo) HasExternalMessage(accountID int64, source, externalID st
 	return exists, err
 }
 
+func (r *WhatsAppRepo) HasWhatsAppMessage(accountID int64, externalID string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRow(
+		`SELECT EXISTS(
+		    SELECT 1 FROM channel_messages
+		     WHERE external_account_id = $1 AND external_source = 'whatsapp' AND external_message_id = $2
+		    UNION ALL
+		    SELECT 1 FROM whatsapp_message_links
+		     WHERE whatsapp_account_id = $1 AND whatsapp_message_id = $2
+		)`, accountID, externalID,
+	).Scan(&exists)
+	return exists, err
+}
+
+func (r *WhatsAppRepo) CreateSyncedMessage(message *model.ChannelMessage, accountID int64, whatsappMessageID, direction string, ack *int) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRow(
+		`INSERT INTO channel_messages (
+		     channel_id, sender_id, sender_type, content, external_source, external_account_id, external_message_id,
+		     external_sender_name, external_sender_address, external_sender_avatar,
+		     reply_to_message_id, reply_external_message_id, reply_snapshot_sender, reply_snapshot_content, created_at
+		 ) VALUES ($1,NULLIF($2,0),$3,$4,'whatsapp',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		 ON CONFLICT DO NOTHING RETURNING id, created_at`,
+		message.ChannelID, message.SenderID, message.SenderType, message.Content, accountID, whatsappMessageID,
+		message.ExternalSenderName, message.ExternalSenderAddress, message.ExternalSenderAvatar,
+		message.ReplyToMessageID, message.ReplyExternalMessageID, message.ReplySnapshotSender, message.ReplySnapshotContent, message.CreatedAt,
+	).Scan(&message.ID, &message.CreatedAt); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO whatsapp_message_links (whatsapp_account_id, channel_message_id, whatsapp_message_id, direction, ack, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
+		 ON CONFLICT (channel_message_id, whatsapp_message_id) DO UPDATE SET
+		     ack = COALESCE(EXCLUDED.ack, whatsapp_message_links.ack), updated_at = NOW()`,
+		accountID, message.ID, whatsappMessageID, direction, ack,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *WhatsAppRepo) CreateExternalMessage(message *model.ChannelMessage) error {
 	if message.ExternalAccountID == nil || message.ExternalMessageID == nil || message.ExternalSenderName == nil {
 		return errors.New("external message metadata is required")

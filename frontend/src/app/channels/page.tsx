@@ -59,7 +59,7 @@ import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
 import { wsClient } from '@/lib/ws'
-import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, Workbook, WorkbookImportResult } from '@/types'
+import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, WhatsAppContactSyncResult, WhatsAppHistorySyncResult, Workbook, WorkbookImportResult } from '@/types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -346,6 +346,8 @@ export default function ChannelsPage() {
   const [syncWhatsAppOutbound, setSyncWhatsAppOutbound] = useState(true)
   const [loadingWhatsApp, setLoadingWhatsApp] = useState(false)
   const [savingWhatsApp, setSavingWhatsApp] = useState(false)
+  const [syncingWhatsAppHistory, setSyncingWhatsAppHistory] = useState(false)
+  const [syncingWhatsAppContacts, setSyncingWhatsAppContacts] = useState(false)
   const [channelBackups, setChannelBackups] = useState<ChannelBackup[]>([])
   const [backupRestores, setBackupRestores] = useState<ChannelBackupRestore[]>([])
   const [selectedBackupId, setSelectedBackupId] = useState<number | null>(null)
@@ -1595,6 +1597,49 @@ export default function ChannelsPage() {
       setNotice('已取消 WhatsApp 关联')
     } finally {
       setSavingWhatsApp(false)
+    }
+  }
+
+  const handleSyncWhatsAppHistory = async () => {
+    if (!activeChannel || !whatsAppLink || syncingWhatsAppHistory) return
+    setSyncingWhatsAppHistory(true)
+    setError('')
+    try {
+      const response = await api.post<WhatsAppHistorySyncResult>(`/channels/${activeChannel.id}/whatsapp/sync-history`, { limit: 500 })
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || '同步 WhatsApp 历史消息失败')
+        return
+      }
+      shouldStickToBottomRef.current = true
+      await Promise.all([loadMessages(activeChannel.id, true), loadChannels(true)])
+      setNotice(`已同步 ${response.data.imported} 条历史消息，跳过 ${response.data.skipped} 条已有消息`)
+    } catch {
+      setError('同步 WhatsApp 历史消息失败')
+    } finally {
+      setSyncingWhatsAppHistory(false)
+    }
+  }
+
+  const handleSyncWhatsAppContacts = async () => {
+    if (!selectedWhatsAppAccountId || syncingWhatsAppContacts) return
+    setSyncingWhatsAppContacts(true)
+    setError('')
+    try {
+      const response = await api.post<WhatsAppContactSyncResult>('/whatsapp/contacts/sync-channels', {
+        whatsapp_account_id: Number(selectedWhatsAppAccountId),
+        limit: 1000,
+      })
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || '同步 WhatsApp 客户失败')
+        return
+      }
+      await loadChannels(true)
+      const failureText = response.data.failed > 0 ? `，${response.data.failed} 个失败` : ''
+      setNotice(`已创建 ${response.data.created} 个客户频道，跳过 ${response.data.skipped} 个已有联系人${failureText}`)
+    } catch {
+      setError('同步 WhatsApp 客户失败')
+    } finally {
+      setSyncingWhatsAppContacts(false)
     }
   }
 
@@ -2895,7 +2940,7 @@ export default function ChannelsPage() {
         )}
 
         {renamingGalleryImage && (
-          <div className="fixed inset-0 z-[65] flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setRenamingGalleryImage(null) }}>
+          <div className="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/45 p-4" onMouseDown={(event) => { event.stopPropagation(); if (event.target === event.currentTarget) setRenamingGalleryImage(null) }}>
             <div className="w-full max-w-md rounded-lg bg-white shadow-2xl">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3059,6 +3104,15 @@ export default function ChannelsPage() {
                     </select>
                   </label>
                   {selectedWhatsAppAccount && <div className="mb-3 flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700">{selectedWhatsAppAccount.profile_pic_url ? <img src={selectedWhatsAppAccount.profile_pic_url} alt="" className="h-full w-full object-cover" /> : <MessageCircle className="h-4 w-4" />}</div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-800">{selectedWhatsAppAccount.display_name || selectedWhatsAppAccount.username}</div><div className="mt-0.5 truncate text-xs text-slate-400">员工 {selectedWhatsAppAccount.username} · {selectedWhatsAppAccount.status === 'ready' ? '可用于频道沟通' : '需要先绑定 WhatsApp'}</div></div></div>}
+                  {selectedWhatsAppAccount?.status === 'ready' && (
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      <button type="button" onClick={() => void handleSyncWhatsAppContacts()} disabled={syncingWhatsAppContacts} className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50" title="为尚未关联的 WhatsApp 联系人批量创建同名频道">
+                        {syncingWhatsAppContacts ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Users className="h-4 w-4" />}
+                        {syncingWhatsAppContacts ? '同步客户中' : '同步客户为频道'}
+                      </button>
+                      {whatsAppLink && <button type="button" onClick={() => void handleSyncWhatsAppHistory()} disabled={syncingWhatsAppHistory} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50" title="导入当前 WhatsApp 会话最近 500 条历史消息">{syncingWhatsAppHistory ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}{syncingWhatsAppHistory ? '同步记录中' : '同步历史聊天'}</button>}
+                    </div>
+                  )}
                   {loadingWhatsApp ? (
                     <div className="flex items-center gap-2 py-6 text-sm text-slate-400"><RefreshCw className="h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div>
                   ) : !selectedWhatsAppAccount || selectedWhatsAppAccount.status !== 'ready' ? (

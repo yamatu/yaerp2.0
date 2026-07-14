@@ -173,7 +173,7 @@ async function safeProfilePic(client, contactId) {
   try { return await client.getProfilePicUrl(contactId) || '' } catch { return '' }
 }
 
-async function serializeMessage(session, message, includeMedia = false) {
+async function serializeMessage(session, message, includeMedia = false, includeContact = true) {
   const payload = {
     id: serializeId(message.id),
     chatId: message.fromMe ? message.to : message.from,
@@ -186,6 +186,7 @@ async function serializeMessage(session, message, includeMedia = false) {
     timestamp: message.timestamp || Math.floor(Date.now() / 1000),
     hasMedia: Boolean(message.hasMedia),
     ack: message.ack,
+    senderName: message._data?.notifyName || message._data?.sender?.pushname || '',
   }
   if (includeMedia && message.hasMedia) {
     try {
@@ -203,12 +204,16 @@ async function serializeMessage(session, message, includeMedia = false) {
       payload.mediaSkipped = error.message
     }
   }
-  try {
-    const contact = await message.getContact()
-    payload.senderName = contact.pushname || contact.name || contact.shortName || contact.number || payload.author || payload.from
-    payload.senderNumber = contact.number || ''
-    payload.senderProfilePicUrl = await safeProfilePic(session.client, serializeId(contact.id))
-  } catch {
+  if (includeContact) {
+    try {
+      const contact = await message.getContact()
+      payload.senderName = contact.pushname || contact.name || contact.shortName || contact.number || payload.author || payload.from
+      payload.senderNumber = contact.number || ''
+      payload.senderProfilePicUrl = await safeProfilePic(session.client, serializeId(contact.id))
+    } catch {
+      payload.senderName = payload.author || payload.from
+    }
+  } else if (!payload.senderName) {
     payload.senderName = payload.author || payload.from
   }
   if (message.hasQuotedMsg) {
@@ -612,20 +617,22 @@ app.get('/sessions/:sessionId/chats', requireSession, requireReady, async (req, 
 })
 app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (req, res, next) => {
   try {
-    const contacts = (await req.whatsappSession.client.getContacts()).filter((contact) => contact.isWAContact)
+    const basic = req.query.basic === '1' || req.query.basic === 'true'
+    const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 1000)))
+    const contacts = (await req.whatsappSession.client.getContacts()).filter((contact) => contact.isWAContact).slice(0, limit)
     res.json(await mapWithConcurrency(contacts, 8, async (contact) => ({
       id: serializeId(contact.id), number: contact.number || '',
       name: contact.name || contact.pushname || contact.shortName || contact.number || '',
       isBusiness: Boolean(contact.isBusiness), isMyContact: Boolean(contact.isMyContact),
-      profilePicUrl: await safeProfilePic(req.whatsappSession.client, serializeId(contact.id)),
+      profilePicUrl: basic ? '' : await safeProfilePic(req.whatsappSession.client, serializeId(contact.id)),
     })))
   } catch (error) { next(error) }
 })
 app.get('/sessions/:sessionId/chats/:chatId/messages', requireSession, requireReady, async (req, res, next) => {
   try {
     const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)))
-    res.json(await Promise.all((await chat.fetchMessages({ limit })).map((message) => serializeMessage(req.whatsappSession, message, false))))
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 50)))
+    res.json(await Promise.all((await chat.fetchMessages({ limit })).map((message) => serializeMessage(req.whatsappSession, message, false, false))))
   } catch (error) { next(error) }
 })
 app.post('/sessions/:sessionId/messages/send', requireSession, requireReady, async (req, res, next) => {
