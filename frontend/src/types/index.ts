@@ -399,6 +399,14 @@ export interface ChannelMessage {
   recalled_at?: string | null
   recalled_by?: number | null
   edited_at?: string | null
+  translated_content?: string
+  translation_language?: string
+  translated_at?: string | null
+  staff_read_count: number
+  staff_read_names?: string
+  whatsapp_ack?: number | null
+  whatsapp_direction?: 'inbound' | 'outbound' | ''
+  whatsapp_receipt_at?: string | null
   created_at: string
 }
 

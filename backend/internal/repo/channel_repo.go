@@ -275,11 +275,26 @@ func (r *ChannelRepo) AddChannelMembers(channelID, createdBy int64, userIDs []in
 }
 
 func (r *ChannelRepo) RemoveChannelMember(channelID, userID int64) error {
-	_, err := r.db.Exec(
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
 		`DELETE FROM channel_members WHERE channel_id = $1 AND user_id = $2 AND role <> 'owner'`,
 		channelID, userID,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM channel_read_states
+		  WHERE channel_id = $1 AND user_id = $2
+		    AND NOT EXISTS (SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2)`,
+		channelID, userID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *ChannelRepo) ListChannelAIMembers(channelID int64) ([]model.ChannelAIMember, error) {
@@ -429,13 +444,66 @@ func (r *ChannelRepo) ReorderPinnedChannels(userID int64, channelIDs []int64) er
 	return tx.Commit()
 }
 
-func (r *ChannelRepo) MarkChannelRead(channelID, userID int64) error {
-	_, err := r.db.Exec(
+func (r *ChannelRepo) MarkChannelRead(channelID, userID int64) (bool, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var changed bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(
+		    SELECT 1
+		      FROM channel_messages m
+		     WHERE m.channel_id = $1
+		       AND m.created_at > COALESCE((
+		           SELECT last_read_at FROM channel_read_states WHERE channel_id = $1 AND user_id = $2
+		       ), 'epoch'::timestamptz)
+		       AND (m.sender_type = 'ai' OR m.sender_id IS DISTINCT FROM $2)
+		)`, channelID, userID,
+	).Scan(&changed); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(
 		`INSERT INTO channel_read_states (channel_id, user_id, last_read_at, updated_at)
 		 VALUES ($1, $2, NOW(), NOW())
 		 ON CONFLICT (channel_id, user_id)
 		 DO UPDATE SET last_read_at = EXCLUDED.last_read_at, updated_at = NOW()`,
 		channelID, userID,
+	); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func (r *ChannelRepo) FindMessageTranslation(messageID int64, targetLanguage, sourceContent string) (string, error) {
+	var translated string
+	err := r.db.QueryRow(
+		`SELECT translated_content
+		   FROM channel_message_translations
+		  WHERE message_id = $1 AND target_language = $2 AND source_content = $3`,
+		messageID, targetLanguage, sourceContent,
+	).Scan(&translated)
+	return translated, err
+}
+
+func (r *ChannelRepo) UpsertMessageTranslation(messageID int64, targetLanguage, sourceContent, translatedContent string, assistantID int64, model string, userID int64) error {
+	_, err := r.db.Exec(
+		`INSERT INTO channel_message_translations (
+		     message_id, target_language, source_content, translated_content, assistant_id, model, translated_by, created_at, updated_at
+		 ) VALUES ($1,$2,$3,$4,NULLIF($5,0),$6,$7,NOW(),NOW())
+		 ON CONFLICT (message_id, target_language) DO UPDATE SET
+		     source_content = EXCLUDED.source_content,
+		     translated_content = EXCLUDED.translated_content,
+		     assistant_id = EXCLUDED.assistant_id,
+		     model = EXCLUDED.model,
+		     translated_by = EXCLUDED.translated_by,
+		     updated_at = NOW()`,
+		messageID, targetLanguage, sourceContent, translatedContent, assistantID, model, userID,
 	)
 	return err
 }
@@ -1046,7 +1114,23 @@ func channelMessageSelectSQL() string {
 		  LEFT JOIN users ru ON ru.id = rm.sender_id
 		  LEFT JOIN attachments ra ON ra.id = rm.attachment_id
 		  LEFT JOIN ai_assistants ai ON ai.id = m.assistant_id
-		  LEFT JOIN ai_assistants rai ON rai.id = rm.assistant_id`
+		  LEFT JOIN ai_assistants rai ON rai.id = rm.assistant_id
+		  LEFT JOIN channel_message_translations mt ON mt.message_id = m.id AND mt.target_language = 'zh-CN' AND mt.source_content = m.content
+		  LEFT JOIN LATERAL (
+		      SELECT COUNT(*)::INT AS read_count, COALESCE(STRING_AGG(reader.username, ', ' ORDER BY reader.username), '') AS read_names
+		        FROM channel_read_states crs
+		        JOIN channel_members reader_member ON reader_member.channel_id = crs.channel_id AND reader_member.user_id = crs.user_id
+		        JOIN users reader ON reader.id = crs.user_id
+		       WHERE crs.channel_id = m.channel_id
+		         AND crs.last_read_at >= m.created_at
+		         AND crs.user_id IS DISTINCT FROM m.sender_id
+		  ) reader_receipt ON TRUE
+		  LEFT JOIN LATERAL (
+		      SELECT wml.ack, wml.direction, wml.updated_at
+		        FROM whatsapp_message_links wml
+		       WHERE wml.channel_message_id = m.id
+		       ORDER BY wml.id DESC LIMIT 1
+		  ) wa_receipt ON TRUE`
 }
 
 func channelMessageColumnsSQL() string {
@@ -1068,7 +1152,11 @@ func channelMessageColumnsSQL() string {
 		    ELSE ru.username
 		END, rm.content, ra.filename, rm.recalled_at,
 		m.reply_external_message_id, m.reply_snapshot_sender, m.reply_snapshot_content,
-		m.recalled_at, m.recalled_by, m.edited_at, m.created_at`
+		m.recalled_at, m.recalled_by, m.edited_at,
+		COALESCE(mt.translated_content, ''), COALESCE(mt.target_language, ''), mt.updated_at,
+		COALESCE(reader_receipt.read_count, 0), COALESCE(reader_receipt.read_names, ''),
+		wa_receipt.ack, COALESCE(wa_receipt.direction, ''), wa_receipt.updated_at,
+		m.created_at`
 }
 
 func channelMessageSearchFromSQL() string {
@@ -1083,7 +1171,23 @@ func channelMessageSearchFromSQL() string {
 		LEFT JOIN users ru ON ru.id = rm.sender_id
 		LEFT JOIN attachments ra ON ra.id = rm.attachment_id
 		LEFT JOIN ai_assistants ai ON ai.id = m.assistant_id
-		LEFT JOIN ai_assistants rai ON rai.id = rm.assistant_id`
+		LEFT JOIN ai_assistants rai ON rai.id = rm.assistant_id
+		LEFT JOIN channel_message_translations mt ON mt.message_id = m.id AND mt.target_language = 'zh-CN' AND mt.source_content = m.content
+		LEFT JOIN LATERAL (
+		    SELECT COUNT(*)::INT AS read_count, COALESCE(STRING_AGG(reader.username, ', ' ORDER BY reader.username), '') AS read_names
+		      FROM channel_read_states crs
+		      JOIN channel_members reader_member ON reader_member.channel_id = crs.channel_id AND reader_member.user_id = crs.user_id
+		      JOIN users reader ON reader.id = crs.user_id
+		     WHERE crs.channel_id = m.channel_id
+		       AND crs.last_read_at >= m.created_at
+		       AND crs.user_id IS DISTINCT FROM m.sender_id
+		) reader_receipt ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT wml.ack, wml.direction, wml.updated_at
+		      FROM whatsapp_message_links wml
+		     WHERE wml.channel_message_id = m.id
+		     ORDER BY wml.id DESC LIMIT 1
+		) wa_receipt ON TRUE`
 }
 
 func scanChannelMessage(scanner interface {
@@ -1139,7 +1243,10 @@ func scanChannelMessageValues(scanner interface {
 	var recalledAt sql.NullTime
 	var recalledBy sql.NullInt64
 	var editedAt sql.NullTime
-	destinations := make([]any, 0, 41)
+	var translatedAt sql.NullTime
+	var whatsappAck sql.NullInt64
+	var whatsappReceiptAt sql.NullTime
+	destinations := make([]any, 0, 49)
 	if channelName != nil {
 		destinations = append(destinations, channelName)
 	}
@@ -1151,7 +1258,10 @@ func scanChannelMessageValues(scanner interface {
 		&workbookID, &workbookName, &sheetID, &sheetName, &summaryID, &summaryTitle, &forwardedFrom, &replyToMessageID,
 		&replySenderID, &replySenderName, &replyContent, &replyAttachmentName, &replyRecalledAt,
 		&replyExternalMessageID, &replySnapshotSender, &replySnapshotContent,
-		&recalledAt, &recalledBy, &editedAt, &message.CreatedAt,
+		&recalledAt, &recalledBy, &editedAt,
+		&message.TranslatedContent, &message.TranslationLanguage, &translatedAt,
+		&message.StaffReadCount, &message.StaffReadNames, &whatsappAck, &message.WhatsAppDirection, &whatsappReceiptAt,
+		&message.CreatedAt,
 	)
 	if err := scanner.Scan(destinations...); err != nil {
 		return nil, err
@@ -1251,6 +1361,16 @@ func scanChannelMessageValues(scanner interface {
 	}
 	if editedAt.Valid {
 		message.EditedAt = &editedAt.Time
+	}
+	if translatedAt.Valid {
+		message.TranslatedAt = &translatedAt.Time
+	}
+	if whatsappAck.Valid {
+		ack := int(whatsappAck.Int64)
+		message.WhatsAppAck = &ack
+	}
+	if whatsappReceiptAt.Valid {
+		message.WhatsAppReceiptAt = &whatsappReceiptAt.Time
 	}
 	return &message, nil
 }

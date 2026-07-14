@@ -89,6 +89,14 @@ type ChannelMessage struct {
 	RecalledAt             *time.Time `json:"recalled_at,omitempty" db:"recalled_at"`
 	RecalledBy             *int64     `json:"recalled_by,omitempty" db:"recalled_by"`
 	EditedAt               *time.Time `json:"edited_at,omitempty" db:"edited_at"`
+	TranslatedContent      string     `json:"translated_content,omitempty" db:"translated_content"`
+	TranslationLanguage    string     `json:"translation_language,omitempty" db:"translation_language"`
+	TranslatedAt           *time.Time `json:"translated_at,omitempty" db:"translated_at"`
+	StaffReadCount         int        `json:"staff_read_count" db:"staff_read_count"`
+	StaffReadNames         string     `json:"staff_read_names,omitempty" db:"staff_read_names"`
+	WhatsAppAck            *int       `json:"whatsapp_ack,omitempty" db:"whatsapp_ack"`
+	WhatsAppDirection      string     `json:"whatsapp_direction,omitempty" db:"whatsapp_direction"`
+	WhatsAppReceiptAt      *time.Time `json:"whatsapp_receipt_at,omitempty" db:"whatsapp_receipt_at"`
 	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
 }
 
@@ -134,6 +142,11 @@ type ChannelMessageSearchFilter struct {
 	To          *time.Time
 	Page        int
 	Size        int
+}
+
+type ChannelMessageTranslationRequest struct {
+	TargetLanguage string `json:"target_language"`
+	AssistantID    int64  `json:"assistant_id"`
 }
 
 type GalleryDirectory struct {

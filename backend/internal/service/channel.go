@@ -36,6 +36,7 @@ type ChannelService struct {
 	messageCreatedHook func(userID int64, message *model.ChannelMessage)
 	messageChangedHook func(message *model.ChannelMessage)
 	messageEditedHook  func(userID int64, message *model.ChannelMessage)
+	channelReadHook    func(userID, channelID int64)
 }
 
 func (s *ChannelService) SetAIService(aiSvc *AIService) {
@@ -56,6 +57,10 @@ func (s *ChannelService) SetMessageChangedHook(hook func(message *model.ChannelM
 
 func (s *ChannelService) SetMessageEditedHook(hook func(userID int64, message *model.ChannelMessage)) {
 	s.messageEditedHook = hook
+}
+
+func (s *ChannelService) SetChannelReadHook(hook func(userID, channelID int64)) {
+	s.channelReadHook = hook
 }
 
 func (s *ChannelService) notifyMessageCreated(userID int64, message *model.ChannelMessage) {
@@ -534,7 +539,67 @@ func (s *ChannelService) MarkChannelRead(userID, channelID int64) error {
 	if _, err := s.requireChannelAccess(userID, channelID); err != nil {
 		return err
 	}
-	return s.channelRepo.MarkChannelRead(channelID, userID)
+	changed, err := s.channelRepo.MarkChannelRead(channelID, userID)
+	if err != nil {
+		return err
+	}
+	if changed {
+		s.notifyMessageChanged(&model.ChannelMessage{ChannelID: channelID})
+	}
+	if s.channelReadHook != nil {
+		go s.channelReadHook(userID, channelID)
+	}
+	return nil
+}
+
+func (s *ChannelService) TranslateMessage(userID, channelID, messageID int64, req *model.ChannelMessageTranslationRequest) (*model.ChannelMessage, error) {
+	if s.aiSvc == nil {
+		return nil, fmt.Errorf("AI 服务尚未初始化")
+	}
+	channel, err := s.requireChannelAccess(userID, channelID)
+	if err != nil {
+		return nil, err
+	}
+	message, err := s.channelRepo.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	if message.ChannelID != channelID || message.RecalledAt != nil {
+		return nil, fmt.Errorf("消息不可翻译")
+	}
+	sourceContent := strings.TrimSpace(message.Content)
+	if sourceContent == "" {
+		return nil, fmt.Errorf("这条消息没有可翻译的文字")
+	}
+	targetLanguage := "zh-CN"
+	if req != nil && strings.TrimSpace(req.TargetLanguage) != "" && strings.TrimSpace(req.TargetLanguage) != "zh-CN" {
+		return nil, fmt.Errorf("当前频道界面仅支持翻译成简体中文")
+	}
+	if cached, cacheErr := s.channelRepo.FindMessageTranslation(messageID, targetLanguage, message.Content); cacheErr == nil && strings.TrimSpace(cached) != "" {
+		return s.channelRepo.GetMessage(messageID)
+	} else if cacheErr != nil && !errors.Is(cacheErr, sql.ErrNoRows) {
+		return nil, cacheErr
+	}
+	assistantID := int64(0)
+	if req != nil && req.AssistantID > 0 {
+		assistantID = req.AssistantID
+	} else if channel.AIAssistantID != nil {
+		assistantID = *channel.AIAssistantID
+	}
+	result, err := s.aiSvc.TranslateText(userID, assistantID, sourceContent, targetLanguage)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.channelRepo.UpsertMessageTranslation(messageID, targetLanguage, message.Content, result.Content, result.AssistantID, result.Model, userID); err != nil {
+		return nil, err
+	}
+	updated, err := s.channelRepo.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	s.attachMessageURL(updated)
+	s.notifyMessageChanged(updated)
+	return updated, nil
 }
 
 func (s *ChannelService) SearchMessages(userID int64, filter model.ChannelMessageSearchFilter) ([]model.ChannelMessageSearchResult, int64, error) {

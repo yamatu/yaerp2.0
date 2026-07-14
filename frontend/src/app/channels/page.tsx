@@ -10,6 +10,7 @@ import {
   BellOff,
   Bot,
   Check,
+  CheckCheck,
   ChevronLeft,
   ChevronRight,
   ClipboardPaste,
@@ -23,6 +24,7 @@ import {
   Hash,
   Image as ImageIcon,
   Images,
+  Languages,
   MessageSquare,
   MessageCircle,
   Paperclip,
@@ -191,7 +193,48 @@ function sameMessages(left: ChannelMessage[], right: ChannelMessage[]) {
 	  && message.reply_recalled_at === next.reply_recalled_at
 	  && message.recalled_at === next.recalled_at
 	  && message.edited_at === next.edited_at
+	  && message.translated_content === next.translated_content
+	  && message.staff_read_count === next.staff_read_count
+	  && message.staff_read_names === next.staff_read_names
+	  && message.whatsapp_ack === next.whatsapp_ack
+	  && message.whatsapp_direction === next.whatsapp_direction
   })
+}
+
+function MessageReadReceipts({ message }: { message: ChannelMessage }) {
+  const receipts: Array<{ key: string; label: string; title: string; read: boolean; delivered: boolean }> = []
+  if (message.sender_type === 'user') {
+    receipts.push({
+      key: 'staff',
+      label: message.staff_read_count > 0 ? `员工 ${message.staff_read_count}` : '员工',
+      title: message.staff_read_count > 0
+        ? `员工已读：${message.staff_read_names || `${message.staff_read_count} 人`}`
+        : '频道成员尚未读取',
+      read: message.staff_read_count > 0,
+      delivered: message.staff_read_count > 0,
+    })
+  }
+  if (message.whatsapp_direction === 'outbound') {
+    const ack = message.whatsapp_ack ?? 0
+    receipts.push({
+      key: 'customer', label: '客户',
+      title: ack >= 3 ? 'WhatsApp 客户已读' : ack >= 2 ? '已送达客户设备' : ack >= 1 ? '已发送到 WhatsApp' : '正在发送到 WhatsApp',
+      read: ack >= 3, delivered: ack >= 2,
+    })
+  } else if (message.sender_type === 'whatsapp' && message.whatsapp_direction === 'inbound' && (message.whatsapp_ack ?? -1) >= 3) {
+    receipts.push({ key: 'ours', label: '我们已读', title: '已向 WhatsApp 客户发送已读回执', read: true, delivered: true })
+  }
+  if (receipts.length === 0) return null
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center justify-end gap-2 text-[10px]">
+      {receipts.map((receipt) => (
+        <span key={receipt.key} title={receipt.title} className={`inline-flex items-center gap-1 ${receipt.read ? 'text-sky-600' : 'text-slate-400'}`}>
+          {receipt.delivered ? <CheckCheck className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
+          {receipt.label}
+        </span>
+      ))}
+    </div>
+  )
 }
 
 export default function ChannelsPage() {
@@ -245,6 +288,7 @@ export default function ChannelsPage() {
   const [replyingToMessage, setReplyingToMessage] = useState<ChannelMessage | null>(null)
   const [editingMessage, setEditingMessage] = useState<ChannelMessage | null>(null)
   const [recallingMessageId, setRecallingMessageId] = useState<number | null>(null)
+  const [translatingMessageId, setTranslatingMessageId] = useState<number | null>(null)
   const [importingWorkbookMessageId, setImportingWorkbookMessageId] = useState<number | null>(null)
 
   const [isTablePickerOpen, setIsTablePickerOpen] = useState(false)
@@ -1299,6 +1343,28 @@ export default function ChannelsPage() {
     }
   }
 
+  const handleTranslateMessage = async (message: ChannelMessage) => {
+    if (!message.content || message.recalled_at || translatingMessageId) return
+    setTranslatingMessageId(message.id)
+    setContextMenu(null)
+    setError('')
+    try {
+      const response = await api.post<ChannelMessage>(`/channels/${message.channel_id}/messages/${message.id}/translate`, {
+        target_language: 'zh-CN',
+      })
+      if (response.code !== 0 || !response.data) {
+        setError(response.message || 'AI 翻译失败')
+        return
+      }
+      setMessages((current) => current.map((item) => item.id === message.id ? response.data! : item))
+      setNotice('译文已显示在原文下方')
+    } catch {
+      setError('AI 翻译失败')
+    } finally {
+      setTranslatingMessageId(null)
+    }
+  }
+
   const handleImportWorkbook = async (message: ChannelMessage) => {
     if (!isXlsxMessage(message) || message.linked_workbook_id || importingWorkbookMessageId) return
     setImportingWorkbookMessageId(message.id)
@@ -2231,6 +2297,15 @@ export default function ChannelsPage() {
                                     {message.content && (isAI
                                       ? <div className="text-sm"><AIMessageContent content={message.content} /></div>
                                       : <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</div>)}
+                                    {message.translated_content && (
+                                      <div className="border-t border-slate-200/80 pt-2">
+                                        <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold text-sky-600"><Languages className="h-3 w-3" />AI 译文</div>
+                                        <div className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">{message.translated_content}</div>
+                                      </div>
+                                    )}
+                                    {translatingMessageId === message.id && (
+                                      <div className="flex items-center gap-1.5 border-t border-slate-200/80 pt-2 text-xs text-sky-600"><RefreshCw className="h-3.5 w-3.5 animate-spin" />AI 正在翻译...</div>
+                                    )}
                                   </div>
                                   <button type="button" onClick={() => startReply(message)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-60 transition hover:bg-white hover:text-sky-600 focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100" title="回复消息">
                                     <Reply className="h-4 w-4" />
@@ -2297,6 +2372,7 @@ export default function ChannelsPage() {
                                     <ArrowRight className="h-4 w-4 shrink-0 text-violet-500" />
                                   </a>
                                 )}
+                                <MessageReadReceipts message={message} />
                               </div>
                             </div>
                           )
@@ -3177,7 +3253,14 @@ export default function ChannelsPage() {
                   </div>
                 )}
                 {!contextMenu.message.recalled_at && contextMenu.message.content && (
-                  <button type="button" onClick={() => void copyText(contextMenu.message?.content || '', '消息文字已复制')} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Copy className="h-4 w-4 text-slate-400" />复制文字</button>
+                  <>
+                    {!contextMenu.message.translated_content ? (
+                      <button type="button" onClick={() => { const message = contextMenu.message; if (message) void handleTranslateMessage(message) }} disabled={translatingMessageId === contextMenu.message.id} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-sky-50 hover:text-sky-700 disabled:opacity-50"><Languages className={`h-4 w-4 ${translatingMessageId === contextMenu.message.id ? 'animate-pulse text-sky-500' : 'text-slate-400'}`} />{translatingMessageId === contextMenu.message.id ? 'AI 翻译中...' : 'AI 翻译成中文'}</button>
+                    ) : (
+                      <button type="button" onClick={() => void copyText(contextMenu.message?.translated_content || '', '译文已复制')} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-sky-700 hover:bg-sky-50"><Languages className="h-4 w-4" />复制 AI 译文</button>
+                    )}
+                    <button type="button" onClick={() => void copyText(contextMenu.message?.content || '', '消息文字已复制')} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Copy className="h-4 w-4 text-slate-400" />复制文字</button>
+                  </>
                 )}
                 {!contextMenu.message.recalled_at && isImageMessage(contextMenu.message) && (
                   <>

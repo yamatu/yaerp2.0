@@ -127,6 +127,11 @@ func main() {
 		}
 	})
 	whatsAppService.SetInboundHook(broadcastChannelMessage)
+	channelService.SetChannelReadHook(func(userID, channelID int64) {
+		if err := whatsAppService.MarkChannelSeen(userID, channelID); err != nil {
+			log.Printf("mark WhatsApp channel %d seen: %v", channelID, err)
+		}
+	})
 	wsHandler := ws.NewWSHandler(hub, jwtUtil, permService, sheetService)
 
 	// Handlers
@@ -256,6 +261,7 @@ func main() {
 		api.POST("/channels/:id/messages/:messageId/forward", channelHandler.ForwardMessage)
 		api.POST("/channels/:id/messages/:messageId/recall", channelHandler.RecallMessage)
 		api.PUT("/channels/:id/messages/:messageId", channelHandler.EditMessage)
+		api.POST("/channels/:id/messages/:messageId/translate", channelHandler.TranslateMessage)
 		api.POST("/channels/:id/messages/:messageId/import-workbook", channelHandler.ImportMessageWorkbook)
 		api.POST("/channels/:id/messages/:messageId/save-image", channelHandler.SaveMessageImage)
 		api.POST("/channels/:id/backups", channelHandler.CreateBackup)
@@ -271,6 +277,7 @@ func main() {
 		api.POST("/whatsapp/account/restart", whatsAppHandler.RestartOwnAccount)
 		api.POST("/whatsapp/account/logout", whatsAppHandler.LogoutOwnAccount)
 		api.GET("/whatsapp/chats", whatsAppHandler.ListOwnChats)
+		api.POST("/whatsapp/chats/:chatId/read", whatsAppHandler.MarkOwnChatRead)
 		api.POST("/whatsapp/send", whatsAppHandler.SendResource)
 
 		// Folders

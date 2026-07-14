@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -93,6 +94,19 @@ func (h *WhatsAppHandler) ListOwnChats(c *gin.Context) {
 		return
 	}
 	response.OK(c, chats)
+}
+
+func (h *WhatsAppHandler) MarkOwnChatRead(c *gin.Context) {
+	chatID := strings.TrimSpace(c.Param("chatId"))
+	if chatID == "" {
+		response.BadRequest(c, "invalid WhatsApp chat id")
+		return
+	}
+	if err := h.service.MarkOwnChatRead(c.GetInt64("user_id"), chatID); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OKMsg(c, "WhatsApp conversation marked as read")
 }
 
 func (h *WhatsAppHandler) ListAccounts(c *gin.Context) {

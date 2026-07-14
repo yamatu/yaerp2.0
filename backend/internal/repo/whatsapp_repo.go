@@ -250,12 +250,70 @@ func (r *WhatsAppRepo) ExternalMessageID(accountID, channelMessageID int64) (str
 	return messageID, err
 }
 
-func (r *WhatsAppRepo) UpdateMessageAck(accountID int64, whatsappMessageID string, ack int) error {
-	_, err := r.db.Exec(
-		`UPDATE whatsapp_message_links SET ack = $1, updated_at = NOW()
-		  WHERE whatsapp_account_id = $2 AND whatsapp_message_id = $3`, ack, accountID, whatsappMessageID,
+func (r *WhatsAppRepo) UpdateMessageAck(accountID int64, whatsappMessageID string, ack int) (int64, int64, error) {
+	var messageID, channelID int64
+	err := r.db.QueryRow(
+		`UPDATE whatsapp_message_links link
+		    SET ack = GREATEST(COALESCE(link.ack, -1), $1), updated_at = NOW()
+		   FROM channel_messages message
+		  WHERE link.channel_message_id = message.id
+		    AND link.whatsapp_account_id = $2
+		    AND link.whatsapp_message_id = $3
+		  RETURNING link.channel_message_id, message.channel_id`,
+		ack, accountID, whatsappMessageID,
+	).Scan(&messageID, &channelID)
+	return messageID, channelID, err
+}
+
+func (r *WhatsAppRepo) HasUnreadInboundChat(accountID int64, chatID string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRow(
+		`SELECT EXISTS(
+		    SELECT 1
+		      FROM whatsapp_message_links message_link
+		      JOIN channel_messages message ON message.id = message_link.channel_message_id
+		      JOIN whatsapp_channel_links channel_link ON channel_link.channel_id = message.channel_id
+		     WHERE message_link.whatsapp_account_id = $1
+		       AND channel_link.whatsapp_account_id = $1
+		       AND channel_link.whatsapp_chat_id = $2
+		       AND message_link.direction = 'inbound'
+		       AND COALESCE(message_link.ack, -1) < 3
+		)`, accountID, chatID,
+	).Scan(&exists)
+	return exists, err
+}
+
+func (r *WhatsAppRepo) MarkInboundChatRead(accountID int64, chatID string) ([]int64, error) {
+	rows, err := r.db.Query(
+		`UPDATE whatsapp_message_links message_link
+		    SET ack = GREATEST(COALESCE(message_link.ack, -1), 3), updated_at = NOW()
+		   FROM channel_messages message, whatsapp_channel_links channel_link
+		  WHERE message_link.channel_message_id = message.id
+		    AND channel_link.channel_id = message.channel_id
+		    AND message_link.whatsapp_account_id = $1
+		    AND channel_link.whatsapp_account_id = $1
+		    AND channel_link.whatsapp_chat_id = $2
+		    AND message_link.direction = 'inbound'
+		    AND COALESCE(message_link.ack, -1) < 3
+		  RETURNING message.channel_id`, accountID, chatID,
 	)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := make(map[int64]struct{})
+	channels := make([]int64, 0)
+	for rows.Next() {
+		var channelID int64
+		if err := rows.Scan(&channelID); err != nil {
+			return nil, err
+		}
+		if _, exists := seen[channelID]; !exists {
+			seen[channelID] = struct{}{}
+			channels = append(channels, channelID)
+		}
+	}
+	return channels, rows.Err()
 }
 
 func (r *WhatsAppRepo) TouchChannel(channelID int64) error {

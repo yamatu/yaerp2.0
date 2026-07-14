@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, CheckCircle2, LogOut, MessageCircle, RefreshCw, Save, Search, Smartphone, Users, Wifi, WifiOff } from 'lucide-react'
+import { ArrowLeft, CheckCheck, CheckCircle2, LogOut, MessageCircle, RefreshCw, Save, Search, Smartphone, Users, Wifi, WifiOff } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import api from '@/lib/api'
 import type { WhatsAppAccount, WhatsAppChat } from '@/types'
@@ -31,6 +31,7 @@ export default function WhatsAppWorkspacePage() {
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [markingReadChatId, setMarkingReadChatId] = useState('')
   const accountRequestRef = useRef(false)
   const chatsRequestRef = useRef(false)
   const lastChatsLoadAtRef = useRef(0)
@@ -130,6 +131,25 @@ export default function WhatsAppWorkspacePage() {
     }
   }
 
+  const markChatRead = async (chat: WhatsAppChat) => {
+    if (!connected || markingReadChatId) return
+    setMarkingReadChatId(chat.id)
+    setError('')
+    try {
+      const response = await api.post(`/whatsapp/chats/${encodeURIComponent(chat.id)}/read`)
+      if (response.code !== 0) {
+        setError(response.message || '标记 WhatsApp 会话已读失败')
+        return
+      }
+      setChats((current) => current.map((item) => item.id === chat.id ? { ...item, unreadCount: 0 } : item))
+      setNotice(`已将「${chat.name}」标记为已读`)
+    } catch {
+      setError('标记 WhatsApp 会话已读失败')
+    } finally {
+      setMarkingReadChatId('')
+    }
+  }
+
   const filteredChats = useMemo(() => {
     const keyword = search.trim().toLowerCase()
     if (!keyword) return chats
@@ -200,6 +220,7 @@ export default function WhatsAppWorkspacePage() {
                 <div key={chat.id} className="flex items-center gap-3 border-b border-slate-100 bg-white px-4 py-3 transition hover:bg-slate-50">
                   <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500">{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />}</div>
                   <div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div>{chat.timestamp > 0 && <span className="shrink-0 text-[11px] text-slate-400">{new Date(chat.timestamp * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}</span>}</div><div className="mt-1 flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</span>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div></div>
+                  {chat.unreadCount > 0 && <button type="button" onClick={() => void markChatRead(chat)} disabled={Boolean(markingReadChatId)} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#008069] transition hover:bg-emerald-50 disabled:opacity-40" title="将这个 WhatsApp 会话标记为已读"><CheckCheck className={`h-4 w-4 ${markingReadChatId === chat.id ? 'animate-pulse' : ''}`} /></button>}
                 </div>
               ))}
             </div>

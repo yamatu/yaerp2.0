@@ -62,6 +62,7 @@ type whatsappSentMessage struct {
 	ID        string `json:"id"`
 	ChatID    string `json:"chatId"`
 	Timestamp int64  `json:"timestamp"`
+	Ack       *int   `json:"ack,omitempty"`
 }
 
 type whatsAppWebhookEvent struct {
@@ -492,7 +493,17 @@ func (s *WhatsAppService) HandleWebhook(body []byte) error {
 		if err := json.Unmarshal(event.Payload, &ack); err != nil {
 			return err
 		}
-		return s.repo.UpdateMessageAck(account.ID, ack.ID, ack.Ack)
+		messageID, channelID, err := s.repo.UpdateMessageAck(account.ID, ack.ID, ack.Ack)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if s.inboundHook != nil {
+			s.inboundHook(&model.ChannelMessage{ID: messageID, ChannelID: channelID})
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -639,9 +650,65 @@ func (s *WhatsAppService) sendStoredChannelMessage(userID int64, link *model.Wha
 		return nil, err
 	}
 	if sent.ID != "" {
-		_ = s.repo.RecordMessageLink(link.WhatsAppAccountID, message.ID, sent.ID, "outbound", nil)
+		_ = s.repo.RecordMessageLink(link.WhatsAppAccountID, message.ID, sent.ID, "outbound", sent.Ack)
+		if s.inboundHook != nil {
+			s.inboundHook(&model.ChannelMessage{ID: message.ID, ChannelID: message.ChannelID})
+		}
 	}
 	return sent, nil
+}
+
+func (s *WhatsAppService) MarkOwnChatRead(requesterID int64, chatID string) error {
+	account, err := s.accountForAccess(requesterID, requesterID)
+	if err != nil {
+		return err
+	}
+	return s.markChatRead(account, strings.TrimSpace(chatID), true)
+}
+
+func (s *WhatsAppService) MarkChannelSeen(userID, channelID int64) error {
+	link, err := s.repo.GetChannelLink(channelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	pending, err := s.repo.HasUnreadInboundChat(link.WhatsAppAccountID, link.WhatsAppChatID)
+	if err != nil || !pending {
+		return err
+	}
+	account, err := s.repo.GetAccountByID(link.WhatsAppAccountID)
+	if err != nil {
+		return err
+	}
+	return s.markChatRead(account, link.WhatsAppChatID, false)
+}
+
+func (s *WhatsAppService) markChatRead(account *model.WhatsAppAccount, chatID string, force bool) error {
+	if account == nil || strings.TrimSpace(chatID) == "" {
+		return fmt.Errorf("WhatsApp 会话不能为空")
+	}
+	if !force {
+		pending, err := s.repo.HasUnreadInboundChat(account.ID, chatID)
+		if err != nil || !pending {
+			return err
+		}
+	}
+	payload := map[string]string{"action": "seen"}
+	if err := s.callSidecar(http.MethodPost, s.sessionPath(account.UserID)+"/chats/"+url.PathEscape(chatID)+"/action", payload, nil); err != nil {
+		return err
+	}
+	channelIDs, err := s.repo.MarkInboundChatRead(account.ID, chatID)
+	if err != nil {
+		return err
+	}
+	if s.inboundHook != nil {
+		for _, channelID := range channelIDs {
+			s.inboundHook(&model.ChannelMessage{ChannelID: channelID})
+		}
+	}
+	return nil
 }
 
 func (s *WhatsAppService) EditForwardedChannelMessage(userID, channelID, messageID int64, content string) error {

@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -287,6 +288,30 @@ func (h *ChannelHandler) MarkChannelRead(c *gin.Context) {
 		return
 	}
 	response.OKMsg(c, "channel marked as read")
+}
+
+func (h *ChannelHandler) TranslateMessage(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	messageID, err := parseIDParam(c, "messageId")
+	if err != nil {
+		response.BadRequest(c, "invalid message id")
+		return
+	}
+	var req model.ChannelMessageTranslationRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	message, err := h.channelService.TranslateMessage(c.GetInt64("user_id"), channelID, messageID, &req)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, message)
 }
 
 func (h *ChannelHandler) SearchMessages(c *gin.Context) {

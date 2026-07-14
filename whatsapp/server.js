@@ -666,7 +666,7 @@ app.post('/sessions/:sessionId/chats/:chatId/action', requireSession, requireRea
   try {
     const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
     switch (req.body.action) {
-      case 'seen': await chat.sendSeen(); break
+      case 'seen': await chat.sendSeen(); invalidateChatList(req.whatsappSession); break
       case 'typing': await chat.sendStateTyping(); break
       case 'recording': await chat.sendStateRecording(); break
       case 'clear_state': await chat.clearState(); break
