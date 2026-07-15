@@ -185,6 +185,7 @@ func main() {
 		// Workbooks
 		api.GET("/workbooks", sheetHandler.ListWorkbooks)
 		api.POST("/workbooks", sheetHandler.CreateWorkbook)
+		api.POST("/workbooks/:id/duplicate", sheetHandler.DuplicateWorkbook)
 		api.POST("/workbooks/import/xlsx", importHandler.ImportWorkbookXLSX)
 		api.PUT("/workbooks/state/batch", sheetHandler.UpdateWorkbookStates)
 		api.GET("/workbooks/:id/source/xlsx", importHandler.DownloadWorkbookSourceXLSX)
@@ -197,6 +198,7 @@ func main() {
 
 		// Sheets
 		api.POST("/workbooks/:id/sheets", sheetHandler.CreateSheet)
+		api.POST("/sheets/:id/duplicate", sheetHandler.DuplicateSheet)
 
 		// Cells
 		sheetView := api.Group("/sheets/:id")

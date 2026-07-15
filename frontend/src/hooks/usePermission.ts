@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import type { PermissionMatrix, ScopedPermissionLayer } from '@/types'
 import { api } from '@/lib/api'
 
@@ -44,6 +44,10 @@ export function resolveCellPermission(permissions: PermissionMatrix, col: string
 export function usePermission(sheetId: number) {
   const [permissions, setPermissions] = useState<PermissionMatrix | null>(null)
   const [loading, setLoading] = useState(true)
+  const [refreshVersion, setRefreshVersion] = useState(0)
+  const loadedSheetIdRef = useRef(0)
+
+  const refreshPermissions = useCallback(() => setRefreshVersion((current) => current + 1), [])
 
   useEffect(() => {
     let active = true
@@ -59,7 +63,7 @@ export function usePermission(sheetId: number) {
 
       if (active) {
         setLoading(true)
-        setPermissions(null)
+        if (loadedSheetIdRef.current !== sheetId) setPermissions(null)
       }
 
       try {
@@ -67,6 +71,7 @@ export function usePermission(sheetId: number) {
         if (!active) return
         if (res.code === 0 && res.data) {
           setPermissions(res.data)
+          loadedSheetIdRef.current = sheetId
         } else {
           setPermissions(null)
         }
@@ -85,7 +90,7 @@ export function usePermission(sheetId: number) {
     return () => {
       active = false
     }
-  }, [sheetId])
+  }, [refreshVersion, sheetId])
 
   const canEditCell = (col: string, row?: number): boolean => {
     if (!permissions) return false
@@ -110,5 +115,6 @@ export function usePermission(sheetId: number) {
     canEditCell,
     canViewColumn,
     isColumnReadOnly,
+    refreshPermissions,
   }
 }

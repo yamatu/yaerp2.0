@@ -100,6 +100,7 @@ type UpdateProtectionRequest struct {
 	EditableDepartmentIDs   []int64 `json:"editable_department_ids,omitempty"`
 	ViewHiddenUserIDs       []int64 `json:"view_hidden_user_ids,omitempty"`
 	ViewHiddenDepartmentIDs []int64 `json:"view_hidden_department_ids,omitempty"`
+	LockEditing             *bool   `json:"lock_editing,omitempty"`
 	Hidden                  *bool   `json:"hidden,omitempty"`
 }
 
@@ -124,7 +125,10 @@ type ProtectionInfo struct {
 	EditableDepartmentIDs   []int64   `json:"editable_department_ids,omitempty"`
 	ViewHiddenUserIDs       []int64   `json:"view_hidden_user_ids,omitempty"`
 	ViewHiddenDepartmentIDs []int64   `json:"view_hidden_department_ids,omitempty"`
+	LockEditing             bool      `json:"lock_editing"`
 	Hidden                  bool      `json:"hidden,omitempty"`
+	CanEdit                 bool      `json:"can_edit"`
+	MaskedForCurrentUser    bool      `json:"masked_for_current_user"`
 	ProtectedAt             time.Time `json:"protected_at"`
 }
 

@@ -115,6 +115,7 @@ export interface ProtectionOwner {
   editableDepartmentIds?: number[]
   viewHiddenUserIds?: number[]
   viewHiddenDepartmentIds?: number[]
+  lockEditing?: boolean
   hidden?: boolean
   protectedAt: string
 }
@@ -132,7 +133,10 @@ export interface ProtectionInfo {
   editable_department_ids?: number[]
   view_hidden_user_ids?: number[]
   view_hidden_department_ids?: number[]
+  lock_editing: boolean
   hidden?: boolean
+  can_edit: boolean
+  masked_for_current_user: boolean
   protected_at: string
 }
 

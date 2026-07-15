@@ -9,6 +9,7 @@ import {
   CheckSquare,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Download,
   FolderIcon,
   FolderKanban,
@@ -50,7 +51,11 @@ interface WorkbookImportSource {
   attachment_id?: number | null
 }
 
-function ownWorkbookFilterStorageKey(userId: number) {
+function ownResourceFilterStorageKey(userId: number) {
+  return `yaerp:home:${userId}:show-only-own-resources`
+}
+
+function legacyOwnWorkbookFilterStorageKey(userId: number) {
   return `yaerp:home:${userId}:show-only-own-workbooks`
 }
 
@@ -137,16 +142,19 @@ export default function HomePage() {
   const [workbookImportProgress, setWorkbookImportProgress] = useState(0)
   const [workbookFolderImportStatus, setWorkbookFolderImportStatus] = useState('')
   const [workbookImportError, setWorkbookImportError] = useState('')
+  const [duplicatingWorkbookId, setDuplicatingWorkbookId] = useState<number | null>(null)
   const [downloadingSourceWorkbookId, setDownloadingSourceWorkbookId] = useState<number | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchFocused, setSearchFocused] = useState(false)
   const [workbookSortBy, setWorkbookSortBy] = useState<'updated_at' | 'created_at' | 'name'>('updated_at')
   const [workbookSortOrder, setWorkbookSortOrder] = useState<'asc' | 'desc'>('desc')
   const [groupByOwner, setGroupByOwner] = useState(true)
-  const [showOnlyOwnWorkbooks, setShowOnlyOwnWorkbooks] = useState(() => {
+  const [showOnlyOwnResources, setShowOnlyOwnResources] = useState(() => {
     const user = getStoredUser()
     if (!user || typeof window === 'undefined') return false
-    return localStorage.getItem(ownWorkbookFilterStorageKey(user.id)) === 'true'
+    const stored = localStorage.getItem(ownResourceFilterStorageKey(user.id))
+      ?? localStorage.getItem(legacyOwnWorkbookFilterStorageKey(user.id))
+    return stored === 'true'
   })
   const [workbookPage, setWorkbookPage] = useState(1)
   const [assigningWorkbook, setAssigningWorkbook] = useState<Workbook | null>(null)
@@ -273,10 +281,17 @@ export default function HomePage() {
   }
 
   const directoryWorkbooks = useMemo(
-    () => adminMode && showOnlyOwnWorkbooks
+    () => adminMode && showOnlyOwnResources
       ? contents.workbooks.filter((workbook) => workbook.owner_id === profile?.id)
       : contents.workbooks,
-    [adminMode, contents.workbooks, profile?.id, showOnlyOwnWorkbooks]
+    [adminMode, contents.workbooks, profile?.id, showOnlyOwnResources]
+  )
+
+  const directoryFolders = useMemo(
+    () => adminMode && showOnlyOwnResources
+      ? contents.folders.filter((folder) => folder.owner_id === profile?.id)
+      : contents.folders,
+    [adminMode, contents.folders, profile?.id, showOnlyOwnResources]
   )
 
   const filteredWorkbooks = useMemo(() => {
@@ -331,24 +346,25 @@ export default function HomePage() {
   const foldersPerPage = 8
   const filteredFolders = useMemo(() => {
     const keyword = folderSearchQuery.trim().toLowerCase()
-    if (!keyword) return contents.folders
-    return contents.folders.filter((f) => f.name.toLowerCase().includes(keyword))
-  }, [contents.folders, folderSearchQuery])
+    if (!keyword) return directoryFolders
+    return directoryFolders.filter((folder) => folder.name.toLowerCase().includes(keyword))
+  }, [directoryFolders, folderSearchQuery])
   const totalFolderPages = Math.max(1, Math.ceil(filteredFolders.length / foldersPerPage))
   const paginatedFolders = useMemo(() => {
     const start = (folderPage - 1) * foldersPerPage
     return filteredFolders.slice(start, start + foldersPerPage)
   }, [filteredFolders, folderPage])
   const visibleSharedFolders = useMemo(() => {
+    if (adminMode && showOnlyOwnResources) return []
     const existingIds = new Set(contents.folders.map((folder) => folder.id))
     return sharedFolders.filter((folder) => !existingIds.has(folder.id))
-  }, [contents.folders, sharedFolders])
-  useEffect(() => { setFolderPage(1) }, [folderSearchQuery])
-  useEffect(() => { setWorkbookPage(1) }, [showOnlyOwnWorkbooks])
+  }, [adminMode, contents.folders, sharedFolders, showOnlyOwnResources])
+  useEffect(() => { setFolderPage(1) }, [folderSearchQuery, showOnlyOwnResources])
+  useEffect(() => { setWorkbookPage(1) }, [showOnlyOwnResources])
   useEffect(() => {
     if (!profile?.id || !adminMode) return
-    localStorage.setItem(ownWorkbookFilterStorageKey(profile.id), String(showOnlyOwnWorkbooks))
-  }, [adminMode, profile?.id, showOnlyOwnWorkbooks])
+    localStorage.setItem(ownResourceFilterStorageKey(profile.id), String(showOnlyOwnResources))
+  }, [adminMode, profile?.id, showOnlyOwnResources])
   useEffect(() => {
     if (folderPage > totalFolderPages) setFolderPage(totalFolderPages)
   }, [folderPage, totalFolderPages])
@@ -688,6 +704,28 @@ export default function HomePage() {
     }
   }
 
+  const handleDuplicateWorkbook = async (event: React.MouseEvent, workbook: Workbook) => {
+    event.stopPropagation()
+    if (!canManageWorkbook(workbook) || duplicatingWorkbookId !== null) return
+
+    setDuplicatingWorkbookId(workbook.id)
+    setWorkbookImportError('')
+    try {
+      const res = await api.post<Workbook>(`/workbooks/${workbook.id}/duplicate`)
+      if (res.code !== 0 || !res.data) {
+        setWorkbookImportError(res.message || '复制工作簿失败，请稍后再试。')
+        return
+      }
+      setWorkbookPage(1)
+      await Promise.all([refresh(), refreshFolder()])
+    } catch (err) {
+      console.error('Failed to duplicate workbook:', err)
+      setWorkbookImportError(err instanceof Error ? err.message : '复制工作簿失败，请稍后再试。')
+    } finally {
+      setDuplicatingWorkbookId(null)
+    }
+  }
+
   const handleUpdateWorkbookState = async (e: React.MouseEvent, workbookId: number, action: 'lock' | 'unlock' | 'hide' | 'unhide' | 'publish' | 'unpublish') => {
     e.stopPropagation()
     try {
@@ -968,12 +1006,19 @@ export default function HomePage() {
                 {adminMode && (
                   <button
                     type="button"
-                    onClick={() => setShowOnlyOwnWorkbooks((current) => !current)}
-                    className={`order-3 inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition ${showOnlyOwnWorkbooks ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
-                    title={showOnlyOwnWorkbooks ? '恢复查看所有员工的工作簿' : '隐藏其他员工的工作簿'}
+                    onClick={() => {
+                      const nextValue = !showOnlyOwnResources
+                      setShowOnlyOwnResources(nextValue)
+                      if (nextValue && currentFolderMeta && currentFolderMeta.owner_id !== profile?.id) {
+                        void navigateToFolder(null)
+                      }
+                    }}
+                    className={`order-3 inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition ${showOnlyOwnResources ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+                    title={showOnlyOwnResources ? '恢复查看全部工作簿和文件夹' : '仅显示自己创建的工作簿和文件夹'}
+                    aria-pressed={showOnlyOwnResources}
                   >
-                    {showOnlyOwnWorkbooks ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
-                    {showOnlyOwnWorkbooks ? '只看我的' : '仅看自己的表'}
+                    {showOnlyOwnResources ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+                    仅看自己
                   </button>
                 )}
                 <button
@@ -1216,10 +1261,10 @@ export default function HomePage() {
             )}
 
             {/* Folder list */}
-            {contents.folders.length > 0 && (
+            {directoryFolders.length > 0 && (
               <div className="mb-4 space-y-3">
                 {/* Folder search + pagination toolbar */}
-                {contents.folders.length > foldersPerPage && (
+                {(directoryFolders.length > foldersPerPage || folderSearchQuery.trim()) && (
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="relative flex-1 max-w-xs">
                       <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
@@ -1328,6 +1373,11 @@ export default function HomePage() {
                       </div>
                     </div>
                   ))}
+                  {filteredFolders.length === 0 && (
+                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500 md:col-span-3 lg:col-span-4">
+                      没有找到匹配的文件夹
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1432,14 +1482,14 @@ export default function HomePage() {
               </div>
             )}
 
-            {!folderLoading && !folderError && directoryWorkbooks.length === 0 && contents.folders.length === 0 && (
+            {!folderLoading && !folderError && directoryWorkbooks.length === 0 && directoryFolders.length === 0 && (
               <div className="rounded-[24px] border border-dashed border-slate-300 bg-[linear-gradient(180deg,rgba(248,250,252,0.95),rgba(255,255,255,0.98))] px-6 py-14 text-center">
                 <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-3xl bg-slate-900 text-white">
                   <FolderKanban className="h-7 w-7" />
                 </div>
-                <h3 className="text-2xl font-semibold text-slate-950">还没有工作簿</h3>
+                <h3 className="text-2xl font-semibold text-slate-950">{showOnlyOwnResources ? '还没有自己的工作簿或文件夹' : '还没有工作簿'}</h3>
                 <p className="mt-3 text-sm leading-7 text-slate-500">
-                  从一个基础业务台账开始，后续可以逐步延展成销售、库存、采购和人事模块。
+                  {showOnlyOwnResources ? '可以新建自己的文件夹或工作簿，关闭筛选后仍可查看其他有权限的资源。' : '从一个基础业务台账开始，后续可以逐步延展成销售、库存、采购和人事模块。'}
                 </p>
               </div>
             )}
@@ -1522,7 +1572,7 @@ export default function HomePage() {
                     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
                       <div className="overflow-x-auto">
                         <div className="min-w-[1160px]">
-                          <div className="grid grid-cols-[minmax(340px,1.6fr)_170px_140px_170px_330px] items-center border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-500">
+                          <div className="grid grid-cols-[minmax(340px,1.6fr)_170px_140px_170px_365px] items-center border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-500">
                             <div>名称</div>
                             <div>归属 / 状态</div>
                             <div>创建时间</div>
@@ -1537,7 +1587,7 @@ export default function HomePage() {
                                 onDragStart={() => canManageWorkbook(workbook) && setDraggedWorkbookId(workbook.id)}
                                 onDragEnd={() => setDraggedWorkbookId(null)}
                                 onDoubleClick={() => router.push(`/sheets/${workbook.id}`)}
-                                className={`grid grid-cols-[minmax(340px,1.6fr)_170px_140px_170px_330px] items-center gap-3 px-4 py-2.5 text-sm transition ${
+                                className={`grid grid-cols-[minmax(340px,1.6fr)_170px_140px_170px_365px] items-center gap-3 px-4 py-2.5 text-sm transition ${
                                   workbook.is_hidden ? 'bg-slate-50/70 text-slate-500 hover:bg-slate-100' : 'hover:bg-sky-50/50'
                                 }`}
                               >
@@ -1605,6 +1655,20 @@ export default function HomePage() {
                                       title="移出当前文件夹到根目录"
                                     >
                                       {movingWorkbookId === workbook.id ? '移动中' : '移出'}
+                                    </button>
+                                  )}
+                                  {canManageWorkbook(workbook) && (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => void handleDuplicateWorkbook(event, workbook)}
+                                      disabled={duplicatingWorkbookId !== null}
+                                      className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-sky-200 bg-sky-50 text-sky-700 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
+                                      title="复制工作簿"
+                                      aria-label={`复制工作簿 ${workbook.name}`}
+                                      data-tooltip={duplicatingWorkbookId === workbook.id ? '正在复制工作簿' : '复制工作簿'}
+                                      data-tooltip-side="top"
+                                    >
+                                      <Copy className="h-3.5 w-3.5" />
                                     </button>
                                   )}
                                   <button

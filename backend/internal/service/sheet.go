@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,10 @@ var ErrSheetLocked = errors.New("sheet is locked")
 var ErrSheetArchived = errors.New("sheet is archived")
 var ErrSheetStateDenied = errors.New("sheet state change denied")
 
+const maxCopiedResourceNameRunes = 256
+
+var copiedResourceSuffixPattern = regexp.MustCompile(`^(.+) - 副本(?: [0-9]+)?$`)
+
 type protectionOwner struct {
 	OwnerID                 int64   `json:"ownerId"`
 	OwnerName               string  `json:"ownerName"`
@@ -31,6 +36,7 @@ type protectionOwner struct {
 	EditableDepartmentIDs   []int64 `json:"editableDepartmentIds,omitempty"`
 	ViewHiddenUserIDs       []int64 `json:"viewHiddenUserIds,omitempty"`
 	ViewHiddenDepartmentIDs []int64 `json:"viewHiddenDepartmentIds,omitempty"`
+	LockEditing             *bool   `json:"lockEditing,omitempty"`
 	Hidden                  bool    `json:"hidden,omitempty"`
 	ProtectedAt             string  `json:"protectedAt"`
 }
@@ -53,17 +59,127 @@ func NewSheetService(sheetRepo *repo.SheetRepo, permService *PermissionService) 
 // Workbook operations
 
 func (s *SheetService) CreateWorkbookForUser(userID int64, workbook *model.Workbook) error {
-	if workbook.FolderID != nil {
-		canWriteFolder, err := s.permService.CanWriteFolder(*workbook.FolderID, userID)
-		if err != nil {
-			return err
-		}
-		if !canWriteFolder {
-			return ErrFolderManageDenied
-		}
+	if err := s.ensureWorkbookFolderWritable(userID, workbook.FolderID); err != nil {
+		return err
 	}
 
 	return s.sheetRepo.CreateWorkbook(workbook)
+}
+
+func (s *SheetService) ensureWorkbookFolderWritable(userID int64, folderID *int64) error {
+	if folderID == nil {
+		return nil
+	}
+	canWriteFolder, err := s.permService.CanWriteFolder(*folderID, userID)
+	if err != nil {
+		return err
+	}
+	if !canWriteFolder {
+		return ErrFolderManageDenied
+	}
+	return nil
+}
+
+func nextCopiedResourceName(sourceName string, existingNames []string) string {
+	baseName := strings.TrimSpace(sourceName)
+	if baseName == "" {
+		baseName = "未命名"
+	}
+	for {
+		matches := copiedResourceSuffixPattern.FindStringSubmatch(baseName)
+		if len(matches) != 2 {
+			break
+		}
+		baseName = strings.TrimSpace(matches[1])
+	}
+
+	existing := make(map[string]struct{}, len(existingNames))
+	for _, name := range existingNames {
+		existing[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+
+	for index := 0; ; index++ {
+		suffix := " - 副本"
+		if index > 0 {
+			suffix = fmt.Sprintf(" - 副本 %d", index)
+		}
+		candidate := fitCopiedResourceName(baseName, suffix)
+		if _, exists := existing[strings.ToLower(candidate)]; !exists {
+			return candidate
+		}
+	}
+}
+
+func fitCopiedResourceName(baseName, suffix string) string {
+	baseRunes := []rune(strings.TrimSpace(baseName))
+	suffixRunes := []rune(suffix)
+	maxBaseRunes := maxCopiedResourceNameRunes - len(suffixRunes)
+	if len(baseRunes) > maxBaseRunes {
+		baseRunes = baseRunes[:maxBaseRunes]
+	}
+	return string(baseRunes) + suffix
+}
+
+func duplicatedWorkbookMetadata(metadata json.RawMessage) (json.RawMessage, error) {
+	payload := make(map[string]interface{})
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			return nil, fmt.Errorf("parse workbook metadata for copy: %w", err)
+		}
+	}
+	if payload == nil {
+		payload = make(map[string]interface{})
+	}
+	delete(payload, "workbookState")
+	delete(payload, "source_workbook_id")
+	delete(payload, "assigned_by")
+	delete(payload, "assigned_at")
+	return json.Marshal(payload)
+}
+
+func (s *SheetService) DuplicateWorkbookForUser(userID, workbookID int64) (*model.Workbook, error) {
+	source, err := s.sheetRepo.GetWorkbook(workbookID)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyWorkbookLifecycleState(source); err != nil {
+		return nil, err
+	}
+	canManage, err := s.CanManageWorkbook(userID, source)
+	if err != nil {
+		return nil, err
+	}
+	if !canManage {
+		return nil, ErrWorkbookAccessDenied
+	}
+	if err := s.ensureWorkbookVisible(source, userID); err != nil {
+		return nil, err
+	}
+	if err := s.ensureWorkbookFolderWritable(userID, source.FolderID); err != nil {
+		return nil, err
+	}
+
+	existingNames, err := s.sheetRepo.ListWorkbookNames(userID, source.FolderID)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := duplicatedWorkbookMetadata(source.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	clone := &model.Workbook{
+		Name:        nextCopiedResourceName(source.Name, existingNames),
+		Description: source.Description,
+		OwnerID:     userID,
+		FolderID:    source.FolderID,
+		Metadata:    metadata,
+		IsTemplate:  source.IsTemplate,
+		Status:      source.Status,
+	}
+	if err := s.sheetRepo.DuplicateWorkbook(source.ID, clone, userID); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, error) {
@@ -379,28 +495,8 @@ func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) erro
 	if err != nil {
 		return err
 	}
-	if err := applyWorkbookLifecycleState(wb); err != nil {
+	if err := s.ensureCanAddSheet(userID, wb); err != nil {
 		return err
-	}
-
-	canManageWorkbook, err := s.CanManageWorkbook(userID, wb)
-	if err != nil {
-		return err
-	}
-	if !canManageWorkbook {
-		return ErrWorkbookAccessDenied
-	}
-	if err := s.ensureWorkbookVisible(wb, userID); err != nil {
-		return err
-	}
-	if wb.IsLocked {
-		isAdmin, err := s.permService.IsAdmin(userID)
-		if err != nil {
-			return err
-		}
-		if !isAdmin {
-			return fmt.Errorf("%w: 当前工作簿已锁定，仅管理员可以新增工作表", ErrWorkbookAccessDenied)
-		}
 	}
 
 	nextSortOrder, err := s.sheetRepo.GetNextSheetSortOrder(sheet.WorkbookID)
@@ -410,6 +506,89 @@ func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) erro
 	sheet.SortOrder = nextSortOrder
 
 	return s.sheetRepo.CreateSheet(sheet)
+}
+
+func (s *SheetService) ensureCanAddSheet(userID int64, workbook *model.Workbook) error {
+	if workbook == nil {
+		return ErrWorkbookAccessDenied
+	}
+	if err := applyWorkbookLifecycleState(workbook); err != nil {
+		return err
+	}
+
+	canManageWorkbook, err := s.CanManageWorkbook(userID, workbook)
+	if err != nil {
+		return err
+	}
+	if !canManageWorkbook {
+		return ErrWorkbookAccessDenied
+	}
+	if err := s.ensureWorkbookVisible(workbook, userID); err != nil {
+		return err
+	}
+	if workbook.IsLocked {
+		isAdmin, err := s.permService.IsAdmin(userID)
+		if err != nil {
+			return err
+		}
+		if !isAdmin {
+			return fmt.Errorf("%w: 当前工作簿已锁定，仅管理员可以新增工作表", ErrWorkbookAccessDenied)
+		}
+	}
+	return nil
+}
+
+func (s *SheetService) DuplicateSheetForUser(userID, sheetID int64) (*model.Sheet, error) {
+	source, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	if err := applySheetLifecycleState(source); err != nil {
+		return nil, err
+	}
+	workbook, err := s.sheetRepo.GetWorkbook(source.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureCanAddSheet(userID, workbook); err != nil {
+		return nil, err
+	}
+	if source.IsHidden {
+		isAdmin, err := s.permService.IsAdmin(userID)
+		if err != nil {
+			return nil, err
+		}
+		if !isAdmin {
+			return nil, fmt.Errorf("%w: 当前工作表已隐藏，仅管理员可以复制", ErrWorkbookAccessDenied)
+		}
+	}
+
+	sheets, err := s.sheetRepo.GetSheetsByWorkbook(source.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	existingNames := make([]string, 0, len(sheets))
+	for _, item := range sheets {
+		existingNames = append(existingNames, item.Name)
+	}
+	nextSortOrder, err := s.sheetRepo.GetNextSheetSortOrder(source.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	clone, err := s.sheetRepo.DuplicateSheet(
+		source.ID,
+		source.WorkbookID,
+		nextCopiedResourceName(source.Name, existingNames),
+		nextSortOrder,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := applySheetLifecycleState(clone); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.Sheet) error {
@@ -834,7 +1013,7 @@ func (s *SheetService) DeleteRow(userID, sheetID int64, rowIndex int) error {
 	return s.sheetRepo.DeleteRowWithConfig(sheetID, rowIndex, nextConfig)
 }
 
-func (s *SheetService) GetProtectionSnapshot(sheetID int64) (*model.ProtectionSnapshot, error) {
+func (s *SheetService) GetProtectionSnapshot(sheetID, userID int64) (*model.ProtectionSnapshot, error) {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return nil, err
@@ -848,12 +1027,7 @@ func (s *SheetService) GetProtectionSnapshot(sheetID int64) (*model.ProtectionSn
 		return nil, err
 	}
 
-	snapshot := &model.ProtectionSnapshot{
-		Rows:    flattenProtectionMap("row", protections.Rows),
-		Columns: flattenProtectionMap("column", protections.Columns),
-		Cells:   flattenProtectionMap("cell", protections.Cells),
-	}
-	return snapshot, nil
+	return s.buildProtectionSnapshot(protections, userID)
 }
 
 func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, req *model.UpdateProtectionRequest) (*model.Sheet, *model.ProtectionSnapshot, error) {
@@ -901,10 +1075,9 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 		return nil, nil, err
 	}
 
-	snapshot := &model.ProtectionSnapshot{
-		Rows:    flattenProtectionMap("row", protections.Rows),
-		Columns: flattenProtectionMap("column", protections.Columns),
-		Cells:   flattenProtectionMap("cell", protections.Cells),
+	snapshot, err := s.buildProtectionSnapshot(protections, userID)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	updatedSheet, err := s.sheetRepo.GetSheet(sheetID)
@@ -991,10 +1164,9 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 		return nil, nil, err
 	}
 
-	snapshot := &model.ProtectionSnapshot{
-		Rows:    flattenProtectionMap("row", protections.Rows),
-		Columns: flattenProtectionMap("column", protections.Columns),
-		Cells:   flattenProtectionMap("cell", protections.Cells),
+	snapshot, err := s.buildProtectionSnapshot(protections, userID)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	updatedSheet, err := s.sheetRepo.GetSheet(sheetID)
@@ -1109,21 +1281,21 @@ func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey strin
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, departmentSet) {
+		if !protectionLocksEditing(check.info) || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, departmentSet) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, rowIndex, colKey), nil
 	}
 	if strings.TrimSpace(colKey) == "" {
 		for protectedColumn, info := range protections.Columns {
-			if info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentSet) {
+			if !protectionLocksEditing(info) || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentSet) {
 				continue
 			}
 			return true, buildProtectionMessage("column", info.OwnerName, rowIndex, protectedColumn), nil
 		}
 		rowPrefix := fmt.Sprintf("%d:", rowIndex)
 		for key, info := range protections.Cells {
-			if !strings.HasPrefix(key, rowPrefix) || info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentSet) {
+			if !strings.HasPrefix(key, rowPrefix) || !protectionLocksEditing(info) || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentSet) {
 				continue
 			}
 			protectedColumn := strings.TrimPrefix(key, rowPrefix)
@@ -1330,6 +1502,21 @@ func protectionAllowsViewHidden(info protectionOwner, userID int64, departmentID
 		protectionListAllows(info.ViewHiddenUserIDs, info.ViewHiddenDepartmentIDs, userID, departmentIDs)
 }
 
+func protectionLocksEditing(info protectionOwner) bool {
+	return info.OwnerID != 0 && (info.LockEditing == nil || *info.LockEditing)
+}
+
+func resolveProtectionLockEditing(requested, current *bool) *bool {
+	value := true
+	if current != nil {
+		value = *current
+	}
+	if requested != nil {
+		value = *requested
+	}
+	return &value
+}
+
 func int64Set(values []int64) map[int64]struct{} {
 	result := make(map[int64]struct{}, len(values))
 	for _, value := range values {
@@ -1347,6 +1534,11 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 	if req.Action == "lock" {
 		if info.OwnerID != 0 && info.OwnerID != userID && !isAdmin {
 			return fmt.Errorf("%w: 此保护已由 %s 添加", ErrProtectionDenied, info.OwnerName)
+		}
+		lockEditing := resolveProtectionLockEditing(req.LockEditing, info.LockEditing)
+		hidden := resolveProtectionHidden(req.Hidden, info.Hidden)
+		if !*lockEditing && !hidden {
+			return fmt.Errorf("%w: 请至少开启锁定编辑或数据遮罩", ErrProtectionDenied)
 		}
 		ownerID := userID
 		ownerName := username
@@ -1369,7 +1561,8 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 			EditableDepartmentIDs:   access.EditableDepartmentIDs,
 			ViewHiddenUserIDs:       access.ViewHiddenUserIDs,
 			ViewHiddenDepartmentIDs: access.ViewHiddenDepartmentIDs,
-			Hidden:                  resolveProtectionHidden(req.Hidden, info.Hidden),
+			LockEditing:             lockEditing,
+			Hidden:                  hidden,
 			ProtectedAt:             protectedAt,
 		}
 		return nil
@@ -1412,7 +1605,27 @@ func finalizeProtectionPayload(payload map[string]interface{}, protections prote
 	}
 }
 
-func flattenProtectionMap(scope string, items map[string]protectionOwner) []model.ProtectionInfo {
+func (s *SheetService) buildProtectionSnapshot(protections protectionMaps, userID int64) (*model.ProtectionSnapshot, error) {
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentSet := map[int64]struct{}{}
+	if !isAdmin {
+		departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+		if err != nil {
+			return nil, err
+		}
+		departmentSet = int64Set(departmentIDs)
+	}
+	return &model.ProtectionSnapshot{
+		Rows:    flattenProtectionMap("row", protections.Rows, userID, isAdmin, departmentSet),
+		Columns: flattenProtectionMap("column", protections.Columns, userID, isAdmin, departmentSet),
+		Cells:   flattenProtectionMap("cell", protections.Cells, userID, isAdmin, departmentSet),
+	}, nil
+}
+
+func flattenProtectionMap(scope string, items map[string]protectionOwner, userID int64, isAdmin bool, departmentIDs map[int64]struct{}) []model.ProtectionInfo {
 	result := make([]model.ProtectionInfo, 0, len(items))
 	for key, info := range items {
 		if info.OwnerID == 0 {
@@ -1430,7 +1643,10 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner) []mode
 			EditableDepartmentIDs:   append([]int64(nil), info.EditableDepartmentIDs...),
 			ViewHiddenUserIDs:       append([]int64(nil), info.ViewHiddenUserIDs...),
 			ViewHiddenDepartmentIDs: append([]int64(nil), info.ViewHiddenDepartmentIDs...),
+			LockEditing:             protectionLocksEditing(info),
 			Hidden:                  info.Hidden,
+			CanEdit:                 !protectionLocksEditing(info) || isAdmin || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs),
+			MaskedForCurrentUser:    info.Hidden && !isAdmin && info.OwnerID != userID && !protectionAllowsViewHidden(info, userID, departmentIDs),
 		}
 		if parsedTime, err := time.Parse(time.RFC3339, info.ProtectedAt); err == nil {
 			entry.ProtectedAt = parsedTime
@@ -1900,7 +2116,7 @@ func (s *SheetService) checkProtectionByWorksheetRow(config json.RawMessage, wor
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, departmentSet) {
+		if !protectionLocksEditing(check.info) || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, departmentSet) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, dataRowIndex, colKey), nil

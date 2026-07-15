@@ -48,6 +48,114 @@ func (r *SheetRepo) CreateWorkbook(wb *model.Workbook) error {
 	return nil
 }
 
+func (r *SheetRepo) ListWorkbookNames(ownerID int64, folderID *int64) ([]string, error) {
+	rows, err := r.db.Query(
+		`SELECT name
+		 FROM workbooks
+		 WHERE owner_id = $1 AND folder_id IS NOT DISTINCT FROM $2
+		 ORDER BY id`,
+		ownerID, folderID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list workbook names: %w", err)
+	}
+	defer rows.Close()
+
+	names := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan workbook name: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workbook names: %w", err)
+	}
+	return names, nil
+}
+
+func (r *SheetRepo) DuplicateWorkbook(sourceWorkbookID int64, clone *model.Workbook, actorID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin duplicate workbook: %w", err)
+	}
+	defer tx.Rollback()
+
+	var sourceExists int
+	if err := tx.QueryRow(`SELECT 1 FROM workbooks WHERE id = $1 FOR SHARE`, sourceWorkbookID).Scan(&sourceExists); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("workbook %d not found", sourceWorkbookID)
+		}
+		return fmt.Errorf("lock source workbook: %w", err)
+	}
+
+	now := time.Now()
+	metadata := clone.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage(`{}`)
+	}
+	status := clone.Status
+	if status == 0 {
+		status = 1
+	}
+	if err := tx.QueryRow(
+		`INSERT INTO workbooks (name, description, owner_id, folder_id, metadata, is_template, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+		 RETURNING id`,
+		clone.Name, clone.Description, clone.OwnerID, clone.FolderID, metadata, clone.IsTemplate, status, now,
+	).Scan(&clone.ID); err != nil {
+		return fmt.Errorf("create duplicated workbook: %w", err)
+	}
+
+	type sourceSheet struct {
+		id        int64
+		name      string
+		sortOrder int
+	}
+	sourceRows, err := tx.Query(
+		`SELECT id, name, sort_order
+		 FROM sheets
+		 WHERE workbook_id = $1
+		 ORDER BY sort_order, id`,
+		sourceWorkbookID,
+	)
+	if err != nil {
+		return fmt.Errorf("list source workbook sheets: %w", err)
+	}
+	sourceSheets := make([]sourceSheet, 0)
+	for sourceRows.Next() {
+		var item sourceSheet
+		if err := sourceRows.Scan(&item.id, &item.name, &item.sortOrder); err != nil {
+			sourceRows.Close()
+			return fmt.Errorf("scan source workbook sheet: %w", err)
+		}
+		sourceSheets = append(sourceSheets, item)
+	}
+	if err := sourceRows.Err(); err != nil {
+		sourceRows.Close()
+		return fmt.Errorf("iterate source workbook sheets: %w", err)
+	}
+	if err := sourceRows.Close(); err != nil {
+		return fmt.Errorf("close source workbook sheets: %w", err)
+	}
+
+	for _, source := range sourceSheets {
+		if _, err := duplicateSheetTx(tx, source.id, clone.ID, source.name, source.sortOrder, actorID, now); err != nil {
+			return fmt.Errorf("duplicate sheet %d: %w", source.id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit duplicate workbook: %w", err)
+	}
+	clone.Metadata = metadata
+	clone.Status = status
+	clone.CreatedAt = now
+	clone.UpdatedAt = now
+	return nil
+}
+
 func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	var wb model.Workbook
 	err := r.db.QueryRow(
@@ -197,6 +305,104 @@ func (r *SheetRepo) CreateSheet(s *model.Sheet) error {
 	s.CreatedAt = now
 	s.UpdatedAt = now
 	return nil
+}
+
+func (r *SheetRepo) DuplicateSheet(sourceSheetID, workbookID int64, name string, sortOrder int, actorID int64) (*model.Sheet, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin duplicate sheet: %w", err)
+	}
+	defer tx.Rollback()
+
+	clone, err := duplicateSheetTx(tx, sourceSheetID, workbookID, name, sortOrder, actorID, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit duplicate sheet: %w", err)
+	}
+	return clone, nil
+}
+
+func duplicateSheetTx(tx *sql.Tx, sourceSheetID, workbookID int64, name string, sortOrder int, actorID int64, now time.Time) (*model.Sheet, error) {
+	clone := &model.Sheet{}
+	err := tx.QueryRow(
+		`INSERT INTO sheets (workbook_id, name, sort_order, columns, frozen, config, created_at, updated_at)
+		 SELECT $2, $3, $4, columns, frozen, config, $5, $5
+		 FROM sheets
+		 WHERE id = $1
+		 RETURNING id, workbook_id, name, sort_order, columns, frozen, config, created_at, updated_at`,
+		sourceSheetID, workbookID, name, sortOrder, now,
+	).Scan(
+		&clone.ID,
+		&clone.WorkbookID,
+		&clone.Name,
+		&clone.SortOrder,
+		&clone.Columns,
+		&clone.Frozen,
+		&clone.Config,
+		&clone.CreatedAt,
+		&clone.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("sheet %d not found", sourceSheetID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create duplicated sheet: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`INSERT INTO rows (sheet_id, row_index, data, created_by, updated_by, created_at, updated_at)
+		 SELECT $2, row_index, data, $3, $3, $4, $4
+		 FROM rows
+		 WHERE sheet_id = $1`,
+		sourceSheetID, clone.ID, actorID, now,
+	); err != nil {
+		return nil, fmt.Errorf("copy sheet rows: %w", err)
+	}
+
+	permissionCopies := []struct {
+		name  string
+		query string
+	}{
+		{
+			name: "role sheet permissions",
+			query: `INSERT INTO sheet_permissions (sheet_id, role_id, can_view, can_edit, can_delete, can_export)
+				SELECT $2, role_id, can_view, can_edit, can_delete, can_export
+				FROM sheet_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "role cell permissions",
+			query: `INSERT INTO cell_permissions (sheet_id, role_id, column_key, row_index, permission)
+				SELECT $2, role_id, column_key, row_index, permission
+				FROM cell_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "user sheet permissions",
+			query: `INSERT INTO user_sheet_permissions (sheet_id, user_id, can_view, can_edit, can_delete, can_export)
+				SELECT $2, user_id, can_view, can_edit, can_delete, can_export
+				FROM user_sheet_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "principal sheet permissions",
+			query: `INSERT INTO principal_sheet_permissions (sheet_id, principal_type, principal_id, can_view, can_edit, can_delete, can_export, created_at, updated_at)
+				SELECT $2, principal_type, principal_id, can_view, can_edit, can_delete, can_export, created_at, updated_at
+				FROM principal_sheet_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "principal cell permissions",
+			query: `INSERT INTO principal_cell_permissions (sheet_id, principal_type, principal_id, column_key, row_index, permission, created_at, updated_at)
+				SELECT $2, principal_type, principal_id, column_key, row_index, permission, created_at, updated_at
+				FROM principal_cell_permissions WHERE sheet_id = $1`,
+		},
+	}
+	for _, permissionCopy := range permissionCopies {
+		if _, err := tx.Exec(permissionCopy.query, sourceSheetID, clone.ID); err != nil {
+			return nil, fmt.Errorf("copy %s: %w", permissionCopy.name, err)
+		}
+	}
+
+	return clone, nil
 }
 
 func (r *SheetRepo) GetNextSheetSortOrder(workbookID int64) (int, error) {

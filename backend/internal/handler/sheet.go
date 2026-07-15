@@ -228,6 +228,26 @@ func (h *SheetHandler) CreateWorkbook(c *gin.Context) {
 	response.OK(c, wb)
 }
 
+func (h *SheetHandler) DuplicateWorkbook(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	workbookID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid workbook id")
+		return
+	}
+
+	clone, err := h.sheetService.DuplicateWorkbookForUser(userID, workbookID)
+	if err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) || errors.Is(err, service.ErrFolderManageDenied) {
+			response.Forbidden(c, "you do not have permission to duplicate this workbook")
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, clone)
+}
+
 func (h *SheetHandler) GetWorkbook(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -383,6 +403,26 @@ func (h *SheetHandler) CreateSheet(c *gin.Context) {
 	response.OK(c, sheet)
 }
 
+func (h *SheetHandler) DuplicateSheet(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	clone, err := h.sheetService.DuplicateSheetForUser(userID, sheetID)
+	if err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+			response.Forbidden(c, "you do not have permission to duplicate this sheet")
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, clone)
+}
+
 func (h *SheetHandler) GetSheet(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -535,7 +575,7 @@ func (h *SheetHandler) GetProtections(c *gin.Context) {
 		return
 	}
 
-	snapshot, err := h.sheetService.GetProtectionSnapshot(id)
+	snapshot, err := h.sheetService.GetProtectionSnapshot(id, c.GetInt64("user_id"))
 	if err != nil {
 		response.ServerError(c, err.Error())
 		return

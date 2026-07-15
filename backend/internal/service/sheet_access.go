@@ -79,7 +79,7 @@ func (c *sheetCellAccessCache) checkProtection(columnKey string, worksheetRowInd
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, c.departmentIDs) {
+		if !protectionLocksEditing(check.info) || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, c.departmentIDs) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, dataRowIndex, columnKey)

@@ -4,7 +4,7 @@ import dynamic from 'next/dynamic'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
-import { Archive, ArchiveRestore, ArrowLeft, Check, Eye, EyeOff, FileSpreadsheet, Globe2, Lock, Maximize2, MessageCircle, Minimize2, PanelLeftClose, PanelLeftOpen, PencilLine, Plus, Search, Trash2, Unlock, X } from 'lucide-react'
+import { Archive, ArchiveRestore, ArrowLeft, Check, Copy, Eye, EyeOff, FileSpreadsheet, Globe2, Lock, Maximize2, MessageCircle, Minimize2, PanelLeftClose, PanelLeftOpen, PencilLine, Plus, Search, Trash2, Unlock, X } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
 import { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
@@ -13,6 +13,7 @@ import { usePermission } from '@/hooks/usePermission'
 import { useSheetWebSocket } from '@/hooks/useSheetWebSocket'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import api from '@/lib/api'
+import { prepareDataMutation } from '@/lib/dataEvents'
 import type { AuthUser, Sheet } from '@/types'
 
 const UniverSheetEditor = dynamic(() => import('@/components/spreadsheet/UniverSheetEditor'), {
@@ -300,6 +301,33 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
     }
   }
 
+  const handleDuplicateSheet = async (targetSheet: Sheet) => {
+    if (!canManageWorkbook || sheetActionLoading) return
+
+    setSheetActionError('')
+    setSheetActionLoading(true)
+    setSheetContextMenu(null)
+    try {
+      if (targetSheet.id === activeSheet?.id) {
+        await prepareDataMutation()
+      }
+      const res = await api.post<Sheet>(`/sheets/${targetSheet.id}/duplicate`)
+      if (res.code !== 0 || !res.data) {
+        setSheetActionError(res.message || '复制工作表失败，请稍后再试。')
+        return
+      }
+      setSelectedSheetIds([])
+      setOptimisticEditableSheetId(res.data.id)
+      await refresh()
+      router.replace(`/sheets/${workbookId}/${res.data.id}`)
+    } catch (err) {
+      console.error('Failed to duplicate sheet:', err)
+      setSheetActionError(err instanceof Error ? err.message : '复制工作表失败，请稍后再试。')
+    } finally {
+      setSheetActionLoading(false)
+    }
+  }
+
   const startRenameSheet = (sheet: Sheet) => {
     if (!canManageWorkbook) return
     setSheetActionError('')
@@ -469,7 +497,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
       if (selectedSheetIds.length > 0) setSelectedSheetIds([])
     }
     const menuWidth = 240
-    const menuHeight = modifierPressed && nextSelectedIds.length > 1 ? 420 : canManageWorkbook ? 286 : 48
+    const menuHeight = modifierPressed && nextSelectedIds.length > 1 ? 420 : canManageWorkbook ? 324 : 80
     setSheetContextMenu({
       sheet: targetSheet,
       batch: modifierPressed && nextSelectedIds.length > 1,
@@ -1008,6 +1036,11 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 <button type="button" onClick={() => { router.push(`/sheets/${workbookId}/${sheetContextMenu.sheet.id}`); setSelectedSheetIds([]); setSheetContextMenu(null) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50">
                   <FileSpreadsheet className="h-4 w-4 text-slate-400" />打开工作表
                 </button>
+                {canManageWorkbook && (
+                  <button type="button" onClick={() => void handleDuplicateSheet(sheetContextMenu.sheet)} disabled={sheetActionLoading} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-sky-50 disabled:opacity-50">
+                    <Copy className="h-4 w-4 text-sky-600" />复制工作表
+                  </button>
+                )}
                 <button type="button" onClick={() => { const target = sheetContextMenu.sheet; setSheetContextMenu(null); setWhatsAppResource({ sheetId: target.id, title: `${workbook.name} / ${target.name}`, defaultContent: `工作表：${workbook.name} / ${target.name}` }) }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-emerald-700 hover:bg-emerald-50">
                   <MessageCircle className="h-4 w-4 text-emerald-600" />发送到 WhatsApp
                 </button>

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
 import { AlertCircle, ChevronDown, ChevronUp, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, ImagePlus, LocateFixed, Lock, Printer, Rows3, Save, Search, Shield, Square, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
-import type { ICellData, IWorkbookData, IWorksheetData } from '@univerjs/core'
+import { RANGE_TYPE, type ICellData, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
@@ -74,6 +74,8 @@ interface SelectionState {
   endColumnKey: string
   rangeLabel: string
   includesHeaderRow: boolean
+  isEntireColumnSelection: boolean
+  isEntireRowSelection: boolean
 }
 
 type ProtectionScope = 'row' | 'column' | 'cell'
@@ -90,6 +92,7 @@ interface ProtectionMutationPayload {
   editable_department_ids?: number[]
   view_hidden_user_ids?: number[]
   view_hidden_department_ids?: number[]
+  lock_editing?: boolean
   hidden?: boolean
 }
 
@@ -143,6 +146,7 @@ interface ProtectionHighlightBlock {
 
 const MIN_UNIVER_ZOOM = 0.1
 const MAX_UNIVER_ZOOM = 4
+const PROTECTION_HIGHLIGHT_PREFERENCE_KEY = 'yaerp:show-protection-highlights'
 const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
   'sheet.contextMenu.permission': { title: '选区权限' },
   'sheet.command.add-range-protection-from-context-menu': { title: '配置选区白名单' },
@@ -190,7 +194,7 @@ const PROTECTION_VISUALS: ProtectionVisual[] = [
 ]
 const HIDDEN_PROTECTION_VISUAL: ProtectionVisual = {
   stroke: '#475569',
-  fill: 'rgba(71, 85, 105, 0.12)',
+  fill: 'rgba(71, 85, 105, 0.055)',
   soft: '#e2e8f0',
 }
 
@@ -201,6 +205,13 @@ function visualForUser(userId: number) {
 
 function protectionVisualKey(item: Pick<ProtectionInfo, 'owner_id' | 'hidden'>) {
   return item.hidden ? 'hidden' : `owner:${item.owner_id}`
+}
+
+function formatProtectionMode(item: Pick<ProtectionInfo, 'hidden' | 'lock_editing'>) {
+  if (item.hidden && item.lock_editing) return '数据遮罩并锁定编辑'
+  if (item.hidden) return '数据遮罩'
+  if (item.lock_editing) return '锁定编辑'
+  return '访问规则'
 }
 
 function compactLinearProtectionBlocks(
@@ -257,7 +268,7 @@ function compactCellProtectionBlocks(items: ProtectionInfo[], columnIndexes: Map
     if (typeof item.row_index !== 'number') return
     const row = item.row_index + 1
     const column = columnIndexes.get(item.column_key || item.key)
-    if (row < 1 || row >= maxRows || column === undefined || column < 0 || column >= maxColumns) return
+    if (row < 0 || row >= maxRows || column === undefined || column < 0 || column >= maxColumns) return
     const key = protectionVisualKey(item)
     const group = groups.get(key) || { ownerId: item.owner_id, hidden: Boolean(item.hidden), rows: new Map<number, Set<number>>() }
     const columns = group.rows.get(row) || new Set<number>()
@@ -1055,6 +1066,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [protectionUsersLoadToken, setProtectionUsersLoadToken] = useState(0)
   const [protectionUserSearch, setProtectionUserSearch] = useState('')
   const [protectionScope, setProtectionScope] = useState<ProtectionScope>('cell')
+  const [selectedProtectionLockEditing, setSelectedProtectionLockEditing] = useState(true)
   const [selectedProtectionHidden, setSelectedProtectionHidden] = useState(false)
   const [selectedProtectionReadonlyUserIds, setSelectedProtectionReadonlyUserIds] = useState<number[]>([])
   const [selectedProtectionReadonlyDepartmentIds, setSelectedProtectionReadonlyDepartmentIds] = useState<number[]>([])
@@ -1062,7 +1074,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [selectedProtectionEditableDepartmentIds, setSelectedProtectionEditableDepartmentIds] = useState<number[]>([])
   const [selectedProtectionViewHiddenUserIds, setSelectedProtectionViewHiddenUserIds] = useState<number[]>([])
   const [selectedProtectionViewHiddenDepartmentIds, setSelectedProtectionViewHiddenDepartmentIds] = useState<number[]>([])
-  const [showProtectionHighlights, setShowProtectionHighlights] = useState(false)
+  const [showProtectionHighlights, setShowProtectionHighlights] = useState(true)
+  const [protectionHighlightPreferenceReady, setProtectionHighlightPreferenceReady] = useState(false)
   const [protectionFocusNotice, setProtectionFocusNotice] = useState('')
   const [sheetPresence, setSheetPresence] = useState<SheetPresenceEntry[]>([])
   const [presenceExpanded, setPresenceExpanded] = useState(false)
@@ -1077,7 +1090,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const adminMode = isAdmin(profile)
   const sheetId = sheet.id
-  const { permissions, loading: permissionLoading } = usePermission(sheetId)
+  const { permissions, loading: permissionLoading, canEditCell, refreshPermissions } = usePermission(sheetId)
   const canViewSheet = permissions?.sheet.canView ?? false
   const canEditSheet = permissions?.sheet.canEdit ?? false
   const canExportSheet = permissions?.sheet.canExport ?? false
@@ -1139,7 +1152,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
       const rawStartRow = Math.max(range.getRow(), 0)
       const rawEndRow = Math.max(range.getLastRow(), 0)
+      const rangeType = range.getRange().rangeType
       const includesHeaderRow = rawStartRow === 0 || rawEndRow === 0
+      const isEntireColumnSelection = rangeType === RANGE_TYPE.COLUMN
+      const isEntireRowSelection = rangeType === RANGE_TYPE.ROW
       const startRow = rawStartRow - 1
       const endRow = rawEndRow - 1
       const displayStartRow = rawStartRow + 1
@@ -1149,7 +1165,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         startRow === endRow && startColumnIndex === endColumnIndex
           ? `${column.name || column.key} / 第 ${displayStartRow} 行`
           : `第 ${displayStartRow}-${displayEndRow} 行 / ${column.name || column.key} 到 ${endColumn?.name || endColumn?.key || column.key}`
-
       const nextSelection = {
         rowIndex: startRow,
         displayRowIndex: displayStartRow,
@@ -1161,6 +1176,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         endColumnKey: endColumn?.key || column.key,
         rangeLabel,
         includesHeaderRow,
+        isEntireColumnSelection,
+        isEntireRowSelection,
       }
 
       setSelectionState(nextSelection)
@@ -1244,7 +1261,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const target = getProtectionRange(item)
     if (!target) return
     setShowProtectionHighlights(true)
-    setProtectionFocusNotice(`${item.owner_name}${item.hidden ? ' 隐藏并保护了 ' : ' 保护了 '}${item.scope === 'row' ? `第 ${(item.row_index ?? 0) + 2} 行` : item.scope === 'column' ? `列 ${item.column_key || item.key}` : `${item.column_key || item.key}${(item.row_index ?? 0) + 2}`}`)
+    const targetLabel = item.scope === 'row' ? `第 ${(item.row_index ?? 0) + 2} 行` : item.scope === 'column' ? `列 ${item.column_key || item.key}` : `${item.column_key || item.key}${(item.row_index ?? 0) + 2}`
+    setProtectionFocusNotice(`${item.owner_name}已为 ${targetLabel} 设置${formatProtectionMode(item)}`)
     target.range.activate?.()
     target.worksheet.scrollToCell?.(target.row, target.column)
     protectionFocusDisposableRef.current?.dispose()
@@ -1317,14 +1335,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             block.endColumn - block.startColumn + 1
           )
           protectionHighlightDisposablesRef.current.push(range.highlight({
-            stroke: visual.stroke,
-            strokeWidth: block.scope === 'cell' ? 2 : 1.25,
-            strokeDash: block.scope === 'cell' ? 0 : 4,
+            stroke: 'rgba(0, 0, 0, 0)',
+            strokeWidth: 0,
             fill: visual.fill,
             rowHeaderFill: block.scope === 'row' ? visual.fill : undefined,
-            rowHeaderStroke: block.scope === 'row' ? visual.stroke : undefined,
             columnHeaderFill: block.scope === 'column' ? visual.fill : undefined,
-            columnHeaderStroke: block.scope === 'column' ? visual.stroke : undefined,
           }))
         } catch (highlightError) {
           console.error('Failed to highlight protected range:', highlightError)
@@ -1340,9 +1355,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   useEffect(() => {
     protectionSnapshotRef.current = protectionSnapshot
-    showProtectionHighlightsRef.current = showProtectionHighlights
+    showProtectionHighlightsRef.current = protectionHighlightPreferenceReady && showProtectionHighlights
     protectionHighlightsLoadingRef.current = loading
-    if (!showProtectionHighlights || loading) {
+    if (!protectionHighlightPreferenceReady || !showProtectionHighlights || loading) {
       if (protectionHighlightRefreshTimerRef.current) {
         clearTimeout(protectionHighlightRefreshTimerRef.current)
         protectionHighlightRefreshTimerRef.current = null
@@ -1351,10 +1366,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       return
     }
     requestProtectionHighlightRefresh()
-  }, [clearProtectionHighlights, loading, protectionSnapshot, requestProtectionHighlightRefresh, showProtectionHighlights])
+  }, [clearProtectionHighlights, loading, protectionHighlightPreferenceReady, protectionSnapshot, requestProtectionHighlightRefresh, showProtectionHighlights])
 
   useEffect(() => {
-    if (!showProtectionHighlights) return
+    if (!protectionHighlightPreferenceReady || !showProtectionHighlights) return
     const root = containerRef.current
     const refresh = () => requestProtectionHighlightRefresh()
     const resizeObserver = root && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(refresh) : null
@@ -1366,7 +1381,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       root?.removeEventListener('scroll', refresh, true)
       window.removeEventListener('resize', refresh)
     }
-  }, [requestProtectionHighlightRefresh, showProtectionHighlights])
+  }, [protectionHighlightPreferenceReady, requestProtectionHighlightRefresh, showProtectionHighlights])
 
   useEffect(() => {
     clearPresenceVisuals()
@@ -1451,6 +1466,26 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   useEffect(() => { latestSheetRef.current = sheet }, [sheet])
 
   useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(PROTECTION_HIGHLIGHT_PREFERENCE_KEY)
+      if (stored !== null) setShowProtectionHighlights(stored === 'true')
+    } catch (storageError) {
+      console.warn('Failed to load protection highlight preference:', storageError)
+    } finally {
+      setProtectionHighlightPreferenceReady(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!protectionHighlightPreferenceReady) return
+    try {
+      window.localStorage.setItem(PROTECTION_HIGHLIGHT_PREFERENCE_KEY, String(showProtectionHighlights))
+    } catch (storageError) {
+      console.warn('Failed to save protection highlight preference:', storageError)
+    }
+  }, [protectionHighlightPreferenceReady, showProtectionHighlights])
+
+  useEffect(() => {
     sheetPresenceRef.current = sheetPresence
   }, [sheetPresence])
 
@@ -1462,10 +1497,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setProtectionSnapshot({ rows: [], columns: [], cells: [] })
     setShowProtectionPanel(false)
     setShowAllProtections(false)
-    setShowProtectionHighlights(false)
     setProtectionFocusNotice('')
     setProtectionUserSearch('')
     setProtectionScope('cell')
+    setSelectedProtectionLockEditing(true)
     setSelectedProtectionHidden(false)
     setSelectedProtectionReadonlyUserIds([])
     setSelectedProtectionReadonlyDepartmentIds([])
@@ -1741,24 +1776,25 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       setActionError('请先在工作表中框选需要保护的范围。')
       return
     }
-    if (selection.includesHeaderRow && scope !== 'column') {
-      setActionError('表头不属于数据行；如需保护字段，请选择“所选整列”。')
-      return
-    }
+    const effectiveScope: ProtectionScope = selection.isEntireColumnSelection
+      ? 'column'
+      : selection.isEntireRowSelection
+        ? 'row'
+        : scope
     const columns = latestSheetRef.current.columns || []
     const startColumnIndex = columns.findIndex((column) => column.key === selection.columnKey)
     const endColumnIndex = columns.findIndex((column) => column.key === selection.endColumnKey)
-    if (scope !== 'row' && (startColumnIndex < 0 || endColumnIndex < 0)) {
+    if (effectiveScope !== 'row' && (startColumnIndex < 0 || endColumnIndex < 0)) {
       setActionError('当前选择的列信息无效，请重新选择。')
       return
     }
 
     const requests: Array<Omit<ProtectionMutationPayload, 'action'>> = []
-    if (scope === 'row') {
+    if (effectiveScope === 'row') {
       for (let row = selection.rowIndex; row <= selection.endRowIndex; row += 1) {
         requests.push({ scope: 'row', row_index: row })
       }
-    } else if (scope === 'column') {
+    } else if (effectiveScope === 'column') {
       const start = Math.min(startColumnIndex, endColumnIndex)
       const end = Math.max(startColumnIndex, endColumnIndex)
       for (let index = start; index <= end; index += 1) {
@@ -1792,12 +1828,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           ...(action === 'lock' ? { editable_department_ids: selectedProtectionEditableDepartmentIds } : {}),
           ...(action === 'lock' ? { view_hidden_user_ids: selectedProtectionViewHiddenUserIds } : {}),
           ...(action === 'lock' ? { view_hidden_department_ids: selectedProtectionViewHiddenDepartmentIds } : {}),
+          ...(action === 'lock' ? { lock_editing: selectedProtectionLockEditing } : {}),
           ...(action === 'lock' && typeof hidden === 'boolean' ? { hidden } : {}),
         })),
       })
       if (res.code !== 0) {
         throw new Error(res.message || '批量保护失败')
       }
+      refreshPermissions()
       await refreshProtectionSnapshot()
     } catch (err) {
       console.error('Failed to update protection range:', err)
@@ -1805,7 +1843,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
+  }, [editLocked, refreshPermissions, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionLockEditing, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
 
   const applyIncomingChanges = useCallback((changes: Array<{ row: number; col: string; value: unknown }>) => {
     if (changes.length === 0) return
@@ -2027,6 +2065,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     const unsubscribeProtection = wsClient.on('protection_updated', (msg) => {
       if (msg.sheetId !== sheetId) return
+      refreshPermissions()
       void refreshProtectionSnapshot()
     })
 
@@ -2043,7 +2082,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       wsClient.leaveSheet(sheetId)
       setSheetPresence([])
     }
-  }, [applyIncomingChanges, refreshProtectionSnapshot, sheetId, syncSheetSilently])
+  }, [applyIncomingChanges, refreshPermissions, refreshProtectionSnapshot, sheetId, syncSheetSilently])
 
   useEffect(() => subscribeDataChanged((detail) => {
     if (!detail.sheetIds.includes(sheetId)) return
@@ -2524,6 +2563,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       editable_department_ids: selectedProtectionEditableDepartmentIds,
       view_hidden_user_ids: selectedProtectionViewHiddenUserIds,
       view_hidden_department_ids: selectedProtectionViewHiddenDepartmentIds,
+      lock_editing: true,
     })
     if (response.code !== 0) {
       throw new Error(response.message || '图片已插入，但锁定所在单元格失败。')
@@ -2881,6 +2921,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   useEffect(() => {
     if (!selectionState) {
+      setSelectedProtectionLockEditing(true)
       setSelectedProtectionHidden(false)
       setSelectedProtectionReadonlyUserIds([])
       setSelectedProtectionReadonlyDepartmentIds([])
@@ -2899,6 +2940,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const activeProtection = currentCell || currentRow || currentColumn
 
     if (activeProtection) setProtectionScope(activeProtection.scope)
+    setSelectedProtectionLockEditing(activeProtection?.lock_editing ?? true)
     setSelectedProtectionHidden(Boolean(activeProtection?.hidden))
     setSelectedProtectionReadonlyUserIds(activeProtection?.readonly_user_ids || [])
     setSelectedProtectionReadonlyDepartmentIds(activeProtection?.readonly_department_ids || [])
@@ -2941,7 +2983,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     if (item.scope === 'column') return `列 ${getProtectionColumnLabel(item.column_key || item.key)}`
     return `${getProtectionColumnLabel(item.column_key || item.key)}${(item.row_index ?? 0) + 2}`
   }
-  const formatProtectionBadge = (item: ProtectionInfo) => `${formatProtectionTarget(item)} - ${item.owner_name}`
+  const formatProtectionBadge = (item: ProtectionInfo) => `${formatProtectionTarget(item)} · ${formatProtectionMode(item)} - ${item.owner_name}`
   const allProtectionItems = [
     ...protectionSnapshot.rows,
     ...protectionSnapshot.columns,
@@ -3018,6 +3060,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const selectProtectionScope = (scope: ProtectionScope) => {
     const item = scope === 'row' ? currentRowProtection : scope === 'column' ? currentColumnProtection : currentCellProtection
     setProtectionScope(scope)
+    setSelectedProtectionLockEditing(item?.lock_editing ?? true)
     setSelectedProtectionHidden(Boolean(item?.hidden))
     setSelectedProtectionReadonlyUserIds(item?.readonly_user_ids || [])
     setSelectedProtectionReadonlyDepartmentIds(item?.readonly_department_ids || [])
@@ -3028,6 +3071,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }
   const currentProtectionItems = [currentRowProtection, currentColumnProtection, currentCellProtection]
     .filter((item): item is ProtectionInfo => Boolean(item))
+  const selectedCellCannotEdit = Boolean(
+    selectionState && permissions && (
+      !canEditCell(selectionState.columnKey, selectionState.rowIndex) ||
+      currentProtectionItems.some((item) => !item.can_edit)
+    )
+  )
+  const selectedCellMasked = currentProtectionItems.some((item) => item.masked_for_current_user)
+  const showSelectionRestriction = selectedCellMasked || (currentProtectionItems.length > 0 && selectedCellCannotEdit)
   const protectionOwnerGroups = Array.from(allProtectionItems.reduce((groups, item) => {
     const current = groups.get(item.owner_id) || { ownerId: item.owner_id, ownerName: item.owner_name, items: [] as ProtectionInfo[] }
     current.items.push(item)
@@ -3529,13 +3580,32 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                     </button>
                   ))}
                 </div>
-                <label className={`mt-3 flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition ${selectedProtectionHidden ? 'border-slate-400 bg-slate-100' : 'border-slate-200 bg-white'}`}>
-                  <input type="checkbox" checked={selectedProtectionHidden} onChange={(event) => setSelectedProtectionHidden(event.target.checked)} disabled={editLocked} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-slate-700" />
-                  <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><EyeOff className="h-3.5 w-3.5" />对未授权人员遮罩数据</span>
-                    <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">未获得“修改”或“查看遮罩内容”的成员只会看到 ••••。</span>
-                  </span>
-                </label>
+                {(selectionState?.includesHeaderRow || selectionState?.isEntireColumnSelection || selectionState?.isEntireRowSelection) && (
+                  <div className="mt-2 text-[11px] leading-5 text-sky-700">
+                    {selectionState.isEntireColumnSelection
+                      ? '已通过列标题选择整列，将按所选列处理。'
+                      : selectionState.isEntireRowSelection
+                        ? '已通过行标题选择整行，将按所选行处理。'
+                        : '已选择表头单元格区域，将按当前范围处理，不会扩展为整列。'}
+                  </div>
+                )}
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  <label className={`flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition ${selectedProtectionLockEditing ? 'border-sky-300 bg-sky-50' : 'border-slate-200 bg-white'}`}>
+                    <input type="checkbox" checked={selectedProtectionLockEditing} onChange={(event) => setSelectedProtectionLockEditing(event.target.checked)} disabled={editLocked} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600" />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><Lock className="h-3.5 w-3.5" />锁定单元格编辑</span>
+                      <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">未获得“修改”权限的成员不能更改内容。</span>
+                    </span>
+                  </label>
+                  <label className={`flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition ${selectedProtectionHidden ? 'border-slate-400 bg-slate-100' : 'border-slate-200 bg-white'}`}>
+                    <input type="checkbox" checked={selectedProtectionHidden} onChange={(event) => setSelectedProtectionHidden(event.target.checked)} disabled={editLocked} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-slate-700" />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><EyeOff className="h-3.5 w-3.5" />对未授权人员遮罩数据</span>
+                      <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">未获得原文权限的成员只会看到 ••••。</span>
+                    </span>
+                  </label>
+                </div>
+                {!selectedProtectionLockEditing && !selectedProtectionHidden && <div className="mt-2 text-[11px] font-medium text-amber-700">请至少开启“锁定编辑”或“数据遮罩”中的一项。</div>}
               </div>
 
               <div className="px-3 py-3">
@@ -3597,9 +3667,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               </div>
 
               <div className="border-t border-slate-200 bg-slate-50 px-3 py-3">
-                {activeProtection && <div className="mb-2 text-[11px] leading-5 text-slate-500">当前{protectionScope === 'row' ? '行' : protectionScope === 'column' ? '列' : '单元格'}已由 {activeProtection.owner_name} 设置：{formatProtectionWhitelist(activeProtection)}</div>}
+                {activeProtection && <div className="mb-2 text-[11px] leading-5 text-slate-500">当前{protectionScope === 'row' ? '行' : protectionScope === 'column' ? '列' : '单元格'}已由 {activeProtection.owner_name} 设置“{formatProtectionMode(activeProtection)}”：{formatProtectionWhitelist(activeProtection)}</div>}
                 <div className="grid grid-cols-[1fr_auto] gap-2">
-                  <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'lock', selectedProtectionHidden)} disabled={!selectionState || editLocked || protectionAction === `${protectionScope}:bulk:lock` || Boolean(activeProtection && !canUpdateProtectionEditors(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"><Shield className="h-4 w-4" />保存并应用到选区</button>
+                  <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'lock', selectedProtectionHidden)} disabled={!selectionState || editLocked || (!selectedProtectionLockEditing && !selectedProtectionHidden) || protectionAction === `${protectionScope}:bulk:lock` || Boolean(activeProtection && !canUpdateProtectionEditors(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"><Shield className="h-4 w-4" />保存并应用到选区</button>
                   <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'unlock')} disabled={!selectionState || editLocked || protectionAction === `${protectionScope}:bulk:unlock` || Boolean(activeProtection && !canReleaseProtection(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"><Unlock className="h-4 w-4" />解除</button>
                 </div>
                 <div className="mt-2 text-[10px] leading-5 text-slate-400">白名单会并入最终权限矩阵；工作簿或工作表的锁定、归档状态仍然优先。</div>
@@ -3645,6 +3715,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                                   {item.scope === 'row' ? <Rows3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : item.scope === 'column' ? <Columns3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : <Square className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} />}
                                   <span className="truncate">{formatProtectionTarget(item)}</span>
                                   {item.hidden && <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600"><EyeOff className="h-3 w-3" />已遮盖</span>}
+                                  {item.lock_editing && <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700"><Lock className="h-3 w-3" />已锁定</span>}
                                 </div>
                                 <LocateFixed className="h-3.5 w-3.5 shrink-0 text-slate-300" />
                               </div>
@@ -3682,14 +3753,23 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         </div>
       )}
 
-      {currentProtectionItems.length > 0 && (
+      {(currentProtectionItems.length > 0 || showSelectionRestriction) && (
         <div className="absolute left-3 top-3 z-20 flex max-w-[60%] flex-wrap gap-2">
-	          {currentProtectionItems.map((item) => {
+            {showSelectionRestriction && (
+              <span className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white/95 px-2.5 py-1 text-[11px] font-semibold text-slate-700 shadow-sm" title={selectedCellMasked && selectedCellCannotEdit ? '当前单元格内容已遮罩，且当前账号没有修改权限' : selectedCellMasked ? '当前单元格内容已遮罩' : '当前账号不能修改此单元格'}>
+                {selectedCellMasked && <EyeOff className="h-3 w-3" />}
+                {selectedCellMasked && <span>内容已遮罩</span>}
+                {selectedCellMasked && selectedCellCannotEdit && <span className="text-slate-300">·</span>}
+                {selectedCellCannotEdit && <Lock className="h-3 w-3" />}
+                {selectedCellCannotEdit && <span>不可修改</span>}
+              </span>
+            )}
+            {currentProtectionItems.map((item) => {
                 const visual = item.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(item.owner_id)
-                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title="点击定位保护区域">{item.hidden ? <EyeOff className="h-3 w-3" /> : <Shield className="h-3 w-3" />}{formatProtectionBadge(item)}</button>
+                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title={`点击定位：${formatProtectionMode(item)}`}>{item.hidden ? <EyeOff className="h-3 w-3" /> : <Lock className="h-3 w-3" />}{formatProtectionBadge(item)}</button>
               })}
-	        </div>
-	      )}
+          </div>
+      )}
 
       {/* Image picker modal */}
       {showImagePicker && (

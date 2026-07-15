@@ -74,6 +74,40 @@ func TestMaskUniverSheetConfig(t *testing.T) {
 	}
 }
 
+func TestMaskUniverHeaderCellProtection(t *testing.T) {
+	config := json.RawMessage(`{
+		"univerSheetData": {
+			"cellData": {
+				"0": {"0": {"v": "供应商"}, "1": {"v": "采购金额"}},
+				"1": {"0": {"v": "示例公司"}, "1": {"v": 12000}}
+			}
+		}
+	}`)
+	protections := protectionMaps{
+		Rows:    map[string]protectionOwner{},
+		Columns: map[string]protectionOwner{},
+		Cells: map[string]protectionOwner{
+			"-1:amount": {OwnerID: 1, Hidden: true},
+		},
+	}
+
+	masked, err := maskUniverSheetConfig(config, []string{"supplier", "amount"}, protections, fullAccessMatrix(), 2, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(masked, &payload); err != nil {
+		t.Fatal(err)
+	}
+	header := nestedCellData(payload)["0"].(map[string]interface{})
+	if header["0"].(map[string]interface{})["v"] != "供应商" {
+		t.Fatalf("unprotected header changed: %#v", header["0"])
+	}
+	if header["1"].(map[string]interface{})["v"] != hiddenCellPlaceholder {
+		t.Fatalf("protected header was not masked: %#v", header["1"])
+	}
+}
+
 func TestLegacyProtectionDoesNotHideCell(t *testing.T) {
 	protections := protectionMaps{
 		Rows: map[string]protectionOwner{},
@@ -84,6 +118,24 @@ func TestLegacyProtectionDoesNotHideCell(t *testing.T) {
 	}
 	if protectionHidesCell(protections, 0, "salary", 2, false, nil) {
 		t.Fatal("existing protection without hidden flag must remain visible")
+	}
+}
+
+func TestMaskOnlyProtectionDoesNotPreventEditing(t *testing.T) {
+	disabled := false
+	protections := protectionMaps{
+		Rows: map[string]protectionOwner{},
+		Columns: map[string]protectionOwner{
+			"salary": {OwnerID: 1, LockEditing: &disabled, Hidden: true},
+		},
+		Cells: map[string]protectionOwner{},
+	}
+
+	if !protectionHidesCell(protections, 0, "salary", 2, false, nil) {
+		t.Fatal("mask-only rule must still hide the original value")
+	}
+	if protectionPreventsCellEdit(protections, 0, "salary", 2, nil) {
+		t.Fatal("mask-only rule must not block editing")
 	}
 }
 

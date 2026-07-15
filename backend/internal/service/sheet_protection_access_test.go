@@ -96,3 +96,86 @@ func TestProtectionWhitelistDepartmentConflictIsRestrictive(t *testing.T) {
 		t.Fatalf("expected restrictive department permission, got permission=%q direct=%v allowed=%v", permission, directUser, allowed)
 	}
 }
+
+func TestFlattenProtectionMapIncludesEffectiveUserState(t *testing.T) {
+	items := map[string]protectionOwner{
+		"amount": {
+			OwnerID:           1,
+			OwnerName:         "owner",
+			Hidden:            true,
+			ReadonlyUserIDs:   []int64{2},
+			ViewHiddenUserIDs: []int64{3},
+			EditableUserIDs:   []int64{4},
+		},
+	}
+
+	readonly := flattenProtectionMap("column", items, 2, false, nil)
+	if len(readonly) != 1 || readonly[0].CanEdit || !readonly[0].MaskedForCurrentUser {
+		t.Fatalf("unexpected readonly state: %#v", readonly)
+	}
+
+	viewHidden := flattenProtectionMap("column", items, 3, false, nil)
+	if len(viewHidden) != 1 || viewHidden[0].CanEdit || viewHidden[0].MaskedForCurrentUser {
+		t.Fatalf("unexpected view-hidden state: %#v", viewHidden)
+	}
+
+	editable := flattenProtectionMap("column", items, 4, false, nil)
+	if len(editable) != 1 || !editable[0].CanEdit || editable[0].MaskedForCurrentUser {
+		t.Fatalf("unexpected editable state: %#v", editable)
+	}
+}
+
+func TestProtectionLockEditingIsBackwardCompatible(t *testing.T) {
+	legacy := protectionOwner{OwnerID: 1}
+	if !protectionLocksEditing(legacy) {
+		t.Fatal("legacy protection without lockEditing must remain locked")
+	}
+
+	disabled := false
+	maskOnly := protectionOwner{OwnerID: 1, LockEditing: &disabled, Hidden: true}
+	if protectionLocksEditing(maskOnly) {
+		t.Fatal("explicitly disabled edit lock must allow editing")
+	}
+}
+
+func TestFlattenProtectionMapSupportsMaskOnlyRule(t *testing.T) {
+	disabled := false
+	items := map[string]protectionOwner{
+		"salary": {
+			OwnerID:     1,
+			OwnerName:   "owner",
+			LockEditing: &disabled,
+			Hidden:      true,
+		},
+	}
+
+	result := flattenProtectionMap("column", items, 2, false, nil)
+	if len(result) != 1 || result[0].LockEditing || !result[0].CanEdit || !result[0].MaskedForCurrentUser {
+		t.Fatalf("unexpected mask-only state: %#v", result)
+	}
+}
+
+func TestApplyProtectionRequestRequiresMaskOrLock(t *testing.T) {
+	disabled := false
+	columnKey := "salary"
+	protections := protectionMaps{
+		Rows:    map[string]protectionOwner{},
+		Columns: map[string]protectionOwner{},
+		Cells:   map[string]protectionOwner{},
+	}
+	request := &model.UpdateProtectionRequest{
+		Action:      "lock",
+		Scope:       "column",
+		ColumnKey:   &columnKey,
+		LockEditing: &disabled,
+		Hidden:      &disabled,
+	}
+
+	err := applyProtectionRequest(&protections, map[string]interface{}{}, map[string]bool{}, request, 1, "owner", false)
+	if err == nil {
+		t.Fatal("expected an empty protection rule to be rejected")
+	}
+	if len(protections.Columns) != 0 {
+		t.Fatalf("invalid rule must not be persisted: %#v", protections.Columns)
+	}
+}

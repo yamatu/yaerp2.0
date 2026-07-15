@@ -28,6 +28,30 @@ func protectionHidesCell(protections protectionMaps, rowIndex int, columnKey str
 	return false
 }
 
+func protectionPreventsCellEdit(protections protectionMaps, rowIndex int, columnKey string, userID int64, departmentIDs map[int64]struct{}) bool {
+	checks := []protectionOwner{
+		protections.Cells[fmt.Sprintf("%d:%s", rowIndex, columnKey)],
+		protections.Rows[strconv.Itoa(rowIndex)],
+		protections.Columns[columnKey],
+	}
+	for _, info := range checks {
+		if !protectionLocksEditing(info) || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isMaskedPlaceholderCell(value interface{}) bool {
+	cell, ok := value.(map[string]interface{})
+	if !ok || cell["v"] != hiddenCellPlaceholder {
+		return false
+	}
+	_, hasFormula := cell["f"]
+	return !hasFormula
+}
+
 func (s *SheetService) GetSheetForUser(sheetID, userID int64) (*model.Sheet, error) {
 	sheet, err := s.GetSheet(sheetID)
 	if err != nil {
@@ -154,7 +178,7 @@ func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protecti
 	}
 	for worksheetRowKey, rowValue := range cellData {
 		worksheetRow, err := strconv.Atoi(worksheetRowKey)
-		if err != nil || worksheetRow <= 0 {
+		if err != nil || worksheetRow < 0 {
 			continue
 		}
 		rowCells, ok := rowValue.(map[string]interface{})
@@ -226,7 +250,7 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 	}
 	for worksheetRowKey, existingRowValue := range existingCells {
 		worksheetRow, err := strconv.Atoi(worksheetRowKey)
-		if err != nil || worksheetRow <= 0 {
+		if err != nil || worksheetRow < 0 {
 			continue
 		}
 		existingRow, ok := existingRowValue.(map[string]interface{})
@@ -245,12 +269,17 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 				!cellIsMasked(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
 				continue
 			}
+			nextValue, nextExists := nextRow[columnIndexKey]
+			if !protectionPreventsCellEdit(protections, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) &&
+				nextExists && !isMaskedPlaceholderCell(nextValue) {
+				continue
+			}
 			nextRow[columnIndexKey] = original
 		}
 	}
 	for worksheetRowKey, nextRowValue := range nextCells {
 		worksheetRow, err := strconv.Atoi(worksheetRowKey)
-		if err != nil || worksheetRow <= 0 {
+		if err != nil || worksheetRow < 0 {
 			continue
 		}
 		nextRow, ok := nextRowValue.(map[string]interface{})
@@ -262,6 +291,10 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 			columnIndex, err := strconv.Atoi(columnIndexKey)
 			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) ||
 				!cellIsMasked(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
+				continue
+			}
+			if !protectionPreventsCellEdit(protections, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) &&
+				!isMaskedPlaceholderCell(nextRow[columnIndexKey]) {
 				continue
 			}
 			if existingRow, ok := existingCells[worksheetRowKey].(map[string]interface{}); ok {
