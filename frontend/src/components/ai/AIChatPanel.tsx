@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { BarChart3, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RotateCcw, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useWorkbooks } from '@/hooks/useSheet'
+import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
 import { notifyDataChanged, prepareDataMutation } from '@/lib/dataEvents'
@@ -238,17 +239,28 @@ function renderTraceData(trace: AIChatToolTrace) {
 }
 
 export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
+  const userId = getStoredUser()?.id ?? 0
   const [messages, setMessages] = useState<PersistedMessage[]>([])
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
   const [thinkingElapsed, setThinkingElapsed] = useState(0)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [assistants, setAssistants] = useState<AIAssistant[]>([])
-  const [assistantId, setAssistantId] = useState<number | null>(null)
+  const [assistantId, setAssistantId] = useUserPreference<number | null>(
+    userId,
+    'ai.assistant-id',
+    null,
+    isNullablePositiveIntegerPreference
+  )
   const [panelSize, setPanelSize] = useState<PanelSize>(DEFAULT_PANEL_SIZE)
   const [resizing, setResizing] = useState(false)
   const [contextPickerOpen, setContextPickerOpen] = useState(false)
-  const [composerExpanded, setComposerExpanded] = useState(false)
+  const [composerExpanded, setComposerExpanded] = useUserPreference(
+    userId,
+    'ai.composer-expanded',
+    false,
+    isBooleanPreference
+  )
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
   const [loadingContextWorkbookId, setLoadingContextWorkbookId] = useState<number | null>(null)
@@ -259,7 +271,6 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
   const historyReadyRef = useRef(false)
-  const userId = getStoredUser()?.id ?? 0
   const storageKey = userId ? `yaerp_ai_chat_history_${userId}` : 'yaerp_ai_chat_history_guest'
   const panelSizeStorageKey = userId ? `yaerp_ai_panel_size_${userId}` : 'yaerp_ai_panel_size_guest'
 
@@ -308,7 +319,10 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         const res = await api.get<AIAssistant[]>('/ai/assistants')
         if (!active || res.code !== 0 || !Array.isArray(res.data)) return
         setAssistants(res.data)
-        setAssistantId((current) => current ?? res.data?.find((item) => item.is_default)?.id ?? res.data?.[0]?.id ?? null)
+        setAssistantId((current) => {
+          if (current !== null && res.data?.some((item) => item.id === current)) return current
+          return res.data?.find((item) => item.is_default)?.id ?? res.data?.[0]?.id ?? null
+        })
       } catch {
         // The chat request will surface configuration errors when needed.
       }

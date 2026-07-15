@@ -11,6 +11,7 @@ import { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import { useWorkbook } from '@/hooks/useSheet'
 import { usePermission } from '@/hooks/usePermission'
 import { useSheetWebSocket } from '@/hooks/useSheetWebSocket'
+import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import api from '@/lib/api'
 import { prepareDataMutation } from '@/lib/dataEvents'
@@ -33,6 +34,16 @@ interface SheetContextMenuState {
 }
 
 type SheetStateAction = 'lock' | 'unlock' | 'archive' | 'unarchive' | 'hide' | 'unhide'
+type SheetSortBy = 'updated_at' | 'created_at' | 'name'
+type SheetSortOrder = 'asc' | 'desc'
+
+function isSheetSortBy(value: unknown): value is SheetSortBy {
+  return value === 'updated_at' || value === 'created_at' || value === 'name'
+}
+
+function isSheetSortOrder(value: unknown): value is SheetSortOrder {
+  return value === 'asc' || value === 'desc'
+}
 
 function lastViewedSheetStorageKey(userId: number, workbookId: string) {
   return `yaerp:workbook-view:${userId}:${workbookId}:last-sheet`
@@ -63,12 +74,27 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [addingSheet, setAddingSheet] = useState(false)
   const [newSheetName, setNewSheetName] = useState('')
   const [fullscreen, setFullscreen] = useState(false)
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useUserPreference(
+    currentUser?.id,
+    'workbook.sidebar-collapsed',
+    false,
+    isBooleanPreference
+  )
   const [sheetActionError, setSheetActionError] = useState('')
   const [sheetActionLoading, setSheetActionLoading] = useState(false)
   const [sheetSearchQuery, setSheetSearchQuery] = useState('')
-  const [sheetSortBy, setSheetSortBy] = useState<'updated_at' | 'created_at' | 'name'>('updated_at')
-  const [sheetSortOrder, setSheetSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [sheetSortBy, setSheetSortBy] = useUserPreference<SheetSortBy>(
+    currentUser?.id,
+    'workbook.sheet-sort-by',
+    'updated_at',
+    isSheetSortBy
+  )
+  const [sheetSortOrder, setSheetSortOrder] = useUserPreference<SheetSortOrder>(
+    currentUser?.id,
+    'workbook.sheet-sort-order',
+    'desc',
+    isSheetSortOrder
+  )
   const [selectedSheetIds, setSelectedSheetIds] = useState<number[]>([])
   const [optimisticEditableSheetId, setOptimisticEditableSheetId] = useState<number | null>(null)
   const [reloadToken, setReloadToken] = useState(0)
@@ -804,7 +830,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 <div className="mt-3 flex gap-2">
                   <select
                     value={sheetSortBy}
-                    onChange={(event) => setSheetSortBy(event.target.value as 'updated_at' | 'created_at' | 'name')}
+                    onChange={(event) => setSheetSortBy(event.target.value as SheetSortBy)}
                     className="h-10 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm leading-10 text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
                   >
                     <option value="updated_at">按更新时间</option>
@@ -813,7 +839,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                   </select>
                   <select
                     value={sheetSortOrder}
-                    onChange={(event) => setSheetSortOrder(event.target.value as 'asc' | 'desc')}
+                    onChange={(event) => setSheetSortOrder(event.target.value as SheetSortOrder)}
                     className="h-10 w-24 rounded-xl border border-slate-200 bg-white px-3 text-sm leading-10 text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
                   >
                     <option value="desc">降序</option>

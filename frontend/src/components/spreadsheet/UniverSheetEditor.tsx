@@ -15,6 +15,7 @@ import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import { CellAlertType, ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
+import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
@@ -1147,7 +1148,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle')
   const [univerHasOverlay, setUniverHasOverlay] = useState(false)
   const [univerSidebarOpen, setUniverSidebarOpen] = useState(false)
-  const [toolbarExpanded, setToolbarExpanded] = useState(false)
+  const [toolbarExpanded, setToolbarExpanded] = useUserPreference(
+    getStoredUser()?.id,
+    'sheet.toolbar-expanded',
+    false,
+    isBooleanPreference
+  )
   const [hasFilter, setHasFilter] = useState(false)
   const [actionError, setActionError] = useState('')
   const [dragImportActive, setDragImportActive] = useState(false)
@@ -1654,7 +1660,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setSelectedProtectionViewHiddenDepartmentIds([])
     setSheetPresence([])
     setPresenceExpanded(false)
-    setToolbarExpanded(false)
     setHasFilter(false)
   }, [sheetId])
 
