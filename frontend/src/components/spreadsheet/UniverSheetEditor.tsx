@@ -114,6 +114,16 @@ interface ProtectionVisual {
   soft: string
 }
 
+interface ProtectionHighlightBlock {
+  scope: ProtectionInfo['scope']
+  startRow: number
+  endRow: number
+  startColumn: number
+  endColumn: number
+  ownerId: number
+  hidden: boolean
+}
+
 const MIN_UNIVER_ZOOM = 0.1
 const MAX_UNIVER_ZOOM = 4
 const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
@@ -131,6 +141,23 @@ const YAERP_PROTECTION_CONTEXT_MENU_LABELS = [
   '解除当前保护',
   '显示保护区域与记录',
 ]
+const PROTECTION_HIGHLIGHT_LAYOUT_COMMANDS = new Set([
+  'sheet.command.append-row',
+  'sheet.command.delta-column-width',
+  'sheet.command.delta-row-height',
+  'sheet.command.insert-col',
+  'sheet.command.insert-row',
+  'sheet.command.move-cols',
+  'sheet.command.move-rows',
+  'sheet.command.remove-col',
+  'sheet.command.remove-row',
+  'sheet.command.set-col-data',
+  'sheet.command.set-row-data',
+  'sheet.command.set-row-height',
+  'sheet.command.set-worksheet-col-width',
+  'sheet.command.set-worksheet-column-count',
+  'sheet.command.set-worksheet-row-count',
+])
 
 const PROTECTION_VISUALS: ProtectionVisual[] = [
   { stroke: '#0284c7', fill: 'rgba(14, 165, 233, 0.08)', soft: '#e0f2fe' },
@@ -151,6 +178,174 @@ const HIDDEN_PROTECTION_VISUAL: ProtectionVisual = {
 function visualForUser(userId: number) {
   const safeId = Number.isFinite(userId) ? Math.abs(userId) : 0
   return PROTECTION_VISUALS[safeId % PROTECTION_VISUALS.length]
+}
+
+function protectionVisualKey(item: Pick<ProtectionInfo, 'owner_id' | 'hidden'>) {
+  return item.hidden ? 'hidden' : `owner:${item.owner_id}`
+}
+
+function compactLinearProtectionBlocks(
+  items: ProtectionInfo[],
+  scope: 'row' | 'column',
+  resolveIndex: (item: ProtectionInfo) => number,
+  maxRows: number,
+  maxColumns: number
+) {
+  const groups = new Map<string, { ownerId: number; hidden: boolean; indexes: Set<number> }>()
+  items.forEach((item) => {
+    const index = resolveIndex(item)
+    const limit = scope === 'row' ? maxRows : maxColumns
+    if (!Number.isInteger(index) || index < 0 || index >= limit) return
+    const key = protectionVisualKey(item)
+    const group = groups.get(key) || { ownerId: item.owner_id, hidden: Boolean(item.hidden), indexes: new Set<number>() }
+    group.indexes.add(index)
+    groups.set(key, group)
+  })
+
+  const blocks: ProtectionHighlightBlock[] = []
+  groups.forEach((group) => {
+    const indexes = Array.from(group.indexes).sort((left, right) => left - right)
+    let start = indexes[0]
+    let end = start
+    const flush = () => {
+      if (start === undefined || end === undefined) return
+      blocks.push(scope === 'row'
+        ? { scope, startRow: start, endRow: end, startColumn: 0, endColumn: maxColumns - 1, ownerId: group.ownerId, hidden: group.hidden }
+        : { scope, startRow: 1, endRow: maxRows - 1, startColumn: start, endColumn: end, ownerId: group.ownerId, hidden: group.hidden })
+    }
+    indexes.slice(1).forEach((index) => {
+      if (index === end + 1) {
+        end = index
+        return
+      }
+      flush()
+      start = index
+      end = index
+    })
+    flush()
+  })
+  return blocks
+}
+
+function compactCellProtectionBlocks(items: ProtectionInfo[], columnIndexes: Map<string, number>, maxRows: number, maxColumns: number) {
+  const groups = new Map<string, {
+    ownerId: number
+    hidden: boolean
+    rows: Map<number, Set<number>>
+  }>()
+
+  items.forEach((item) => {
+    if (typeof item.row_index !== 'number') return
+    const row = item.row_index + 1
+    const column = columnIndexes.get(item.column_key || item.key)
+    if (row < 1 || row >= maxRows || column === undefined || column < 0 || column >= maxColumns) return
+    const key = protectionVisualKey(item)
+    const group = groups.get(key) || { ownerId: item.owner_id, hidden: Boolean(item.hidden), rows: new Map<number, Set<number>>() }
+    const columns = group.rows.get(row) || new Set<number>()
+    columns.add(column)
+    group.rows.set(row, columns)
+    groups.set(key, group)
+  })
+
+  const blocks: ProtectionHighlightBlock[] = []
+  groups.forEach((group) => {
+    const verticalRuns = new Map<string, Array<{ row: number; startColumn: number; endColumn: number }>>()
+    Array.from(group.rows.entries())
+      .sort(([left], [right]) => left - right)
+      .forEach(([row, columnSet]) => {
+        const columns = Array.from(columnSet).sort((left, right) => left - right)
+        let startColumn = columns[0]
+        let endColumn = startColumn
+        const flush = () => {
+          if (startColumn === undefined || endColumn === undefined) return
+          const key = `${startColumn}:${endColumn}`
+          const runs = verticalRuns.get(key) || []
+          runs.push({ row, startColumn, endColumn })
+          verticalRuns.set(key, runs)
+        }
+        columns.slice(1).forEach((column) => {
+          if (column === endColumn + 1) {
+            endColumn = column
+            return
+          }
+          flush()
+          startColumn = column
+          endColumn = column
+        })
+        flush()
+      })
+
+    verticalRuns.forEach((runs) => {
+      let startRow = runs[0]?.row
+      let endRow = startRow
+      let startColumn = runs[0]?.startColumn
+      let endColumn = runs[0]?.endColumn
+      const flush = () => {
+        if (startRow === undefined || endRow === undefined || startColumn === undefined || endColumn === undefined) return
+        blocks.push({
+          scope: 'cell',
+          startRow,
+          endRow,
+          startColumn,
+          endColumn,
+          ownerId: group.ownerId,
+          hidden: group.hidden,
+        })
+      }
+      runs.slice(1).forEach((run) => {
+        if (run.row === endRow + 1) {
+          endRow = run.row
+          return
+        }
+        flush()
+        startRow = run.row
+        endRow = run.row
+        startColumn = run.startColumn
+        endColumn = run.endColumn
+      })
+      flush()
+    })
+  })
+  return blocks
+}
+
+function buildProtectionHighlightBlocks(snapshot: ProtectionSnapshot, columns: ColumnDef[], maxRows: number, maxColumns: number) {
+  const safeMaxRows = Math.max(maxRows, 2)
+  const safeMaxColumns = Math.max(maxColumns, 1)
+  const columnIndexes = new Map(columns.map((column, index) => [column.key, index]))
+  return [
+    ...compactLinearProtectionBlocks(snapshot.rows, 'row', (item) => (item.row_index ?? -2) + 1, safeMaxRows, safeMaxColumns),
+    ...compactLinearProtectionBlocks(snapshot.columns, 'column', (item) => columnIndexes.get(item.column_key || item.key) ?? -1, safeMaxRows, safeMaxColumns),
+    ...compactCellProtectionBlocks(snapshot.cells, columnIndexes, safeMaxRows, safeMaxColumns),
+  ]
+}
+
+function clipProtectionHighlightBlocks(
+  blocks: ProtectionHighlightBlock[],
+  visibleRange: { startRow: number; endRow: number; startColumn: number; endColumn: number } | null,
+  maxRows: number,
+  maxColumns: number
+) {
+  if (!visibleRange) return blocks
+  const rowStart = Math.max(0, visibleRange.startRow - 12)
+  const rowEnd = Math.min(maxRows - 1, visibleRange.endRow + 12)
+  const columnStart = Math.max(0, visibleRange.startColumn - 4)
+  const columnEnd = Math.min(maxColumns - 1, visibleRange.endColumn + 4)
+  return blocks.flatMap((block) => {
+    const startRow = Math.max(block.startRow, rowStart)
+    const endRow = Math.min(block.endRow, rowEnd)
+    const startColumn = Math.max(block.startColumn, columnStart)
+    const endColumn = Math.min(block.endColumn, columnEnd)
+    if (startRow > endRow || startColumn > endColumn) return []
+    return [{ ...block, startRow, endRow, startColumn, endColumn }]
+  })
+}
+
+function commandChangesProtectionHighlightLayout(commandId: string) {
+  return PROTECTION_HIGHLIGHT_LAYOUT_COMMANDS.has(commandId) ||
+    commandId.startsWith('sheet.command.insert-multi-') ||
+    commandId.endsWith('-row-by-range') ||
+    commandId.endsWith('-col-by-range')
 }
 
 function clampUniverZoom(zoomRatio: number) {
@@ -797,6 +992,19 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const protectionFocusDisposableRef = useRef<UniverDisposable | null>(null)
   const protectionFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const protectionHighlightRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const protectionHighlightRenderFrameRef = useRef<number | null>(null)
+  const protectionHighlightRenderGenerationRef = useRef(0)
+  const protectionHighlightRendererRef = useRef<() => void>(() => undefined)
+  const protectionSnapshotRef = useRef<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
+  const showProtectionHighlightsRef = useRef(false)
+  const protectionHighlightsLoadingRef = useRef(true)
+  const protectionHighlightBlocksCacheRef = useRef<{
+    snapshot: ProtectionSnapshot
+    columnsSignature: string
+    maxRows: number
+    maxColumns: number
+    blocks: ProtectionHighlightBlock[]
+  } | null>(null)
   const sheetPresenceRef = useRef<SheetPresenceEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -830,7 +1038,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [selectedProtectionEditableUserIds, setSelectedProtectionEditableUserIds] = useState<number[]>([])
   const [selectedProtectionEditableDepartmentIds, setSelectedProtectionEditableDepartmentIds] = useState<number[]>([])
   const [showProtectionHighlights, setShowProtectionHighlights] = useState(false)
-  const [protectionHighlightVersion, setProtectionHighlightVersion] = useState(0)
   const [protectionFocusNotice, setProtectionFocusNotice] = useState('')
   const [sheetPresence, setSheetPresence] = useState<SheetPresenceEntry[]>([])
   const [presenceExpanded, setPresenceExpanded] = useState(false)
@@ -959,18 +1166,24 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }, [sheetId])
 
   const clearProtectionHighlights = useCallback(() => {
+    protectionHighlightRenderGenerationRef.current += 1
+    if (protectionHighlightRenderFrameRef.current !== null) {
+      window.cancelAnimationFrame(protectionHighlightRenderFrameRef.current)
+      protectionHighlightRenderFrameRef.current = null
+    }
     protectionHighlightDisposablesRef.current.forEach((item) => item.dispose())
     protectionHighlightDisposablesRef.current = []
   }, [])
 
   const requestProtectionHighlightRefresh = useCallback(() => {
+    if (!showProtectionHighlightsRef.current) return
     if (protectionHighlightRefreshTimerRef.current) {
       clearTimeout(protectionHighlightRefreshTimerRef.current)
     }
     protectionHighlightRefreshTimerRef.current = setTimeout(() => {
-      setProtectionHighlightVersion((current) => current + 1)
       protectionHighlightRefreshTimerRef.current = null
-    }, 60)
+      protectionHighlightRendererRef.current()
+    }, 120)
   }, [])
 
   const clearPresenceVisuals = useCallback(() => {
@@ -1026,45 +1239,107 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     window.setTimeout(() => syncSelectionState(), 0)
   }, [getProtectionRange, syncSelectionState])
 
-  useEffect(() => {
+  const renderProtectionHighlights = useCallback(() => {
     clearProtectionHighlights()
-    if (!showProtectionHighlights || loading) return
-    const items = [...protectionSnapshot.rows, ...protectionSnapshot.columns, ...protectionSnapshot.cells]
-    items.forEach((item) => {
-      try {
-        const target = getProtectionRange(item)
-        if (!target) return
-        const visual = item.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(item.owner_id)
-        protectionHighlightDisposablesRef.current.push(target.range.highlight({
-          stroke: visual.stroke,
-          strokeWidth: item.scope === 'cell' ? 2 : 1.25,
-          strokeDash: item.scope === 'cell' ? 0 : 4,
-          fill: visual.fill,
-          rowHeaderFill: item.scope === 'row' ? visual.fill : undefined,
-          rowHeaderStroke: item.scope === 'row' ? visual.stroke : undefined,
-          columnHeaderFill: item.scope === 'column' ? visual.fill : undefined,
-          columnHeaderStroke: item.scope === 'column' ? visual.stroke : undefined,
-        }))
-      } catch (highlightError) {
-        console.error('Failed to highlight protected range:', highlightError)
+    if (!showProtectionHighlightsRef.current || protectionHighlightsLoadingRef.current) return
+
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    if (!worksheet) return
+    const columns = latestSheetRef.current.columns || []
+    const maxRows = Math.max(worksheet.getMaxRows?.() || 2, 2)
+    const maxColumns = Math.max(worksheet.getMaxColumns?.() || columns.length || 1, 1)
+    const columnsSignature = columns.map((column) => column.key).join('\u001f')
+    const snapshot = protectionSnapshotRef.current
+    const cached = protectionHighlightBlocksCacheRef.current
+    const blocks = cached && cached.snapshot === snapshot && cached.columnsSignature === columnsSignature && cached.maxRows === maxRows && cached.maxColumns === maxColumns
+      ? cached.blocks
+      : buildProtectionHighlightBlocks(snapshot, columns, maxRows, maxColumns)
+    protectionHighlightBlocksCacheRef.current = { snapshot, columnsSignature, maxRows, maxColumns, blocks }
+    let visibleRange: { startRow: number; endRow: number; startColumn: number; endColumn: number } | null = null
+    try {
+      const range = worksheet.getVisibleRange?.()
+      if (range) {
+        visibleRange = {
+          startRow: range.startRow,
+          endRow: range.endRow,
+          startColumn: range.startColumn,
+          endColumn: range.endColumn,
+        }
       }
-    })
-    return clearProtectionHighlights
-  }, [clearProtectionHighlights, getProtectionRange, loading, protectionHighlightVersion, protectionSnapshot.cells, protectionSnapshot.columns, protectionSnapshot.rows, showProtectionHighlights])
+    } catch {
+      visibleRange = null
+    }
+    const renderBlocks = clipProtectionHighlightBlocks(blocks, visibleRange, maxRows, maxColumns)
+
+    const generation = protectionHighlightRenderGenerationRef.current
+    let blockIndex = 0
+    const renderChunk = () => {
+      if (generation !== protectionHighlightRenderGenerationRef.current || !showProtectionHighlightsRef.current) return
+      protectionHighlightRenderFrameRef.current = null
+      const frameStartedAt = performance.now()
+      let renderedInFrame = 0
+      while (blockIndex < renderBlocks.length && renderedInFrame < 48 && performance.now() - frameStartedAt < 8) {
+        const block = renderBlocks[blockIndex]
+        blockIndex += 1
+        renderedInFrame += 1
+        try {
+          const visual = block.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(block.ownerId)
+          const range = worksheet.getRange(
+            block.startRow,
+            block.startColumn,
+            block.endRow - block.startRow + 1,
+            block.endColumn - block.startColumn + 1
+          )
+          protectionHighlightDisposablesRef.current.push(range.highlight({
+            stroke: visual.stroke,
+            strokeWidth: block.scope === 'cell' ? 2 : 1.25,
+            strokeDash: block.scope === 'cell' ? 0 : 4,
+            fill: visual.fill,
+            rowHeaderFill: block.scope === 'row' ? visual.fill : undefined,
+            rowHeaderStroke: block.scope === 'row' ? visual.stroke : undefined,
+            columnHeaderFill: block.scope === 'column' ? visual.fill : undefined,
+            columnHeaderStroke: block.scope === 'column' ? visual.stroke : undefined,
+          }))
+        } catch (highlightError) {
+          console.error('Failed to highlight protected range:', highlightError)
+        }
+      }
+      if (blockIndex < renderBlocks.length) {
+        protectionHighlightRenderFrameRef.current = window.requestAnimationFrame(renderChunk)
+      }
+    }
+    renderChunk()
+  }, [clearProtectionHighlights])
+  protectionHighlightRendererRef.current = renderProtectionHighlights
+
+  useEffect(() => {
+    protectionSnapshotRef.current = protectionSnapshot
+    showProtectionHighlightsRef.current = showProtectionHighlights
+    protectionHighlightsLoadingRef.current = loading
+    if (!showProtectionHighlights || loading) {
+      if (protectionHighlightRefreshTimerRef.current) {
+        clearTimeout(protectionHighlightRefreshTimerRef.current)
+        protectionHighlightRefreshTimerRef.current = null
+      }
+      clearProtectionHighlights()
+      return
+    }
+    requestProtectionHighlightRefresh()
+  }, [clearProtectionHighlights, loading, protectionSnapshot, requestProtectionHighlightRefresh, showProtectionHighlights])
 
   useEffect(() => {
     if (!showProtectionHighlights) return
     const root = containerRef.current
     const refresh = () => requestProtectionHighlightRefresh()
+    const resizeObserver = root && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(refresh) : null
+    if (root) resizeObserver?.observe(root)
     root?.addEventListener('scroll', refresh, true)
-    root?.addEventListener('wheel', refresh, { passive: true, capture: true })
     window.addEventListener('resize', refresh)
-    window.addEventListener('focus', refresh)
     return () => {
+      resizeObserver?.disconnect()
       root?.removeEventListener('scroll', refresh, true)
-      root?.removeEventListener('wheel', refresh, true)
       window.removeEventListener('resize', refresh)
-      window.removeEventListener('focus', refresh)
     }
   }, [requestProtectionHighlightRefresh, showProtectionHighlights])
 
@@ -1580,7 +1855,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         columns
       )
       syncSelectionState()
-      requestProtectionHighlightRefresh()
     } catch (err) {
       console.error('Failed to apply incoming sheet updates:', err)
     } finally {
@@ -1589,7 +1863,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         remotePatchResetTimerRef.current = null
       }, 200)
     }
-  }, [requestProtectionHighlightRefresh, syncSelectionState])
+  }, [syncSelectionState])
 
   const syncSheetSilently = useCallback(async () => {
     if (silentSyncInFlightRef.current) {
@@ -2119,18 +2393,19 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           }, 900)
         }
 
-        const disposable = workbookApi.onCommandExecuted(() => {
+        const disposable = workbookApi.onCommandExecuted((command) => {
+          const refreshProtectionLayout = commandChangesProtectionHighlightLayout(command.id)
           if (applyingRemotePatchRef.current) {
             syncFilterState()
             syncSelectionState()
-            requestProtectionHighlightRefresh()
+            if (refreshProtectionLayout) requestProtectionHighlightRefresh()
             return
           }
 
           schedulePersist()
           syncFilterState()
           syncSelectionState()
-          requestProtectionHighlightRefresh()
+          if (refreshProtectionLayout) requestProtectionHighlightRefresh()
         })
 
         const sendPresenceForCell = (state: 'selected' | 'editing', row: number, column: number) => {
