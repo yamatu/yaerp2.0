@@ -19,7 +19,8 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AdminShell } from '@/components/admin/AdminShell'
 import api from '@/lib/api'
-import type { Department, PageData, User, Workbook } from '@/types'
+import { resolveCellPermissionDetail } from '@/hooks/usePermission'
+import type { Department, PageData, PermissionMatrix, User, Workbook } from '@/types'
 
 type PrincipalType = 'department' | 'user'
 type RangePermission = 'none' | 'read' | 'write'
@@ -33,6 +34,7 @@ interface SheetOption {
 }
 
 interface SheetPermission {
+  id?: number
   can_view: boolean
   can_edit: boolean
   can_delete: boolean
@@ -63,7 +65,9 @@ const emptySheetPermission: SheetPermission = {
   can_export: false,
 }
 
-const sheetPermissionOptions: Array<{ key: keyof SheetPermission; label: string; icon: typeof Eye }> = [
+type SheetPermissionKey = 'can_view' | 'can_edit' | 'can_delete' | 'can_export'
+
+const sheetPermissionOptions: Array<{ key: SheetPermissionKey; label: string; icon: typeof Eye }> = [
   { key: 'can_view', label: '允许查看', icon: Eye },
   { key: 'can_edit', label: '允许编辑', icon: PencilLine },
   { key: 'can_delete', label: '允许删除', icon: Trash2 },
@@ -92,6 +96,7 @@ export default function PermissionsPage() {
   const [principalType, setPrincipalType] = useState<PrincipalType>('department')
   const [principalId, setPrincipalId] = useState<number | null>(null)
   const [sheetPermission, setSheetPermission] = useState<SheetPermission>(emptySheetPermission)
+  const [inheritSheetPermission, setInheritSheetPermission] = useState(true)
   const [rangeRules, setRangeRules] = useState<RangeRule[]>([])
   const [scopeType, setScopeType] = useState<ScopeType>('column')
   const [draftColumn, setDraftColumn] = useState('')
@@ -101,6 +106,10 @@ export default function PermissionsPage() {
   const [saving, setSaving] = useState('')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+  const [previewUserId, setPreviewUserId] = useState<number | null>(null)
+  const [previewColumn, setPreviewColumn] = useState('')
+  const [previewDisplayRow, setPreviewDisplayRow] = useState(2)
+  const [effectiveMatrix, setEffectiveMatrix] = useState<PermissionMatrix | null>(null)
 
   const showNotice = (message: string) => {
     setNotice(message)
@@ -186,30 +195,62 @@ export default function PermissionsPage() {
     if (selectedSheet?.columns.length && !selectedSheet.columns.includes(draftColumn)) {
       setDraftColumn(selectedSheet.columns[0])
     }
-  }, [draftColumn, selectedSheet])
+    if (selectedSheet?.columns.length && !selectedSheet.columns.includes(previewColumn)) {
+      setPreviewColumn(selectedSheet.columns[0])
+    }
+  }, [draftColumn, previewColumn, selectedSheet])
+
+  useEffect(() => {
+    if (users.length === 0) {
+      setPreviewUserId(null)
+      return
+    }
+    if (!previewUserId || !users.some((user) => user.id === previewUserId)) {
+      setPreviewUserId(users[0].id)
+    }
+  }, [previewUserId, users])
 
   const loadPermissionConfig = useCallback(async () => {
     if (!selectedSheetId || !principalId) {
       setSheetPermission(emptySheetPermission)
+      setInheritSheetPermission(true)
       setRangeRules([])
       return
     }
     const response = await api.get<PermissionConfig>(`/permissions/sheets/${selectedSheetId}/principals/${principalType}/${principalId}`)
     if (response.code !== 0 || !response.data) {
       setSheetPermission(emptySheetPermission)
+      setInheritSheetPermission(true)
       setRangeRules([])
       return
     }
     setSheetPermission({
+      id: response.data.sheet.id,
       can_view: response.data.sheet.can_view || false,
       can_edit: response.data.sheet.can_edit || false,
       can_delete: response.data.sheet.can_delete || false,
       can_export: response.data.sheet.can_export || false,
     })
+    setInheritSheetPermission(!response.data.sheet.id)
     setRangeRules([...(response.data.columns || []), ...(response.data.rows || []), ...(response.data.cells || [])])
   }, [principalId, principalType, selectedSheetId])
 
   useEffect(() => { void loadPermissionConfig() }, [loadPermissionConfig])
+
+  const loadEffectiveMatrix = useCallback(async () => {
+    if (!selectedSheetId || !previewUserId) {
+      setEffectiveMatrix(null)
+      return
+    }
+    try {
+      const response = await api.get<PermissionMatrix>(`/permissions/sheets/${selectedSheetId}/users/${previewUserId}/effective`)
+      setEffectiveMatrix(response.code === 0 && response.data ? response.data : null)
+    } catch {
+      setEffectiveMatrix(null)
+    }
+  }, [previewUserId, selectedSheetId])
+
+  useEffect(() => { void loadEffectiveMatrix() }, [loadEffectiveMatrix])
 
   const filteredUsers = useMemo(() => {
     const keyword = memberSearch.trim().toLocaleLowerCase('zh-CN')
@@ -276,15 +317,21 @@ export default function PermissionsPage() {
     setSaving('sheet')
     setError('')
     try {
-      const response = await api.post('/permissions/principal-sheet', {
-        sheet_id: selectedSheetId,
-        principal_type: principalType,
-        principal_id: principalId,
-        ...sheetPermission,
-      })
+      const response = inheritSheetPermission
+        ? await api.delete(`/permissions/sheets/${selectedSheetId}/principals/${principalType}/${principalId}/sheet`)
+        : await api.post('/permissions/principal-sheet', {
+            sheet_id: selectedSheetId,
+            principal_type: principalType,
+            principal_id: principalId,
+            can_view: sheetPermission.can_view,
+            can_edit: sheetPermission.can_edit,
+            can_delete: sheetPermission.can_delete,
+            can_export: sheetPermission.can_export,
+          })
       if (response.code !== 0) throw new Error(response.message || '保存整表权限失败')
       await loadPermissionConfig()
-      showNotice('整表权限已保存')
+      await loadEffectiveMatrix()
+      showNotice(inheritSheetPermission ? '已恢复继承上级整表权限' : '整表权限已保存')
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '保存整表权限失败')
     } finally {
@@ -433,12 +480,52 @@ export default function PermissionsPage() {
             </div>
           </section>
 
+          <section className="rounded-lg border border-sky-200 bg-sky-50/50 p-4 shadow-sm md:p-5">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <h2 className="text-base font-semibold text-slate-950">员工实际可见性预览</h2>
+                <p className="mt-1 text-xs text-slate-500">按个人规则、部门规则、角色默认的优先级计算最终结果。</p>
+              </div>
+              <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-sky-200 bg-white px-2.5 py-1 text-xs text-sky-700"><Eye className="h-3.5 w-3.5" />实时权限结果</span>
+            </div>
+            <div className="mt-4 grid gap-3 md:grid-cols-[1fr_1fr_150px]">
+              <label className="text-xs font-medium text-slate-600">员工
+                <select value={previewUserId ?? ''} onChange={(event) => setPreviewUserId(Number(event.target.value) || null)} className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300">
+                  {users.map((user) => <option key={user.id} value={user.id}>{user.username}</option>)}
+                </select>
+              </label>
+              <label className="text-xs font-medium text-slate-600">列
+                <select value={previewColumn} onChange={(event) => setPreviewColumn(event.target.value)} className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300">
+                  {selectedSheet?.columns.map((column) => <option key={column} value={column}>{column}</option>)}
+                </select>
+              </label>
+              <label className="text-xs font-medium text-slate-600">工作表行号
+                <input type="number" min={2} value={previewDisplayRow} onChange={(event) => setPreviewDisplayRow(Math.max(2, Number(event.target.value) || 2))} className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300" />
+              </label>
+            </div>
+            {effectiveMatrix && previewUserId ? (() => {
+              const detail = resolveCellPermissionDetail(effectiveMatrix, previewColumn, displayRowToDataRow(previewDisplayRow))
+              const permission = effectiveMatrix.sheet.canView ? detail.permission : 'none'
+              const previewUser = users.find((user) => user.id === previewUserId)
+              const userDepartments = departments.filter((department) => department.member_ids?.includes(previewUserId))
+              const label = permission === 'write' ? '可编辑' : permission === 'read' ? '可查看' : '已遮盖'
+              const tone = permission === 'write' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : permission === 'read' ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-rose-200 bg-rose-50 text-rose-700'
+              const sourceLabels = { user: '个人例外', department: '部门规则', role: '角色范围', default: '整表默认' }
+              const sourceLabel = effectiveMatrix.sheet.canView ? sourceLabels[detail.source] : '整表拒绝'
+              return <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-white bg-white px-3 py-2.5 text-xs text-slate-600"><span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-semibold ${tone}`}>{permission === 'none' ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}{label}</span><span>{previewUser?.username || '员工'} · {previewColumn || '未选择列'} · 第 {previewDisplayRow} 行</span><span className="text-slate-400">规则来源：{sourceLabel}</span><span className="text-slate-400">所属部门：{userDepartments.map((department) => department.name).join('、') || '未加入部门'}</span></div>
+            })() : <div className="mt-3 rounded-lg border border-dashed border-sky-200 bg-white px-3 py-3 text-xs text-slate-400">选择员工和工作表后查看最终权限。</div>}
+          </section>
+
           <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div><h2 className="text-base font-semibold text-slate-950">整张工作表权限</h2><p className="mt-1 text-xs text-slate-500">范围规则会覆盖这里的默认查看和编辑权限。</p></div>
+              <div><h2 className="text-base font-semibold text-slate-950">整张工作表权限</h2><p className="mt-1 text-xs text-slate-500">范围规则只覆盖对应区域，个人规则优先于所属部门。</p></div>
               <button type="button" onClick={saveSheetPermission} disabled={!principalId || !selectedSheetId || saving === 'sheet'} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50"><Save className="h-4 w-4" />保存整表权限</button>
             </div>
-            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <label className={`mt-4 flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-3 transition ${inheritSheetPermission ? 'border-sky-300 bg-sky-50' : 'border-slate-200 bg-white'}`}>
+              <input type="checkbox" checked={inheritSheetPermission} onChange={(event) => setInheritSheetPermission(event.target.checked)} className="h-4 w-4 rounded border-slate-300 text-sky-600" />
+              <span><span className="block text-sm font-medium text-slate-700">继承角色或部门的整表权限</span><span className="mt-0.5 block text-xs text-slate-500">推荐用于“只给某个员工增加一条遮盖规则”的场景。</span></span>
+            </label>
+            <div className={`mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 ${inheritSheetPermission ? 'pointer-events-none opacity-45' : ''}`}>
               {sheetPermissionOptions.map(({ key, label, icon: Icon }) => (
                 <label key={key} className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-3 transition ${sheetPermission[key] ? 'border-sky-300 bg-sky-50' : 'border-slate-200 hover:bg-slate-50'}`}>
                   <input type="checkbox" checked={sheetPermission[key]} onChange={(event) => setSheetPermission((current) => ({ ...current, [key]: event.target.checked }))} className="h-4 w-4 rounded border-slate-300 text-sky-600" />
@@ -449,7 +536,7 @@ export default function PermissionsPage() {
           </section>
 
           <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-            <div><h2 className="text-base font-semibold text-slate-950">精确区域权限</h2><p className="mt-1 text-xs text-slate-500">优先级：单元格高于行，行高于列，未配置区域继承整表权限。个人同级规则优先于部门。</p></div>
+            <div><h2 className="text-base font-semibold text-slate-950">精确区域权限</h2><p className="mt-1 text-xs text-slate-500">优先级：个人规则 &gt; 部门规则 &gt; 角色默认；同一层内单元格 &gt; 行 &gt; 列。多个部门同范围冲突时不可见优先，不可见会在接口和实时同步时遮盖原值。</p></div>
             <div className="mt-4 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 md:grid-cols-[160px_1fr_1fr_180px_auto]">
               <label className="text-xs font-medium text-slate-600">范围类型
                 <select value={scopeType} onChange={(event) => setScopeType(event.target.value as ScopeType)} className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm">

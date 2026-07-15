@@ -11,7 +11,7 @@ func TestScopedPermissionKeepsRestrictedDefault(t *testing.T) {
 	matrix.Sheet.CanView = true
 	matrix.DefaultPermission = "read"
 	row := 0
-	mergePrincipalCellPermissions(matrix, []model.PrincipalCellPermission{
+	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, []model.PrincipalCellPermission{
 		{ColumnKey: "amount", RowIndex: &row, Permission: "write"},
 		{ColumnKey: "secret", Permission: "none"},
 	}, false)
@@ -34,14 +34,53 @@ func TestScopedPermissionKeepsRestrictedDefault(t *testing.T) {
 func TestEmployeeScopeOverridesDepartmentScope(t *testing.T) {
 	matrix := emptyPermissionMatrix()
 	matrix.DefaultPermission = "read"
-	mergePrincipalCellPermissions(matrix, []model.PrincipalCellPermission{
-		{ColumnKey: "salary", Permission: "write"},
+	row := 0
+	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, []model.PrincipalCellPermission{
+		{ColumnKey: "customer", RowIndex: &row, Permission: "read"},
 	}, false)
-	mergePrincipalCellPermissions(matrix, []model.PrincipalCellPermission{
-		{ColumnKey: "salary", Permission: "none"},
+	mergePrincipalCellPermissions(&matrix.UserOverrides, []model.PrincipalCellPermission{
+		{RowIndex: &row, Permission: "none"},
 	}, true)
 
-	if permissionMatrixAllowsCell(matrix, "salary", 0, "read") {
-		t.Fatal("employee-specific deny must override the department write rule")
+	if permissionMatrixAllowsCell(matrix, "customer", 0, "read") {
+		t.Fatal("employee row deny must override a more specific department cell grant")
+	}
+}
+
+func TestEmployeeGrantOverridesDepartmentDenyAcrossScopes(t *testing.T) {
+	matrix := emptyPermissionMatrix()
+	matrix.DefaultPermission = "read"
+	row := 0
+	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, []model.PrincipalCellPermission{
+		{ColumnKey: "supplier", RowIndex: &row, Permission: "none"},
+	}, false)
+	mergePrincipalCellPermissions(&matrix.UserOverrides, []model.PrincipalCellPermission{
+		{ColumnKey: "supplier", Permission: "read"},
+	}, true)
+
+	if !permissionMatrixAllowsCell(matrix, "supplier", 0, "read") {
+		t.Fatal("employee column grant must override a department cell deny")
+	}
+}
+
+func TestDepartmentOverrideBeatsRolePermission(t *testing.T) {
+	matrix := fullAccessMatrix()
+	matrix.DepartmentOverrides.Rows["0"] = "none"
+
+	if permissionMatrixAllowsCell(matrix, "customer", 0, "read") {
+		t.Fatal("department row mask must override role-level write access")
+	}
+}
+
+func TestDepartmentConflictUsesMostRestrictiveSameScopeRule(t *testing.T) {
+	matrix := emptyPermissionMatrix()
+	matrix.DefaultPermission = "none"
+	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, []model.PrincipalCellPermission{
+		{ColumnKey: "supplier", Permission: "read"},
+		{ColumnKey: "supplier", Permission: "none"},
+	}, false)
+
+	if permissionMatrixAllowsCell(matrix, "supplier", 0, "read") {
+		t.Fatal("an explicit department deny must win conflicting same-scope department grants")
 	}
 }

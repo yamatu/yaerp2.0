@@ -331,12 +331,14 @@ func main() {
 			admin.POST("/permissions/user-sheet", permHandler.SetUserSheetPermission)
 			admin.POST("/permissions/cell", permHandler.SetCellPermission)
 			admin.POST("/permissions/principal-sheet", permHandler.SetPrincipalSheetPermission)
+			admin.DELETE("/permissions/sheets/:id/principals/:principalType/:principalId/sheet", permHandler.DeletePrincipalSheetPermission)
 			admin.POST("/permissions/principal-cell", permHandler.SetPrincipalCellPermission)
 			admin.DELETE("/permissions/principal-cell/:id", permHandler.DeletePrincipalCellPermission)
 			admin.GET("/permissions/sheets/:id/principals/:principalType/:principalId", permHandler.GetPrincipalPermissionConfig)
 			admin.GET("/permissions/sheets/:id/roles/:roleId", permHandler.GetPermissionMatrixForRole)
 			admin.GET("/permissions/sheets/:id/users", permHandler.ListUserSheetPermissions)
 			admin.GET("/permissions/sheets/:id/users/:userId", permHandler.GetPermissionMatrixForUser)
+			admin.GET("/permissions/sheets/:id/users/:userId/effective", permHandler.GetEffectivePermissionMatrixForUser)
 			admin.POST("/workbooks/:id/assign", sheetHandler.AssignWorkbook)
 
 			// Departments

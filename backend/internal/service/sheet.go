@@ -1420,15 +1420,17 @@ func (s *SheetService) ensureRowDeletionAllowed(userID int64, sheet *model.Sheet
 		}
 	}
 	if matrix != nil {
-		for columnKey := range matrix.Columns {
-			if columnKey != "" {
-				columnSet[columnKey] = struct{}{}
+		for _, layer := range permissionMatrixScopedLayers(matrix) {
+			for columnKey := range layer.Columns {
+				if columnKey != "" {
+					columnSet[columnKey] = struct{}{}
+				}
 			}
-		}
-		rowPrefix := fmt.Sprintf("%d:", rowIndex)
-		for key := range matrix.Cells {
-			if strings.HasPrefix(key, rowPrefix) {
-				columnSet[strings.TrimPrefix(key, rowPrefix)] = struct{}{}
+			rowPrefix := fmt.Sprintf("%d:", rowIndex)
+			for key := range layer.Cells {
+				if strings.HasPrefix(key, rowPrefix) {
+					columnSet[strings.TrimPrefix(key, rowPrefix)] = struct{}{}
+				}
 			}
 		}
 	}
@@ -1550,7 +1552,7 @@ func permissionMatrixAllowsStructureMutation(matrix *model.PermissionMatrix) boo
 	if matrix.DefaultPermission != "" && !permissionSatisfies(matrix.DefaultPermission, "write") {
 		return false
 	}
-	for _, items := range []map[string]string{matrix.Rows, matrix.Columns, matrix.Cells} {
+	for _, items := range permissionMatrixMaps(matrix) {
 		for _, permission := range items {
 			if !permissionSatisfies(permission, "write") {
 				return false

@@ -97,19 +97,17 @@ func permissionMatrixAllowsCell(matrix *model.PermissionMatrix, columnKey string
 	if matrix == nil {
 		return false
 	}
-
-	cellKey := fmt.Sprintf("%d:%s", rowIndex, columnKey)
-	if cellPerm, ok := matrix.Cells[cellKey]; ok {
-		return permissionSatisfies(cellPerm, requiredPerm)
+	// Principal precedence is resolved before range specificity: a user's
+	// explicit exception must be able to override a department-wide rule.
+	if permission, exists := scopedPermissionValue(matrix.UserOverrides, columnKey, rowIndex); exists {
+		return permissionSatisfies(permission, requiredPerm)
 	}
-
-	rowKey := fmt.Sprintf("%d", rowIndex)
-	if rowPerm, ok := matrix.Rows[rowKey]; ok {
-		return permissionSatisfies(rowPerm, requiredPerm)
+	if permission, exists := scopedPermissionValue(matrix.DepartmentOverrides, columnKey, rowIndex); exists {
+		return permissionSatisfies(permission, requiredPerm)
 	}
-
-	if colPerm, ok := matrix.Columns[columnKey]; ok {
-		return permissionSatisfies(colPerm, requiredPerm)
+	base := model.ScopedPermissionLayer{Rows: matrix.Rows, Columns: matrix.Columns, Cells: matrix.Cells}
+	if permission, exists := scopedPermissionValue(base, columnKey, rowIndex); exists {
+		return permissionSatisfies(permission, requiredPerm)
 	}
 	if matrix.DefaultPermission != "" {
 		return permissionSatisfies(matrix.DefaultPermission, requiredPerm)
@@ -123,4 +121,21 @@ func permissionMatrixAllowsCell(matrix *model.PermissionMatrix, columnKey string
 	default:
 		return false
 	}
+}
+
+func scopedPermissionValue(layer model.ScopedPermissionLayer, columnKey string, rowIndex int) (string, bool) {
+	cellKey := fmt.Sprintf("%d:%s", rowIndex, columnKey)
+	if cellPerm, ok := layer.Cells[cellKey]; ok {
+		return cellPerm, true
+	}
+
+	rowKey := fmt.Sprintf("%d", rowIndex)
+	if rowPerm, ok := layer.Rows[rowKey]; ok {
+		return rowPerm, true
+	}
+
+	if colPerm, ok := layer.Columns[columnKey]; ok {
+		return colPerm, true
+	}
+	return "", false
 }

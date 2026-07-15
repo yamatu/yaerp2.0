@@ -226,6 +226,15 @@ export interface PermissionMatrix {
   rows: Record<string, string>
   columns: Record<string, string>
   cells: Record<string, string>
+  departmentOverrides: ScopedPermissionLayer
+  userOverrides: ScopedPermissionLayer
+  explicitUserSheetRule?: boolean
+}
+
+export interface ScopedPermissionLayer {
+  rows: Record<string, string>
+  columns: Record<string, string>
+  cells: Record<string, string>
 }
 
 export interface TokenResponse {

@@ -300,7 +300,7 @@ func hasRestrictedPermission(matrix *model.PermissionMatrix) bool {
 	if matrix.DefaultPermission == "none" {
 		return true
 	}
-	for _, permissions := range []map[string]string{matrix.Rows, matrix.Columns, matrix.Cells} {
+	for _, permissions := range permissionMatrixMaps(matrix) {
 		for _, permission := range permissions {
 			if permission == "none" {
 				return true

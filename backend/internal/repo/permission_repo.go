@@ -169,6 +169,15 @@ func (r *PermissionRepo) SetPrincipalSheetPermission(perm *model.PrincipalSheetP
 	return err
 }
 
+func (r *PermissionRepo) DeletePrincipalSheetPermission(sheetID int64, principalType string, principalID int64) error {
+	_, err := r.db.Exec(
+		`DELETE FROM principal_sheet_permissions
+		 WHERE sheet_id = $1 AND principal_type = $2 AND principal_id = $3`,
+		sheetID, principalType, principalID,
+	)
+	return err
+}
+
 func (r *PermissionRepo) SetPrincipalCellPermission(perm *model.PrincipalCellPermission) error {
 	tx, err := r.db.Begin()
 	if err != nil {

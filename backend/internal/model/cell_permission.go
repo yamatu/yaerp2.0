@@ -30,11 +30,20 @@ type CellPermission struct {
 }
 
 type PermissionMatrix struct {
-	Sheet             SheetPerm         `json:"sheet"`
-	DefaultPermission string            `json:"defaultPermission,omitempty"`
-	Rows              map[string]string `json:"rows"`
-	Columns           map[string]string `json:"columns"`
-	Cells             map[string]string `json:"cells"`
+	Sheet                 SheetPerm             `json:"sheet"`
+	DefaultPermission     string                `json:"defaultPermission,omitempty"`
+	Rows                  map[string]string     `json:"rows"`
+	Columns               map[string]string     `json:"columns"`
+	Cells                 map[string]string     `json:"cells"`
+	DepartmentOverrides   ScopedPermissionLayer `json:"departmentOverrides"`
+	UserOverrides         ScopedPermissionLayer `json:"userOverrides"`
+	ExplicitUserSheetRule bool                  `json:"explicitUserSheetRule,omitempty"`
+}
+
+type ScopedPermissionLayer struct {
+	Rows    map[string]string `json:"rows"`
+	Columns map[string]string `json:"columns"`
+	Cells   map[string]string `json:"cells"`
 }
 
 type SheetPerm struct {

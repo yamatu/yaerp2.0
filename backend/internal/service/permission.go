@@ -74,6 +74,16 @@ func (s *PermissionService) SetPrincipalSheetPermission(req *model.SetPrincipalS
 	return s.permRepo.SetPrincipalSheetPermission(permission)
 }
 
+func (s *PermissionService) DeletePrincipalSheetPermission(sheetID int64, principalType string, principalID int64) error {
+	if sheetID <= 0 {
+		return fmt.Errorf("invalid sheet id")
+	}
+	if err := s.validatePrincipal(principalType, principalID); err != nil {
+		return err
+	}
+	return s.permRepo.DeletePrincipalSheetPermission(sheetID, principalType, principalID)
+}
+
 func (s *PermissionService) SetPrincipalCellPermission(req *model.SetPrincipalCellPermissionRequest) error {
 	if err := s.validatePrincipal(req.PrincipalType, req.PrincipalID); err != nil {
 		return err
@@ -190,6 +200,7 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 	if err != nil {
 		return nil, err
 	}
+	ensurePermissionMatrixLayers(matrix)
 	departmentIDs, err := s.departmentRepo.GetUserDepartmentIDs(userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load user departments: %w", err)
@@ -251,12 +262,15 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 			CanView: permission.CanView, CanEdit: permission.CanEdit,
 			CanDelete: permission.CanDelete, CanExport: permission.CanExport,
 		}
+		matrix.ExplicitUserSheetRule = true
 	}
 
 	matrix.DefaultPermission = defaultCellPermission(matrix.Sheet)
-	mergePrincipalCellPermissions(matrix, departmentCellPerms, false)
-	mergePrincipalCellPermissions(matrix, userPrincipalCellPerms, true)
-	elevateMatrixForScopedPermissions(matrix)
+	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, departmentCellPerms, false)
+	mergePrincipalCellPermissions(&matrix.UserOverrides, userPrincipalCellPerms, true)
+	if !matrix.ExplicitUserSheetRule {
+		elevateMatrixForScopedPermissions(matrix)
+	}
 
 	applyWorkbookStateToPermissionMatrix(workbook, matrix)
 	applySheetStateToPermissionMatrix(sheet, matrix)
@@ -269,6 +283,7 @@ func (s *PermissionService) GetPermissionMatrixForRole(sheetID, roleID int64) (*
 	if err != nil {
 		return nil, err
 	}
+	ensurePermissionMatrixLayers(matrix)
 	matrix.DefaultPermission = defaultCellPermission(matrix.Sheet)
 	return matrix, nil
 }
@@ -542,23 +557,85 @@ func defaultCellPermission(permission model.SheetPerm) string {
 	return "none"
 }
 
-func mergePrincipalCellPermissions(matrix *model.PermissionMatrix, permissions []model.PrincipalCellPermission, override bool) {
+func newScopedPermissionLayer() model.ScopedPermissionLayer {
+	return model.ScopedPermissionLayer{
+		Rows:    make(map[string]string),
+		Columns: make(map[string]string),
+		Cells:   make(map[string]string),
+	}
+}
+
+func ensurePermissionLayer(layer *model.ScopedPermissionLayer) {
+	if layer.Rows == nil {
+		layer.Rows = make(map[string]string)
+	}
+	if layer.Columns == nil {
+		layer.Columns = make(map[string]string)
+	}
+	if layer.Cells == nil {
+		layer.Cells = make(map[string]string)
+	}
+}
+
+func ensurePermissionMatrixLayers(matrix *model.PermissionMatrix) {
 	if matrix == nil {
 		return
 	}
+	if matrix.Rows == nil {
+		matrix.Rows = make(map[string]string)
+	}
+	if matrix.Columns == nil {
+		matrix.Columns = make(map[string]string)
+	}
+	if matrix.Cells == nil {
+		matrix.Cells = make(map[string]string)
+	}
+	ensurePermissionLayer(&matrix.DepartmentOverrides)
+	ensurePermissionLayer(&matrix.UserOverrides)
+}
+
+func permissionMatrixMaps(matrix *model.PermissionMatrix) []map[string]string {
+	if matrix == nil {
+		return nil
+	}
+	ensurePermissionMatrixLayers(matrix)
+	return []map[string]string{
+		matrix.Rows, matrix.Columns, matrix.Cells,
+		matrix.DepartmentOverrides.Rows, matrix.DepartmentOverrides.Columns, matrix.DepartmentOverrides.Cells,
+		matrix.UserOverrides.Rows, matrix.UserOverrides.Columns, matrix.UserOverrides.Cells,
+	}
+}
+
+func permissionMatrixScopedLayers(matrix *model.PermissionMatrix) []model.ScopedPermissionLayer {
+	if matrix == nil {
+		return nil
+	}
+	ensurePermissionMatrixLayers(matrix)
+	return []model.ScopedPermissionLayer{
+		{Rows: matrix.Rows, Columns: matrix.Columns, Cells: matrix.Cells},
+		matrix.DepartmentOverrides,
+		matrix.UserOverrides,
+	}
+}
+
+func mergePrincipalCellPermissions(layer *model.ScopedPermissionLayer, permissions []model.PrincipalCellPermission, override bool) {
+	if layer == nil {
+		return
+	}
+	ensurePermissionLayer(layer)
 	for _, permission := range permissions {
 		columnKey := strings.TrimSpace(permission.ColumnKey)
 		var target map[string]string
 		var key string
 		switch {
 		case permission.RowIndex != nil && columnKey != "":
-			target = matrix.Cells
+			target = layer.Cells
 			key = fmt.Sprintf("%d:%s", *permission.RowIndex, columnKey)
 		case permission.RowIndex != nil:
-			target = matrix.Rows
+			target = layer.Rows
 			key = fmt.Sprintf("%d", *permission.RowIndex)
 		case columnKey != "":
-			target = matrix.Columns
+			target = layer.Columns
 			key = columnKey
 		default:
 			continue
@@ -566,14 +643,17 @@ func mergePrincipalCellPermissions(matrix *model.PermissionMatrix, permissions [
 		if override {
 			target[key] = permission.Permission
 		} else {
-			target[key] = bestPermissionValue(target[key], permission.Permission)
+			target[key] = restrictivePermissionValue(target[key], permission.Permission)
 		}
 	}
 }
 
-func bestPermissionValue(current, next string) string {
-	levels := map[string]int{"": -1, "none": 0, "read": 1, "write": 2}
-	if levels[next] > levels[current] {
+func restrictivePermissionValue(current, next string) string {
+	if current == "" {
+		return next
+	}
+	levels := map[string]int{"none": 0, "read": 1, "write": 2}
+	if levels[next] < levels[current] {
 		return next
 	}
 	return current
@@ -583,7 +663,7 @@ func elevateMatrixForScopedPermissions(matrix *model.PermissionMatrix) {
 	if matrix == nil {
 		return
 	}
-	for _, permissions := range []map[string]string{matrix.Rows, matrix.Columns, matrix.Cells} {
+	for _, permissions := range permissionMatrixMaps(matrix) {
 		for _, permission := range permissions {
 			if permissionSatisfies(permission, "read") {
 				matrix.Sheet.CanView = true
@@ -611,11 +691,13 @@ func hasPrincipalAccess(sheetPermissions []model.PrincipalSheetPermission, cellP
 
 func emptyPermissionMatrix() *model.PermissionMatrix {
 	return &model.PermissionMatrix{
-		Sheet:             model.SheetPerm{},
-		DefaultPermission: "none",
-		Rows:              make(map[string]string),
-		Columns:           make(map[string]string),
-		Cells:             make(map[string]string),
+		Sheet:               model.SheetPerm{},
+		DefaultPermission:   "none",
+		Rows:                make(map[string]string),
+		Columns:             make(map[string]string),
+		Cells:               make(map[string]string),
+		DepartmentOverrides: newScopedPermissionLayer(),
+		UserOverrides:       newScopedPermissionLayer(),
 	}
 }
 
@@ -654,7 +736,7 @@ func setAllScopedPermissions(matrix *model.PermissionMatrix, permission string) 
 	if matrix == nil {
 		return
 	}
-	for _, permissions := range []map[string]string{matrix.Rows, matrix.Columns, matrix.Cells} {
+	for _, permissions := range permissionMatrixMaps(matrix) {
 		for key := range permissions {
 			permissions[key] = permission
 		}
@@ -665,7 +747,7 @@ func downgradeScopedWritePermissions(matrix *model.PermissionMatrix) {
 	if matrix == nil {
 		return
 	}
-	for _, permissions := range []map[string]string{matrix.Rows, matrix.Columns, matrix.Cells} {
+	for _, permissions := range permissionMatrixMaps(matrix) {
 		for key, permission := range permissions {
 			if permission == "write" {
 				permissions[key] = "read"
@@ -679,9 +761,11 @@ func fullAccessMatrix() *model.PermissionMatrix {
 		Sheet: model.SheetPerm{
 			CanView: true, CanEdit: true, CanDelete: true, CanExport: true,
 		},
-		DefaultPermission: "write",
-		Rows:              make(map[string]string),
-		Columns:           make(map[string]string),
-		Cells:             make(map[string]string),
+		DefaultPermission:   "write",
+		Rows:                make(map[string]string),
+		Columns:             make(map[string]string),
+		Cells:               make(map[string]string),
+		DepartmentOverrides: newScopedPermissionLayer(),
+		UserOverrides:       newScopedPermissionLayer(),
 	}
 }

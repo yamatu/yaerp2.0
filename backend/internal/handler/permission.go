@@ -90,6 +90,25 @@ func (h *PermissionHandler) SetPrincipalCellPermission(c *gin.Context) {
 	response.OKMsg(c, "principal range permission set")
 }
 
+func (h *PermissionHandler) DeletePrincipalSheetPermission(c *gin.Context) {
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+	principalType := strings.TrimSpace(c.Param("principalType"))
+	principalID, err := strconv.ParseInt(c.Param("principalId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid principal id")
+		return
+	}
+	if err := h.permService.DeletePrincipalSheetPermission(sheetID, principalType, principalID); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OKMsg(c, "principal sheet permission reset")
+}
+
 func (h *PermissionHandler) GetPrincipalPermissionConfig(c *gin.Context) {
 	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -187,6 +206,27 @@ func (h *PermissionHandler) GetPermissionMatrixForUser(c *gin.Context) {
 	}
 
 	response.OK(c, perm)
+}
+
+func (h *PermissionHandler) GetEffectivePermissionMatrixForUser(c *gin.Context) {
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+
+	userID, err := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid user id")
+		return
+	}
+
+	matrix, err := h.permService.GetPermissionMatrix(sheetID, userID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, matrix)
 }
 
 func (h *PermissionHandler) ListUserSheetPermissions(c *gin.Context) {
