@@ -12,7 +12,7 @@ import UniverPresetSheetsFilterZhCN from '@univerjs/preset-sheets-filter/locales
 import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-replace'
 import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
-import { CellAlertType, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
+import { CellAlertType, ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
 import { getStoredUser, isAdmin } from '@/lib/auth'
@@ -79,11 +79,15 @@ interface SelectionState {
 }
 
 interface SheetViewMemory {
-  version: 1
+  version: 2
   selectionRow: number
   selectionColumn: number
+  selectionEndRow: number
+  selectionEndColumn: number
   viewRow: number
   viewColumn: number
+  offsetX: number
+  offsetY: number
   updatedAt: number
 }
 
@@ -156,7 +160,7 @@ interface ProtectionHighlightBlock {
 const MIN_UNIVER_ZOOM = 0.1
 const MAX_UNIVER_ZOOM = 4
 const PROTECTION_HIGHLIGHT_PREFERENCE_KEY = 'yaerp:show-protection-highlights'
-const SHEET_VIEW_MEMORY_VERSION = 1
+const SHEET_VIEW_MEMORY_VERSION = 2
 const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
   'sheet.contextMenu.permission': { title: '选区权限' },
   'sheet.command.add-range-protection-from-context-menu': { title: '配置选区白名单' },
@@ -222,11 +226,28 @@ function readSheetViewMemory(userId: number | undefined, sheetId: number): Sheet
   try {
     const raw = window.localStorage.getItem(sheetViewMemoryStorageKey(userId, sheetId))
     if (!raw) return null
-    const value = JSON.parse(raw) as Partial<SheetViewMemory>
-    if (value.version !== SHEET_VIEW_MEMORY_VERSION) return null
+    const value = JSON.parse(raw) as Partial<Omit<SheetViewMemory, 'version'>> & { version?: number }
+    if (value.version !== 1 && value.version !== SHEET_VIEW_MEMORY_VERSION) return null
     const coordinates = [value.selectionRow, value.selectionColumn, value.viewRow, value.viewColumn]
     if (!coordinates.every((coordinate) => Number.isInteger(coordinate) && Number(coordinate) >= 0)) return null
-    return value as SheetViewMemory
+    const selectionRow = Number(value.selectionRow)
+    const selectionColumn = Number(value.selectionColumn)
+    return {
+      version: SHEET_VIEW_MEMORY_VERSION,
+      selectionRow,
+      selectionColumn,
+      selectionEndRow: Number.isInteger(value.selectionEndRow) && Number(value.selectionEndRow) >= selectionRow
+        ? Number(value.selectionEndRow)
+        : selectionRow,
+      selectionEndColumn: Number.isInteger(value.selectionEndColumn) && Number(value.selectionEndColumn) >= selectionColumn
+        ? Number(value.selectionEndColumn)
+        : selectionColumn,
+      viewRow: Number(value.viewRow),
+      viewColumn: Number(value.viewColumn),
+      offsetX: Number.isFinite(value.offsetX) ? Math.max(0, Number(value.offsetX)) : 0,
+      offsetY: Number.isFinite(value.offsetY) ? Math.max(0, Number(value.offsetY)) : 0,
+      updatedAt: Number.isFinite(value.updatedAt) ? Number(value.updatedAt) : Date.now(),
+    }
   } catch {
     return null
   }
@@ -1063,6 +1084,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const protectionHighlightRenderFrameRef = useRef<number | null>(null)
   const sheetViewMemorySaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sheetViewRestoreFrameRef = useRef<number | null>(null)
+  const sheetViewRestoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sheetViewMemoryRestoringRef = useRef(false)
   const protectionHighlightRenderGenerationRef = useRef(0)
   const protectionHighlightRendererRef = useRef<() => void>(() => undefined)
   const protectionSnapshotRef = useRef<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
@@ -1148,18 +1171,25 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const workbookExportName = workbookName || '工作簿'
 
   const persistSheetViewMemory = useCallback(() => {
+    if (sheetViewMemoryRestoringRef.current) return
     try {
       const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
       const worksheet = workbook?.getActiveSheet?.()
       const range = worksheet?.getActiveRange?.() || worksheet?.getSelection?.()?.getActiveRange?.()
       if (!worksheet || !range) return
       const scrollState = worksheet.getScrollState()
+      const selectionRow = Math.max(0, Math.trunc(range.getRow()))
+      const selectionColumn = Math.max(0, Math.trunc(range.getColumn()))
       writeSheetViewMemory(profile?.id, sheetId, {
         version: SHEET_VIEW_MEMORY_VERSION,
-        selectionRow: Math.max(0, Math.trunc(range.getRow())),
-        selectionColumn: Math.max(0, Math.trunc(range.getColumn())),
+        selectionRow,
+        selectionColumn,
+        selectionEndRow: Math.max(selectionRow, Math.trunc(range.getLastRow())),
+        selectionEndColumn: Math.max(selectionColumn, Math.trunc(range.getLastColumn())),
         viewRow: Math.max(0, Math.trunc(scrollState.sheetViewStartRow)),
         viewColumn: Math.max(0, Math.trunc(scrollState.sheetViewStartColumn)),
+        offsetX: Math.max(0, Number(scrollState.offsetX) || 0),
+        offsetY: Math.max(0, Number(scrollState.offsetY) || 0),
         updatedAt: Date.now(),
       })
     } catch {
@@ -1168,6 +1198,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }, [profile?.id, sheetId])
 
   const scheduleSheetViewMemoryPersist = useCallback(() => {
+    if (sheetViewMemoryRestoringRef.current) return
     if (sheetViewMemorySaveTimerRef.current) clearTimeout(sheetViewMemorySaveTimerRef.current)
     sheetViewMemorySaveTimerRef.current = setTimeout(() => {
       sheetViewMemorySaveTimerRef.current = null
@@ -2402,8 +2433,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         syncFilterState()
         const rememberedView = readSheetViewMemory(profile?.id, sheetId)
         if (rememberedView) {
-          sheetViewRestoreFrameRef.current = window.requestAnimationFrame(() => {
-            sheetViewRestoreFrameRef.current = null
+          sheetViewMemoryRestoringRef.current = true
+          let readinessChecks = 0
+
+          const applyRememberedView = async () => {
             if (disposed) return
             try {
               const worksheet = workbookApi.getActiveSheet()
@@ -2411,17 +2444,64 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               const maxColumn = Math.max(0, worksheet.getMaxColumns() - 1)
               const selectionRow = Math.min(maxRow, rememberedView.selectionRow)
               const selectionColumn = Math.min(maxColumn, rememberedView.selectionColumn)
+              const selectionEndRow = Math.min(maxRow, Math.max(selectionRow, rememberedView.selectionEndRow))
+              const selectionEndColumn = Math.min(maxColumn, Math.max(selectionColumn, rememberedView.selectionEndColumn))
               const viewRow = Math.min(maxRow, rememberedView.viewRow)
               const viewColumn = Math.min(maxColumn, rememberedView.viewColumn)
-              worksheet.getRange(selectionRow, selectionColumn, 1, 1).activate()
-              worksheet.scrollToCell(viewRow, viewColumn)
+              worksheet.getRange(
+                selectionRow,
+                selectionColumn,
+                selectionEndRow - selectionRow + 1,
+                selectionEndColumn - selectionColumn + 1
+              ).activate()
+              const restored = await univerAPI.executeCommand(ScrollCommand.id, {
+                sheetViewStartRow: viewRow,
+                sheetViewStartColumn: viewColumn,
+                offsetX: rememberedView.offsetX,
+                offsetY: rememberedView.offsetY,
+              })
+              if (!restored) worksheet.scrollToCell(viewRow, viewColumn)
             } catch (restoreError) {
               console.warn('Failed to restore sheet view position:', restoreError)
             }
-            syncSelectionState()
-            setLoading(false)
-          })
+          }
+
+          const finishRestore = () => {
+            sheetViewRestoreTimerRef.current = null
+            void applyRememberedView().finally(() => {
+              if (disposed) return
+              sheetViewMemoryRestoringRef.current = false
+              syncSelectionState()
+              setLoading(false)
+            })
+          }
+
+          const restoreWhenReady = () => {
+            sheetViewRestoreFrameRef.current = null
+            if (disposed) return
+            const worksheet = workbookApi.getActiveSheet()
+            let lifecycleReady = false
+            let viewportReady = false
+            try {
+              lifecycleReady = univerAPI.getCurrentLifecycleStage() >= univerAPI.Enum.LifecycleStages.Steady
+              viewportReady = Boolean(worksheet.getSkeleton())
+            } catch {
+              lifecycleReady = false
+              viewportReady = false
+            }
+            if ((!lifecycleReady || !viewportReady) && readinessChecks < 120) {
+              readinessChecks += 1
+              sheetViewRestoreFrameRef.current = window.requestAnimationFrame(restoreWhenReady)
+              return
+            }
+
+            void applyRememberedView()
+            sheetViewRestoreTimerRef.current = setTimeout(finishRestore, 120)
+          }
+
+          sheetViewRestoreFrameRef.current = window.requestAnimationFrame(restoreWhenReady)
         } else {
+          sheetViewMemoryRestoringRef.current = false
           syncSelectionState()
           if (!disposed) setLoading(false)
         }
@@ -2599,6 +2679,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
           if (sheetViewMemorySaveTimerRef.current) { clearTimeout(sheetViewMemorySaveTimerRef.current); sheetViewMemorySaveTimerRef.current = null }
           if (sheetViewRestoreFrameRef.current !== null) { window.cancelAnimationFrame(sheetViewRestoreFrameRef.current); sheetViewRestoreFrameRef.current = null }
+          if (sheetViewRestoreTimerRef.current) { clearTimeout(sheetViewRestoreTimerRef.current); sheetViewRestoreTimerRef.current = null }
+          sheetViewMemoryRestoringRef.current = false
           if (remotePatchResetTimerRef.current) { clearTimeout(remotePatchResetTimerRef.current); remotePatchResetTimerRef.current = null }
           applyingRemotePatchRef.current = false
           persistedWorksheetDataRef.current = null
