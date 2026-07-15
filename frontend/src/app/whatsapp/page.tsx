@@ -61,10 +61,17 @@ export default function WhatsAppWorkspacePage() {
     setLoadingChats(true)
     try {
       const response = await api.get<WhatsAppChat[]>('/whatsapp/chats')
-      setChats(response.code === 0 && response.data ? response.data : [])
-      if (response.code === 0) lastChatsLoadAtRef.current = Date.now()
-    } catch {
+      if (response.code !== 0) {
+        setChats([])
+        setError(response.message || '读取 WhatsApp 会话失败')
+        return
+      }
+      setChats(response.data || [])
+      setError('')
+      lastChatsLoadAtRef.current = Date.now()
+    } catch (requestError) {
       setChats([])
+      setError(requestError instanceof Error ? requestError.message : '读取 WhatsApp 会话失败，请重新连接后重试')
     } finally {
       chatsRequestRef.current = false
       setLoadingChats(false)

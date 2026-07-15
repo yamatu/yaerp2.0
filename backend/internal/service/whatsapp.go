@@ -301,6 +301,9 @@ func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *m
 	if err != nil {
 		return nil, err
 	}
+	if err := s.ensureAccountReady(account); err != nil {
+		return nil, err
+	}
 	limit := 200
 	if request != nil && request.Limit > 0 {
 		limit = request.Limit
@@ -426,6 +429,9 @@ func (s *WhatsAppService) SyncContactsToChannels(userID int64, request *model.Wh
 	}
 	account, err := s.accountByIDForAccess(userID, accountID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureAccountReady(account); err != nil {
 		return nil, err
 	}
 	contacts := make([]model.WhatsAppContact, 0)
@@ -1057,11 +1063,22 @@ func (s *WhatsAppService) startAccount(account *model.WhatsAppAccount, enable bo
 }
 
 func (s *WhatsAppService) listChatsForAccount(account *model.WhatsAppAccount) ([]model.WhatsAppChat, error) {
+	if err := s.ensureAccountReady(account); err != nil {
+		return nil, err
+	}
 	chats := make([]model.WhatsAppChat, 0)
 	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/chats", nil, &chats, 25*time.Second); err != nil {
 		return nil, err
 	}
 	return chats, nil
+}
+
+func (s *WhatsAppService) ensureAccountReady(account *model.WhatsAppAccount) error {
+	s.refreshAccountStatus(account)
+	if account.Status != "ready" {
+		return fmt.Errorf("WhatsApp 账号尚未连接，请先扫码登录并等待状态变为已连接")
+	}
+	return nil
 }
 
 func (s *WhatsAppService) refreshAccountStatus(account *model.WhatsAppAccount) {
@@ -1192,6 +1209,9 @@ func (s *WhatsAppService) callSidecarWithTimeout(method, path string, input, out
 		_ = json.Unmarshal(data, &payload)
 		if payload.Error == "" {
 			payload.Error = strings.TrimSpace(string(data))
+		}
+		if response.StatusCode == http.StatusConflict && strings.Contains(strings.ToLower(payload.Error), "not ready") {
+			return fmt.Errorf("WhatsApp 账号尚未连接，请先扫码登录并等待状态变为已连接")
 		}
 		return fmt.Errorf("WhatsApp 服务返回 %d: %s", response.StatusCode, payload.Error)
 	}

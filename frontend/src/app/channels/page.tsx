@@ -11,6 +11,7 @@ import {
   Bot,
   Check,
   CheckCheck,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   ClipboardPaste,
@@ -250,6 +251,7 @@ export default function ChannelsPage() {
   const [currentUserId] = useState<number | null>(() => getStoredUser()?.id || null)
   const [loadingChannels, setLoadingChannels] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false)
   const [sending, setSending] = useState(false)
   const [creatingChannel, setCreatingChannel] = useState(false)
   const [forwarding, setForwarding] = useState(false)
@@ -713,6 +715,7 @@ export default function ChannelsPage() {
       : null
     pendingMessageScrollRef.current = storedScroll ?? 'bottom'
     shouldStickToBottomRef.current = storedScroll === null
+    setShowScrollToLatest(false)
     setSelectedDirectoryId('')
     setSavePendingImage(false)
     setMessageText('')
@@ -747,6 +750,32 @@ export default function ChannelsPage() {
   useEffect(() => {
     if (!activeChannelId || !currentUserId) return
     localStorage.setItem(channelStorageKey(currentUserId, 'active-channel'), String(activeChannelId))
+  }, [activeChannelId, currentUserId])
+
+  useEffect(() => {
+    if (!currentUserId) return
+    const persistChannelPosition = () => {
+      if (activeChannelId) {
+        localStorage.setItem(channelStorageKey(currentUserId, 'active-channel'), String(activeChannelId))
+        if (messagesViewportRef.current) {
+          localStorage.setItem(
+            channelStorageKey(currentUserId, `message-scroll:${activeChannelId}`),
+            String(Math.max(0, Math.round(messagesViewportRef.current.scrollTop)))
+          )
+        }
+      }
+      if (channelListRef.current) {
+        localStorage.setItem(
+          channelStorageKey(currentUserId, 'channel-list-scroll'),
+          String(Math.max(0, Math.round(channelListRef.current.scrollTop)))
+        )
+      }
+    }
+    window.addEventListener('pagehide', persistChannelPosition)
+    return () => {
+      persistChannelPosition()
+      window.removeEventListener('pagehide', persistChannelPosition)
+    }
   }, [activeChannelId, currentUserId])
 
   useEffect(() => {
@@ -851,16 +880,23 @@ export default function ChannelsPage() {
       if (pendingScroll === 'bottom') {
         viewport.scrollTop = viewport.scrollHeight
         shouldStickToBottomRef.current = true
+        setShowScrollToLatest(false)
         pendingMessageScrollRef.current = null
         return
       }
       if (typeof pendingScroll === 'number') {
         viewport.scrollTop = Math.min(pendingScroll, Math.max(0, viewport.scrollHeight - viewport.clientHeight))
         shouldStickToBottomRef.current = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120
+        setShowScrollToLatest(!shouldStickToBottomRef.current)
         pendingMessageScrollRef.current = null
         return
       }
-      if (shouldStickToBottomRef.current) viewport.scrollTop = viewport.scrollHeight
+      if (shouldStickToBottomRef.current) {
+        viewport.scrollTop = viewport.scrollHeight
+        setShowScrollToLatest(false)
+      } else {
+        setShowScrollToLatest(true)
+      }
     })
     return () => window.cancelAnimationFrame(frame)
   }, [activeChannelId, loadingMessages, messages.length])
@@ -2045,10 +2081,25 @@ export default function ChannelsPage() {
     const viewport = messagesViewportRef.current
     if (!viewport) return
     shouldStickToBottomRef.current = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120
+    setShowScrollToLatest(!shouldStickToBottomRef.current)
     if (activeChannelId && currentUserId) {
       localStorage.setItem(
         channelStorageKey(currentUserId, `message-scroll:${activeChannelId}`),
         String(Math.max(0, Math.round(viewport.scrollTop)))
+      )
+    }
+  }
+
+  const scrollToLatestMessage = () => {
+    const viewport = messagesViewportRef.current
+    if (!viewport) return
+    shouldStickToBottomRef.current = true
+    setShowScrollToLatest(false)
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
+    if (activeChannelId && currentUserId) {
+      localStorage.setItem(
+        channelStorageKey(currentUserId, `message-scroll:${activeChannelId}`),
+        String(viewport.scrollHeight)
       )
     }
   }
@@ -2426,6 +2477,12 @@ export default function ChannelsPage() {
                       </div>
                     )}
                   </div>
+
+                  {showScrollToLatest && (
+                    <button type="button" onClick={scrollToLatestMessage} className="absolute bottom-28 right-4 z-20 inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 hover:text-[#00a884] md:right-6" title="回到最新消息">
+                      <ChevronDown className="h-5 w-5" />
+                    </button>
+                  )}
 
                   <div className="shrink-0 border-t border-slate-300 bg-[#f0f2f5] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:px-5 md:py-3">
                     <div className="mx-auto max-w-4xl overflow-hidden rounded-lg bg-white shadow-sm focus-within:ring-1 focus-within:ring-[#00a884]/30">

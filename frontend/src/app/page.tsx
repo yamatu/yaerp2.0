@@ -50,6 +50,10 @@ interface WorkbookImportSource {
   attachment_id?: number | null
 }
 
+function ownWorkbookFilterStorageKey(userId: number) {
+  return `yaerp:home:${userId}:show-only-own-workbooks`
+}
+
 function getWorkbookImportSource(workbook: Workbook): WorkbookImportSource | null {
   const source = workbook.metadata?.importSource
   if (!source || typeof source !== 'object') return null
@@ -139,7 +143,11 @@ export default function HomePage() {
   const [workbookSortBy, setWorkbookSortBy] = useState<'updated_at' | 'created_at' | 'name'>('updated_at')
   const [workbookSortOrder, setWorkbookSortOrder] = useState<'asc' | 'desc'>('desc')
   const [groupByOwner, setGroupByOwner] = useState(true)
-  const [showOnlyOwnWorkbooks, setShowOnlyOwnWorkbooks] = useState(false)
+  const [showOnlyOwnWorkbooks, setShowOnlyOwnWorkbooks] = useState(() => {
+    const user = getStoredUser()
+    if (!user || typeof window === 'undefined') return false
+    return localStorage.getItem(ownWorkbookFilterStorageKey(user.id)) === 'true'
+  })
   const [workbookPage, setWorkbookPage] = useState(1)
   const [assigningWorkbook, setAssigningWorkbook] = useState<Workbook | null>(null)
   const [assignableUsers, setAssignableUsers] = useState<User[]>([])
@@ -337,6 +345,10 @@ export default function HomePage() {
   }, [contents.folders, sharedFolders])
   useEffect(() => { setFolderPage(1) }, [folderSearchQuery])
   useEffect(() => { setWorkbookPage(1) }, [showOnlyOwnWorkbooks])
+  useEffect(() => {
+    if (!profile?.id || !adminMode) return
+    localStorage.setItem(ownWorkbookFilterStorageKey(profile.id), String(showOnlyOwnWorkbooks))
+  }, [adminMode, profile?.id, showOnlyOwnWorkbooks])
   useEffect(() => {
     if (folderPage > totalFolderPages) setFolderPage(totalFolderPages)
   }, [folderPage, totalFolderPages])

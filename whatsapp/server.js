@@ -459,6 +459,71 @@ function serializeChatBasic(chat) {
   }
 }
 
+function readableError(error, fallback = 'WhatsApp Web operation failed') {
+  const message = String(error?.message || error || '').trim()
+  return message.length > 2 ? message : fallback
+}
+
+function comparableChatId(value) {
+  const serialized = serializeId(value).trim().toLowerCase()
+  const [local = '', server = ''] = serialized.split('@')
+  return { serialized, local: local.split(':')[0], server }
+}
+
+function chatIdMatches(left, right) {
+  const a = comparableChatId(left)
+  const b = comparableChatId(right)
+  if (!a.serialized || !b.serialized) return false
+  if (a.serialized === b.serialized) return true
+  return Boolean(a.local && b.local && a.local === b.local && (!a.server || !b.server || a.server === b.server))
+}
+
+function serializeContactAsChat(contact) {
+  const id = serializeId(contact.id)
+  return {
+    id,
+    name: contact.name || contact.pushname || contact.shortName || contact.number || id,
+    isGroup: false,
+    unreadCount: 0,
+    timestamp: 0,
+    pinned: false,
+    archived: false,
+    isMuted: false,
+    lastMessage: '',
+    profilePicUrl: '',
+    about: '',
+    description: '',
+    participantCount: 0,
+  }
+}
+
+async function getContactChatFallback(session, limit) {
+  const contacts = await withTimeout(session.client.getContacts(), 20000, 'get contacts')
+  return contacts
+    .filter((contact) => contact.isWAContact && !contact.isMe && serializeId(contact.id))
+    .slice(0, limit)
+    .map(serializeContactAsChat)
+}
+
+async function resolveChat(session, chatId) {
+  let directError = null
+  try {
+    const direct = await session.client.getChatById(chatId)
+    if (direct) return direct
+  } catch (error) {
+    directError = error
+  }
+  try {
+    const chats = await withTimeout(session.client.getChats(), 20000, 'resolve chat list')
+    const matched = chats.find((chat) => chatIdMatches(chat.id, chatId))
+    if (matched) return matched
+  } catch (error) {
+    if (!directError) directError = error
+  }
+  if (directError) console.error(`Chat resolution failed (${session.id}/${chatId}):`, readableError(directError))
+  return null
+}
+
 async function enrichChat(session, chat) {
   const basic = serializeChatBasic(chat)
   basic.profilePicUrl = await safeProfilePic(session.client, basic.id)
@@ -513,15 +578,30 @@ async function getChatList(session, limit) {
   }
   if (!session.chatListPromise) {
     const client = session.client
-    session.chatListPromise = withTimeout(client.getChats(), 20000, 'get chats').then((chats) => {
+    session.chatListPromise = withTimeout(client.getChats(), 20000, 'get chats').then(async (chats) => {
       if (session.client !== client) return []
+      if (chats.length === 0) {
+        const contacts = await getContactChatFallback(session, limit)
+        session.chatCache.items = contacts
+        session.chatCache.loadedAt = Date.now()
+        return contacts
+      }
       const selected = chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, Math.max(limit, 200))
       session.chatCache.items = mergeChatMetadata(session, selected.map(serializeChatBasic))
       session.chatCache.loadedAt = Date.now()
       if (Date.now() - session.chatCache.metadataLoadedAt >= CHAT_METADATA_CACHE_MS) void refreshChatMetadata(session, selected)
       return session.chatCache.items
-    }).catch((error) => {
-      if (session.chatCache.items.length === 0) throw error
+    }).catch(async (error) => {
+      if (session.chatCache.items.length === 0) {
+        try {
+          const contacts = await getContactChatFallback(session, limit)
+          session.chatCache.items = contacts
+          session.chatCache.loadedAt = Date.now()
+          return contacts
+        } catch (fallbackError) {
+          throw new Error(`无法读取 WhatsApp 会话，请重新连接后重试：${readableError(error, readableError(fallbackError))}`)
+        }
+      }
       console.error(`Chat list refresh failed, serving cache (${session.id}):`, error.message)
       session.chatCache.loadedAt = Date.now()
       return session.chatCache.items
@@ -630,7 +710,8 @@ app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (re
 })
 app.get('/sessions/:sessionId/chats/:chatId/messages', requireSession, requireReady, async (req, res, next) => {
   try {
-    const chat = await req.whatsappSession.client.getChatById(req.params.chatId)
+    const chat = await resolveChat(req.whatsappSession, req.params.chatId)
+    if (!chat) return res.json([])
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 50)))
     const includeMedia = req.query.includeMedia === '1' || req.query.includeMedia === 'true'
     const messages = await chat.fetchMessages({ limit })
@@ -733,7 +814,7 @@ app.post('/sessions/:sessionId/groups/:chatId/participants', requireSession, req
 
 app.use((error, _req, res, _next) => {
   console.error(error)
-  res.status(500).json({ error: error.message || 'internal error' })
+  res.status(500).json({ error: readableError(error, 'WhatsApp Web 操作失败，请重新连接后重试') })
 })
 
 process.on('SIGTERM', async () => {
