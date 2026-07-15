@@ -151,10 +151,31 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 				continue
 			}
 
-			// Broadcast to other users viewing same sheet
-			broadcastData, _ := json.Marshal(msg)
+			broadcastMessage := msg
+			if hidden, hiddenErr := h.mutationTouchesHiddenProtection(client.SheetID, &msg); hiddenErr != nil {
+				log.Printf("failed to inspect hidden websocket mutation for sheet %d: %v", client.SheetID, hiddenErr)
+				broadcastMessage = Message{Type: "sheet_sync", SheetID: client.SheetID, UserID: client.UserID, Username: client.Username, ClientID: client.ClientID}
+			} else if hidden {
+				broadcastMessage = Message{Type: "sheet_sync", SheetID: client.SheetID, UserID: client.UserID, Username: client.Username, ClientID: client.ClientID}
+			}
+			broadcastData, _ := json.Marshal(broadcastMessage)
 			h.Hub.BroadcastToSheet(client.SheetID, broadcastData, client)
 		}
+	}
+}
+
+func (h *WSHandler) mutationTouchesHiddenProtection(sheetID int64, msg *Message) (bool, error) {
+	switch msg.Type {
+	case "cell_update":
+		return h.SheetService.CellHasHiddenProtection(sheetID, msg.Row, msg.Col)
+	case "batch_update":
+		var changes []model.CellUpdate
+		if err := json.Unmarshal(msg.Changes, &changes); err != nil {
+			return false, err
+		}
+		return h.SheetService.CellChangesTouchHiddenProtection(sheetID, changes)
+	default:
+		return false, nil
 	}
 }
 

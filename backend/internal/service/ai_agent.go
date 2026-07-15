@@ -3043,6 +3043,14 @@ func mapArg(args map[string]any, key string) map[string]any {
 
 func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) ([]aiPreviewRow, error) {
 	previewRows := buildAIPreviewRows(sheet, columns, rows)
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
+	if err != nil {
+		return nil, err
+	}
 	result := make([]aiPreviewRow, 0, len(previewRows))
 	for _, row := range previewRows {
 		filtered := make(map[string]interface{}, len(row.Data))
@@ -3051,7 +3059,7 @@ func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, co
 			if err != nil {
 				return nil, err
 			}
-			if allowed {
+			if allowed && !protectionHidesCell(protections, row.Row, key, userID, isAdmin) {
 				filtered[key] = value
 			}
 		}

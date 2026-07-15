@@ -23,6 +23,7 @@ type sheetExportFile struct {
 }
 
 type sheetExportContext struct {
+	UserID   int64
 	Sheet    *model.Sheet
 	Workbook *model.Workbook
 	Columns  []sheetColumnPayload
@@ -171,7 +172,7 @@ func (s *SheetService) writeSheetExportContext(file *excelize.File, excelSheetNa
 		return err
 	}
 	if !writtenFromSnapshot {
-		rows, err := s.sheetRepo.GetRows(ctx.Sheet.ID)
+		rows, err := s.GetSheetDataForUser(ctx.Sheet.ID, ctx.UserID)
 		if err != nil {
 			return err
 		}
@@ -230,6 +231,10 @@ func (s *SheetService) loadSheetExportContext(userID, sheetID int64, requireExpo
 	if err := s.ensureWorkbookVisible(workbook, userID); err != nil {
 		return nil, err
 	}
+	sheet, err = s.maskSheetForUser(sheet, userID)
+	if err != nil {
+		return nil, err
+	}
 
 	columns, err := parseSheetColumns(sheet.Columns)
 	if err != nil {
@@ -241,7 +246,7 @@ func (s *SheetService) loadSheetExportContext(userID, sheetID int64, requireExpo
 		return nil, err
 	}
 
-	return &sheetExportContext{Sheet: sheet, Workbook: workbook, Columns: columns, Matrix: matrix, Styles: styles}, nil
+	return &sheetExportContext{UserID: userID, Sheet: sheet, Workbook: workbook, Columns: columns, Matrix: matrix, Styles: styles}, nil
 }
 
 func (s *SheetService) loadWorkbookExportContexts(userID, workbookID int64, sheetIDs []int64, requireExport bool) (*model.Workbook, []*sheetExportContext, error) {

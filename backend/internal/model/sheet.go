@@ -95,6 +95,7 @@ type UpdateProtectionRequest struct {
 	RowIndex        *int    `json:"row_index,omitempty"`
 	ColumnKey       *string `json:"column_key,omitempty"`
 	EditableUserIDs []int64 `json:"editable_user_ids,omitempty"`
+	Hidden          *bool   `json:"hidden,omitempty"`
 }
 
 type BatchUpdateProtectionRequest struct {
@@ -113,6 +114,7 @@ type ProtectionInfo struct {
 	OwnerID         int64     `json:"owner_id"`
 	OwnerName       string    `json:"owner_name"`
 	EditableUserIDs []int64   `json:"editable_user_ids,omitempty"`
+	Hidden          bool      `json:"hidden,omitempty"`
 	ProtectedAt     time.Time `json:"protected_at"`
 }
 

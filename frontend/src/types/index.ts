@@ -99,6 +99,7 @@ export interface ProtectionOwner {
   ownerId: number
   ownerName: string
   editableUserIds?: number[]
+  hidden?: boolean
   protectedAt: string
 }
 
@@ -110,6 +111,7 @@ export interface ProtectionInfo {
   owner_id: number
   owner_name: string
   editable_user_ids?: number[]
+  hidden?: boolean
   protected_at: string
 }
 

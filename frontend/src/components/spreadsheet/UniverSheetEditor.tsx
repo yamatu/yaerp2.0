@@ -118,14 +118,16 @@ const MIN_UNIVER_ZOOM = 0.1
 const MAX_UNIVER_ZOOM = 4
 const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
   'sheet.contextMenu.permission': { title: 'YAERP 保护' },
-  'sheet.command.add-range-protection-from-context-menu': { title: '保护当前选择' },
-  'sheet.command.set-range-protection-from-context-menu': { title: '编辑当前保护' },
+  'sheet.command.add-range-protection-from-context-menu': { title: '保护或隐藏当前选择' },
+  'sheet.command.set-range-protection-from-context-menu': { title: '编辑保护与隐藏设置' },
   'sheet.command.delete-range-protection-from-context-menu': { title: '解除当前保护' },
   'sheet.command.view-sheet-permission-from-context-menu': { title: '显示保护区域与记录' },
 } as const
 const YAERP_PROTECTION_CONTEXT_MENU_LABELS = [
   '保护当前选择',
+  '保护或隐藏当前选择',
   '编辑当前保护',
+  '编辑保护与隐藏设置',
   '解除当前保护',
   '显示保护区域与记录',
 ]
@@ -140,6 +142,11 @@ const PROTECTION_VISUALS: ProtectionVisual[] = [
   { stroke: '#c026d3', fill: 'rgba(217, 70, 239, 0.07)', soft: '#fae8ff' },
   { stroke: '#4f46e5', fill: 'rgba(99, 102, 241, 0.07)', soft: '#e0e7ff' },
 ]
+const HIDDEN_PROTECTION_VISUAL: ProtectionVisual = {
+  stroke: '#475569',
+  fill: 'rgba(71, 85, 105, 0.12)',
+  soft: '#e2e8f0',
+}
 
 function visualForUser(userId: number) {
   const safeId = Number.isFinite(userId) ? Math.abs(userId) : 0
@@ -996,12 +1003,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const target = getProtectionRange(item)
     if (!target) return
     setShowProtectionHighlights(true)
-    setProtectionFocusNotice(`${item.owner_name} 保护了 ${item.scope === 'row' ? `第 ${(item.row_index ?? 0) + 2} 行` : item.scope === 'column' ? `列 ${item.column_key || item.key}` : `${item.column_key || item.key}${(item.row_index ?? 0) + 2}`}`)
+    setProtectionFocusNotice(`${item.owner_name}${item.hidden ? ' 隐藏并保护了 ' : ' 保护了 '}${item.scope === 'row' ? `第 ${(item.row_index ?? 0) + 2} 行` : item.scope === 'column' ? `列 ${item.column_key || item.key}` : `${item.column_key || item.key}${(item.row_index ?? 0) + 2}`}`)
     target.range.activate?.()
     target.worksheet.scrollToCell?.(target.row, target.column)
     protectionFocusDisposableRef.current?.dispose()
     protectionFocusDisposableRef.current = target.range.highlight({
-      stroke: visualForUser(item.owner_id).stroke,
+      stroke: (item.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(item.owner_id)).stroke,
       strokeWidth: 3,
       strokeDash: 6,
       isAnimationDash: true,
@@ -1024,7 +1031,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       try {
         const target = getProtectionRange(item)
         if (!target) return
-        const visual = visualForUser(item.owner_id)
+        const visual = item.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(item.owner_id)
         protectionHighlightDisposablesRef.current.push(target.range.highlight({
           stroke: visual.stroke,
           strokeWidth: item.scope === 'cell' ? 2 : 1.25,
@@ -1409,7 +1416,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [editLocked, persistCurrentSheet, syncFilterState])
 
-  const handleProtectionChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock') => {
+  const handleProtectionChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock', hidden?: boolean) => {
     if (editLocked) {
       setActionError('当前账号只有查看权限，不能修改保护状态。')
       return
@@ -1423,7 +1430,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setProtectionAction(`${scope}:${action}`)
 
     try {
-      const payload: { scope: string; action: string; row_index?: number; column_key?: string; editable_user_ids?: number[] } = {
+      const payload: { scope: string; action: string; row_index?: number; column_key?: string; editable_user_ids?: number[]; hidden?: boolean } = {
         scope,
         action,
       }
@@ -1435,6 +1442,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       }
       if (action === 'lock') {
         payload.editable_user_ids = selectedProtectionEditableUserIds
+        if (typeof hidden === 'boolean') payload.hidden = hidden
       }
 
       const res = await api.post<{ sheet?: Sheet; protections?: ProtectionSnapshot }>(`/sheets/${sheetId}/protections`, payload)
@@ -1462,7 +1470,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
 
-  const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock') => {
+  const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock', hidden?: boolean) => {
     if (editLocked) {
       setActionError('当前账号只有查看权限，不能修改保护状态。')
       return
@@ -1514,6 +1522,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           ...request,
           action,
           ...(action === 'lock' ? { editable_user_ids: selectedProtectionEditableUserIds } : {}),
+          ...(action === 'lock' && typeof hidden === 'boolean' ? { hidden } : {}),
         })),
       })
       if (res.code !== 0) {
@@ -2659,7 +2668,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     : protectionUsers
   const formatEditableUsers = (item: ProtectionInfo | null) => {
     const ids = item?.editable_user_ids || []
-    if (ids.length === 0) return '未指定额外可编辑人员'
+    if (ids.length === 0) return '仅创建者和管理员'
     return ids.map((id) => protectionUserNameMap.get(id) || `用户 #${id}`).join('、')
   }
   const toggleProtectionEditableUser = (userId: number) => {
@@ -3143,6 +3152,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                     const visual = visualForUser(group.ownerId)
                     return <span key={group.ownerId} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600"><span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: visual.fill, border: `2px solid ${visual.stroke}` }} />{group.ownerName}<span className="text-slate-400">{group.items.length}</span></span>
                   })}
+                  {allProtectionItems.some((item) => item.hidden) && <span className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600"><EyeOff className="h-3 w-3 text-slate-600" />对其他人隐藏</span>}
                 </div>
               </div>
             )}
@@ -3150,14 +3160,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               <div className="mb-2 flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
                   <Users className="h-4 w-4 text-sky-600" />
-                  允许编辑人员
+                  允许编辑与查看人员
                 </div>
                 <span className="shrink-0 rounded-lg bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-700">
                   已选 {selectedProtectionEditableUserIds.length} 人
                 </span>
               </div>
               <div className="mb-3 text-xs leading-5 text-slate-500">
-                新增保护或更新当前保护时，这些员工可以编辑被保护的行、列或单元格。
+                这些员工可以编辑被保护范围；启用数据遮盖后，他们也仍然可以查看原始内容。
               </div>
               {protectionUsersLoading ? (
                 <div className="text-xs text-slate-400">正在加载员工...</div>
@@ -3268,6 +3278,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                     解除选中单元格保护
                   </button>
                 </div>
+                <div className="mt-2 flex flex-wrap gap-2 border-t border-sky-200 pt-2">
+                  <button type="button" onClick={() => void handleProtectionRangeChange('row', 'lock', true)} disabled={protectionAction === 'row:bulk:lock'} className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"><EyeOff className="h-4 w-4" />隐藏选中行</button>
+                  <button type="button" onClick={() => void handleProtectionRangeChange('column', 'lock', true)} disabled={protectionAction === 'column:bulk:lock'} className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"><EyeOff className="h-4 w-4" />隐藏选中列</button>
+                  <button type="button" onClick={() => void handleProtectionRangeChange('cell', 'lock', true)} disabled={protectionAction === 'cell:bulk:lock'} className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"><EyeOff className="h-4 w-4" />隐藏选中单元格</button>
+                </div>
               </div>
             )}
 
@@ -3280,7 +3295,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 {currentRowProtection ? `已由 ${currentRowProtection.owner_name} 于 ${new Date(currentRowProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前行未加保护'}
               </div>
               {currentRowProtection && (
-                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑：{formatEditableUsers(currentRowProtection)}</div>
+                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(currentRowProtection)}</div>
               )}
               <button
                 type="button"
@@ -3290,6 +3305,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               >
                 {currentRowProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                 {currentRowProtection ? '解除当前行保护' : '保护当前行'}
+              </button>
+              <button type="button" onClick={() => void handleProtectionChange('row', 'lock', !currentRowProtection?.hidden)} disabled={editLocked || protectionAction === 'row:lock' || (currentRowProtection !== null && !canUpdateProtectionEditors(currentRowProtection))} className={`ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border bg-white px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${currentRowProtection?.hidden ? 'border-slate-300 text-slate-700 hover:bg-slate-50' : 'border-amber-200 text-amber-700 hover:bg-amber-50'}`}>
+                {currentRowProtection?.hidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                {currentRowProtection?.hidden ? '取消行数据遮盖' : '对其他人隐藏此行'}
               </button>
               {currentRowProtection && (
                 <button
@@ -3313,7 +3332,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 {currentColumnProtection ? `已由 ${currentColumnProtection.owner_name} 于 ${new Date(currentColumnProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前列未加保护'}
               </div>
               {currentColumnProtection && (
-                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑：{formatEditableUsers(currentColumnProtection)}</div>
+                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(currentColumnProtection)}</div>
               )}
               <button
                 type="button"
@@ -3323,6 +3342,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               >
                 {currentColumnProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                 {currentColumnProtection ? '解除当前列保护' : '保护当前列'}
+              </button>
+              <button type="button" onClick={() => void handleProtectionChange('column', 'lock', !currentColumnProtection?.hidden)} disabled={editLocked || protectionAction === 'column:lock' || (currentColumnProtection !== null && !canUpdateProtectionEditors(currentColumnProtection))} className={`ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border bg-white px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${currentColumnProtection?.hidden ? 'border-slate-300 text-slate-700 hover:bg-slate-50' : 'border-amber-200 text-amber-700 hover:bg-amber-50'}`}>
+                {currentColumnProtection?.hidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                {currentColumnProtection?.hidden ? '取消列数据遮盖' : '对其他人隐藏此列'}
               </button>
               {currentColumnProtection && (
                 <button
@@ -3346,7 +3369,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 {currentCellProtection ? `已由 ${currentCellProtection.owner_name} 于 ${new Date(currentCellProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前单元格未加保护'}
               </div>
               {currentCellProtection && (
-                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑：{formatEditableUsers(currentCellProtection)}</div>
+                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(currentCellProtection)}</div>
               )}
               <button
                 type="button"
@@ -3356,6 +3379,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               >
                 {currentCellProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                 {currentCellProtection ? '解除当前单元格保护' : '保护当前单元格'}
+              </button>
+              <button type="button" onClick={() => void handleProtectionChange('cell', 'lock', !currentCellProtection?.hidden)} disabled={editLocked || protectionAction === 'cell:lock' || (currentCellProtection !== null && !canUpdateProtectionEditors(currentCellProtection))} className={`ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border bg-white px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${currentCellProtection?.hidden ? 'border-slate-300 text-slate-700 hover:bg-slate-50' : 'border-amber-200 text-amber-700 hover:bg-amber-50'}`}>
+                {currentCellProtection?.hidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+                {currentCellProtection?.hidden ? '取消单元格遮盖' : '对其他人隐藏此单元格'}
               </button>
               {currentCellProtection && (
                 <button
@@ -3409,11 +3436,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                                 <div className="flex min-w-0 items-center gap-2 font-semibold text-slate-700">
                                   {item.scope === 'row' ? <Rows3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : item.scope === 'column' ? <Columns3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : <Square className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} />}
                                   <span className="truncate">{formatProtectionTarget(item)}</span>
+                                  {item.hidden && <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600"><EyeOff className="h-3 w-3" />已遮盖</span>}
                                 </div>
                                 <LocateFixed className="h-3.5 w-3.5 shrink-0 text-slate-300" />
                               </div>
                               <div className="mt-1 leading-5 text-slate-500">{new Date(item.protected_at).toLocaleString('zh-CN')}</div>
-                              <div className="mt-1 truncate leading-5 text-slate-500">允许编辑：{formatEditableUsers(item)}</div>
+                              <div className="mt-1 truncate leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(item)}</div>
                             </button>
                           ))}
                         </div>
@@ -3449,8 +3477,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       {currentProtectionItems.length > 0 && (
         <div className="absolute left-3 top-3 z-20 flex max-w-[60%] flex-wrap gap-2">
 	          {currentProtectionItems.map((item) => {
-                const visual = visualForUser(item.owner_id)
-                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title="点击定位保护区域"><Shield className="h-3 w-3" />{formatProtectionBadge(item)}</button>
+                const visual = item.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(item.owner_id)
+                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title="点击定位保护区域">{item.hidden ? <EyeOff className="h-3 w-3" /> : <Shield className="h-3 w-3" />}{formatProtectionBadge(item)}</button>
               })}
 	        </div>
 	      )}

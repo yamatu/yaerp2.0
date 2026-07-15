@@ -427,7 +427,7 @@ func (s *SheetService) detectSheetPDFBounds(snapshot *univerExportWorksheet, ctx
 }
 
 func (s *SheetService) buildSheetPDFGridFromRows(ctx *sheetExportContext) (*sheetPDFGrid, error) {
-	rows, err := s.sheetRepo.GetRows(ctx.Sheet.ID)
+	rows, err := s.GetSheetDataForUser(ctx.Sheet.ID, ctx.UserID)
 	if err != nil {
 		return nil, err
 	}

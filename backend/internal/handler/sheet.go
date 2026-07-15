@@ -128,13 +128,17 @@ func (h *SheetHandler) broadcastSheetCellChanges(c *gin.Context, sheetIDs []int6
 		if len(targetChanges) == 0 {
 			continue
 		}
+		touchesHidden, checkErr := h.sheetService.CellChangesTouchHiddenProtection(sheetID, targetChanges)
+		if checkErr != nil {
+			log.Printf("failed to inspect hidden sheet cells for sheet %d: %v", sheetID, checkErr)
+			touchesHidden = true
+		}
 
-		payload, err := json.Marshal(gin.H{
-			"type":    "batch_update",
-			"sheetId": sheetID,
-			"userId":  userID,
-			"changes": targetChanges,
-		})
+		message := gin.H{"type": "batch_update", "sheetId": sheetID, "userId": userID, "changes": targetChanges}
+		if touchesHidden {
+			message = gin.H{"type": "sheet_reload", "sheetId": sheetID, "userId": userID}
+		}
+		payload, err := json.Marshal(message)
 		if err != nil {
 			log.Printf("failed to marshal sheet cell changes payload for sheet %d: %v", sheetID, err)
 			continue
@@ -380,7 +384,7 @@ func (h *SheetHandler) GetSheet(c *gin.Context) {
 		return
 	}
 
-	sheet, err := h.sheetService.GetSheet(id)
+	sheet, err := h.sheetService.GetSheetForUser(id, c.GetInt64("user_id"))
 	if err != nil {
 		response.NotFound(c, err.Error())
 		return
@@ -551,6 +555,7 @@ func (h *SheetHandler) UpdateProtection(c *gin.Context) {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
 	h.broadcastProtectionUpdated(c, affectedSheetIDs...)
+	h.broadcastSheetReload(c, affectedSheetIDs...)
 
 	response.OK(c, gin.H{
 		"sheet":       updatedSheet,
@@ -590,6 +595,7 @@ func (h *SheetHandler) UpdateProtectionBatch(c *gin.Context) {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
 	h.broadcastProtectionUpdated(c, affectedSheetIDs...)
+	h.broadcastSheetReload(c, affectedSheetIDs...)
 
 	response.OK(c, gin.H{
 		"sheet":       updatedSheet,
@@ -632,7 +638,7 @@ func (h *SheetHandler) GetSheetData(c *gin.Context) {
 		response.BadRequest(c, "invalid sheet id")
 		return
 	}
-	rows, err := h.sheetService.GetSheetData(id)
+	rows, err := h.sheetService.GetSheetDataForUser(id, c.GetInt64("user_id"))
 	if err != nil {
 		response.ServerError(c, err.Error())
 		return

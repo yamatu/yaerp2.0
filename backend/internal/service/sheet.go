@@ -26,6 +26,7 @@ type protectionOwner struct {
 	OwnerID         int64   `json:"ownerId"`
 	OwnerName       string  `json:"ownerName"`
 	EditableUserIDs []int64 `json:"editableUserIds,omitempty"`
+	Hidden          bool    `json:"hidden,omitempty"`
 	ProtectedAt     string  `json:"protectedAt"`
 }
 
@@ -110,7 +111,11 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 			continue
 		}
 		if canManageWorkbook {
-			visibleSheets = append(visibleSheets, sheet)
+			masked, err := s.maskSheetForUser(&sheet, userID)
+			if err != nil {
+				return nil, err
+			}
+			visibleSheets = append(visibleSheets, *masked)
 			continue
 		}
 		matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
@@ -118,7 +123,11 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 			return nil, fmt.Errorf("check sheet %d permission: %w", sheet.ID, err)
 		}
 		if matrix.Sheet.CanView {
-			visibleSheets = append(visibleSheets, sheet)
+			masked, err := s.maskSheetForUser(&sheet, userID)
+			if err != nil {
+				return nil, err
+			}
+			visibleSheets = append(visibleSheets, *masked)
 		}
 	}
 
@@ -402,6 +411,11 @@ func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.S
 	if err := s.ensureSheetModificationAllowed(existing, userID); err != nil {
 		return err
 	}
+	restoredConfig, err := s.restoreHiddenCellsForUser(userID, existing.Config, sheet.Config, existing.Columns)
+	if err != nil {
+		return err
+	}
+	sheet.Config = restoredConfig
 	if err := s.ensureEditableCellsAuthorized(userID, existing, sheet); err != nil {
 		return err
 	}
@@ -804,6 +818,10 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 	if err := applySheetLifecycleState(updatedSheet); err != nil {
 		return nil, nil, err
 	}
+	updatedSheet, err = s.maskSheetForUser(updatedSheet, userID)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	return updatedSheet, snapshot, nil
 }
@@ -876,6 +894,10 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 		return nil, nil, err
 	}
 	if err := applySheetLifecycleState(updatedSheet); err != nil {
+		return nil, nil, err
+	}
+	updatedSheet, err = s.maskSheetForUser(updatedSheet, userID)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -978,6 +1000,27 @@ func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey strin
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, rowIndex, colKey), nil
+	}
+	if strings.TrimSpace(colKey) == "" {
+		for protectedColumn, info := range protections.Columns {
+			if info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID) {
+				continue
+			}
+			return true, buildProtectionMessage("column", info.OwnerName, rowIndex, protectedColumn), nil
+		}
+		rowPrefix := fmt.Sprintf("%d:", rowIndex)
+		for key, info := range protections.Cells {
+			if !strings.HasPrefix(key, rowPrefix) || info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID) {
+				continue
+			}
+			protectedColumn := strings.TrimPrefix(key, rowPrefix)
+			return true, buildProtectionMessage("cell", info.OwnerName, rowIndex, protectedColumn), nil
+		}
+		for key, locked := range legacyLocks {
+			if locked && strings.HasPrefix(key, rowPrefix) {
+				return true, fmt.Sprintf("第 %d 行包含受保护的单元格", rowIndex+2), nil
+			}
+		}
 	}
 
 	legacyKey := fmt.Sprintf("%d:%s", rowIndex, colKey)
@@ -1110,6 +1153,7 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 			OwnerID:         ownerID,
 			OwnerName:       ownerName,
 			EditableUserIDs: normalizeProtectionEditableUsers(req.EditableUserIDs, ownerID),
+			Hidden:          resolveProtectionHidden(req.Hidden, info.Hidden),
 			ProtectedAt:     protectedAt,
 		}
 		return nil
@@ -1129,6 +1173,13 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 	}
 
 	return nil
+}
+
+func resolveProtectionHidden(requested *bool, current bool) bool {
+	if requested == nil {
+		return current
+	}
+	return *requested
 }
 
 func finalizeProtectionPayload(payload map[string]interface{}, protections protectionMaps, legacyLocks map[string]bool) {
@@ -1158,6 +1209,7 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner) []mode
 			OwnerID:         info.OwnerID,
 			OwnerName:       info.OwnerName,
 			EditableUserIDs: append([]int64(nil), info.EditableUserIDs...),
+			Hidden:          info.Hidden,
 		}
 		if parsedTime, err := time.Parse(time.RFC3339, info.ProtectedAt); err == nil {
 			entry.ProtectedAt = parsedTime
