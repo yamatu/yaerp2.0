@@ -22,6 +22,7 @@ const CHAT_LIST_CACHE_MS = Number(process.env.WHATSAPP_CHAT_LIST_CACHE_MS || 100
 const CHAT_METADATA_CACHE_MS = Number(process.env.WHATSAPP_CHAT_METADATA_CACHE_MS || 10 * 60 * 1000)
 const CHAT_METADATA_LIMIT = Number(process.env.WHATSAPP_CHAT_METADATA_LIMIT || 30)
 const CHAT_METADATA_TIMEOUT_MS = Number(process.env.WHATSAPP_CHAT_METADATA_TIMEOUT_MS || 8000)
+const AVATAR_MAX_BYTES = Number(process.env.WHATSAPP_AVATAR_MAX_BYTES || 5 * 1024 * 1024)
 
 const app = express()
 app.use(express.json({ limit: '40mb' }))
@@ -171,6 +172,47 @@ function serializeId(value) {
 async function safeProfilePic(client, contactId) {
   if (!contactId) return ''
   try { return await client.getProfilePicUrl(contactId) || '' } catch { return '' }
+}
+
+async function fetchProfilePicData(session, contactId) {
+  const sourceUrl = await safeProfilePic(session.client, contactId)
+  if (!sourceUrl) return null
+  const page = session.client?.pupPage
+  if (page) {
+    try {
+      const result = await withTimeout(page.evaluate(async ({ url, maxBytes }) => {
+        const response = await fetch(url)
+        if (!response.ok) throw new Error(`avatar request failed: ${response.status}`)
+        const buffer = await response.arrayBuffer()
+        if (buffer.byteLength > maxBytes) throw new Error('avatar is too large')
+        const bytes = new Uint8Array(buffer)
+        let binary = ''
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+        }
+        return {
+          data: btoa(binary),
+          mimetype: response.headers.get('content-type') || 'image/jpeg',
+        }
+      }, { url: sourceUrl, maxBytes: AVATAR_MAX_BYTES }), CHAT_METADATA_TIMEOUT_MS, 'avatar download')
+      return { ...result, sourceUrl }
+    } catch (error) {
+      console.error(`Browser avatar download failed (${session.id}/${contactId}):`, error.message)
+    }
+  }
+  try {
+    const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(CHAT_METADATA_TIMEOUT_MS) })
+    if (!response.ok) return null
+    const buffer = Buffer.from(await response.arrayBuffer())
+    if (buffer.length > AVATAR_MAX_BYTES) return null
+    return {
+      data: buffer.toString('base64'),
+      mimetype: response.headers.get('content-type') || 'image/jpeg',
+      sourceUrl,
+    }
+  } catch {
+    return null
+  }
 }
 
 async function serializeMessage(session, message, includeMedia = false, includeContact = true) {
@@ -571,7 +613,7 @@ function refreshChatMetadata(session, chats) {
   return session.chatMetadataPromise
 }
 
-async function getChatList(session, limit) {
+async function getChatList(session, limit, waitForMetadata = false) {
   const now = Date.now()
   if (session.chatCache.items.length > 0 && now - session.chatCache.loadedAt < CHAT_LIST_CACHE_MS) {
     return mergeChatMetadata(session, session.chatCache.items).slice(0, limit)
@@ -589,7 +631,10 @@ async function getChatList(session, limit) {
       const selected = chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, Math.max(limit, 200))
       session.chatCache.items = mergeChatMetadata(session, selected.map(serializeChatBasic))
       session.chatCache.loadedAt = Date.now()
-      if (Date.now() - session.chatCache.metadataLoadedAt >= CHAT_METADATA_CACHE_MS) void refreshChatMetadata(session, selected)
+      if (Date.now() - session.chatCache.metadataLoadedAt >= CHAT_METADATA_CACHE_MS) {
+        const refresh = refreshChatMetadata(session, selected)
+        if (waitForMetadata && refresh) await refresh
+      }
       return session.chatCache.items
     }).catch(async (error) => {
       if (session.chatCache.items.length === 0) {
@@ -692,7 +737,11 @@ app.put('/sessions/:sessionId/profile/about', requireSession, requireReady, asyn
 app.get('/sessions/:sessionId/chats', requireSession, requireReady, async (req, res, next) => {
   try {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200)))
-    res.json(await getChatList(req.whatsappSession, limit))
+    const waitForMetadata = req.query.metadata === '1' || req.query.metadata === 'true'
+    if (waitForMetadata && req.whatsappSession.chatCache.metadata.size === 0) {
+      req.whatsappSession.chatCache.loadedAt = 0
+    }
+    res.json(await getChatList(req.whatsappSession, limit, waitForMetadata))
   } catch (error) { next(error) }
 })
 app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (req, res, next) => {
@@ -706,6 +755,15 @@ app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (re
       isBusiness: Boolean(contact.isBusiness), isMyContact: Boolean(contact.isMyContact),
       profilePicUrl: basic ? '' : await safeProfilePic(req.whatsappSession.client, serializeId(contact.id)),
     })))
+  } catch (error) { next(error) }
+})
+app.get('/sessions/:sessionId/avatars/:contactId', requireSession, requireReady, async (req, res, next) => {
+  try {
+    const contactId = String(req.params.contactId || '').trim()
+    if (!contactId) return res.status(400).json({ error: 'contact id is required' })
+    const avatar = await fetchProfilePicData(req.whatsappSession, contactId)
+    if (!avatar?.data) return res.status(404).json({ error: 'avatar is not available' })
+    res.json(avatar)
   } catch (error) { next(error) }
 })
 app.get('/sessions/:sessionId/chats/:chatId/messages', requireSession, requireReady, async (req, res, next) => {

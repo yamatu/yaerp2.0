@@ -67,6 +67,7 @@ func main() {
 	userRepo := repo.NewUserRepo(db)
 	sheetRepo := repo.NewSheetRepo(db)
 	permRepo := repo.NewPermissionRepo(db)
+	departmentRepo := repo.NewDepartmentRepo(db)
 	attachRepo := repo.NewAttachmentRepo(db)
 	folderRepo := repo.NewFolderRepo(db)
 	channelRepo := repo.NewChannelRepo(db)
@@ -75,7 +76,8 @@ func main() {
 
 	// Services
 	authService := service.NewAuthService(userRepo, jwtUtil, rdb)
-	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo)
+	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo, departmentRepo)
+	departmentService := service.NewDepartmentService(departmentRepo, userRepo)
 	sheetService := service.NewSheetService(sheetRepo, permService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, channelRepo, cfg.JWT.Secret)
 	go func() {
@@ -145,6 +147,7 @@ func main() {
 	userHandler := handler.NewUserHandler(userRepo, authService, uploadService)
 	roleHandler := handler.NewRoleHandler(db)
 	permHandler := handler.NewPermissionHandler(permService)
+	departmentHandler := handler.NewDepartmentHandler(departmentService)
 	folderHandler := handler.NewFolderHandler(folderService)
 	backupHandler := handler.NewBackupHandler(backupService)
 	aiHandler := handler.NewAIHandler(aiService, hub)
@@ -165,6 +168,7 @@ func main() {
 		auth.POST("/refresh", authHandler.RefreshToken)
 	}
 	r.GET("/api/files/:id/content", uploadHandler.ServeFile)
+	r.GET("/api/whatsapp/avatar/:userId/:chatId", whatsAppHandler.ServeAvatar)
 	r.POST("/api/internal/whatsapp/events", whatsAppHandler.Webhook)
 
 	// Protected routes
@@ -176,6 +180,7 @@ func main() {
 		api.POST("/auth/change-password", authHandler.ChangePassword)
 		api.PUT("/auth/avatar", userHandler.UpdateOwnAvatar)
 		api.GET("/users/shareable", userHandler.ListShareableUsers)
+		api.GET("/departments", departmentHandler.List)
 
 		// Workbooks
 		api.GET("/workbooks", sheetHandler.ListWorkbooks)
@@ -325,10 +330,20 @@ func main() {
 			admin.POST("/permissions/sheet", permHandler.SetSheetPermission)
 			admin.POST("/permissions/user-sheet", permHandler.SetUserSheetPermission)
 			admin.POST("/permissions/cell", permHandler.SetCellPermission)
+			admin.POST("/permissions/principal-sheet", permHandler.SetPrincipalSheetPermission)
+			admin.POST("/permissions/principal-cell", permHandler.SetPrincipalCellPermission)
+			admin.DELETE("/permissions/principal-cell/:id", permHandler.DeletePrincipalCellPermission)
+			admin.GET("/permissions/sheets/:id/principals/:principalType/:principalId", permHandler.GetPrincipalPermissionConfig)
 			admin.GET("/permissions/sheets/:id/roles/:roleId", permHandler.GetPermissionMatrixForRole)
 			admin.GET("/permissions/sheets/:id/users", permHandler.ListUserSheetPermissions)
 			admin.GET("/permissions/sheets/:id/users/:userId", permHandler.GetPermissionMatrixForUser)
 			admin.POST("/workbooks/:id/assign", sheetHandler.AssignWorkbook)
+
+			// Departments
+			admin.POST("/departments", departmentHandler.Create)
+			admin.PUT("/departments/:id", departmentHandler.Update)
+			admin.DELETE("/departments/:id", departmentHandler.Delete)
+			admin.PUT("/departments/:id/members", departmentHandler.SetMembers)
 
 			// Attachments (admin)
 			admin.DELETE("/attachments/:id", uploadHandler.DeleteFile)

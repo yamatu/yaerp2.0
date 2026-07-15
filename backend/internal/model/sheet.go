@@ -90,12 +90,13 @@ type AssignWorkbookRequest struct {
 }
 
 type UpdateProtectionRequest struct {
-	Scope           string  `json:"scope" binding:"required,oneof=row column cell"`
-	Action          string  `json:"action" binding:"required,oneof=lock unlock"`
-	RowIndex        *int    `json:"row_index,omitempty"`
-	ColumnKey       *string `json:"column_key,omitempty"`
-	EditableUserIDs []int64 `json:"editable_user_ids,omitempty"`
-	Hidden          *bool   `json:"hidden,omitempty"`
+	Scope                 string  `json:"scope" binding:"required,oneof=row column cell"`
+	Action                string  `json:"action" binding:"required,oneof=lock unlock"`
+	RowIndex              *int    `json:"row_index,omitempty"`
+	ColumnKey             *string `json:"column_key,omitempty"`
+	EditableUserIDs       []int64 `json:"editable_user_ids,omitempty"`
+	EditableDepartmentIDs []int64 `json:"editable_department_ids,omitempty"`
+	Hidden                *bool   `json:"hidden,omitempty"`
 }
 
 type BatchUpdateProtectionRequest struct {
@@ -107,15 +108,16 @@ type UpdateSheetStateRequest struct {
 }
 
 type ProtectionInfo struct {
-	Scope           string    `json:"scope"`
-	Key             string    `json:"key"`
-	RowIndex        *int      `json:"row_index,omitempty"`
-	ColumnKey       *string   `json:"column_key,omitempty"`
-	OwnerID         int64     `json:"owner_id"`
-	OwnerName       string    `json:"owner_name"`
-	EditableUserIDs []int64   `json:"editable_user_ids,omitempty"`
-	Hidden          bool      `json:"hidden,omitempty"`
-	ProtectedAt     time.Time `json:"protected_at"`
+	Scope                 string    `json:"scope"`
+	Key                   string    `json:"key"`
+	RowIndex              *int      `json:"row_index,omitempty"`
+	ColumnKey             *string   `json:"column_key,omitempty"`
+	OwnerID               int64     `json:"owner_id"`
+	OwnerName             string    `json:"owner_name"`
+	EditableUserIDs       []int64   `json:"editable_user_ids,omitempty"`
+	EditableDepartmentIDs []int64   `json:"editable_department_ids,omitempty"`
+	Hidden                bool      `json:"hidden,omitempty"`
+	ProtectedAt           time.Time `json:"protected_at"`
 }
 
 type ProtectionSnapshot struct {

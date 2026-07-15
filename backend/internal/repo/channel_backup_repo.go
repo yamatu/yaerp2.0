@@ -3,6 +3,7 @@ package repo
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"yaerp/internal/model"
 )
@@ -30,10 +31,11 @@ func (r *ChannelRepo) ListAllMessages(channelID int64) ([]model.ChannelMessage, 
 func (r *ChannelRepo) CreateBackup(backup *model.ChannelBackup) error {
 	return r.db.QueryRow(
 		`INSERT INTO channel_backups (
-		     source_channel_id, source_channel_name, created_by, filename, attachment_id, message_count, size, created_at
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) RETURNING id, created_at`,
+		     source_channel_id, source_channel_name, created_by, filename, attachment_id, message_count, size,
+		     checksum, snapshot_version, verified_at, created_at
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) RETURNING id, created_at`,
 		backup.SourceChannelID, backup.SourceChannelName, backup.CreatedBy, backup.Filename,
-		backup.AttachmentID, backup.MessageCount, backup.Size,
+		backup.AttachmentID, backup.MessageCount, backup.Size, backup.Checksum, backup.SnapshotVersion, backup.VerifiedAt,
 	).Scan(&backup.ID, &backup.CreatedAt)
 }
 
@@ -41,6 +43,7 @@ func (r *ChannelRepo) ListBackups(userID int64, includeAll bool) ([]model.Channe
 	rows, err := r.db.Query(
 		`SELECT b.id, b.source_channel_id, b.source_channel_name, b.created_by,
 		        COALESCE(u.username, ''), b.filename, b.attachment_id, b.message_count, b.size,
+		        b.checksum, b.snapshot_version, b.verified_at,
 		        COUNT(br.id), MAX(br.created_at), b.created_at
 		   FROM channel_backups b
 		   LEFT JOIN users u ON u.id = b.created_by
@@ -71,6 +74,7 @@ func (r *ChannelRepo) GetBackup(id int64) (*model.ChannelBackup, error) {
 	return scanChannelBackup(r.db.QueryRow(
 		`SELECT b.id, b.source_channel_id, b.source_channel_name, b.created_by,
 		        COALESCE(u.username, ''), b.filename, b.attachment_id, b.message_count, b.size,
+		        b.checksum, b.snapshot_version, b.verified_at,
 		        COUNT(br.id), MAX(br.created_at), b.created_at
 		   FROM channel_backups b
 		   LEFT JOIN users u ON u.id = b.created_by
@@ -92,6 +96,16 @@ func (r *ChannelRepo) CreateBackupRestore(restore *model.ChannelBackupRestore) e
 		 VALUES ($1,$2,$3,$4,NOW()) RETURNING id, created_at`,
 		restore.BackupID, restore.TargetChannelID, restore.RestoredBy, restore.MessageCount,
 	).Scan(&restore.ID, &restore.CreatedAt)
+}
+
+func (r *ChannelRepo) MarkBackupVerified(backupID int64, checksum string, version int) error {
+	_, err := r.db.Exec(
+		`UPDATE channel_backups
+		 SET checksum = CASE WHEN checksum = '' THEN $1 ELSE checksum END,
+		     snapshot_version = $2, verified_at = NOW()
+		 WHERE id = $3`, checksum, version, backupID,
+	)
+	return err
 }
 
 func (r *ChannelRepo) ListBackupRestores(backupID int64) ([]model.ChannelBackupRestore, error) {
@@ -127,13 +141,21 @@ func (r *ChannelRepo) ListBackupRestores(backupID int64) ([]model.ChannelBackupR
 }
 
 func (r *ChannelRepo) RestoreMessage(message *model.ChannelMessage) error {
-	return r.db.QueryRow(
+	return restoreChannelMessage(r.db, message)
+}
+
+type channelMessageQueryer interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func restoreChannelMessage(queryer channelMessageQueryer, message *model.ChannelMessage) error {
+	return queryer.QueryRow(
 		`INSERT INTO channel_messages (
 		     channel_id, sender_id, content, attachment_id, linked_workbook_id, linked_sheet_id,
 		     linked_summary_id, reply_to_message_id, sender_type, assistant_id,
 		     external_source, external_sender_name, external_sender_address, external_sender_avatar,
 		     reply_external_message_id, reply_snapshot_sender, reply_snapshot_content,
-		     recalled_at, edited_at, created_at
+		     forwarded_from_message_id, recalled_at, edited_at, created_at
 		 ) VALUES (
 		     $1, (SELECT id FROM users WHERE id = NULLIF($2,0)), $3,
 		     (SELECT id FROM attachments WHERE id = $4),
@@ -142,23 +164,98 @@ func (r *ChannelRepo) RestoreMessage(message *model.ChannelMessage) error {
 		     (SELECT id FROM ai_summary_pages WHERE id = $7), $8,
 		     CASE WHEN $9 IN ('user','ai','whatsapp') THEN $9 ELSE 'user' END,
 		     (SELECT id FROM ai_assistants WHERE id = $10), $11, $12, $13, $14, $15, $16, $17,
-		     $18, $19, $20
+		     $18, $19, $20, $21
 		 ) RETURNING id, created_at`,
 		message.ChannelID, message.SenderID, message.Content, message.AttachmentID,
 		message.LinkedWorkbookID, message.LinkedSheetID, message.LinkedSummaryID, message.ReplyToMessageID,
 		message.SenderType, message.AssistantID, message.ExternalSource, message.ExternalSenderName,
 		message.ExternalSenderAddress, message.ExternalSenderAvatar, message.ReplyExternalMessageID,
-		message.ReplySnapshotSender, message.ReplySnapshotContent, message.RecalledAt, message.EditedAt, message.CreatedAt,
+		message.ReplySnapshotSender, message.ReplySnapshotContent, message.ForwardedFromMessageID,
+		message.RecalledAt, message.EditedAt, message.CreatedAt,
 	).Scan(&message.ID, &message.CreatedAt)
+}
+
+func (r *ChannelRepo) RestoreBackupSnapshot(items []model.ChannelRestoreMessage, restore *model.ChannelBackupRestore) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	messageMap := make(map[int64]int64, len(items))
+	for index := range items {
+		items[index].Message.ReplyToMessageID = nil
+		items[index].Message.ForwardedFromMessageID = nil
+		if err := restoreChannelMessage(tx, &items[index].Message); err != nil {
+			return fmt.Errorf("restore message %d: %w", index+1, err)
+		}
+		if strings.TrimSpace(items[index].Message.TranslatedContent) != "" {
+			language := strings.TrimSpace(items[index].Message.TranslationLanguage)
+			if language == "" {
+				language = "zh-CN"
+			}
+			translatedAt := items[index].Message.TranslatedAt
+			if translatedAt == nil {
+				translatedAt = &items[index].Message.CreatedAt
+			}
+			if _, err := tx.Exec(
+				`INSERT INTO channel_message_translations
+				 (message_id, target_language, source_content, translated_content, created_at, updated_at)
+				 VALUES ($1,$2,$3,$4,$5,$5)
+				 ON CONFLICT (message_id, target_language) DO UPDATE SET
+				 source_content = EXCLUDED.source_content, translated_content = EXCLUDED.translated_content,
+				 updated_at = EXCLUDED.updated_at`,
+				items[index].Message.ID, language, items[index].Message.Content,
+				items[index].Message.TranslatedContent, translatedAt,
+			); err != nil {
+				return fmt.Errorf("restore message translation %d: %w", index+1, err)
+			}
+		}
+		messageMap[items[index].OriginalID] = items[index].Message.ID
+	}
+	for index := range items {
+		var replyID, forwardedID *int64
+		if original := items[index].OriginalReplyToMessageID; original != nil {
+			if restored, exists := messageMap[*original]; exists {
+				replyID = &restored
+			}
+		}
+		if original := items[index].OriginalForwardedMessageID; original != nil {
+			if restored, exists := messageMap[*original]; exists {
+				forwardedID = &restored
+			}
+		}
+		if replyID == nil && forwardedID == nil {
+			continue
+		}
+		if _, err := tx.Exec(
+			`UPDATE channel_messages SET reply_to_message_id = $1, forwarded_from_message_id = $2 WHERE id = $3`,
+			replyID, forwardedID, items[index].Message.ID,
+		); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE channels SET updated_at = NOW() WHERE id = $1`, restore.TargetChannelID); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(
+		`INSERT INTO channel_backup_restores (backup_id, target_channel_id, restored_by, message_count, created_at)
+		 VALUES ($1,$2,$3,$4,NOW()) RETURNING id, created_at`,
+		restore.BackupID, restore.TargetChannelID, restore.RestoredBy, restore.MessageCount,
+	).Scan(&restore.ID, &restore.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func scanChannelBackup(scanner interface{ Scan(...any) error }) (*model.ChannelBackup, error) {
 	var backup model.ChannelBackup
 	var sourceID, createdBy sql.NullInt64
-	var lastRestored sql.NullTime
+	var lastRestored, verifiedAt sql.NullTime
 	if err := scanner.Scan(
 		&backup.ID, &sourceID, &backup.SourceChannelName, &createdBy, &backup.CreatedByName,
 		&backup.Filename, &backup.AttachmentID, &backup.MessageCount, &backup.Size,
+		&backup.Checksum, &backup.SnapshotVersion, &verifiedAt,
 		&backup.RestoreCount, &lastRestored, &backup.CreatedAt,
 	); err != nil {
 		return nil, fmt.Errorf("scan channel backup: %w", err)
@@ -171,6 +268,9 @@ func scanChannelBackup(scanner interface{ Scan(...any) error }) (*model.ChannelB
 	}
 	if lastRestored.Valid {
 		backup.LastRestoredAt = &lastRestored.Time
+	}
+	if verifiedAt.Valid {
+		backup.VerifiedAt = &verifiedAt.Time
 	}
 	return &backup, nil
 }

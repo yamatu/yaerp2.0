@@ -61,7 +61,8 @@ func (h *CellHandler) BatchUpdate(c *gin.Context) {
 	}
 
 	if err := h.sheetService.UpdateCells(userID, req.Changes); err != nil {
-		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
 			response.Forbidden(c, err.Error())
 			return
 		}
@@ -155,7 +156,8 @@ func (h *CellHandler) DeleteRow(c *gin.Context) {
 	}
 
 	if err := h.sheetService.DeleteRow(userID, sheetID, rowIndex); err != nil {
-		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
 			response.Forbidden(c, err.Error())
 			return
 		}

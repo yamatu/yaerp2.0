@@ -9,6 +9,17 @@ export interface User {
   roles?: Role[]
 }
 
+export interface Department {
+	id: number
+	name: string
+	description: string
+	created_by?: number
+	member_ids: number[]
+	member_count: number
+	created_at: string
+	updated_at: string
+}
+
 export interface AuthUser extends User {
   roles: Role[]
 }
@@ -99,6 +110,7 @@ export interface ProtectionOwner {
   ownerId: number
   ownerName: string
   editableUserIds?: number[]
+  editableDepartmentIds?: number[]
   hidden?: boolean
   protectedAt: string
 }
@@ -111,6 +123,7 @@ export interface ProtectionInfo {
   owner_id: number
   owner_name: string
   editable_user_ids?: number[]
+  editable_department_ids?: number[]
   hidden?: boolean
   protected_at: string
 }
@@ -209,6 +222,7 @@ export interface PermissionMatrix {
     canDelete: boolean
     canExport: boolean
   }
+  defaultPermission?: string
   rows: Record<string, string>
   columns: Record<string, string>
   cells: Record<string, string>
@@ -423,6 +437,9 @@ export interface ChannelBackup {
   download_url: string
   message_count: number
   size: number
+  checksum?: string
+  snapshot_version: number
+  verified_at?: string | null
   restore_count: number
   last_restored_at?: string | null
   created_at: string

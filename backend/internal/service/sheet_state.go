@@ -201,11 +201,17 @@ func applyWorkbookStateToPermissionMatrix(workbook *model.Workbook, matrix *mode
 		matrix.Sheet.CanEdit = false
 		matrix.Sheet.CanDelete = false
 		matrix.Sheet.CanExport = false
+		matrix.DefaultPermission = "none"
+		setAllScopedPermissions(matrix, "none")
 		return
 	}
 	if workbook.IsLocked {
 		matrix.Sheet.CanEdit = false
 		matrix.Sheet.CanDelete = false
+		if matrix.DefaultPermission == "write" {
+			matrix.DefaultPermission = "read"
+		}
+		downgradeScopedWritePermissions(matrix)
 	}
 }
 

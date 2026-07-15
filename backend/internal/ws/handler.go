@@ -151,32 +151,60 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 				continue
 			}
 
-			broadcastMessage := msg
-			if hidden, hiddenErr := h.mutationTouchesHiddenProtection(client.SheetID, &msg); hiddenErr != nil {
-				log.Printf("failed to inspect hidden websocket mutation for sheet %d: %v", client.SheetID, hiddenErr)
-				broadcastMessage = Message{Type: "sheet_sync", SheetID: client.SheetID, UserID: client.UserID, Username: client.Username, ClientID: client.ClientID}
-			} else if hidden {
-				broadcastMessage = Message{Type: "sheet_sync", SheetID: client.SheetID, UserID: client.UserID, Username: client.Username, ClientID: client.ClientID}
+			if msg.Type == "cell_update" || msg.Type == "batch_update" {
+				h.broadcastCellMutation(client, &msg)
+				continue
 			}
-			broadcastData, _ := json.Marshal(broadcastMessage)
+
+			broadcastData, _ := json.Marshal(msg)
 			h.Hub.BroadcastToSheet(client.SheetID, broadcastData, client)
 		}
 	}
 }
 
-func (h *WSHandler) mutationTouchesHiddenProtection(sheetID int64, msg *Message) (bool, error) {
+func (h *WSHandler) broadcastCellMutation(client *Client, msg *Message) {
+	changes := make([]model.CellUpdate, 0, 1)
 	switch msg.Type {
 	case "cell_update":
-		return h.SheetService.CellHasHiddenProtection(sheetID, msg.Row, msg.Col)
+		changes = append(changes, model.CellUpdate{
+			SheetID: client.SheetID,
+			Row:     msg.Row,
+			Col:     msg.Col,
+			Value:   msg.Value,
+		})
 	case "batch_update":
-		var changes []model.CellUpdate
 		if err := json.Unmarshal(msg.Changes, &changes); err != nil {
-			return false, err
+			log.Printf("failed to decode websocket cell changes for sheet %d: %v", client.SheetID, err)
+			return
 		}
-		return h.SheetService.CellChangesTouchHiddenProtection(sheetID, changes)
-	default:
-		return false, nil
 	}
+
+	h.Hub.BroadcastToSheetByUser(client.SheetID, client.ClientID, func(recipientUserID int64) []byte {
+		filteredChanges, err := h.SheetService.RealtimeCellChangesForUser(client.SheetID, recipientUserID, changes)
+		if err != nil {
+			log.Printf("failed to build websocket cell changes for sheet %d user %d: %v", client.SheetID, recipientUserID, err)
+			return nil
+		}
+		if len(filteredChanges) == 0 {
+			return nil
+		}
+		rawChanges, err := json.Marshal(filteredChanges)
+		if err != nil {
+			return nil
+		}
+		payload, err := json.Marshal(Message{
+			Type:     "batch_update",
+			SheetID:  client.SheetID,
+			Changes:  rawChanges,
+			UserID:   client.UserID,
+			Username: client.Username,
+			ClientID: client.ClientID,
+		})
+		if err != nil {
+			return nil
+		}
+		return payload
+	})
 }
 
 func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error {
@@ -211,7 +239,10 @@ func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error 
 	case "row_insert":
 		return h.validateRowMutation(client, msg.AfterRow)
 	case "row_delete":
-		return h.validateRowMutation(client, msg.Row)
+		if err := h.validateRowMutation(client, msg.Row); err != nil {
+			return err
+		}
+		return h.SheetService.EnsureRowDeletionAllowed(client.UserID, client.SheetID, msg.Row)
 	}
 
 	return nil

@@ -234,6 +234,49 @@ func (h *Hub) BroadcastToSheetExceptClientID(sheetID int64, data []byte, exclude
 	}
 }
 
+// BroadcastToSheetByUser builds one permission-aware payload per recipient user.
+// Multiple tabs owned by the same user reuse the same payload.
+func (h *Hub) BroadcastToSheetByUser(sheetID int64, excludeClientID string, payloadForUser func(userID int64) []byte) {
+	if payloadForUser == nil {
+		return
+	}
+
+	h.mu.RLock()
+	clients := h.sheets[sheetID]
+	userIDs := make(map[int64]struct{}, len(clients))
+	for client := range clients {
+		if excludeClientID != "" && client.ClientID == excludeClientID {
+			continue
+		}
+		userIDs[client.UserID] = struct{}{}
+	}
+	h.mu.RUnlock()
+
+	payloads := make(map[int64][]byte, len(userIDs))
+	for userID := range userIDs {
+		if payload := payloadForUser(userID); len(payload) > 0 {
+			payloads[userID] = payload
+		}
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for client := range h.sheets[sheetID] {
+		if excludeClientID != "" && client.ClientID == excludeClientID {
+			continue
+		}
+		payload := payloads[client.UserID]
+		if len(payload) == 0 {
+			continue
+		}
+		select {
+		case client.Send <- payload:
+		default:
+			go func(c *Client) { h.unregister <- c }(client)
+		}
+	}
+}
+
 func (h *Hub) BroadcastAll(data []byte) {
 	h.mu.RLock()
 	targets := make([]*Client, 0, len(h.clients))

@@ -3051,6 +3051,11 @@ func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, co
 	if err != nil {
 		return nil, err
 	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentSet := int64Set(departmentIDs)
 	result := make([]aiPreviewRow, 0, len(previewRows))
 	for _, row := range previewRows {
 		filtered := make(map[string]interface{}, len(row.Data))
@@ -3059,7 +3064,7 @@ func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, co
 			if err != nil {
 				return nil, err
 			}
-			if allowed && !protectionHidesCell(protections, row.Row, key, userID, isAdmin) {
+			if allowed && !protectionHidesCell(protections, row.Row, key, userID, isAdmin, departmentSet) {
 				filtered[key] = value
 			}
 		}

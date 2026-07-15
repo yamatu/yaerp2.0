@@ -21,6 +21,7 @@ import (
 
 type sheetBroadcaster interface {
 	BroadcastToSheetExceptClientID(sheetID int64, data []byte, excludeClientID string)
+	BroadcastToSheetByUser(sheetID int64, excludeClientID string, payloadForUser func(userID int64) []byte)
 }
 
 type SheetHandler struct {
@@ -128,22 +129,27 @@ func (h *SheetHandler) broadcastSheetCellChanges(c *gin.Context, sheetIDs []int6
 		if len(targetChanges) == 0 {
 			continue
 		}
-		touchesHidden, checkErr := h.sheetService.CellChangesTouchHiddenProtection(sheetID, targetChanges)
-		if checkErr != nil {
-			log.Printf("failed to inspect hidden sheet cells for sheet %d: %v", sheetID, checkErr)
-			touchesHidden = true
-		}
-
-		message := gin.H{"type": "batch_update", "sheetId": sheetID, "userId": userID, "changes": targetChanges}
-		if touchesHidden {
-			message = gin.H{"type": "sheet_reload", "sheetId": sheetID, "userId": userID}
-		}
-		payload, err := json.Marshal(message)
-		if err != nil {
-			log.Printf("failed to marshal sheet cell changes payload for sheet %d: %v", sheetID, err)
-			continue
-		}
-		h.broadcaster.BroadcastToSheetExceptClientID(sheetID, payload, excludeClientID)
+		h.broadcaster.BroadcastToSheetByUser(sheetID, excludeClientID, func(recipientUserID int64) []byte {
+			filteredChanges, err := h.sheetService.RealtimeCellChangesForUser(sheetID, recipientUserID, targetChanges)
+			if err != nil {
+				log.Printf("failed to build realtime sheet changes for sheet %d user %d: %v", sheetID, recipientUserID, err)
+				return nil
+			}
+			if len(filteredChanges) == 0 {
+				return nil
+			}
+			payload, err := json.Marshal(gin.H{
+				"type":    "batch_update",
+				"sheetId": sheetID,
+				"userId":  userID,
+				"changes": filteredChanges,
+			})
+			if err != nil {
+				log.Printf("failed to marshal realtime sheet changes for sheet %d user %d: %v", sheetID, recipientUserID, err)
+				return nil
+			}
+			return payload
+		})
 	}
 }
 
@@ -437,6 +443,15 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	if req.Config != nil {
 		sheet.Config = *req.Config
 	}
+	if err := h.sheetService.ValidateCellChangesForUser(userID, id, req.CellChanges); err != nil {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
 	if !sheetChanged(existing, sheet) {
 		response.OKMsg(c, "sheet updated")
 		return
@@ -464,7 +479,7 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	} else {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
-	if len(req.CellChanges) > 0 {
+	if len(req.CellChanges) > 0 && !sheetStructureChanged(existing, sheet) {
 		h.broadcastSheetCellChanges(c, affectedSheetIDs, req.CellChanges)
 	} else if sheetStructureChanged(existing, sheet) {
 		h.broadcastSheetReload(c, affectedSheetIDs...)
@@ -473,12 +488,18 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 }
 
 func (h *SheetHandler) DeleteSheet(c *gin.Context) {
+	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "invalid sheet id")
 		return
 	}
-	if err := h.sheetService.DeleteSheet(id); err != nil {
+	if err := h.sheetService.DeleteSheetForUser(userID, id); err != nil {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}

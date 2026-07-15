@@ -10,7 +10,7 @@ import (
 
 const hiddenCellPlaceholder = "••••"
 
-func protectionHidesCell(protections protectionMaps, rowIndex int, columnKey string, userID int64, isAdmin bool) bool {
+func protectionHidesCell(protections protectionMaps, rowIndex int, columnKey string, userID int64, isAdmin bool, departmentIDs map[int64]struct{}) bool {
 	if isAdmin {
 		return false
 	}
@@ -20,18 +20,12 @@ func protectionHidesCell(protections protectionMaps, rowIndex int, columnKey str
 		protections.Columns[columnKey],
 	}
 	for _, info := range checks {
-		if !info.Hidden || info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID) {
+		if !info.Hidden || info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs) {
 			continue
 		}
 		return true
 	}
 	return false
-}
-
-func protectionCoversHiddenCell(protections protectionMaps, rowIndex int, columnKey string) bool {
-	return protections.Cells[fmt.Sprintf("%d:%s", rowIndex, columnKey)].Hidden ||
-		protections.Rows[strconv.Itoa(rowIndex)].Hidden ||
-		protections.Columns[columnKey].Hidden
 }
 
 func (s *SheetService) GetSheetForUser(sheetID, userID int64) (*model.Sheet, error) {
@@ -62,18 +56,26 @@ func (s *SheetService) maskSheetForUser(sheet *model.Sheet, userID int64) (*mode
 	if isAdmin {
 		return sheet, nil
 	}
+	matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
 	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
 	if err != nil {
 		return nil, err
 	}
-	if !hasHiddenProtection(protections) {
+	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
 		return sheet, nil
 	}
 	columnKeys, err := parseColumnKeys(sheet.Columns)
 	if err != nil {
 		return nil, err
 	}
-	maskedConfig, err := maskUniverSheetConfig(sheet.Config, columnKeys, protections, userID, false)
+	maskedConfig, err := maskUniverSheetConfig(sheet.Config, columnKeys, protections, matrix, userID, false, int64Set(departmentIDs))
 	if err != nil {
 		return nil, err
 	}
@@ -90,11 +92,20 @@ func (s *SheetService) maskRowsForUser(sheet *model.Sheet, rows []model.Row, use
 	if isAdmin {
 		return rows, nil
 	}
+	matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentSet := int64Set(departmentIDs)
 	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
 	if err != nil {
 		return nil, err
 	}
-	if !hasHiddenProtection(protections) {
+	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
 		return rows, nil
 	}
 	masked := make([]model.Row, len(rows))
@@ -108,7 +119,8 @@ func (s *SheetService) maskRowsForUser(sheet *model.Sheet, rows []model.Row, use
 		}
 		changed := false
 		for columnKey := range data {
-			if protectionHidesCell(protections, masked[index].RowIndex, columnKey, userID, false) {
+			if protectionHidesCell(protections, masked[index].RowIndex, columnKey, userID, false, departmentSet) ||
+				!permissionMatrixAllowsCell(matrix, columnKey, masked[index].RowIndex, "read") {
 				data[columnKey] = json.RawMessage(strconv.Quote(hiddenCellPlaceholder))
 				changed = true
 			}
@@ -124,8 +136,8 @@ func (s *SheetService) maskRowsForUser(sheet *model.Sheet, rows []model.Row, use
 	return masked, nil
 }
 
-func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protections protectionMaps, userID int64, isAdmin bool) (json.RawMessage, error) {
-	if isAdmin || !hasHiddenProtection(protections) || len(config) == 0 {
+func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protections protectionMaps, matrix *model.PermissionMatrix, userID int64, isAdmin bool, departmentIDs map[int64]struct{}) (json.RawMessage, error) {
+	if isAdmin || (!hasHiddenProtection(protections) && !hasRestrictedPermission(matrix)) || len(config) == 0 {
 		return config, nil
 	}
 	var payload map[string]interface{}
@@ -155,7 +167,8 @@ func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protecti
 			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) {
 				continue
 			}
-			if !protectionHidesCell(protections, dataRowIndex, columnKeys[columnIndex], userID, false) {
+			if !protectionHidesCell(protections, dataRowIndex, columnKeys[columnIndex], userID, false, departmentIDs) &&
+				permissionMatrixAllowsCell(matrix, columnKeys[columnIndex], dataRowIndex, "read") {
 				continue
 			}
 			maskedCell := map[string]interface{}{"v": hiddenCellPlaceholder, "t": 1}
@@ -170,7 +183,7 @@ func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protecti
 	return json.Marshal(payload)
 }
 
-func (s *SheetService) restoreHiddenCellsForUser(userID int64, existingConfig, nextConfig, columns json.RawMessage) (json.RawMessage, error) {
+func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existingConfig, nextConfig, columns json.RawMessage) (json.RawMessage, error) {
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
 		return nil, err
@@ -182,7 +195,16 @@ func (s *SheetService) restoreHiddenCellsForUser(userID int64, existingConfig, n
 	if err != nil {
 		return nil, err
 	}
-	if !hasHiddenProtection(protections) {
+	matrix, err := s.permService.GetPermissionMatrix(sheetID, userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentSet := int64Set(departmentIDs)
+	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
 		return nextConfig, nil
 	}
 	columnKeys, err := parseColumnKeys(columns)
@@ -219,7 +241,8 @@ func (s *SheetService) restoreHiddenCellsForUser(userID int64, existingConfig, n
 		dataRowIndex := worksheetRow - 1
 		for columnIndexKey, original := range existingRow {
 			columnIndex, err := strconv.Atoi(columnIndexKey)
-			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) || !protectionHidesCell(protections, dataRowIndex, columnKeys[columnIndex], userID, false) {
+			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) ||
+				!cellIsMasked(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
 				continue
 			}
 			nextRow[columnIndexKey] = original
@@ -237,7 +260,8 @@ func (s *SheetService) restoreHiddenCellsForUser(userID int64, existingConfig, n
 		dataRowIndex := worksheetRow - 1
 		for columnIndexKey := range nextRow {
 			columnIndex, err := strconv.Atoi(columnIndexKey)
-			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) || !protectionHidesCell(protections, dataRowIndex, columnKeys[columnIndex], userID, false) {
+			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) ||
+				!cellIsMasked(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
 				continue
 			}
 			if existingRow, ok := existingCells[worksheetRowKey].(map[string]interface{}); ok {
@@ -269,31 +293,84 @@ func hasHiddenProtection(protections protectionMaps) bool {
 	return false
 }
 
-func (s *SheetService) CellChangesTouchHiddenProtection(sheetID int64, changes []model.CellUpdate) (bool, error) {
-	sheet, err := s.sheetRepo.GetSheet(sheetID)
-	if err != nil {
-		return false, err
+func hasRestrictedPermission(matrix *model.PermissionMatrix) bool {
+	if matrix == nil {
+		return true
 	}
-	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
-	if err != nil {
-		return false, err
+	if matrix.DefaultPermission == "none" {
+		return true
 	}
-	for _, change := range changes {
-		if protectionCoversHiddenCell(protections, change.Row, change.Col) {
-			return true, nil
+	for _, permissions := range []map[string]string{matrix.Rows, matrix.Columns, matrix.Cells} {
+		for _, permission := range permissions {
+			if permission == "none" {
+				return true
+			}
 		}
 	}
-	return false, nil
+	return false
 }
 
-func (s *SheetService) CellHasHiddenProtection(sheetID int64, rowIndex int, columnKey string) (bool, error) {
+func cellIsMasked(protections protectionMaps, matrix *model.PermissionMatrix, rowIndex int, columnKey string, userID int64, departmentIDs map[int64]struct{}) bool {
+	return protectionHidesCell(protections, rowIndex, columnKey, userID, false, departmentIDs) ||
+		!permissionMatrixAllowsCell(matrix, columnKey, rowIndex, "read")
+}
+
+func (s *SheetService) RealtimeCellChangesForUser(sheetID, userID int64, changes []model.CellUpdate) ([]model.CellUpdate, error) {
+	if len(changes) == 0 {
+		return nil, nil
+	}
+
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
-		return false, err
+		return nil, err
+	}
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if isAdmin {
+		return filterRealtimeCellChanges(sheetID, userID, changes, true, protectionMaps{}, nil, nil), nil
+	}
+
+	matrix, err := s.permService.GetPermissionMatrix(sheetID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if matrix == nil || !matrix.Sheet.CanView {
+		return nil, nil
+	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
 	}
 	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return protectionCoversHiddenCell(protections, rowIndex, columnKey), nil
+
+	return filterRealtimeCellChanges(sheetID, userID, changes, false, protections, matrix, int64Set(departmentIDs)), nil
+}
+
+func filterRealtimeCellChanges(
+	sheetID int64,
+	userID int64,
+	changes []model.CellUpdate,
+	isAdmin bool,
+	protections protectionMaps,
+	matrix *model.PermissionMatrix,
+	departmentIDs map[int64]struct{},
+) []model.CellUpdate {
+	filtered := make([]model.CellUpdate, 0, len(changes))
+	for _, change := range changes {
+		if change.Row < 0 || change.Col == "" {
+			continue
+		}
+		next := change
+		next.SheetID = sheetID
+		if !isAdmin && cellIsMasked(protections, matrix, change.Row, change.Col, userID, departmentIDs) {
+			next.Value = json.RawMessage(strconv.Quote(hiddenCellPlaceholder))
+		}
+		filtered = append(filtered, next)
+	}
+	return filtered
 }

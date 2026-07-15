@@ -54,35 +54,33 @@ export function usePermission(sheetId: number) {
     if (!permissions) return false
     if (!permissions.sheet.canEdit) return false
 
-    // Check cell-specific permission
     if (row !== undefined) {
       const cellKey = `${row}:${col}`
-      if (permissions.cells[cellKey] === 'read') return false
-      if (permissions.cells[cellKey] === 'none') return false
+      if (permissions.cells[cellKey]) return permissions.cells[cellKey] === 'write'
 
       const rowKey = `${row}`
-      if (permissions.rows[rowKey] === 'read') return false
-      if (permissions.rows[rowKey] === 'none') return false
+      if (permissions.rows[rowKey]) return permissions.rows[rowKey] === 'write'
     }
 
-    // Check column permission
     const colPerm = permissions.columns[col]
-    if (colPerm === 'read' || colPerm === 'none') return false
+    if (colPerm) return colPerm === 'write'
 
-    return true
+    return permissions.defaultPermission ? permissions.defaultPermission === 'write' : permissions.sheet.canEdit
   }
 
   const canViewColumn = (col: string): boolean => {
     if (!permissions) return false
     if (!permissions.sheet.canView) return false
     const colPerm = permissions.columns[col]
-    return colPerm !== 'none'
+    if (colPerm) return colPerm !== 'none'
+    return permissions.defaultPermission ? permissions.defaultPermission !== 'none' : true
   }
 
   const isColumnReadOnly = (col: string): boolean => {
     if (!permissions) return true
     const colPerm = permissions.columns[col]
-    return colPerm === 'read'
+    if (colPerm) return colPerm !== 'write'
+    return permissions.defaultPermission ? permissions.defaultPermission !== 'write' : !permissions.sheet.canEdit
   }
 
   return {

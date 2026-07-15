@@ -111,9 +111,19 @@ type ChannelBackup struct {
 	DownloadURL       string     `json:"download_url"`
 	MessageCount      int        `json:"message_count"`
 	Size              int64      `json:"size"`
+	Checksum          string     `json:"checksum,omitempty"`
+	SnapshotVersion   int        `json:"snapshot_version"`
+	VerifiedAt        *time.Time `json:"verified_at,omitempty"`
 	RestoreCount      int        `json:"restore_count"`
 	LastRestoredAt    *time.Time `json:"last_restored_at,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
+}
+
+type ChannelRestoreMessage struct {
+	OriginalID                 int64
+	OriginalReplyToMessageID   *int64
+	OriginalForwardedMessageID *int64
+	Message                    ChannelMessage
 }
 
 type ChannelBackupRestore struct {

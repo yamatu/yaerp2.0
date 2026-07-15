@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +66,12 @@ type whatsappSentMessage struct {
 	ChatID    string `json:"chatId"`
 	Timestamp int64  `json:"timestamp"`
 	Ack       *int   `json:"ack,omitempty"`
+}
+
+type whatsAppAvatarPayload struct {
+	Data      string `json:"data"`
+	Mimetype  string `json:"mimetype"`
+	SourceURL string `json:"sourceUrl"`
 }
 
 type whatsAppWebhookEvent struct {
@@ -208,6 +216,7 @@ func (s *WhatsAppService) GetAccount(requesterID, targetUserID int64) (*model.Wh
 		return nil, err
 	}
 	s.refreshAccountStatus(account)
+	s.attachAccountAvatarURL(account)
 	return account, nil
 }
 
@@ -225,6 +234,7 @@ func (s *WhatsAppService) ListAccounts(requesterID int64) ([]model.WhatsAppAccou
 	}
 	for index := range accounts {
 		s.refreshAccountStatus(&accounts[index])
+		s.attachAccountAvatarURL(&accounts[index])
 	}
 	return accounts, nil
 }
@@ -283,7 +293,16 @@ func (s *WhatsAppService) ListChats(requesterID, targetUserID int64) ([]model.Wh
 	if err != nil {
 		return nil, err
 	}
-	return s.listChatsForAccount(account)
+	chats, err := s.listChatsForAccount(account)
+	if err != nil {
+		return nil, err
+	}
+	for index := range chats {
+		if strings.TrimSpace(chats[index].ProfilePicURL) != "" {
+			chats[index].ProfilePicURL = s.avatarProxyURL(account.UserID, chats[index].ID)
+		}
+	}
+	return chats, nil
 }
 
 func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *model.WhatsAppHistorySyncRequest) (*model.WhatsAppHistorySyncResult, error) {
@@ -384,6 +403,10 @@ func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *m
 			if senderAddress != "" {
 				message.ExternalSenderAddress = &senderAddress
 			}
+			if strings.TrimSpace(incoming.SenderProfilePicURL) != "" {
+				avatar := s.avatarProxyURL(account.UserID, whatsAppFirstNonEmpty(incoming.Author, incoming.From, link.WhatsAppChatID))
+				message.ExternalSenderAvatar = &avatar
+			}
 		}
 		if quotedID := strings.TrimSpace(incoming.QuotedMessageID); quotedID != "" {
 			message.ReplyExternalMessageID = &quotedID
@@ -435,7 +458,7 @@ func (s *WhatsAppService) SyncContactsToChannels(userID int64, request *model.Wh
 		return nil, err
 	}
 	contacts := make([]model.WhatsAppContact, 0)
-	path := s.sessionPath(account.UserID) + "/contacts?basic=1&limit=" + strconv.Itoa(limit)
+	path := s.sessionPath(account.UserID) + "/contacts?basic=0&limit=" + strconv.Itoa(limit)
 	if err := s.callSidecarWithTimeout(http.MethodGet, path, nil, &contacts, 60*time.Second); err != nil {
 		return nil, err
 	}
@@ -446,7 +469,17 @@ func (s *WhatsAppService) SyncContactsToChannels(userID int64, request *model.Wh
 			result.Skipped++
 			continue
 		}
-		if _, err := s.repo.FindChannelLink(account.ID, contactID); err == nil {
+		if existingLink, err := s.repo.FindChannelLink(account.ID, contactID); err == nil {
+			existingLink.WhatsAppChatName = truncateWhatsAppChannelName(whatsAppFirstNonEmpty(contact.Name, contact.Number, contactID))
+			existingLink.WhatsAppChatAvatarURL = contact.ProfilePicURL
+			_ = s.repo.UpsertChannelLink(existingLink)
+			if strings.TrimSpace(contact.ProfilePicURL) != "" {
+				if channel, channelErr := s.channelRepo.GetChannel(existingLink.ChannelID, account.UserID); channelErr == nil && channel.AvatarAttachmentID == nil {
+					if avatarErr := s.syncWhatsAppChannelAvatar(account, existingLink.ChannelID, contactID, existingLink.WhatsAppChatName); avatarErr != nil {
+						result.Errors = appendWhatsAppSyncError(result.Errors, existingLink.WhatsAppChatName+" 头像", avatarErr)
+					}
+				}
+			}
 			result.Skipped++
 			continue
 		} else if !errors.Is(err, sql.ErrNoRows) {
@@ -477,6 +510,11 @@ func (s *WhatsAppService) SyncContactsToChannels(userID int64, request *model.Wh
 			result.Errors = appendWhatsAppSyncError(result.Errors, channelName, err)
 			continue
 		}
+		if strings.TrimSpace(contact.ProfilePicURL) != "" {
+			if avatarErr := s.syncWhatsAppChannelAvatar(account, channel.ID, contactID, channelName); avatarErr != nil {
+				result.Errors = appendWhatsAppSyncError(result.Errors, channelName+" 头像", avatarErr)
+			}
+		}
 		result.Created++
 		result.Channels = append(result.Channels, channel.ID)
 	}
@@ -503,6 +541,9 @@ func (s *WhatsAppService) GetChannelLink(userID, channelID int64) (*model.WhatsA
 	link, err := s.repo.GetChannelLink(channelID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
+	}
+	if err == nil {
+		s.attachChannelLinkAvatarURL(link)
 	}
 	return link, err
 }
@@ -547,10 +588,17 @@ func (s *WhatsAppService) UpdateChannelLink(userID, channelID int64, request *mo
 		WhatsAppChatAbout: whatsAppFirstNonEmpty(selected.Description, selected.About), WhatsAppIsGroup: selected.IsGroup,
 		WhatsAppParticipantCount: selected.ParticipantCount, SyncInbound: syncInbound, SyncOutbound: syncOutbound, CreatedBy: userID,
 	}
+	if strings.TrimSpace(link.WhatsAppChatAvatarURL) != "" {
+		link.WhatsAppChatAvatarURL = s.avatarProxyURL(account.UserID, selected.ID)
+	}
 	if err := s.repo.UpsertChannelLink(link); err != nil {
 		return nil, err
 	}
-	return s.repo.GetChannelLink(channelID)
+	channel, channelErr := s.channelRepo.GetChannel(channelID, userID)
+	if channelErr == nil && channel.AvatarAttachmentID == nil && strings.TrimSpace(selected.ProfilePicURL) != "" {
+		_ = s.syncWhatsAppChannelAvatar(account, channelID, selected.ID, selected.Name)
+	}
+	return s.GetChannelLink(userID, channelID)
 }
 
 func (s *WhatsAppService) DeleteChannelLink(userID, channelID int64) error {
@@ -794,6 +842,7 @@ func (s *WhatsAppService) handleIncomingMessage(account *model.WhatsAppAccount, 
 		}
 	}
 	if avatar != "" {
+		avatar = s.avatarProxyURL(account.UserID, whatsAppFirstNonEmpty(incoming.Author, incoming.From, link.WhatsAppChatID))
 		message.ExternalSenderAvatar = &avatar
 	}
 	if err := s.repo.CreateExternalMessage(message); err != nil {
@@ -1067,10 +1116,120 @@ func (s *WhatsAppService) listChatsForAccount(account *model.WhatsAppAccount) ([
 		return nil, err
 	}
 	chats := make([]model.WhatsAppChat, 0)
-	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/chats", nil, &chats, 25*time.Second); err != nil {
+	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/chats?metadata=1", nil, &chats, 45*time.Second); err != nil {
 		return nil, err
 	}
 	return chats, nil
+}
+
+func (s *WhatsAppService) attachAccountAvatarURL(account *model.WhatsAppAccount) {
+	if account == nil || strings.TrimSpace(account.ProfilePicURL) == "" || strings.TrimSpace(account.WhatsAppID) == "" {
+		return
+	}
+	account.ProfilePicURL = s.avatarProxyURL(account.UserID, account.WhatsAppID)
+}
+
+func (s *WhatsAppService) attachChannelLinkAvatarURL(link *model.WhatsAppChannelLink) {
+	if link == nil || strings.TrimSpace(link.WhatsAppChatAvatarURL) == "" || link.WhatsAppUserID <= 0 {
+		return
+	}
+	link.WhatsAppChatAvatarURL = s.avatarProxyURL(link.WhatsAppUserID, link.WhatsAppChatID)
+}
+
+func (s *WhatsAppService) avatarProxyURL(userID int64, chatID string) string {
+	chatID = strings.TrimSpace(chatID)
+	if userID <= 0 || chatID == "" {
+		return ""
+	}
+	expires := time.Now().Add(24 * time.Hour).Unix()
+	signature := s.signAvatarRequest(userID, chatID, expires)
+	return fmt.Sprintf("/api/whatsapp/avatar/%d/%s?expires=%d&signature=%s", userID, url.PathEscape(chatID), expires, signature)
+}
+
+func (s *WhatsAppService) signAvatarRequest(userID int64, chatID string, expires int64) string {
+	mac := hmac.New(sha256.New, s.encryptionKey[:])
+	_, _ = fmt.Fprintf(mac, "%d|%s|%d", userID, chatID, expires)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *WhatsAppService) GetAvatar(userID int64, chatID string, expires int64, signature string) ([]byte, string, error) {
+	chatID = strings.TrimSpace(chatID)
+	if userID <= 0 || chatID == "" || expires < time.Now().Unix() || expires > time.Now().Add(48*time.Hour).Unix() {
+		return nil, "", fmt.Errorf("avatar link expired")
+	}
+	expected, err := hex.DecodeString(s.signAvatarRequest(userID, chatID, expires))
+	if err != nil {
+		return nil, "", err
+	}
+	provided, err := hex.DecodeString(strings.TrimSpace(signature))
+	if err != nil || !hmac.Equal(expected, provided) {
+		return nil, "", fmt.Errorf("invalid avatar signature")
+	}
+	avatar, err := s.downloadWhatsAppAvatar(userID, chatID)
+	if err != nil {
+		return nil, "", err
+	}
+	data, err := base64.StdEncoding.DecodeString(avatar.Data)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) == 0 || len(data) > 5*1024*1024 {
+		return nil, "", fmt.Errorf("invalid avatar data")
+	}
+	mimeType := strings.TrimSpace(avatar.Mimetype)
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		mimeType = "image/jpeg"
+	}
+	return data, mimeType, nil
+}
+
+func (s *WhatsAppService) downloadWhatsAppAvatar(userID int64, chatID string) (*whatsAppAvatarPayload, error) {
+	var avatar whatsAppAvatarPayload
+	path := s.sessionPath(userID) + "/avatars/" + url.PathEscape(strings.TrimSpace(chatID))
+	if err := s.callSidecarWithTimeout(http.MethodGet, path, nil, &avatar, 20*time.Second); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(avatar.Data) == "" {
+		return nil, fmt.Errorf("WhatsApp 头像不可用")
+	}
+	return &avatar, nil
+}
+
+func (s *WhatsAppService) syncWhatsAppChannelAvatar(account *model.WhatsAppAccount, channelID int64, chatID, name string) error {
+	if account == nil || channelID <= 0 {
+		return fmt.Errorf("invalid WhatsApp channel avatar target")
+	}
+	avatar, err := s.downloadWhatsAppAvatar(account.UserID, chatID)
+	if err != nil {
+		return err
+	}
+	data, err := base64.StdEncoding.DecodeString(avatar.Data)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 || len(data) > 5*1024*1024 {
+		return fmt.Errorf("WhatsApp 头像数据无效")
+	}
+	mimeType := strings.TrimSpace(avatar.Mimetype)
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		mimeType = "image/jpeg"
+	}
+	extension := ".jpg"
+	if strings.Contains(strings.ToLower(mimeType), "png") {
+		extension = ".png"
+	} else if strings.Contains(strings.ToLower(mimeType), "webp") {
+		extension = ".webp"
+	}
+	filename := sanitizeWhatsAppFilename(whatsAppFirstNonEmpty(name, chatID, "whatsapp-avatar") + extension)
+	attachment, _, err := s.uploadSvc.UploadBytes(filename, mimeType, data, account.UserID)
+	if err != nil {
+		return err
+	}
+	if err := s.channelRepo.UpdateChannelAvatar(channelID, &attachment.ID); err != nil {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
+		return err
+	}
+	return nil
 }
 
 func (s *WhatsAppService) ensureAccountReady(account *model.WhatsAppAccount) error {

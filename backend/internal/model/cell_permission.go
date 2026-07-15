@@ -30,10 +30,11 @@ type CellPermission struct {
 }
 
 type PermissionMatrix struct {
-	Sheet   SheetPerm         `json:"sheet"`
-	Rows    map[string]string `json:"rows"`
-	Columns map[string]string `json:"columns"`
-	Cells   map[string]string `json:"cells"`
+	Sheet             SheetPerm         `json:"sheet"`
+	DefaultPermission string            `json:"defaultPermission,omitempty"`
+	Rows              map[string]string `json:"rows"`
+	Columns           map[string]string `json:"columns"`
+	Cells             map[string]string `json:"cells"`
 }
 
 type SheetPerm struct {
@@ -67,4 +68,51 @@ type SetCellPermissionRequest struct {
 	ColumnKey  string `json:"column_key"`
 	RowIndex   *int   `json:"row_index"`
 	Permission string `json:"permission" binding:"required,oneof=read write none"`
+}
+
+type PrincipalSheetPermission struct {
+	ID            int64  `json:"id"`
+	SheetID       int64  `json:"sheet_id"`
+	PrincipalType string `json:"principal_type"`
+	PrincipalID   int64  `json:"principal_id"`
+	CanView       bool   `json:"can_view"`
+	CanEdit       bool   `json:"can_edit"`
+	CanDelete     bool   `json:"can_delete"`
+	CanExport     bool   `json:"can_export"`
+}
+
+type PrincipalCellPermission struct {
+	ID            int64  `json:"id"`
+	SheetID       int64  `json:"sheet_id"`
+	PrincipalType string `json:"principal_type"`
+	PrincipalID   int64  `json:"principal_id"`
+	ColumnKey     string `json:"column_key"`
+	RowIndex      *int   `json:"row_index,omitempty"`
+	Permission    string `json:"permission"`
+}
+
+type SetPrincipalSheetPermissionRequest struct {
+	SheetID       int64  `json:"sheet_id" binding:"required"`
+	PrincipalType string `json:"principal_type" binding:"required,oneof=department user"`
+	PrincipalID   int64  `json:"principal_id" binding:"required"`
+	CanView       bool   `json:"can_view"`
+	CanEdit       bool   `json:"can_edit"`
+	CanDelete     bool   `json:"can_delete"`
+	CanExport     bool   `json:"can_export"`
+}
+
+type SetPrincipalCellPermissionRequest struct {
+	SheetID       int64  `json:"sheet_id" binding:"required"`
+	PrincipalType string `json:"principal_type" binding:"required,oneof=department user"`
+	PrincipalID   int64  `json:"principal_id" binding:"required"`
+	ColumnKey     string `json:"column_key"`
+	RowIndex      *int   `json:"row_index"`
+	Permission    string `json:"permission" binding:"required,oneof=read write none"`
+}
+
+type PrincipalPermissionConfig struct {
+	Sheet   PrincipalSheetPermission  `json:"sheet"`
+	Rows    []PrincipalCellPermission `json:"rows"`
+	Columns []PrincipalCellPermission `json:"columns"`
+	Cells   []PrincipalCellPermission `json:"cells"`
 }

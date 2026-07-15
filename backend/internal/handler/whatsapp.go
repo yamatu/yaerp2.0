@@ -20,6 +20,26 @@ func NewWhatsAppHandler(whatsAppService *service.WhatsAppService) *WhatsAppHandl
 	return &WhatsAppHandler{service: whatsAppService}
 }
 
+func (h *WhatsAppHandler) ServeAvatar(c *gin.Context) {
+	userID, err := strconv.ParseInt(c.Param("userId"), 10, 64)
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	expires, err := strconv.ParseInt(c.Query("expires"), 10, 64)
+	if err != nil {
+		c.Status(http.StatusBadRequest)
+		return
+	}
+	data, mimeType, err := h.service.GetAvatar(userID, c.Param("chatId"), expires, c.Query("signature"))
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Header("Cache-Control", "private, max-age=3600")
+	c.Data(http.StatusOK, mimeType, data)
+}
+
 func (h *WhatsAppHandler) GetSettings(c *gin.Context) {
 	settings, err := h.service.GetSettings()
 	if err != nil {

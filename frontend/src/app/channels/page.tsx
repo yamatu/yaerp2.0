@@ -54,6 +54,7 @@ import {
   ZoomOut,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { WhatsAppAvatarImage } from '@/components/whatsapp/WhatsAppAvatarImage'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useWorkbooks } from '@/hooks/useSheet'
 import api from '@/lib/api'
@@ -1671,7 +1672,8 @@ export default function ChannelsPage() {
       }
       await loadChannels(true)
       const failureText = response.data.failed > 0 ? `，${response.data.failed} 个失败` : ''
-      setNotice(`已创建 ${response.data.created} 个客户频道，跳过 ${response.data.skipped} 个已有联系人${failureText}`)
+      const warningText = response.data.errors?.length ? `，${response.data.errors.length} 个头像或联系人信息未完整同步` : ''
+      setNotice(`已创建 ${response.data.created} 个客户频道，检查并更新 ${response.data.skipped} 个已有联系人${failureText}${warningText}`)
     } catch {
       setError('同步 WhatsApp 客户失败')
     } finally {
@@ -3122,7 +3124,13 @@ export default function ChannelsPage() {
                             <div className="min-w-0 flex-1">
                               <div className="truncate text-sm font-semibold text-slate-800">{backup.source_channel_name}</div>
                               <div className="mt-1 text-xs text-slate-400">{backup.message_count} 条消息 · {formatFileSize(backup.size)} · {formatTime(backup.created_at)}</div>
-                              <div className="mt-0.5 text-[11px] text-slate-400">创建人 {backup.created_by_name || '已删除账号'}{backup.restore_count > 0 ? ` · 已恢复 ${backup.restore_count} 次` : ''}</div>
+                              <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-400">
+                                <span>创建人 {backup.created_by_name || '已删除账号'}{backup.restore_count > 0 ? ` · 已恢复 ${backup.restore_count} 次` : ''}</span>
+                                <span className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium ${backup.verified_at ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`} title={backup.verified_at ? `SHA-256 已校验${backup.checksum ? `：${backup.checksum}` : ''}` : '旧备份会在首次恢复前进行完整性校验'}>
+                                  <CheckCheck className="h-3 w-3" />
+                                  {backup.verified_at ? '完整性已校验' : '恢复前校验'}
+                                </span>
+                              </div>
                             </div>
                             <div className="flex shrink-0 items-center gap-1">
                               <a href={backup.download_url} download={backup.filename} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="下载备份"><Download className="h-4 w-4" /></a>
@@ -3160,7 +3168,7 @@ export default function ChannelsPage() {
                       {whatsAppAccounts.map((account) => <option key={account.id} value={account.id}>{account.username} · {account.status === 'ready' ? (account.display_name || account.phone_number || '已连接') : '未连接'}</option>)}
                     </select>
                   </label>
-                  {selectedWhatsAppAccount && <div className="mb-3 flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700">{selectedWhatsAppAccount.profile_pic_url ? <img src={selectedWhatsAppAccount.profile_pic_url} alt="" className="h-full w-full object-cover" /> : <MessageCircle className="h-4 w-4" />}</div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-800">{selectedWhatsAppAccount.display_name || selectedWhatsAppAccount.username}</div><div className="mt-0.5 truncate text-xs text-slate-400">员工 {selectedWhatsAppAccount.username} · {selectedWhatsAppAccount.status === 'ready' ? '可用于频道沟通' : '需要先绑定 WhatsApp'}</div></div></div>}
+                  {selectedWhatsAppAccount && <div className="mb-3 flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700"><WhatsAppAvatarImage src={selectedWhatsAppAccount.profile_pic_url} fallback={<MessageCircle className="h-4 w-4" />} /></div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-800">{selectedWhatsAppAccount.display_name || selectedWhatsAppAccount.username}</div><div className="mt-0.5 truncate text-xs text-slate-400">员工 {selectedWhatsAppAccount.username} · {selectedWhatsAppAccount.status === 'ready' ? '可用于频道沟通' : '需要先绑定 WhatsApp'}</div></div></div>}
                   {selectedWhatsAppAccount?.status === 'ready' && (
                     <div className="mb-3 flex flex-wrap gap-2">
                       <button type="button" onClick={() => void handleSyncWhatsAppContacts()} disabled={syncingWhatsAppContacts} className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50" title="为尚未关联的 WhatsApp 联系人批量创建同名频道">
@@ -3185,7 +3193,7 @@ export default function ChannelsPage() {
                       <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border border-slate-200 p-1">
                         {filteredWhatsAppChats.map((chat) => (
                           <button key={chat.id} type="button" onClick={() => setSelectedWhatsAppChatId(chat.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-50' : 'hover:bg-slate-50'}`}>
-                            <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}>{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-3.5 w-3.5" /> : <MessageCircle className="h-3.5 w-3.5" />}</div>
+                            <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}><WhatsAppAvatarImage src={chat.profilePicUrl} fallback={chat.isGroup ? <Users className="h-3.5 w-3.5" /> : <MessageCircle className="h-3.5 w-3.5" />} /></div>
                             <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-slate-800">{chat.name}</div><div className="truncate text-xs text-slate-400">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</div></div>
                             {selectedWhatsAppChatId === chat.id && <Check className="h-4 w-4 text-emerald-600" />}
                           </button>

@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, CheckCheck, CheckCircle2, LogOut, MessageCircle, RefreshCw, Save, Search, Smartphone, Users, Wifi, WifiOff } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { WhatsAppAvatarImage } from '@/components/whatsapp/WhatsAppAvatarImage'
 import api from '@/lib/api'
 import type { WhatsAppAccount, WhatsAppChat } from '@/types'
 
@@ -186,7 +187,7 @@ export default function WhatsAppWorkspacePage() {
               <div className="p-5">
                 <div className="flex items-center gap-4">
                   <div className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700">
-                    {account?.profile_pic_url ? <img src={account.profile_pic_url} alt="" className="h-full w-full object-cover" /> : <Smartphone className="h-8 w-8" />}
+                    <WhatsAppAvatarImage src={account?.profile_pic_url} fallback={<Smartphone className="h-8 w-8" />} />
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-lg font-semibold text-slate-900">{account?.display_name || account?.username || '尚未绑定'}</div>
@@ -225,7 +226,7 @@ export default function WhatsAppWorkspacePage() {
             <div className="min-h-0 flex-1 overflow-y-auto">
               {!connected ? <div className="flex h-full min-h-96 flex-col items-center justify-center text-center text-slate-400"><div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 text-emerald-700"><MessageCircle className="h-7 w-7" /></div><div className="mt-4 text-base font-semibold text-slate-700">绑定后显示 WhatsApp 会话</div><p className="mt-2 max-w-sm text-sm leading-6">员工只能管理自己的账号。系统代理由管理员统一配置，不会在这里显示。</p></div> : loadingChats && chats.length === 0 ? <div className="flex h-full min-h-72 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div> : filteredChats.length === 0 ? <div className="p-10 text-center text-sm text-slate-400">没有匹配的 WhatsApp 会话</div> : filteredChats.map((chat) => (
                 <div key={chat.id} className="flex items-center gap-3 border-b border-slate-100 bg-white px-4 py-3 transition hover:bg-slate-50">
-                  <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500">{chat.profilePicUrl ? <img src={chat.profilePicUrl} alt="" className="h-full w-full object-cover" /> : chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />}</div>
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500"><WhatsAppAvatarImage src={chat.profilePicUrl} fallback={chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />} /></div>
                   <div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div>{chat.timestamp > 0 && <span className="shrink-0 text-[11px] text-slate-400">{new Date(chat.timestamp * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}</span>}</div><div className="mt-1 flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</span>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div></div>
                   {chat.unreadCount > 0 && <button type="button" onClick={() => void markChatRead(chat)} disabled={Boolean(markingReadChatId)} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#008069] transition hover:bg-emerald-50 disabled:opacity-40" title="将这个 WhatsApp 会话标记为已读"><CheckCheck className={`h-4 w-4 ${markingReadChatId === chat.id ? 'animate-pulse' : ''}`} /></button>}
                 </div>

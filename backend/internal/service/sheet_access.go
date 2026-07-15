@@ -8,10 +8,11 @@ import (
 )
 
 type sheetCellAccessCache struct {
-	isAdmin     bool
-	matrix      *model.PermissionMatrix
-	protections protectionMaps
-	legacyLocks map[string]bool
+	isAdmin       bool
+	matrix        *model.PermissionMatrix
+	protections   protectionMaps
+	legacyLocks   map[string]bool
+	departmentIDs map[int64]struct{}
 }
 
 func newSheetCellAccessCache(permService *PermissionService, userID, sheetID int64, config json.RawMessage, includeProtection bool) (*sheetCellAccessCache, error) {
@@ -30,6 +31,11 @@ func newSheetCellAccessCache(permService *PermissionService, userID, sheetID int
 		return nil, err
 	}
 	cache.matrix = matrix
+	departmentIDs, err := permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
+	cache.departmentIDs = int64Set(departmentIDs)
 
 	if includeProtection {
 		_, protections, legacyLocks, err := parseSheetConfigProtection(config)
@@ -73,7 +79,7 @@ func (c *sheetCellAccessCache) checkProtection(columnKey string, worksheetRowInd
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID) {
+		if check.info.OwnerID == 0 || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, c.departmentIDs) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, dataRowIndex, columnKey)
@@ -104,6 +110,9 @@ func permissionMatrixAllowsCell(matrix *model.PermissionMatrix, columnKey string
 
 	if colPerm, ok := matrix.Columns[columnKey]; ok {
 		return permissionSatisfies(colPerm, requiredPerm)
+	}
+	if matrix.DefaultPermission != "" {
+		return permissionSatisfies(matrix.DefaultPermission, requiredPerm)
 	}
 
 	switch requiredPerm {

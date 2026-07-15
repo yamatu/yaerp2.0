@@ -1,7 +1,9 @@
 package service
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -108,6 +110,12 @@ func (s *ChannelService) CreateBackup(userID, channelID int64) (*model.ChannelBa
 	if err != nil {
 		return nil, err
 	}
+	if _, err := validateChannelBackupSnapshot(&snapshot); err != nil {
+		return nil, fmt.Errorf("备份校验失败: %w", err)
+	}
+	checksumBytes := sha256.Sum256(data)
+	checksum := hex.EncodeToString(checksumBytes[:])
+	verifiedAt := time.Now()
 	filename := fmt.Sprintf("%s-%s.yaerp-channel-backup.json", sanitizeBackupFilename(channel.Name), time.Now().Format("20060102-150405"))
 	attachment, _, err := s.uploadSvc.UploadBytes(filename, "application/json", data, userID)
 	if err != nil {
@@ -116,6 +124,7 @@ func (s *ChannelService) CreateBackup(userID, channelID int64) (*model.ChannelBa
 	backup := &model.ChannelBackup{
 		SourceChannelID: &channelID, SourceChannelName: channel.Name, CreatedBy: &userID,
 		Filename: filename, AttachmentID: attachment.ID, MessageCount: len(messages), Size: int64(len(data)),
+		Checksum: checksum, SnapshotVersion: channelBackupVersion, VerifiedAt: &verifiedAt,
 	}
 	if err := s.channelRepo.CreateBackup(backup); err != nil {
 		_ = s.uploadSvc.DeleteFile(attachment.ID)
@@ -182,27 +191,45 @@ func (s *ChannelService) RestoreBackup(userID, targetChannelID, backupID int64) 
 	if len(snapshot.Messages) > channelBackupMaxMessages {
 		return nil, fmt.Errorf("备份消息数量超过限制")
 	}
+	decodedFiles, err := validateChannelBackupSnapshot(&snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("备份内容校验失败: %w", err)
+	}
+	checksumBytes := sha256.Sum256(data)
+	checksum := hex.EncodeToString(checksumBytes[:])
+	if strings.TrimSpace(backup.Checksum) != "" && !strings.EqualFold(strings.TrimSpace(backup.Checksum), checksum) {
+		return nil, fmt.Errorf("备份文件完整性校验失败，文件可能已损坏或被修改")
+	}
+	if err := s.channelRepo.MarkBackupVerified(backupID, checksum, snapshot.Version); err != nil {
+		return nil, fmt.Errorf("记录备份校验状态失败: %w", err)
+	}
 
 	attachmentMap := make(map[int64]int64, len(snapshot.Files))
+	uploadedAttachmentIDs := make([]int64, 0, len(snapshot.Files))
+	cleanupUploads := true
+	defer func() {
+		if !cleanupUploads {
+			return
+		}
+		for _, attachmentID := range uploadedAttachmentIDs {
+			_ = s.uploadSvc.DeleteFile(attachmentID)
+		}
+	}()
 	for _, file := range snapshot.Files {
-		decoded, err := base64.StdEncoding.DecodeString(file.Data)
-		if err != nil {
-			return nil, fmt.Errorf("附件 %s 数据损坏", file.Filename)
-		}
-		if len(decoded) > channelBackupMaxFileBytes {
-			return nil, fmt.Errorf("附件 %s 超过恢复限制", file.Filename)
-		}
+		decoded := decodedFiles[file.OriginalID]
 		attachment, _, err := s.uploadSvc.UploadBytes(file.Filename, file.MimeType, decoded, userID)
 		if err != nil {
 			return nil, err
 		}
 		attachmentMap[file.OriginalID] = attachment.ID
+		uploadedAttachmentIDs = append(uploadedAttachmentIDs, attachment.ID)
 	}
 
-	messageMap := make(map[int64]int64, len(snapshot.Messages))
-	restoredCount := 0
+	restoreItems := make([]model.ChannelRestoreMessage, 0, len(snapshot.Messages))
 	for _, item := range snapshot.Messages {
 		message := item.ChannelMessage
+		originalReplyToMessageID := message.ReplyToMessageID
+		originalForwardedMessageID := message.ForwardedFromMessageID
 		message.ID = 0
 		message.ChannelID = targetChannelID
 		message.ExternalAccountID = nil
@@ -215,35 +242,82 @@ func (s *ChannelService) RestoreBackup(userID, targetChannelID, backupID int64) 
 				message.AttachmentID = nil
 			}
 		}
-		if message.ReplyToMessageID != nil {
-			if restoredID, ok := messageMap[*message.ReplyToMessageID]; ok {
-				message.ReplyToMessageID = &restoredID
-			} else {
-				message.ReplyToMessageID = nil
-			}
-		}
+		message.ReplyToMessageID = nil
+		message.ForwardedFromMessageID = nil
 		if message.CreatedAt.IsZero() {
 			message.CreatedAt = time.Now()
 		}
-		if err := s.channelRepo.RestoreMessage(&message); err != nil {
-			return nil, fmt.Errorf("恢复第 %d 条消息失败: %w", restoredCount+1, err)
-		}
-		messageMap[item.OriginalID] = message.ID
-		restoredCount++
+		restoreItems = append(restoreItems, model.ChannelRestoreMessage{
+			OriginalID: item.OriginalID, OriginalReplyToMessageID: originalReplyToMessageID,
+			OriginalForwardedMessageID: originalForwardedMessageID, Message: message,
+		})
 	}
-	_ = s.channelRepo.TouchChannel(targetChannelID)
 	restore := &model.ChannelBackupRestore{
 		BackupID: backupID, TargetChannelID: &targetChannelID, TargetName: targetChannel.Name,
-		RestoredBy: &userID, MessageCount: restoredCount,
+		RestoredBy: &userID, MessageCount: len(restoreItems),
 	}
 	if user, userErr := s.userRepo.GetByID(userID); userErr == nil && user != nil {
 		restore.RestoredByName = user.Username
 	}
-	if err := s.channelRepo.CreateBackupRestore(restore); err != nil {
-		return nil, err
+	if err := s.channelRepo.RestoreBackupSnapshot(restoreItems, restore); err != nil {
+		return nil, fmt.Errorf("恢复备份事务失败: %w", err)
 	}
+	cleanupUploads = false
 	s.notifyMessageChanged(&model.ChannelMessage{ChannelID: targetChannelID})
 	return restore, nil
+}
+
+func validateChannelBackupSnapshot(snapshot *channelBackupSnapshot) (map[int64][]byte, error) {
+	if snapshot == nil {
+		return nil, fmt.Errorf("备份内容为空")
+	}
+	if snapshot.Version != channelBackupVersion {
+		return nil, fmt.Errorf("不支持的备份版本 %d", snapshot.Version)
+	}
+	if len(snapshot.Messages) > channelBackupMaxMessages {
+		return nil, fmt.Errorf("消息数量超过 %d 条", channelBackupMaxMessages)
+	}
+	decodedFiles := make(map[int64][]byte, len(snapshot.Files))
+	totalBytes := 0
+	for _, file := range snapshot.Files {
+		if file.OriginalID <= 0 {
+			return nil, fmt.Errorf("附件标识无效")
+		}
+		if _, exists := decodedFiles[file.OriginalID]; exists {
+			return nil, fmt.Errorf("附件 %d 重复", file.OriginalID)
+		}
+		if strings.TrimSpace(file.Filename) == "" || strings.TrimSpace(file.MimeType) == "" {
+			return nil, fmt.Errorf("附件 %d 元数据不完整", file.OriginalID)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(file.Data)
+		if err != nil {
+			return nil, fmt.Errorf("附件 %s 数据损坏", file.Filename)
+		}
+		if len(decoded) > channelBackupMaxFileBytes {
+			return nil, fmt.Errorf("附件 %s 超过 25MB", file.Filename)
+		}
+		totalBytes += len(decoded)
+		if totalBytes > channelBackupMaxTotalBytes {
+			return nil, fmt.Errorf("附件总量超过 100MB")
+		}
+		decodedFiles[file.OriginalID] = decoded
+	}
+	messageIDs := make(map[int64]struct{}, len(snapshot.Messages))
+	for _, item := range snapshot.Messages {
+		if item.OriginalID <= 0 {
+			return nil, fmt.Errorf("消息标识无效")
+		}
+		if _, exists := messageIDs[item.OriginalID]; exists {
+			return nil, fmt.Errorf("消息 %d 重复", item.OriginalID)
+		}
+		messageIDs[item.OriginalID] = struct{}{}
+		if item.AttachmentID != nil {
+			if _, exists := decodedFiles[*item.AttachmentID]; !exists {
+				return nil, fmt.Errorf("消息 %d 引用的附件不存在", item.OriginalID)
+			}
+		}
+	}
+	return decodedFiles, nil
 }
 
 func (s *ChannelService) DeleteBackup(userID, backupID int64) error {

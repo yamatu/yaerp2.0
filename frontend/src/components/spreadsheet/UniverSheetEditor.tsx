@@ -22,7 +22,7 @@ import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
 import ImportXlsxButton, { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
-import type { AuthUser, CellUpdate, ColumnDef, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
+import type { AuthUser, CellUpdate, ColumnDef, Department, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
 
 interface Props {
   workbookId: string | number
@@ -821,11 +821,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [protectionLoading, setProtectionLoading] = useState(false)
   const [protectionAction, setProtectionAction] = useState('')
   const [protectionUsers, setProtectionUsers] = useState<User[]>([])
+  const [protectionDepartments, setProtectionDepartments] = useState<Department[]>([])
   const [protectionUsersLoading, setProtectionUsersLoading] = useState(false)
+  const [protectionDirectoryLoaded, setProtectionDirectoryLoaded] = useState(false)
   const [protectionUsersError, setProtectionUsersError] = useState('')
   const [protectionUsersLoadToken, setProtectionUsersLoadToken] = useState(0)
   const [protectionUserSearch, setProtectionUserSearch] = useState('')
   const [selectedProtectionEditableUserIds, setSelectedProtectionEditableUserIds] = useState<number[]>([])
+  const [selectedProtectionEditableDepartmentIds, setSelectedProtectionEditableDepartmentIds] = useState<number[]>([])
   const [showProtectionHighlights, setShowProtectionHighlights] = useState(false)
   const [protectionHighlightVersion, setProtectionHighlightVersion] = useState(0)
   const [protectionFocusNotice, setProtectionFocusNotice] = useState('')
@@ -1162,6 +1165,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setShowProtectionHighlights(false)
     setProtectionFocusNotice('')
     setProtectionUserSearch('')
+    setSelectedProtectionEditableDepartmentIds([])
     setSheetPresence([])
     setPresenceExpanded(false)
     setToolbarExpanded(false)
@@ -1173,15 +1177,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }, [refreshProtectionSnapshot])
 
   useEffect(() => {
-    if (!showProtectionPanel || protectionUsers.length > 0) return
+    if (!showProtectionPanel || protectionDirectoryLoaded) return
 
     let active = true
     setProtectionUsersLoading(true)
     setProtectionUsersError('')
-    api.get<User[]>('/users/shareable')
-      .then((res) => {
+    Promise.all([api.get<User[]>('/users/shareable'), api.get<Department[]>('/departments')])
+      .then(([res, departmentRes]) => {
         if (!active) return
         setProtectionUsers(res.code === 0 && Array.isArray(res.data) ? res.data : [])
+        setProtectionDepartments(departmentRes.code === 0 && Array.isArray(departmentRes.data) ? departmentRes.data : [])
       })
       .catch((err) => {
         console.error('Failed to load protection users:', err)
@@ -1191,13 +1196,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         }
       })
       .finally(() => {
-        if (active) setProtectionUsersLoading(false)
+        if (active) {
+          setProtectionUsersLoading(false)
+          setProtectionDirectoryLoaded(true)
+        }
       })
 
     return () => {
       active = false
     }
-  }, [protectionUsers.length, protectionUsersLoadToken, showProtectionPanel])
+  }, [protectionDirectoryLoaded, protectionUsersLoadToken, showProtectionPanel])
 
   // Manual save handler — triggers immediate persist
   const persistCurrentSheet = useCallback(async () => {
@@ -1430,7 +1438,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setProtectionAction(`${scope}:${action}`)
 
     try {
-      const payload: { scope: string; action: string; row_index?: number; column_key?: string; editable_user_ids?: number[]; hidden?: boolean } = {
+      const payload: { scope: string; action: string; row_index?: number; column_key?: string; editable_user_ids?: number[]; editable_department_ids?: number[]; hidden?: boolean } = {
         scope,
         action,
       }
@@ -1442,6 +1450,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       }
       if (action === 'lock') {
         payload.editable_user_ids = selectedProtectionEditableUserIds
+        payload.editable_department_ids = selectedProtectionEditableDepartmentIds
         if (typeof hidden === 'boolean') payload.hidden = hidden
       }
 
@@ -1468,7 +1477,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
 
   const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock', hidden?: boolean) => {
     if (editLocked) {
@@ -1488,7 +1497,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       return
     }
 
-    const requests: Array<{ scope: 'row' | 'column' | 'cell'; row_index?: number; column_key?: string; editable_user_ids?: number[] }> = []
+    const requests: Array<{ scope: 'row' | 'column' | 'cell'; row_index?: number; column_key?: string; editable_user_ids?: number[]; editable_department_ids?: number[] }> = []
     if (scope === 'row') {
       for (let row = selection.rowIndex; row <= selection.endRowIndex; row += 1) {
         requests.push({ scope: 'row', row_index: row })
@@ -1522,6 +1531,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           ...request,
           action,
           ...(action === 'lock' ? { editable_user_ids: selectedProtectionEditableUserIds } : {}),
+          ...(action === 'lock' ? { editable_department_ids: selectedProtectionEditableDepartmentIds } : {}),
           ...(action === 'lock' && typeof hidden === 'boolean' ? { hidden } : {}),
         })),
       })
@@ -1535,7 +1545,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
 
   const applyIncomingChanges = useCallback((changes: Array<{ row: number; col: string; value: unknown }>) => {
     if (changes.length === 0) return
@@ -2249,6 +2259,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       row_index: rowIndex,
       column_key: column.key,
       editable_user_ids: selectedProtectionEditableUserIds,
+      editable_department_ids: selectedProtectionEditableDepartmentIds,
     })
     if (response.code !== 0) {
       throw new Error(response.message || '图片已插入，但锁定所在单元格失败。')
@@ -2260,7 +2271,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
     setShowProtectionHighlights(true)
     requestProtectionHighlightRefresh()
-  }, [lockInsertedImageCell, protectionSnapshot.cells, refreshProtectionSnapshot, requestProtectionHighlightRefresh, selectedProtectionEditableUserIds, sheetId])
+  }, [lockInsertedImageCell, protectionSnapshot.cells, refreshProtectionSnapshot, requestProtectionHighlightRefresh, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, sheetId])
 
   const insertImageToCell = useCallback(async (img: GalleryImage) => {
     const result = univerApiRef.current
@@ -2607,6 +2618,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   useEffect(() => {
     if (!selectionState) {
       setSelectedProtectionEditableUserIds([])
+      setSelectedProtectionEditableDepartmentIds([])
       return
     }
 
@@ -2618,6 +2630,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const activeProtection = currentCell || currentRow || currentColumn
 
     setSelectedProtectionEditableUserIds(activeProtection?.editable_user_ids || [])
+    setSelectedProtectionEditableDepartmentIds(activeProtection?.editable_department_ids || [])
   }, [protectionSnapshot.cells, protectionSnapshot.columns, protectionSnapshot.rows, selectionState])
 
   if (error) {
@@ -2662,20 +2675,37 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const canReleaseProtection = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
   const canUpdateProtectionEditors = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
   const protectionUserNameMap = new Map(protectionUsers.map((user) => [user.id, user.username]))
+  const protectionDepartmentNameMap = new Map(protectionDepartments.map((department) => [department.id, department.name]))
   const normalizedProtectionUserSearch = protectionUserSearch.trim().toLocaleLowerCase('zh-CN')
   const filteredProtectionUsers = normalizedProtectionUserSearch
     ? protectionUsers.filter((user) => `${user.username} ${user.email}`.toLocaleLowerCase('zh-CN').includes(normalizedProtectionUserSearch))
     : protectionUsers
   const formatEditableUsers = (item: ProtectionInfo | null) => {
     const ids = item?.editable_user_ids || []
-    if (ids.length === 0) return '仅创建者和管理员'
-    return ids.map((id) => protectionUserNameMap.get(id) || `用户 #${id}`).join('、')
+    const departmentIds = item?.editable_department_ids || []
+    if (ids.length === 0 && departmentIds.length === 0) return '仅创建者和管理员'
+    return [
+      ...departmentIds.map((id) => `部门：${protectionDepartmentNameMap.get(id) || `#${id}`}`),
+      ...ids.map((id) => protectionUserNameMap.get(id) || `用户 #${id}`),
+    ].join('、')
   }
   const toggleProtectionEditableUser = (userId: number) => {
     setSelectedProtectionEditableUserIds((prev) =>
       prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId].sort((a, b) => a - b)
     )
   }
+  const toggleProtectionEditableDepartment = (departmentId: number) => {
+    setSelectedProtectionEditableDepartmentIds((prev) =>
+      prev.includes(departmentId) ? prev.filter((id) => id !== departmentId) : [...prev, departmentId].sort((a, b) => a - b)
+    )
+  }
+  const activeProtectionScope: 'row' | 'column' | 'cell' | null = currentCellProtection
+    ? 'cell'
+    : currentRowProtection
+      ? 'row'
+      : currentColumnProtection
+        ? 'column'
+        : null
   const currentProtectionItems = [currentRowProtection, currentColumnProtection, currentCellProtection]
     .filter((item): item is ProtectionInfo => Boolean(item))
   const protectionOwnerGroups = Array.from(allProtectionItems.reduce((groups, item) => {
@@ -3160,21 +3190,44 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               <div className="mb-2 flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
                   <Users className="h-4 w-4 text-sky-600" />
-                  允许编辑与查看人员
+                  允许编辑与查看
                 </div>
                 <span className="shrink-0 rounded-lg bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-700">
-                  已选 {selectedProtectionEditableUserIds.length} 人
+                  {selectedProtectionEditableDepartmentIds.length} 部门 / {selectedProtectionEditableUserIds.length} 人
                 </span>
               </div>
               <div className="mb-3 text-xs leading-5 text-slate-500">
                 这些员工可以编辑被保护范围；启用数据遮盖后，他们也仍然可以查看原始内容。
               </div>
+              {protectionDepartments.length > 0 && (
+                <div className="mb-3">
+                  <div className="mb-1.5 text-xs font-semibold text-slate-600">按部门授权</div>
+                  <div className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto rounded-lg border border-slate-100 p-2">
+                    {protectionDepartments.map((department) => {
+                      const selected = selectedProtectionEditableDepartmentIds.includes(department.id)
+                      return (
+                        <button
+                          key={department.id}
+                          type="button"
+                          onClick={() => toggleProtectionEditableDepartment(department.id)}
+                          disabled={editLocked}
+                          className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition disabled:opacity-50 ${selected ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+                        >
+                          <Users className="h-3.5 w-3.5" />
+                          {department.name}
+                          <span className="text-[10px] text-slate-400">{department.member_count}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               {protectionUsersLoading ? (
                 <div className="text-xs text-slate-400">正在加载员工...</div>
               ) : protectionUsersError ? (
                 <div className="flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                   <span>{protectionUsersError}</span>
-                  <button type="button" onClick={() => setProtectionUsersLoadToken((current) => current + 1)} className="shrink-0 font-semibold text-rose-800 hover:underline">重试</button>
+                  <button type="button" onClick={() => { setProtectionDirectoryLoaded(false); setProtectionUsersLoadToken((current) => current + 1) }} className="shrink-0 font-semibold text-rose-800 hover:underline">重试</button>
                 </div>
               ) : protectionUsers.length === 0 ? (
                 <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-400">暂无可选择员工，请先创建并启用员工账号。</div>
@@ -3191,8 +3244,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                         className="h-8 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-2 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
                       />
                     </label>
-                    {selectedProtectionEditableUserIds.length > 0 && (
-                      <button type="button" onClick={() => setSelectedProtectionEditableUserIds([])} disabled={editLocked} className="h-8 shrink-0 rounded-lg border border-slate-200 px-2 text-xs font-medium text-slate-500 transition hover:bg-slate-50 disabled:opacity-50">
+                    {(selectedProtectionEditableUserIds.length > 0 || selectedProtectionEditableDepartmentIds.length > 0) && (
+                      <button type="button" onClick={() => { setSelectedProtectionEditableUserIds([]); setSelectedProtectionEditableDepartmentIds([]) }} disabled={editLocked} className="h-8 shrink-0 rounded-lg border border-slate-200 px-2 text-xs font-medium text-slate-500 transition hover:bg-slate-50 disabled:opacity-50">
                         清空
                       </button>
                     )}
@@ -3218,6 +3271,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   </div>
                 </div>
               )}
+              <button
+                type="button"
+                onClick={() => activeProtectionScope && void handleProtectionChange(activeProtectionScope, 'lock')}
+                disabled={!activeProtectionScope || editLocked || protectionAction === `${activeProtectionScope}:lock`}
+                className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Save className="h-4 w-4" />
+                {activeProtectionScope ? '保存当前保护的部门与员工授权' : '先选择已有保护区域'}
+              </button>
             </div>
             {selectionState && (selectionState.endRowIndex > selectionState.rowIndex || selectionState.endColumnKey !== selectionState.columnKey) && (
               <div className="rounded-xl border border-sky-200 bg-sky-50/80 p-3">
