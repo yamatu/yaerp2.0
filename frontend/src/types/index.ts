@@ -109,8 +109,12 @@ export interface SheetConfig {
 export interface ProtectionOwner {
   ownerId: number
   ownerName: string
+  readonlyUserIds?: number[]
+  readonlyDepartmentIds?: number[]
   editableUserIds?: number[]
   editableDepartmentIds?: number[]
+  viewHiddenUserIds?: number[]
+  viewHiddenDepartmentIds?: number[]
   hidden?: boolean
   protectedAt: string
 }
@@ -122,8 +126,12 @@ export interface ProtectionInfo {
   column_key?: string
   owner_id: number
   owner_name: string
+  readonly_user_ids?: number[]
+  readonly_department_ids?: number[]
   editable_user_ids?: number[]
   editable_department_ids?: number[]
+  view_hidden_user_ids?: number[]
+  view_hidden_department_ids?: number[]
   hidden?: boolean
   protected_at: string
 }

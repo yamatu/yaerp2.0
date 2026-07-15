@@ -205,6 +205,12 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 	if err != nil {
 		return nil, fmt.Errorf("failed to load user departments: %w", err)
 	}
+	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load visual protection rules: %w", err)
+	}
+	departmentSet := int64Set(departmentIDs)
+	hasVisualWhitelistAccess := protectionWhitelistHasAccess(protections, userID, departmentSet)
 	departmentSheetPerms, err := s.permRepo.GetPrincipalSheetPermissions(sheetID, "department", departmentIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load department sheet permissions: %w", err)
@@ -242,7 +248,8 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 		}
 		if !workbook.IsPublic && !access.CanView && !hasAnyDirectUserSheetPermission(userPerm) &&
 			!hasPrincipalAccess(departmentSheetPerms, departmentCellPerms) &&
-			!hasPrincipalAccess(userPrincipalSheetPerms, userPrincipalCellPerms) {
+			!hasPrincipalAccess(userPrincipalSheetPerms, userPrincipalCellPerms) &&
+			!hasVisualWhitelistAccess {
 			return emptyPermissionMatrix(), nil
 		}
 		if access.CanView {
@@ -268,6 +275,7 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 	matrix.DefaultPermission = defaultCellPermission(matrix.Sheet)
 	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, departmentCellPerms, false)
 	mergePrincipalCellPermissions(&matrix.UserOverrides, userPrincipalCellPerms, true)
+	mergeProtectionWhitelistPermissions(matrix, protections, userID, departmentSet)
 	if !matrix.ExplicitUserSheetRule {
 		elevateMatrixForScopedPermissions(matrix)
 	}
@@ -646,6 +654,89 @@ func mergePrincipalCellPermissions(layer *model.ScopedPermissionLayer, permissio
 			target[key] = restrictivePermissionValue(target[key], permission.Permission)
 		}
 	}
+}
+
+func mergeProtectionWhitelistPermissions(matrix *model.PermissionMatrix, protections protectionMaps, userID int64, departmentIDs map[int64]struct{}) bool {
+	if matrix == nil {
+		return false
+	}
+	ensurePermissionMatrixLayers(matrix)
+	merged := false
+	apply := func(scope string, items map[string]protectionOwner) {
+		for key, info := range items {
+			permission, directUser, allowed := protectionWhitelistPermission(info, userID, departmentIDs)
+			if !allowed {
+				continue
+			}
+			layer := &matrix.DepartmentOverrides
+			if directUser {
+				layer = &matrix.UserOverrides
+			}
+			switch scope {
+			case "row":
+				layer.Rows[key] = permission
+			case "column":
+				layer.Columns[key] = permission
+			case "cell":
+				layer.Cells[key] = permission
+			}
+			merged = true
+		}
+	}
+	apply("row", protections.Rows)
+	apply("column", protections.Columns)
+	apply("cell", protections.Cells)
+	return merged
+}
+
+func protectionWhitelistHasAccess(protections protectionMaps, userID int64, departmentIDs map[int64]struct{}) bool {
+	for _, items := range []map[string]protectionOwner{protections.Rows, protections.Columns, protections.Cells} {
+		for _, info := range items {
+			if _, _, allowed := protectionWhitelistPermission(info, userID, departmentIDs); allowed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func protectionWhitelistPermission(info protectionOwner, userID int64, departmentIDs map[int64]struct{}) (string, bool, bool) {
+	if containsProtectionID(info.ReadonlyUserIDs, userID) || containsProtectionID(info.ViewHiddenUserIDs, userID) {
+		return "read", true, true
+	}
+	if containsProtectionID(info.EditableUserIDs, userID) {
+		return "write", true, true
+	}
+
+	permission := ""
+	if protectionDepartmentsMatch(info.EditableDepartmentIDs, departmentIDs) {
+		permission = "write"
+	}
+	if protectionDepartmentsMatch(info.ReadonlyDepartmentIDs, departmentIDs) || protectionDepartmentsMatch(info.ViewHiddenDepartmentIDs, departmentIDs) {
+		permission = restrictivePermissionValue(permission, "read")
+	}
+	if permission == "" {
+		return "", false, false
+	}
+	return permission, false, true
+}
+
+func containsProtectionID(values []int64, target int64) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func protectionDepartmentsMatch(values []int64, departments map[int64]struct{}) bool {
+	for _, value := range values {
+		if _, exists := departments[value]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func restrictivePermissionValue(current, next string) string {

@@ -76,6 +76,23 @@ interface SelectionState {
   includesHeaderRow: boolean
 }
 
+type ProtectionScope = 'row' | 'column' | 'cell'
+type ProtectionWhitelistAccess = 'readonly' | 'edit' | 'view_hidden'
+
+interface ProtectionMutationPayload {
+  scope: ProtectionScope
+  action: 'lock' | 'unlock'
+  row_index?: number
+  column_key?: string
+  readonly_user_ids?: number[]
+  readonly_department_ids?: number[]
+  editable_user_ids?: number[]
+  editable_department_ids?: number[]
+  view_hidden_user_ids?: number[]
+  view_hidden_department_ids?: number[]
+  hidden?: boolean
+}
+
 interface PrintableColumn {
   index: number
   key: string
@@ -127,17 +144,19 @@ interface ProtectionHighlightBlock {
 const MIN_UNIVER_ZOOM = 0.1
 const MAX_UNIVER_ZOOM = 4
 const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
-  'sheet.contextMenu.permission': { title: 'YAERP 保护' },
-  'sheet.command.add-range-protection-from-context-menu': { title: '保护或隐藏当前选择' },
-  'sheet.command.set-range-protection-from-context-menu': { title: '编辑保护与隐藏设置' },
+  'sheet.contextMenu.permission': { title: '选区权限' },
+  'sheet.command.add-range-protection-from-context-menu': { title: '配置选区白名单' },
+  'sheet.command.set-range-protection-from-context-menu': { title: '编辑选区白名单' },
   'sheet.command.delete-range-protection-from-context-menu': { title: '解除当前保护' },
   'sheet.command.view-sheet-permission-from-context-menu': { title: '显示保护区域与记录' },
 } as const
 const YAERP_PROTECTION_CONTEXT_MENU_LABELS = [
   '保护当前选择',
   '保护或隐藏当前选择',
+  '配置选区白名单',
   '编辑当前保护',
   '编辑保护与隐藏设置',
+  '编辑选区白名单',
   '解除当前保护',
   '显示保护区域与记录',
 ]
@@ -1035,8 +1054,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [protectionUsersError, setProtectionUsersError] = useState('')
   const [protectionUsersLoadToken, setProtectionUsersLoadToken] = useState(0)
   const [protectionUserSearch, setProtectionUserSearch] = useState('')
+  const [protectionScope, setProtectionScope] = useState<ProtectionScope>('cell')
+  const [selectedProtectionHidden, setSelectedProtectionHidden] = useState(false)
+  const [selectedProtectionReadonlyUserIds, setSelectedProtectionReadonlyUserIds] = useState<number[]>([])
+  const [selectedProtectionReadonlyDepartmentIds, setSelectedProtectionReadonlyDepartmentIds] = useState<number[]>([])
   const [selectedProtectionEditableUserIds, setSelectedProtectionEditableUserIds] = useState<number[]>([])
   const [selectedProtectionEditableDepartmentIds, setSelectedProtectionEditableDepartmentIds] = useState<number[]>([])
+  const [selectedProtectionViewHiddenUserIds, setSelectedProtectionViewHiddenUserIds] = useState<number[]>([])
+  const [selectedProtectionViewHiddenDepartmentIds, setSelectedProtectionViewHiddenDepartmentIds] = useState<number[]>([])
   const [showProtectionHighlights, setShowProtectionHighlights] = useState(false)
   const [protectionFocusNotice, setProtectionFocusNotice] = useState('')
   const [sheetPresence, setSheetPresence] = useState<SheetPresenceEntry[]>([])
@@ -1440,7 +1465,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setShowProtectionHighlights(false)
     setProtectionFocusNotice('')
     setProtectionUserSearch('')
+    setProtectionScope('cell')
+    setSelectedProtectionHidden(false)
+    setSelectedProtectionReadonlyUserIds([])
+    setSelectedProtectionReadonlyDepartmentIds([])
+    setSelectedProtectionEditableUserIds([])
     setSelectedProtectionEditableDepartmentIds([])
+    setSelectedProtectionViewHiddenUserIds([])
+    setSelectedProtectionViewHiddenDepartmentIds([])
     setSheetPresence([])
     setPresenceExpanded(false)
     setToolbarExpanded(false)
@@ -1699,62 +1731,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [editLocked, persistCurrentSheet, syncFilterState])
 
-  const handleProtectionChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock', hidden?: boolean) => {
-    if (editLocked) {
-      setActionError('当前账号只有查看权限，不能修改保护状态。')
-      return
-    }
-    const selection = syncSelectionState()
-    if (!selection) {
-      setActionError('请先在工作表中选中一个单元格。')
-      return
-    }
-    setActionError('')
-    setProtectionAction(`${scope}:${action}`)
-
-    try {
-      const payload: { scope: string; action: string; row_index?: number; column_key?: string; editable_user_ids?: number[]; editable_department_ids?: number[]; hidden?: boolean } = {
-        scope,
-        action,
-      }
-      if (scope === 'row' || scope === 'cell') {
-        payload.row_index = selection.rowIndex
-      }
-      if (scope === 'column' || scope === 'cell') {
-        payload.column_key = selection.columnKey
-      }
-      if (action === 'lock') {
-        payload.editable_user_ids = selectedProtectionEditableUserIds
-        payload.editable_department_ids = selectedProtectionEditableDepartmentIds
-        if (typeof hidden === 'boolean') payload.hidden = hidden
-      }
-
-      const res = await api.post<{ sheet?: Sheet; protections?: ProtectionSnapshot }>(`/sheets/${sheetId}/protections`, payload)
-      if (res.code !== 0) {
-        setActionError(res.message || '更新保护状态失败，请稍后再试。')
-        return
-      }
-
-      if (res.data?.sheet) {
-        latestSheetRef.current = {
-          ...latestSheetRef.current,
-          config: res.data.sheet.config,
-        }
-      }
-      if (res.data?.protections) {
-        setProtectionSnapshot(res.data.protections)
-      } else {
-        await refreshProtectionSnapshot()
-      }
-    } catch (err) {
-      console.error('Failed to update protection:', err)
-      setActionError(err instanceof Error ? err.message : '更新保护状态失败，请稍后再试。')
-    } finally {
-      setProtectionAction('')
-    }
-  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
-
-  const handleProtectionRangeChange = useCallback(async (scope: 'row' | 'column' | 'cell', action: 'lock' | 'unlock', hidden?: boolean) => {
+  const handleProtectionRangeChange = useCallback(async (scope: ProtectionScope, action: 'lock' | 'unlock', hidden?: boolean) => {
     if (editLocked) {
       setActionError('当前账号只有查看权限，不能修改保护状态。')
       return
@@ -1762,6 +1739,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const selection = syncSelectionState()
     if (!selection) {
       setActionError('请先在工作表中框选需要保护的范围。')
+      return
+    }
+    if (selection.includesHeaderRow && scope !== 'column') {
+      setActionError('表头不属于数据行；如需保护字段，请选择“所选整列”。')
       return
     }
     const columns = latestSheetRef.current.columns || []
@@ -1772,7 +1753,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       return
     }
 
-    const requests: Array<{ scope: 'row' | 'column' | 'cell'; row_index?: number; column_key?: string; editable_user_ids?: number[]; editable_department_ids?: number[] }> = []
+    const requests: Array<Omit<ProtectionMutationPayload, 'action'>> = []
     if (scope === 'row') {
       for (let row = selection.rowIndex; row <= selection.endRowIndex; row += 1) {
         requests.push({ scope: 'row', row_index: row })
@@ -1805,8 +1786,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         items: requests.map((request) => ({
           ...request,
           action,
+          ...(action === 'lock' ? { readonly_user_ids: selectedProtectionReadonlyUserIds } : {}),
+          ...(action === 'lock' ? { readonly_department_ids: selectedProtectionReadonlyDepartmentIds } : {}),
           ...(action === 'lock' ? { editable_user_ids: selectedProtectionEditableUserIds } : {}),
           ...(action === 'lock' ? { editable_department_ids: selectedProtectionEditableDepartmentIds } : {}),
+          ...(action === 'lock' ? { view_hidden_user_ids: selectedProtectionViewHiddenUserIds } : {}),
+          ...(action === 'lock' ? { view_hidden_department_ids: selectedProtectionViewHiddenDepartmentIds } : {}),
           ...(action === 'lock' && typeof hidden === 'boolean' ? { hidden } : {}),
         })),
       })
@@ -1820,7 +1805,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, sheetId, syncSelectionState])
+  }, [editLocked, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
 
   const applyIncomingChanges = useCallback((changes: Array<{ row: number; col: string; value: unknown }>) => {
     if (changes.length === 0) return
@@ -2533,8 +2518,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       action: 'lock',
       row_index: rowIndex,
       column_key: column.key,
+      readonly_user_ids: selectedProtectionReadonlyUserIds,
+      readonly_department_ids: selectedProtectionReadonlyDepartmentIds,
       editable_user_ids: selectedProtectionEditableUserIds,
       editable_department_ids: selectedProtectionEditableDepartmentIds,
+      view_hidden_user_ids: selectedProtectionViewHiddenUserIds,
+      view_hidden_department_ids: selectedProtectionViewHiddenDepartmentIds,
     })
     if (response.code !== 0) {
       throw new Error(response.message || '图片已插入，但锁定所在单元格失败。')
@@ -2546,7 +2535,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
     setShowProtectionHighlights(true)
     requestProtectionHighlightRefresh()
-  }, [lockInsertedImageCell, protectionSnapshot.cells, refreshProtectionSnapshot, requestProtectionHighlightRefresh, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, sheetId])
+  }, [lockInsertedImageCell, protectionSnapshot.cells, refreshProtectionSnapshot, requestProtectionHighlightRefresh, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId])
 
   const insertImageToCell = useCallback(async (img: GalleryImage) => {
     const result = univerApiRef.current
@@ -2892,8 +2881,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   useEffect(() => {
     if (!selectionState) {
+      setSelectedProtectionHidden(false)
+      setSelectedProtectionReadonlyUserIds([])
+      setSelectedProtectionReadonlyDepartmentIds([])
       setSelectedProtectionEditableUserIds([])
       setSelectedProtectionEditableDepartmentIds([])
+      setSelectedProtectionViewHiddenUserIds([])
+      setSelectedProtectionViewHiddenDepartmentIds([])
       return
     }
 
@@ -2904,8 +2898,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const currentColumn = protectionSnapshot.columns.find((item) => item.column_key === selectionState.columnKey)
     const activeProtection = currentCell || currentRow || currentColumn
 
+    if (activeProtection) setProtectionScope(activeProtection.scope)
+    setSelectedProtectionHidden(Boolean(activeProtection?.hidden))
+    setSelectedProtectionReadonlyUserIds(activeProtection?.readonly_user_ids || [])
+    setSelectedProtectionReadonlyDepartmentIds(activeProtection?.readonly_department_ids || [])
     setSelectedProtectionEditableUserIds(activeProtection?.editable_user_ids || [])
     setSelectedProtectionEditableDepartmentIds(activeProtection?.editable_department_ids || [])
+    setSelectedProtectionViewHiddenUserIds(activeProtection?.view_hidden_user_ids || [])
+    setSelectedProtectionViewHiddenDepartmentIds(activeProtection?.view_hidden_department_ids || [])
   }, [protectionSnapshot.cells, protectionSnapshot.columns, protectionSnapshot.rows, selectionState])
 
   if (error) {
@@ -2955,32 +2955,77 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const filteredProtectionUsers = normalizedProtectionUserSearch
     ? protectionUsers.filter((user) => `${user.username} ${user.email}`.toLocaleLowerCase('zh-CN').includes(normalizedProtectionUserSearch))
     : protectionUsers
-  const formatEditableUsers = (item: ProtectionInfo | null) => {
-    const ids = item?.editable_user_ids || []
-    const departmentIds = item?.editable_department_ids || []
-    if (ids.length === 0 && departmentIds.length === 0) return '仅创建者和管理员'
-    return [
-      ...departmentIds.map((id) => `部门：${protectionDepartmentNameMap.get(id) || `#${id}`}`),
-      ...ids.map((id) => protectionUserNameMap.get(id) || `用户 #${id}`),
-    ].join('、')
+  const describeProtectionPrincipals = (userIds: number[] = [], departmentIds: number[] = []) => [
+    ...departmentIds.map((id) => `部门：${protectionDepartmentNameMap.get(id) || `#${id}`}`),
+    ...userIds.map((id) => protectionUserNameMap.get(id) || `用户 #${id}`),
+  ]
+  const formatProtectionWhitelist = (item: ProtectionInfo | null) => {
+    if (!item) return '未设置'
+    const groups = [
+      { label: '修改', values: describeProtectionPrincipals(item.editable_user_ids, item.editable_department_ids) },
+      { label: '查看原文', values: describeProtectionPrincipals(item.view_hidden_user_ids, item.view_hidden_department_ids) },
+      { label: '只读', values: describeProtectionPrincipals(item.readonly_user_ids, item.readonly_department_ids) },
+    ].filter((group) => group.values.length > 0)
+    if (groups.length === 0) return '仅创建者和管理员'
+    return groups.map((group) => `${group.label}：${group.values.join('、')}`).join('；')
   }
-  const toggleProtectionEditableUser = (userId: number) => {
-    setSelectedProtectionEditableUserIds((prev) =>
-      prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId].sort((a, b) => a - b)
-    )
+  const selectedProtectionPrincipalCount = new Set([
+    ...selectedProtectionReadonlyUserIds,
+    ...selectedProtectionReadonlyDepartmentIds.map((id) => -id),
+    ...selectedProtectionEditableUserIds,
+    ...selectedProtectionEditableDepartmentIds.map((id) => -id),
+    ...selectedProtectionViewHiddenUserIds,
+    ...selectedProtectionViewHiddenDepartmentIds.map((id) => -id),
+  ]).size
+  const updateProtectionAccessList = (current: number[], id: number, selected: boolean) => selected
+    ? Array.from(new Set([...current, id])).sort((left, right) => left - right)
+    : current.filter((item) => item !== id)
+  const getProtectionUserAccess = (userId: number): ProtectionWhitelistAccess | '' => {
+    if (selectedProtectionEditableUserIds.includes(userId)) return 'edit'
+    if (selectedProtectionViewHiddenUserIds.includes(userId)) return 'view_hidden'
+    if (selectedProtectionReadonlyUserIds.includes(userId)) return 'readonly'
+    return ''
   }
-  const toggleProtectionEditableDepartment = (departmentId: number) => {
-    setSelectedProtectionEditableDepartmentIds((prev) =>
-      prev.includes(departmentId) ? prev.filter((id) => id !== departmentId) : [...prev, departmentId].sort((a, b) => a - b)
-    )
+  const getProtectionDepartmentAccess = (departmentId: number): ProtectionWhitelistAccess | '' => {
+    if (selectedProtectionEditableDepartmentIds.includes(departmentId)) return 'edit'
+    if (selectedProtectionViewHiddenDepartmentIds.includes(departmentId)) return 'view_hidden'
+    if (selectedProtectionReadonlyDepartmentIds.includes(departmentId)) return 'readonly'
+    return ''
   }
-  const activeProtectionScope: 'row' | 'column' | 'cell' | null = currentCellProtection
-    ? 'cell'
-    : currentRowProtection
-      ? 'row'
-      : currentColumnProtection
-        ? 'column'
-        : null
+  const setProtectionUserAccess = (userId: number, access: ProtectionWhitelistAccess | '') => {
+    setSelectedProtectionReadonlyUserIds((current) => updateProtectionAccessList(current, userId, access === 'readonly'))
+    setSelectedProtectionEditableUserIds((current) => updateProtectionAccessList(current, userId, access === 'edit'))
+    setSelectedProtectionViewHiddenUserIds((current) => updateProtectionAccessList(current, userId, access === 'view_hidden'))
+  }
+  const setProtectionDepartmentAccess = (departmentId: number, access: ProtectionWhitelistAccess | '') => {
+    setSelectedProtectionReadonlyDepartmentIds((current) => updateProtectionAccessList(current, departmentId, access === 'readonly'))
+    setSelectedProtectionEditableDepartmentIds((current) => updateProtectionAccessList(current, departmentId, access === 'edit'))
+    setSelectedProtectionViewHiddenDepartmentIds((current) => updateProtectionAccessList(current, departmentId, access === 'view_hidden'))
+  }
+  const clearProtectionWhitelist = () => {
+    setSelectedProtectionReadonlyUserIds([])
+    setSelectedProtectionReadonlyDepartmentIds([])
+    setSelectedProtectionEditableUserIds([])
+    setSelectedProtectionEditableDepartmentIds([])
+    setSelectedProtectionViewHiddenUserIds([])
+    setSelectedProtectionViewHiddenDepartmentIds([])
+  }
+  const activeProtection = protectionScope === 'row'
+    ? currentRowProtection
+    : protectionScope === 'column'
+      ? currentColumnProtection
+      : currentCellProtection
+  const selectProtectionScope = (scope: ProtectionScope) => {
+    const item = scope === 'row' ? currentRowProtection : scope === 'column' ? currentColumnProtection : currentCellProtection
+    setProtectionScope(scope)
+    setSelectedProtectionHidden(Boolean(item?.hidden))
+    setSelectedProtectionReadonlyUserIds(item?.readonly_user_ids || [])
+    setSelectedProtectionReadonlyDepartmentIds(item?.readonly_department_ids || [])
+    setSelectedProtectionEditableUserIds(item?.editable_user_ids || [])
+    setSelectedProtectionEditableDepartmentIds(item?.editable_department_ids || [])
+    setSelectedProtectionViewHiddenUserIds(item?.view_hidden_user_ids || [])
+    setSelectedProtectionViewHiddenDepartmentIds(item?.view_hidden_department_ids || [])
+  }
   const currentProtectionItems = [currentRowProtection, currentColumnProtection, currentCellProtection]
     .filter((item): item is ProtectionInfo => Boolean(item))
   const protectionOwnerGroups = Array.from(allProtectionItems.reduce((groups, item) => {
@@ -3418,10 +3463,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {showProtectionPanel && (
-        <div className="absolute inset-x-3 bottom-3 z-30 max-h-[min(780px,calc(100vh-5rem))] overflow-y-auto rounded-lg border border-slate-200 bg-white p-4 shadow-2xl sm:inset-x-auto sm:bottom-20 sm:right-20 sm:w-[420px]">
+        <div className="absolute inset-x-3 bottom-3 z-30 max-h-[min(820px,calc(100vh-5rem))] overflow-y-auto rounded-lg border border-slate-200 bg-white p-4 shadow-2xl sm:inset-x-auto sm:bottom-20 sm:right-20 sm:w-[560px]">
           <div className="mb-4 flex items-start justify-between gap-3">
             <div>
-              <div className="text-sm font-semibold text-slate-900">保护设置</div>
+              <div className="text-sm font-semibold text-slate-900">选区保护与数据白名单</div>
               <div className="mt-1 text-xs leading-5 text-slate-500">
                 当前选择：{selectionState ? selectionState.rangeLabel : '未选中单元格'}
               </div>
@@ -3461,279 +3506,105 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 </div>
               </div>
             )}
-            <div className="rounded-xl border border-slate-200 bg-white p-3">
-              <div className="mb-2 flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
-                  <Users className="h-4 w-4 text-sky-600" />
-                  允许编辑与查看
+            <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+              <div className="border-b border-slate-200 bg-slate-50 px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-slate-800">1. 选择保护范围</div>
+                  <span className="rounded-md bg-white px-2 py-1 text-[11px] font-medium text-slate-500">拖动框选后直接应用</span>
                 </div>
-                <span className="shrink-0 rounded-lg bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-700">
-                  {selectedProtectionEditableDepartmentIds.length} 部门 / {selectedProtectionEditableUserIds.length} 人
-                </span>
+                <div className="mt-3 grid grid-cols-3 gap-1 rounded-lg bg-slate-200/70 p-1">
+                  {([
+                    { value: 'cell', label: '精确选区', icon: Square },
+                    { value: 'row', label: '所选整行', icon: Rows3 },
+                    { value: 'column', label: '所选整列', icon: Columns3 },
+                  ] as Array<{ value: ProtectionScope; label: string; icon: typeof Square }>).map(({ value, label, icon: Icon }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => selectProtectionScope(value)}
+                      className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-md text-xs font-semibold transition ${protectionScope === value ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <label className={`mt-3 flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition ${selectedProtectionHidden ? 'border-slate-400 bg-slate-100' : 'border-slate-200 bg-white'}`}>
+                  <input type="checkbox" checked={selectedProtectionHidden} onChange={(event) => setSelectedProtectionHidden(event.target.checked)} disabled={editLocked} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-slate-700" />
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><EyeOff className="h-3.5 w-3.5" />对未授权人员遮罩数据</span>
+                    <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">未获得“修改”或“查看遮罩内容”的成员只会看到 ••••。</span>
+                  </span>
+                </label>
               </div>
-              <div className="mb-3 text-xs leading-5 text-slate-500">
-                这些员工可以编辑被保护范围；启用数据遮盖后，他们也仍然可以查看原始内容。
-              </div>
-              {protectionDepartments.length > 0 && (
-                <div className="mb-3">
-                  <div className="mb-1.5 text-xs font-semibold text-slate-600">按部门授权</div>
-                  <div className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto rounded-lg border border-slate-100 p-2">
-                    {protectionDepartments.map((department) => {
-                      const selected = selectedProtectionEditableDepartmentIds.includes(department.id)
-                      return (
-                        <button
-                          key={department.id}
-                          type="button"
-                          onClick={() => toggleProtectionEditableDepartment(department.id)}
-                          disabled={editLocked}
-                          className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition disabled:opacity-50 ${selected ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
-                        >
-                          <Users className="h-3.5 w-3.5" />
-                          {department.name}
-                          <span className="text-[10px] text-slate-400">{department.member_count}</span>
-                        </button>
-                      )
-                    })}
+
+              <div className="px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Users className="h-4 w-4 text-sky-600" />2. 配置白名单</div>
+                    <div className="mt-1 text-[11px] leading-5 text-slate-500">修改可编辑并看原文；查看遮罩内容只能看原文；只读不能修改。</div>
                   </div>
+                  <button type="button" onClick={clearProtectionWhitelist} disabled={editLocked || selectedProtectionPrincipalCount === 0} className="h-8 shrink-0 rounded-lg border border-slate-200 px-2.5 text-xs font-medium text-slate-500 transition hover:bg-slate-50 disabled:opacity-40">清空 {selectedProtectionPrincipalCount || ''}</button>
                 </div>
-              )}
-              {protectionUsersLoading ? (
-                <div className="text-xs text-slate-400">正在加载员工...</div>
-              ) : protectionUsersError ? (
-                <div className="flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-                  <span>{protectionUsersError}</span>
-                  <button type="button" onClick={() => { setProtectionDirectoryLoaded(false); setProtectionUsersLoadToken((current) => current + 1) }} className="shrink-0 font-semibold text-rose-800 hover:underline">重试</button>
-                </div>
-              ) : protectionUsers.length === 0 ? (
-                <div className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-400">暂无可选择员工，请先创建并启用员工账号。</div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    <label className="relative min-w-0 flex-1">
-                      <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                      <input
-                        type="search"
-                        value={protectionUserSearch}
-                        onChange={(event) => setProtectionUserSearch(event.target.value)}
-                        placeholder="搜索姓名或邮箱"
-                        className="h-8 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-2 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
-                      />
-                    </label>
-                    {(selectedProtectionEditableUserIds.length > 0 || selectedProtectionEditableDepartmentIds.length > 0) && (
-                      <button type="button" onClick={() => { setSelectedProtectionEditableUserIds([]); setSelectedProtectionEditableDepartmentIds([]) }} disabled={editLocked} className="h-8 shrink-0 rounded-lg border border-slate-200 px-2 text-xs font-medium text-slate-500 transition hover:bg-slate-50 disabled:opacity-50">
-                        清空
-                      </button>
-                    )}
+
+                {protectionDepartments.length > 0 && (
+                  <div className="mt-3">
+                    <div className="mb-1.5 text-xs font-semibold text-slate-600">部门</div>
+                    <div className="max-h-40 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
+                      {protectionDepartments.map((department) => (
+                        <div key={department.id} className="flex items-center gap-3 px-3 py-2">
+                          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-sky-50 text-sky-700"><Users className="h-3.5 w-3.5" /></div>
+                          <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-700">{department.name}</div><div className="text-[10px] text-slate-400">{department.member_count} 名成员</div></div>
+                          <select aria-label={`设置部门 ${department.name} 的选区权限`} value={getProtectionDepartmentAccess(department.id)} onChange={(event) => setProtectionDepartmentAccess(department.id, event.target.value as ProtectionWhitelistAccess | '')} disabled={editLocked} className="h-8 w-32 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 outline-none focus:border-sky-300">
+                            <option value="">不加入</option><option value="readonly">只读</option><option value="edit">修改</option><option value="view_hidden">查看遮罩内容</option>
+                          </select>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                  <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-slate-100 p-1 pr-1.5">
-                    {filteredProtectionUsers.length === 0 ? (
-                      <div className="px-2 py-4 text-center text-xs text-slate-400">没有匹配的员工</div>
-                    ) : filteredProtectionUsers.map((user) => (
-                      <label key={user.id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-xs text-slate-600 transition hover:bg-slate-50">
-                        <input
-                          type="checkbox"
-                          checked={selectedProtectionEditableUserIds.includes(user.id)}
-                          onChange={() => toggleProtectionEditableUser(user.id)}
-                          disabled={editLocked}
-                          className="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate font-medium text-slate-700">{user.username}</span>
-                          <span className="block truncate text-[11px] text-slate-400">{user.email}</span>
-                        </span>
+                )}
+
+                <div className="mt-3">
+                  <div className="mb-1.5 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-600">员工</span><span className="text-[10px] text-slate-400">个人设置优先于部门</span></div>
+                  {protectionUsersLoading ? (
+                    <div className="rounded-lg border border-slate-200 px-3 py-4 text-center text-xs text-slate-400">正在加载员工...</div>
+                  ) : protectionUsersError ? (
+                    <div className="flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"><span>{protectionUsersError}</span><button type="button" onClick={() => { setProtectionDirectoryLoaded(false); setProtectionUsersLoadToken((current) => current + 1) }} className="shrink-0 font-semibold text-rose-800 hover:underline">重试</button></div>
+                  ) : protectionUsers.length === 0 ? (
+                    <div className="rounded-lg bg-slate-50 px-3 py-3 text-xs text-slate-400">暂无可选择员工，请先创建并启用员工账号。</div>
+                  ) : (
+                    <>
+                      <label className="relative block">
+                        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                        <input type="search" value={protectionUserSearch} onChange={(event) => setProtectionUserSearch(event.target.value)} placeholder="搜索姓名或邮箱" className="h-9 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-2 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100" />
                       </label>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <button
-                type="button"
-                onClick={() => activeProtectionScope && void handleProtectionChange(activeProtectionScope, 'lock')}
-                disabled={!activeProtectionScope || editLocked || protectionAction === `${activeProtectionScope}:lock`}
-                className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Save className="h-4 w-4" />
-                {activeProtectionScope ? '保存当前保护的部门与员工授权' : '先选择已有保护区域'}
-              </button>
-            </div>
-            {selectionState && (selectionState.endRowIndex > selectionState.rowIndex || selectionState.endColumnKey !== selectionState.columnKey) && (
-              <div className="rounded-xl border border-sky-200 bg-sky-50/80 p-3">
-                <div className="mb-2 text-sm font-semibold text-sky-800">批量保护所选范围</div>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void handleProtectionRangeChange('row', 'lock')}
-                    disabled={protectionAction === 'row:bulk:lock'}
-                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Lock className="h-4 w-4" />
-                    保护选中行
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleProtectionRangeChange('row', 'unlock')}
-                    disabled={protectionAction === 'row:bulk:unlock'}
-                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Unlock className="h-4 w-4" />
-                    解除选中行保护
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleProtectionRangeChange('column', 'lock')}
-                    disabled={protectionAction === 'column:bulk:lock'}
-                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Lock className="h-4 w-4" />
-                    保护选中列
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleProtectionRangeChange('column', 'unlock')}
-                    disabled={protectionAction === 'column:bulk:unlock'}
-                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Unlock className="h-4 w-4" />
-                    解除选中列保护
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleProtectionRangeChange('cell', 'lock')}
-                    disabled={protectionAction === 'cell:bulk:lock'}
-                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Lock className="h-4 w-4" />
-                    保护选中单元格
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleProtectionRangeChange('cell', 'unlock')}
-                    disabled={protectionAction === 'cell:bulk:unlock'}
-                    className="inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <Unlock className="h-4 w-4" />
-                    解除选中单元格保护
-                  </button>
-                </div>
-                <div className="mt-2 flex flex-wrap gap-2 border-t border-sky-200 pt-2">
-                  <button type="button" onClick={() => void handleProtectionRangeChange('row', 'lock', true)} disabled={protectionAction === 'row:bulk:lock'} className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"><EyeOff className="h-4 w-4" />隐藏选中行</button>
-                  <button type="button" onClick={() => void handleProtectionRangeChange('column', 'lock', true)} disabled={protectionAction === 'column:bulk:lock'} className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"><EyeOff className="h-4 w-4" />隐藏选中列</button>
-                  <button type="button" onClick={() => void handleProtectionRangeChange('cell', 'lock', true)} disabled={protectionAction === 'cell:bulk:lock'} className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"><EyeOff className="h-4 w-4" />隐藏选中单元格</button>
+                      <div className="mt-2 max-h-52 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
+                        {filteredProtectionUsers.length === 0 ? (
+                          <div className="px-2 py-5 text-center text-xs text-slate-400">没有匹配的员工</div>
+                        ) : filteredProtectionUsers.map((user) => (
+                          <div key={user.id} className="flex items-center gap-3 px-3 py-2">
+                            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 text-[10px] font-semibold text-slate-600">{user.username.slice(0, 2).toUpperCase()}</div>
+                            <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-700">{user.username}</div><div className="truncate text-[10px] text-slate-400">{user.email}</div></div>
+                            <select aria-label={`设置员工 ${user.username} 的选区权限`} value={getProtectionUserAccess(user.id)} onChange={(event) => setProtectionUserAccess(user.id, event.target.value as ProtectionWhitelistAccess | '')} disabled={editLocked} className="h-8 w-32 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 outline-none focus:border-sky-300">
+                              <option value="">不加入</option><option value="readonly">只读</option><option value="edit">修改</option><option value="view_hidden">查看遮罩内容</option>
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
-            )}
 
-            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
-              <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-800">
-                <Rows3 className="h-4 w-4 text-sky-600" />
-                行保护
+              <div className="border-t border-slate-200 bg-slate-50 px-3 py-3">
+                {activeProtection && <div className="mb-2 text-[11px] leading-5 text-slate-500">当前{protectionScope === 'row' ? '行' : protectionScope === 'column' ? '列' : '单元格'}已由 {activeProtection.owner_name} 设置：{formatProtectionWhitelist(activeProtection)}</div>}
+                <div className="grid grid-cols-[1fr_auto] gap-2">
+                  <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'lock', selectedProtectionHidden)} disabled={!selectionState || editLocked || protectionAction === `${protectionScope}:bulk:lock` || Boolean(activeProtection && !canUpdateProtectionEditors(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"><Shield className="h-4 w-4" />保存并应用到选区</button>
+                  <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'unlock')} disabled={!selectionState || editLocked || protectionAction === `${protectionScope}:bulk:unlock` || Boolean(activeProtection && !canReleaseProtection(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"><Unlock className="h-4 w-4" />解除</button>
+                </div>
+                <div className="mt-2 text-[10px] leading-5 text-slate-400">白名单会并入最终权限矩阵；工作簿或工作表的锁定、归档状态仍然优先。</div>
               </div>
-              <div className="text-xs leading-5 text-slate-500">
-                {currentRowProtection ? `已由 ${currentRowProtection.owner_name} 于 ${new Date(currentRowProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前行未加保护'}
-              </div>
-              {currentRowProtection && (
-                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(currentRowProtection)}</div>
-              )}
-              <button
-                type="button"
-                onClick={() => void handleProtectionChange('row', currentRowProtection ? 'unlock' : 'lock')}
-                disabled={protectionAction === `row:${currentRowProtection ? 'unlock' : 'lock'}` || (currentRowProtection !== null && !canReleaseProtection(currentRowProtection))}
-                className="mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {currentRowProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
-                {currentRowProtection ? '解除当前行保护' : '保护当前行'}
-              </button>
-              <button type="button" onClick={() => void handleProtectionChange('row', 'lock', !currentRowProtection?.hidden)} disabled={editLocked || protectionAction === 'row:lock' || (currentRowProtection !== null && !canUpdateProtectionEditors(currentRowProtection))} className={`ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border bg-white px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${currentRowProtection?.hidden ? 'border-slate-300 text-slate-700 hover:bg-slate-50' : 'border-amber-200 text-amber-700 hover:bg-amber-50'}`}>
-                {currentRowProtection?.hidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
-                {currentRowProtection?.hidden ? '取消行数据遮盖' : '对其他人隐藏此行'}
-              </button>
-              {currentRowProtection && (
-                <button
-                  type="button"
-                  onClick={() => void handleProtectionChange('row', 'lock')}
-                  disabled={protectionAction === 'row:lock' || !canUpdateProtectionEditors(currentRowProtection)}
-                  className="ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Users className="h-4 w-4" />
-                  保存允许人员
-                </button>
-              )}
             </div>
-
-            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
-              <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-800">
-                <Columns3 className="h-4 w-4 text-sky-600" />
-                列保护
-              </div>
-              <div className="text-xs leading-5 text-slate-500">
-                {currentColumnProtection ? `已由 ${currentColumnProtection.owner_name} 于 ${new Date(currentColumnProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前列未加保护'}
-              </div>
-              {currentColumnProtection && (
-                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(currentColumnProtection)}</div>
-              )}
-              <button
-                type="button"
-                onClick={() => void handleProtectionChange('column', currentColumnProtection ? 'unlock' : 'lock')}
-                disabled={protectionAction === `column:${currentColumnProtection ? 'unlock' : 'lock'}` || (currentColumnProtection !== null && !canReleaseProtection(currentColumnProtection))}
-                className="mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {currentColumnProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
-                {currentColumnProtection ? '解除当前列保护' : '保护当前列'}
-              </button>
-              <button type="button" onClick={() => void handleProtectionChange('column', 'lock', !currentColumnProtection?.hidden)} disabled={editLocked || protectionAction === 'column:lock' || (currentColumnProtection !== null && !canUpdateProtectionEditors(currentColumnProtection))} className={`ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border bg-white px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${currentColumnProtection?.hidden ? 'border-slate-300 text-slate-700 hover:bg-slate-50' : 'border-amber-200 text-amber-700 hover:bg-amber-50'}`}>
-                {currentColumnProtection?.hidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
-                {currentColumnProtection?.hidden ? '取消列数据遮盖' : '对其他人隐藏此列'}
-              </button>
-              {currentColumnProtection && (
-                <button
-                  type="button"
-                  onClick={() => void handleProtectionChange('column', 'lock')}
-                  disabled={protectionAction === 'column:lock' || !canUpdateProtectionEditors(currentColumnProtection)}
-                  className="ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Users className="h-4 w-4" />
-                  保存允许人员
-                </button>
-              )}
-            </div>
-
-            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
-              <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-800">
-                <Square className="h-4 w-4 text-sky-600" />
-                单元格保护
-              </div>
-              <div className="text-xs leading-5 text-slate-500">
-                {currentCellProtection ? `已由 ${currentCellProtection.owner_name} 于 ${new Date(currentCellProtection.protected_at).toLocaleString('zh-CN')} 添加` : '当前单元格未加保护'}
-              </div>
-              {currentCellProtection && (
-                <div className="mt-1 text-xs leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(currentCellProtection)}</div>
-              )}
-              <button
-                type="button"
-                onClick={() => void handleProtectionChange('cell', currentCellProtection ? 'unlock' : 'lock')}
-                disabled={protectionAction === `cell:${currentCellProtection ? 'unlock' : 'lock'}` || (currentCellProtection !== null && !canReleaseProtection(currentCellProtection))}
-                className="mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {currentCellProtection ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
-                {currentCellProtection ? '解除当前单元格保护' : '保护当前单元格'}
-              </button>
-              <button type="button" onClick={() => void handleProtectionChange('cell', 'lock', !currentCellProtection?.hidden)} disabled={editLocked || protectionAction === 'cell:lock' || (currentCellProtection !== null && !canUpdateProtectionEditors(currentCellProtection))} className={`ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border bg-white px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${currentCellProtection?.hidden ? 'border-slate-300 text-slate-700 hover:bg-slate-50' : 'border-amber-200 text-amber-700 hover:bg-amber-50'}`}>
-                {currentCellProtection?.hidden ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
-                {currentCellProtection?.hidden ? '取消单元格遮盖' : '对其他人隐藏此单元格'}
-              </button>
-              {currentCellProtection && (
-                <button
-                  type="button"
-                  onClick={() => void handleProtectionChange('cell', 'lock')}
-                  disabled={protectionAction === 'cell:lock' || !canUpdateProtectionEditors(currentCellProtection)}
-                  className="ml-2 mt-3 inline-flex h-9 items-center gap-2 rounded-xl border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Users className="h-4 w-4" />
-                  保存允许人员
-                </button>
-              )}
-            </div>
-
             <div className="rounded-xl border border-slate-200 bg-white p-3">
               <button
                 type="button"
@@ -3778,7 +3649,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                                 <LocateFixed className="h-3.5 w-3.5 shrink-0 text-slate-300" />
                               </div>
                               <div className="mt-1 leading-5 text-slate-500">{new Date(item.protected_at).toLocaleString('zh-CN')}</div>
-                              <div className="mt-1 truncate leading-5 text-slate-500">允许编辑与查看：{formatEditableUsers(item)}</div>
+                              <div className="mt-1 truncate leading-5 text-slate-500">白名单：{formatProtectionWhitelist(item)}</div>
                             </button>
                           ))}
                         </div>

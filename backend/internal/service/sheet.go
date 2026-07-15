@@ -23,12 +23,16 @@ var ErrSheetArchived = errors.New("sheet is archived")
 var ErrSheetStateDenied = errors.New("sheet state change denied")
 
 type protectionOwner struct {
-	OwnerID               int64   `json:"ownerId"`
-	OwnerName             string  `json:"ownerName"`
-	EditableUserIDs       []int64 `json:"editableUserIds,omitempty"`
-	EditableDepartmentIDs []int64 `json:"editableDepartmentIds,omitempty"`
-	Hidden                bool    `json:"hidden,omitempty"`
-	ProtectedAt           string  `json:"protectedAt"`
+	OwnerID                 int64   `json:"ownerId"`
+	OwnerName               string  `json:"ownerName"`
+	ReadonlyUserIDs         []int64 `json:"readonlyUserIds,omitempty"`
+	ReadonlyDepartmentIDs   []int64 `json:"readonlyDepartmentIds,omitempty"`
+	EditableUserIDs         []int64 `json:"editableUserIds,omitempty"`
+	EditableDepartmentIDs   []int64 `json:"editableDepartmentIds,omitempty"`
+	ViewHiddenUserIDs       []int64 `json:"viewHiddenUserIds,omitempty"`
+	ViewHiddenDepartmentIDs []int64 `json:"viewHiddenDepartmentIds,omitempty"`
+	Hidden                  bool    `json:"hidden,omitempty"`
+	ProtectedAt             string  `json:"protectedAt"`
 }
 
 type protectionMaps struct {
@@ -874,10 +878,10 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 		return nil, nil, err
 	}
 	if req.Action == "lock" {
-		if err := s.permService.ValidateEditableUsers(req.EditableUserIDs); err != nil {
+		if err := s.permService.ValidateEditableUsers(protectionRequestUserIDs(*req)); err != nil {
 			return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
 		}
-		if err := s.permService.ValidateDepartments(req.EditableDepartmentIDs); err != nil {
+		if err := s.permService.ValidateDepartments(protectionRequestDepartmentIDs(*req)); err != nil {
 			return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
 		}
 	}
@@ -940,33 +944,33 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 		return nil, nil, err
 	}
 
-	editableUserIDs := make([]int64, 0)
-	editableDepartmentIDs := make([]int64, 0)
-	seenEditableUserIDs := make(map[int64]struct{})
-	seenEditableDepartmentIDs := make(map[int64]struct{})
+	whitelistUserIDs := make([]int64, 0)
+	whitelistDepartmentIDs := make([]int64, 0)
+	seenWhitelistUserIDs := make(map[int64]struct{})
+	seenWhitelistDepartmentIDs := make(map[int64]struct{})
 	for index := range items {
 		if items[index].Action != "lock" {
 			continue
 		}
-		for _, editableUserID := range items[index].EditableUserIDs {
-			if _, exists := seenEditableUserIDs[editableUserID]; exists {
+		for _, userID := range protectionRequestUserIDs(items[index]) {
+			if _, exists := seenWhitelistUserIDs[userID]; exists {
 				continue
 			}
-			seenEditableUserIDs[editableUserID] = struct{}{}
-			editableUserIDs = append(editableUserIDs, editableUserID)
+			seenWhitelistUserIDs[userID] = struct{}{}
+			whitelistUserIDs = append(whitelistUserIDs, userID)
 		}
-		for _, editableDepartmentID := range items[index].EditableDepartmentIDs {
-			if _, exists := seenEditableDepartmentIDs[editableDepartmentID]; exists {
+		for _, departmentID := range protectionRequestDepartmentIDs(items[index]) {
+			if _, exists := seenWhitelistDepartmentIDs[departmentID]; exists {
 				continue
 			}
-			seenEditableDepartmentIDs[editableDepartmentID] = struct{}{}
-			editableDepartmentIDs = append(editableDepartmentIDs, editableDepartmentID)
+			seenWhitelistDepartmentIDs[departmentID] = struct{}{}
+			whitelistDepartmentIDs = append(whitelistDepartmentIDs, departmentID)
 		}
 	}
-	if err := s.permService.ValidateEditableUsers(editableUserIDs); err != nil {
+	if err := s.permService.ValidateEditableUsers(whitelistUserIDs); err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
 	}
-	if err := s.permService.ValidateDepartments(editableDepartmentIDs); err != nil {
+	if err := s.permService.ValidateDepartments(whitelistDepartmentIDs); err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
 	}
 
@@ -1228,18 +1232,102 @@ func normalizeProtectionEditableUsers(userIDs []int64, ownerID int64) []int64 {
 	return result
 }
 
-func protectionAllowsUser(info protectionOwner, userID int64, departmentIDs map[int64]struct{}) bool {
-	for _, editableUserID := range info.EditableUserIDs {
-		if editableUserID == userID {
+type normalizedProtectionAccess struct {
+	ReadonlyUserIDs         []int64
+	ReadonlyDepartmentIDs   []int64
+	EditableUserIDs         []int64
+	EditableDepartmentIDs   []int64
+	ViewHiddenUserIDs       []int64
+	ViewHiddenDepartmentIDs []int64
+}
+
+func protectionRequestUserIDs(req model.UpdateProtectionRequest) []int64 {
+	result := make([]int64, 0, len(req.ReadonlyUserIDs)+len(req.EditableUserIDs)+len(req.ViewHiddenUserIDs))
+	result = append(result, req.ReadonlyUserIDs...)
+	result = append(result, req.EditableUserIDs...)
+	result = append(result, req.ViewHiddenUserIDs...)
+	return result
+}
+
+func protectionRequestDepartmentIDs(req model.UpdateProtectionRequest) []int64 {
+	result := make([]int64, 0, len(req.ReadonlyDepartmentIDs)+len(req.EditableDepartmentIDs)+len(req.ViewHiddenDepartmentIDs))
+	result = append(result, req.ReadonlyDepartmentIDs...)
+	result = append(result, req.EditableDepartmentIDs...)
+	result = append(result, req.ViewHiddenDepartmentIDs...)
+	return result
+}
+
+func normalizeProtectionAccess(req *model.UpdateProtectionRequest, ownerID int64) normalizedProtectionAccess {
+	editableUserIDs := normalizeProtectionEditableUsers(req.EditableUserIDs, ownerID)
+	viewHiddenUserIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ViewHiddenUserIDs, ownerID),
+		editableUserIDs,
+	)
+	readonlyUserIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ReadonlyUserIDs, ownerID),
+		editableUserIDs,
+		viewHiddenUserIDs,
+	)
+
+	editableDepartmentIDs := normalizeProtectionEditableUsers(req.EditableDepartmentIDs, 0)
+	viewHiddenDepartmentIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ViewHiddenDepartmentIDs, 0),
+		editableDepartmentIDs,
+	)
+	readonlyDepartmentIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ReadonlyDepartmentIDs, 0),
+		editableDepartmentIDs,
+		viewHiddenDepartmentIDs,
+	)
+
+	return normalizedProtectionAccess{
+		ReadonlyUserIDs:         readonlyUserIDs,
+		ReadonlyDepartmentIDs:   readonlyDepartmentIDs,
+		EditableUserIDs:         editableUserIDs,
+		EditableDepartmentIDs:   editableDepartmentIDs,
+		ViewHiddenUserIDs:       viewHiddenUserIDs,
+		ViewHiddenDepartmentIDs: viewHiddenDepartmentIDs,
+	}
+}
+
+func excludeProtectionIDs(values []int64, excluded ...[]int64) []int64 {
+	blocked := make(map[int64]struct{})
+	for _, list := range excluded {
+		for _, value := range list {
+			blocked[value] = struct{}{}
+		}
+	}
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if _, exists := blocked[value]; exists {
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
+}
+
+func protectionListAllows(userIDs []int64, departmentIDs []int64, userID int64, userDepartmentIDs map[int64]struct{}) bool {
+	for _, listedUserID := range userIDs {
+		if listedUserID == userID {
 			return true
 		}
 	}
-	for _, departmentID := range info.EditableDepartmentIDs {
-		if _, exists := departmentIDs[departmentID]; exists {
+	for _, departmentID := range departmentIDs {
+		if _, exists := userDepartmentIDs[departmentID]; exists {
 			return true
 		}
 	}
 	return false
+}
+
+func protectionAllowsUser(info protectionOwner, userID int64, departmentIDs map[int64]struct{}) bool {
+	return protectionListAllows(info.EditableUserIDs, info.EditableDepartmentIDs, userID, departmentIDs)
+}
+
+func protectionAllowsViewHidden(info protectionOwner, userID int64, departmentIDs map[int64]struct{}) bool {
+	return protectionAllowsUser(info, userID, departmentIDs) ||
+		protectionListAllows(info.ViewHiddenUserIDs, info.ViewHiddenDepartmentIDs, userID, departmentIDs)
 }
 
 func int64Set(values []int64) map[int64]struct{} {
@@ -1271,13 +1359,18 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 				protectedAt = time.Now().Format(time.RFC3339)
 			}
 		}
+		access := normalizeProtectionAccess(req, ownerID)
 		(*mapRef)[key] = protectionOwner{
-			OwnerID:               ownerID,
-			OwnerName:             ownerName,
-			EditableUserIDs:       normalizeProtectionEditableUsers(req.EditableUserIDs, ownerID),
-			EditableDepartmentIDs: normalizeProtectionEditableUsers(req.EditableDepartmentIDs, 0),
-			Hidden:                resolveProtectionHidden(req.Hidden, info.Hidden),
-			ProtectedAt:           protectedAt,
+			OwnerID:                 ownerID,
+			OwnerName:               ownerName,
+			ReadonlyUserIDs:         access.ReadonlyUserIDs,
+			ReadonlyDepartmentIDs:   access.ReadonlyDepartmentIDs,
+			EditableUserIDs:         access.EditableUserIDs,
+			EditableDepartmentIDs:   access.EditableDepartmentIDs,
+			ViewHiddenUserIDs:       access.ViewHiddenUserIDs,
+			ViewHiddenDepartmentIDs: access.ViewHiddenDepartmentIDs,
+			Hidden:                  resolveProtectionHidden(req.Hidden, info.Hidden),
+			ProtectedAt:             protectedAt,
 		}
 		return nil
 	}
@@ -1327,13 +1420,17 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner) []mode
 		}
 
 		entry := model.ProtectionInfo{
-			Scope:                 scope,
-			Key:                   key,
-			OwnerID:               info.OwnerID,
-			OwnerName:             info.OwnerName,
-			EditableUserIDs:       append([]int64(nil), info.EditableUserIDs...),
-			EditableDepartmentIDs: append([]int64(nil), info.EditableDepartmentIDs...),
-			Hidden:                info.Hidden,
+			Scope:                   scope,
+			Key:                     key,
+			OwnerID:                 info.OwnerID,
+			OwnerName:               info.OwnerName,
+			ReadonlyUserIDs:         append([]int64(nil), info.ReadonlyUserIDs...),
+			ReadonlyDepartmentIDs:   append([]int64(nil), info.ReadonlyDepartmentIDs...),
+			EditableUserIDs:         append([]int64(nil), info.EditableUserIDs...),
+			EditableDepartmentIDs:   append([]int64(nil), info.EditableDepartmentIDs...),
+			ViewHiddenUserIDs:       append([]int64(nil), info.ViewHiddenUserIDs...),
+			ViewHiddenDepartmentIDs: append([]int64(nil), info.ViewHiddenDepartmentIDs...),
+			Hidden:                  info.Hidden,
 		}
 		if parsedTime, err := time.Parse(time.RFC3339, info.ProtectedAt); err == nil {
 			entry.ProtectedAt = parsedTime

@@ -20,7 +20,7 @@ func protectionHidesCell(protections protectionMaps, rowIndex int, columnKey str
 		protections.Columns[columnKey],
 	}
 	for _, info := range checks {
-		if !info.Hidden || info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs) {
+		if !info.Hidden || info.OwnerID == 0 || info.OwnerID == userID || protectionAllowsViewHidden(info, userID, departmentIDs) {
 			continue
 		}
 		return true

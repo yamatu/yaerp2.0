@@ -100,6 +100,50 @@ func TestDepartmentCanViewHiddenProtection(t *testing.T) {
 	}
 }
 
+func TestViewHiddenWhitelistDoesNotGrantEdit(t *testing.T) {
+	info := protectionOwner{
+		OwnerID:                 1,
+		Hidden:                  true,
+		ViewHiddenUserIDs:       []int64{2},
+		ViewHiddenDepartmentIDs: []int64{8},
+	}
+	protections := protectionMaps{
+		Rows:    map[string]protectionOwner{},
+		Columns: map[string]protectionOwner{"salary": info},
+		Cells:   map[string]protectionOwner{},
+	}
+
+	if protectionHidesCell(protections, 0, "salary", 2, false, nil) {
+		t.Fatal("view-hidden user must receive the original value")
+	}
+	if protectionAllowsUser(info, 2, nil) {
+		t.Fatal("view-hidden user must not receive edit permission")
+	}
+	if protectionHidesCell(protections, 0, "salary", 3, false, map[int64]struct{}{8: {}}) {
+		t.Fatal("view-hidden department member must receive the original value")
+	}
+	if protectionAllowsUser(info, 3, map[int64]struct{}{8: {}}) {
+		t.Fatal("view-hidden department member must not receive edit permission")
+	}
+}
+
+func TestReadonlyWhitelistKeepsHiddenValueMasked(t *testing.T) {
+	protections := protectionMaps{
+		Rows: map[string]protectionOwner{},
+		Columns: map[string]protectionOwner{
+			"salary": {OwnerID: 1, Hidden: true, ReadonlyUserIDs: []int64{2}, ReadonlyDepartmentIDs: []int64{8}},
+		},
+		Cells: map[string]protectionOwner{},
+	}
+
+	if !protectionHidesCell(protections, 0, "salary", 2, false, nil) {
+		t.Fatal("readonly user must not bypass data masking")
+	}
+	if !protectionHidesCell(protections, 0, "salary", 3, false, map[int64]struct{}{8: {}}) {
+		t.Fatal("readonly department member must not bypass data masking")
+	}
+}
+
 func TestFilterRealtimeCellChangesMasksBeforeBroadcast(t *testing.T) {
 	protections := protectionMaps{
 		Rows: map[string]protectionOwner{},
