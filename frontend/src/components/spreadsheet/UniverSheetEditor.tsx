@@ -78,6 +78,17 @@ interface SelectionState {
   isEntireRowSelection: boolean
 }
 
+interface IncomingCellChange {
+  row: number
+  col: string
+  value: unknown
+}
+
+interface EditingCell {
+  row: number
+  col: string
+}
+
 interface SheetViewMemory {
   version: 2
   selectionRow: number
@@ -89,6 +100,23 @@ interface SheetViewMemory {
   offsetX: number
   offsetY: number
   updatedAt: number
+}
+
+function selectionStatesEqual(left: SelectionState | null, right: SelectionState | null) {
+  if (left === right) return true
+  if (!left || !right) return false
+  return left.rowIndex === right.rowIndex
+    && left.displayRowIndex === right.displayRowIndex
+    && left.columnKey === right.columnKey
+    && left.rowLabel === right.rowLabel
+    && left.columnLabel === right.columnLabel
+    && left.endRowIndex === right.endRowIndex
+    && left.endDisplayRowIndex === right.endDisplayRowIndex
+    && left.endColumnKey === right.endColumnKey
+    && left.rangeLabel === right.rangeLabel
+    && left.includesHeaderRow === right.includesHeaderRow
+    && left.isEntireColumnSelection === right.isEntireColumnSelection
+    && left.isEntireRowSelection === right.isEntireRowSelection
 }
 
 type ProtectionScope = 'row' | 'column' | 'cell'
@@ -1075,6 +1103,17 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const remotePatchResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const silentSyncInFlightRef = useRef<Promise<void> | null>(null)
   const silentSyncQueuedRef = useRef(false)
+  const sheetEditorActiveRef = useRef(false)
+  const imeComposingRef = useRef(false)
+  const activeEditCellRef = useRef<EditingCell | null>(null)
+  const completedEditCellRef = useRef<EditingCell | null>(null)
+  const pendingLocalPersistRef = useRef(false)
+  const deferredIncomingChangesRef = useRef<IncomingCellChange[]>([])
+  const deferredSilentSyncRef = useRef(false)
+  const deferredRealtimeFlushFrameRef = useRef<number | null>(null)
+  const compositionEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const flushDeferredRealtimeUpdatesRef = useRef<() => void>(() => undefined)
+  const schedulePersistRef = useRef<() => void>(() => undefined)
   const persistedWorksheetDataRef = useRef<Partial<IWorksheetData> | null>(null)
   const protectionHighlightDisposablesRef = useRef<UniverDisposable[]>([])
   const presenceDisposablesRef = useRef<UniverDisposable[]>([])
@@ -1239,7 +1278,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       const columns = latestSheetRef.current.columns || []
 
       if (!range || columns.length === 0) {
-        setSelectionState(null)
+        setSelectionState((current) => current === null ? current : null)
         return null
       }
 
@@ -1251,7 +1290,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       const column = columns[startColumnIndex]
       const endColumn = columns[endColumnIndex] || column
       if (!column) {
-        setSelectionState(null)
+        setSelectionState((current) => current === null ? current : null)
         return null
       }
 
@@ -1285,10 +1324,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         isEntireRowSelection,
       }
 
-      setSelectionState(nextSelection)
+      setSelectionState((current) => selectionStatesEqual(current, nextSelection) ? current : nextSelection)
       return nextSelection
     } catch {
-      setSelectionState(null)
+      setSelectionState((current) => current === null ? current : null)
       return null
     }
   }, [])
@@ -1805,15 +1844,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     const syncAfterPointerAction = () => {
       window.setTimeout(() => {
+        if (sheetEditorActiveRef.current || imeComposingRef.current) return
         syncSelectionState()
       }, 0)
     }
 
     root.addEventListener('pointerup', syncAfterPointerAction, true)
-    root.addEventListener('keyup', syncAfterPointerAction, true)
     return () => {
       root.removeEventListener('pointerup', syncAfterPointerAction, true)
-      root.removeEventListener('keyup', syncAfterPointerAction, true)
     }
   }, [sheetId, syncSelectionState])
 
@@ -1957,8 +1995,19 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [editLocked, refreshPermissions, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionLockEditing, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
 
-  const applyIncomingChanges = useCallback((changes: Array<{ row: number; col: string; value: unknown }>) => {
+  const applyIncomingChanges = useCallback((changes: IncomingCellChange[]) => {
     if (changes.length === 0) return
+    if (sheetEditorActiveRef.current || imeComposingRef.current) {
+      const queuedByCell = new Map<string, IncomingCellChange>()
+      deferredIncomingChangesRef.current.forEach((change) => {
+        queuedByCell.set(`${change.row}:${change.col}`, change)
+      })
+      changes.forEach((change) => {
+        queuedByCell.set(`${change.row}:${change.col}`, change)
+      })
+      deferredIncomingChangesRef.current = Array.from(queuedByCell.values())
+      return
+    }
 
     try {
       const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
@@ -2001,6 +2050,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }, [syncSelectionState])
 
   const syncSheetSilently = useCallback(async () => {
+    if (sheetEditorActiveRef.current || imeComposingRef.current) {
+      deferredSilentSyncRef.current = true
+      return
+    }
     if (silentSyncInFlightRef.current) {
       silentSyncQueuedRef.current = true
       return silentSyncInFlightRef.current
@@ -2009,6 +2062,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const runSync = async () => {
       do {
         silentSyncQueuedRef.current = false
+        if (sheetEditorActiveRef.current || imeComposingRef.current) {
+          deferredSilentSyncRef.current = true
+          return
+        }
 
         if (saveTimerRef.current) {
           clearTimeout(saveTimerRef.current)
@@ -2040,6 +2097,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         }
         if (rowsResponse.code !== 0) {
           throw new Error(rowsResponse.message || '同步工作表数据失败')
+        }
+        if (sheetEditorActiveRef.current || imeComposingRef.current) {
+          deferredSilentSyncRef.current = true
+          return
         }
 
         const nextSheet = sheetResponse.data
@@ -2153,6 +2214,84 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     return request
   }, [onExternalReload, requestProtectionHighlightRefresh, sheetId, syncSelectionState, workbookId])
 
+  const flushDeferredRealtimeUpdates = useCallback(() => {
+    if (sheetEditorActiveRef.current || imeComposingRef.current) return
+    if (deferredRealtimeFlushFrameRef.current !== null) return
+
+    deferredRealtimeFlushFrameRef.current = window.requestAnimationFrame(() => {
+      deferredRealtimeFlushFrameRef.current = null
+      if (sheetEditorActiveRef.current || imeComposingRef.current) return
+
+      const completedCell = completedEditCellRef.current
+      completedEditCellRef.current = null
+      const queuedChanges = deferredIncomingChangesRef.current
+      deferredIncomingChangesRef.current = []
+      const applicableChanges = completedCell
+        ? queuedChanges.filter((change) => change.row !== completedCell.row || change.col !== completedCell.col)
+        : queuedChanges
+
+      if (applicableChanges.length > 0) {
+        applyIncomingChanges(applicableChanges)
+      }
+      if (applicableChanges.length !== queuedChanges.length) {
+        deferredSilentSyncRef.current = true
+      }
+      if (deferredSilentSyncRef.current) {
+        deferredSilentSyncRef.current = false
+        void syncSheetSilently()
+      }
+    })
+  }, [applyIncomingChanges, syncSheetSilently])
+  flushDeferredRealtimeUpdatesRef.current = flushDeferredRealtimeUpdates
+
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root) return
+
+    const isUniverEditorTarget = (target: EventTarget | null) => {
+      if (!(target instanceof Node)) return false
+      if (root.contains(target)) return true
+      return target instanceof Element && Boolean(target.closest('.univer-editor'))
+    }
+
+    const handleCompositionStart = (event: CompositionEvent) => {
+      if (!isUniverEditorTarget(event.target)) return
+      if (compositionEndTimerRef.current) {
+        clearTimeout(compositionEndTimerRef.current)
+        compositionEndTimerRef.current = null
+      }
+      imeComposingRef.current = true
+      pendingLocalPersistRef.current = true
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current)
+        saveTimerRef.current = null
+      }
+    }
+    const handleCompositionEnd = (event: CompositionEvent) => {
+      if (!isUniverEditorTarget(event.target)) return
+      compositionEndTimerRef.current = setTimeout(() => {
+        compositionEndTimerRef.current = null
+        imeComposingRef.current = false
+        if (!sheetEditorActiveRef.current) {
+          if (pendingLocalPersistRef.current) schedulePersistRef.current()
+          flushDeferredRealtimeUpdatesRef.current()
+        }
+      }, 0)
+    }
+
+    document.addEventListener('compositionstart', handleCompositionStart, true)
+    document.addEventListener('compositionend', handleCompositionEnd, true)
+    return () => {
+      document.removeEventListener('compositionstart', handleCompositionStart, true)
+      document.removeEventListener('compositionend', handleCompositionEnd, true)
+      if (compositionEndTimerRef.current) {
+        clearTimeout(compositionEndTimerRef.current)
+        compositionEndTimerRef.current = null
+      }
+      imeComposingRef.current = false
+    }
+  }, [sheetId])
+
   useEffect(() => {
     wsClient.connect()
     wsClient.joinSheet(sheetId)
@@ -2202,6 +2341,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }), [sheetId, syncSheetSilently])
 
   useEffect(() => subscribePrepareDataMutation(async () => {
+    if (sheetEditorActiveRef.current || imeComposingRef.current) {
+      pendingLocalPersistRef.current = true
+      return
+    }
     if (!editLocked && commitActiveCellEditor()) {
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()))
     }
@@ -2231,6 +2374,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     const handlePointerCenteredZoom = (event: WheelEvent) => {
       if (!event.ctrlKey && !event.metaKey) return
+      if (imeComposingRef.current) return
 
       const result = univerApiRef.current
       const univerAPI = result?.univerAPI as UniverViewportApi | undefined
@@ -2292,6 +2436,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     const commitBeforeScroll = (event?: Event) => {
       if (event instanceof WheelEvent && (event.ctrlKey || event.metaKey)) return
+      if (imeComposingRef.current) return
       if (!getVisibleUniverCellEditor(root)) return
 
       const now = Date.now()
@@ -2592,20 +2737,31 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         persistRef.current = persistSnapshot
 
         const schedulePersist = () => {
+          pendingLocalPersistRef.current = true
           if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+          if (sheetEditorActiveRef.current || imeComposingRef.current) {
+            saveTimerRef.current = null
+            return
+          }
           saveTimerRef.current = setTimeout(() => {
+            saveTimerRef.current = null
+            if (sheetEditorActiveRef.current || imeComposingRef.current) return
+            pendingLocalPersistRef.current = false
             persistSnapshot().catch((e) => {
               console.error('Failed to persist Univer snapshot:', e)
               setActionError(e instanceof Error ? e.message : '保存失败，请稍后再试。')
             })
           }, 900)
         }
+        schedulePersistRef.current = schedulePersist
 
         const disposable = workbookApi.onCommandExecuted((command) => {
           const refreshProtectionLayout = commandChangesProtectionHighlightLayout(command.id)
+          if (sheetEditorActiveRef.current || imeComposingRef.current) {
+            pendingLocalPersistRef.current = true
+            return
+          }
           if (applyingRemotePatchRef.current) {
-            syncFilterState()
-            syncSelectionState()
             if (refreshProtectionLayout) requestProtectionHighlightRefresh()
             return
           }
@@ -2627,6 +2783,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         }
 
         const selectionPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SelectionChanged, () => {
+          if (sheetEditorActiveRef.current || imeComposingRef.current) return
           const selection = syncSelectionState()
           scheduleSheetViewMemoryPersist()
           if (!selection || selection.includesHeaderRow || selection.rowIndex < 0) {
@@ -2657,11 +2814,31 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         })
 
         const editStartedPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SheetEditStarted, (params) => {
+          sheetEditorActiveRef.current = true
+          pendingLocalPersistRef.current = true
+          const columnKey = latestSheetRef.current.columns?.[params.column]?.key
+          activeEditCellRef.current = columnKey && params.row > 0
+            ? { row: params.row - 1, col: columnKey }
+            : null
+          if (saveTimerRef.current) {
+            clearTimeout(saveTimerRef.current)
+            saveTimerRef.current = null
+          }
           sendPresenceForCell('editing', params.row, params.column)
         })
 
         const editEndedPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SheetEditEnded, (params) => {
+          completedEditCellRef.current = params.isConfirm ? activeEditCellRef.current : null
+          activeEditCellRef.current = null
+          sheetEditorActiveRef.current = false
           sendPresenceForCell('selected', params.row, params.column)
+          if (pendingLocalPersistRef.current) schedulePersist()
+          flushDeferredRealtimeUpdatesRef.current()
+          window.setTimeout(() => {
+            if (sheetEditorActiveRef.current || imeComposingRef.current) return
+            syncSelectionState()
+            scheduleSheetViewMemoryPersist()
+          }, 0)
         })
 
         cleanup = () => {
@@ -2673,6 +2850,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           editStartedPresenceDisposable.dispose()
           editEndedPresenceDisposable.dispose()
           persistRef.current = null
+          schedulePersistRef.current = () => undefined
           workbookApiRef.current = null
           persistQueuedRef.current = false
           persistInFlightRef.current = null
@@ -2681,6 +2859,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           if (sheetViewRestoreFrameRef.current !== null) { window.cancelAnimationFrame(sheetViewRestoreFrameRef.current); sheetViewRestoreFrameRef.current = null }
           if (sheetViewRestoreTimerRef.current) { clearTimeout(sheetViewRestoreTimerRef.current); sheetViewRestoreTimerRef.current = null }
           sheetViewMemoryRestoringRef.current = false
+          if (deferredRealtimeFlushFrameRef.current !== null) { window.cancelAnimationFrame(deferredRealtimeFlushFrameRef.current); deferredRealtimeFlushFrameRef.current = null }
+          if (compositionEndTimerRef.current) { clearTimeout(compositionEndTimerRef.current); compositionEndTimerRef.current = null }
+          sheetEditorActiveRef.current = false
+          imeComposingRef.current = false
+          activeEditCellRef.current = null
+          completedEditCellRef.current = null
+          pendingLocalPersistRef.current = false
+          deferredIncomingChangesRef.current = []
+          deferredSilentSyncRef.current = false
           if (remotePatchResetTimerRef.current) { clearTimeout(remotePatchResetTimerRef.current); remotePatchResetTimerRef.current = null }
           applyingRemotePatchRef.current = false
           persistedWorksheetDataRef.current = null
