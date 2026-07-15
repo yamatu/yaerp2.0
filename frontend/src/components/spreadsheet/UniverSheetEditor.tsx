@@ -78,6 +78,15 @@ interface SelectionState {
   isEntireRowSelection: boolean
 }
 
+interface SheetViewMemory {
+  version: 1
+  selectionRow: number
+  selectionColumn: number
+  viewRow: number
+  viewColumn: number
+  updatedAt: number
+}
+
 type ProtectionScope = 'row' | 'column' | 'cell'
 type ProtectionWhitelistAccess = 'readonly' | 'edit' | 'view_hidden'
 
@@ -147,6 +156,7 @@ interface ProtectionHighlightBlock {
 const MIN_UNIVER_ZOOM = 0.1
 const MAX_UNIVER_ZOOM = 4
 const PROTECTION_HIGHLIGHT_PREFERENCE_KEY = 'yaerp:show-protection-highlights'
+const SHEET_VIEW_MEMORY_VERSION = 1
 const UNIVER_PROTECTION_CONTEXT_MENU_CONFIG = {
   'sheet.contextMenu.permission': { title: '选区权限' },
   'sheet.command.add-range-protection-from-context-menu': { title: '配置选区白名单' },
@@ -201,6 +211,34 @@ const HIDDEN_PROTECTION_VISUAL: ProtectionVisual = {
 function visualForUser(userId: number) {
   const safeId = Number.isFinite(userId) ? Math.abs(userId) : 0
   return PROTECTION_VISUALS[safeId % PROTECTION_VISUALS.length]
+}
+
+function sheetViewMemoryStorageKey(userId: number, sheetId: number) {
+  return `yaerp:sheet-view:${userId}:${sheetId}`
+}
+
+function readSheetViewMemory(userId: number | undefined, sheetId: number): SheetViewMemory | null {
+  if (!userId) return null
+  try {
+    const raw = window.localStorage.getItem(sheetViewMemoryStorageKey(userId, sheetId))
+    if (!raw) return null
+    const value = JSON.parse(raw) as Partial<SheetViewMemory>
+    if (value.version !== SHEET_VIEW_MEMORY_VERSION) return null
+    const coordinates = [value.selectionRow, value.selectionColumn, value.viewRow, value.viewColumn]
+    if (!coordinates.every((coordinate) => Number.isInteger(coordinate) && Number(coordinate) >= 0)) return null
+    return value as SheetViewMemory
+  } catch {
+    return null
+  }
+}
+
+function writeSheetViewMemory(userId: number | undefined, sheetId: number, memory: SheetViewMemory) {
+  if (!userId) return
+  try {
+    window.localStorage.setItem(sheetViewMemoryStorageKey(userId, sheetId), JSON.stringify(memory))
+  } catch {
+    // Position memory is optional when browser storage is unavailable.
+  }
 }
 
 function protectionVisualKey(item: Pick<ProtectionInfo, 'owner_id' | 'hidden'>) {
@@ -1023,6 +1061,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const protectionFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const protectionHighlightRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const protectionHighlightRenderFrameRef = useRef<number | null>(null)
+  const sheetViewMemorySaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sheetViewRestoreFrameRef = useRef<number | null>(null)
   const protectionHighlightRenderGenerationRef = useRef(0)
   const protectionHighlightRendererRef = useRef<() => void>(() => undefined)
   const protectionSnapshotRef = useRef<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
@@ -1098,7 +1138,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const effectiveCanViewSheet = hasPermissionSnapshot ? canViewSheet : true
   const effectiveCanEditSheet = hasPermissionSnapshot ? canEditSheet : optimisticCanEdit
   const effectiveCanExportSheet = hasPermissionSnapshot ? canExportSheet : optimisticCanEdit
-  const canInitializeEditor = optimisticCanEdit || !permissionLoading
+  const canInitializeEditor = hasPermissionSnapshot || optimisticCanEdit || !permissionLoading
   const editLocked = !effectiveCanEditSheet
   const activeSheetConfig = parseSheetConfig(sheet.config)
   const importSource = activeSheetConfig.importSource
@@ -1106,6 +1146,40 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const originalWorkbookXlsxFilename = typeof importSource?.filename === 'string' ? importSource.filename : ''
   const workbookSheetOptions = workbookSheets.length > 0 ? workbookSheets : [{ id: sheet.id, name: sheet.name }]
   const workbookExportName = workbookName || '工作簿'
+
+  const persistSheetViewMemory = useCallback(() => {
+    try {
+      const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+      const worksheet = workbook?.getActiveSheet?.()
+      const range = worksheet?.getActiveRange?.() || worksheet?.getSelection?.()?.getActiveRange?.()
+      if (!worksheet || !range) return
+      const scrollState = worksheet.getScrollState()
+      writeSheetViewMemory(profile?.id, sheetId, {
+        version: SHEET_VIEW_MEMORY_VERSION,
+        selectionRow: Math.max(0, Math.trunc(range.getRow())),
+        selectionColumn: Math.max(0, Math.trunc(range.getColumn())),
+        viewRow: Math.max(0, Math.trunc(scrollState.sheetViewStartRow)),
+        viewColumn: Math.max(0, Math.trunc(scrollState.sheetViewStartColumn)),
+        updatedAt: Date.now(),
+      })
+    } catch {
+      // The editor may be between mount and disposal.
+    }
+  }, [profile?.id, sheetId])
+
+  const scheduleSheetViewMemoryPersist = useCallback(() => {
+    if (sheetViewMemorySaveTimerRef.current) clearTimeout(sheetViewMemorySaveTimerRef.current)
+    sheetViewMemorySaveTimerRef.current = setTimeout(() => {
+      sheetViewMemorySaveTimerRef.current = null
+      persistSheetViewMemory()
+    }, 180)
+  }, [persistSheetViewMemory])
+
+  useEffect(() => {
+    const handlePageHide = () => persistSheetViewMemory()
+    window.addEventListener('pagehide', handlePageHide)
+    return () => window.removeEventListener('pagehide', handlePageHide)
+  }, [persistSheetViewMemory])
 
   const commitActiveCellEditor = useCallback(() => {
     const root = containerRef.current
@@ -1818,7 +1892,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setProtectionAction(`${scope}:bulk:${action}`)
 
     try {
-      const res = await api.post(`/sheets/${sheetId}/protections/batch`, {
+      const res = await api.post<{ sheet?: Sheet; protections?: ProtectionSnapshot }>(`/sheets/${sheetId}/protections/batch`, {
         items: requests.map((request) => ({
           ...request,
           action,
@@ -1835,8 +1909,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       if (res.code !== 0) {
         throw new Error(res.message || '批量保护失败')
       }
+      if (res.data?.sheet) {
+        latestSheetRef.current = res.data.sheet
+      }
+      if (res.data?.protections) {
+        setProtectionSnapshot(res.data.protections)
+      } else {
+        await refreshProtectionSnapshot()
+      }
       refreshPermissions()
-      await refreshProtectionSnapshot()
     } catch (err) {
       console.error('Failed to update protection range:', err)
       setActionError(err instanceof Error ? err.message : '批量保护失败，请稍后再试。')
@@ -2319,8 +2400,31 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         syncFilterState()
-        syncSelectionState()
-        if (!disposed) setLoading(false)
+        const rememberedView = readSheetViewMemory(profile?.id, sheetId)
+        if (rememberedView) {
+          sheetViewRestoreFrameRef.current = window.requestAnimationFrame(() => {
+            sheetViewRestoreFrameRef.current = null
+            if (disposed) return
+            try {
+              const worksheet = workbookApi.getActiveSheet()
+              const maxRow = Math.max(0, worksheet.getMaxRows() - 1)
+              const maxColumn = Math.max(0, worksheet.getMaxColumns() - 1)
+              const selectionRow = Math.min(maxRow, rememberedView.selectionRow)
+              const selectionColumn = Math.min(maxColumn, rememberedView.selectionColumn)
+              const viewRow = Math.min(maxRow, rememberedView.viewRow)
+              const viewColumn = Math.min(maxColumn, rememberedView.viewColumn)
+              worksheet.getRange(selectionRow, selectionColumn, 1, 1).activate()
+              worksheet.scrollToCell(viewRow, viewColumn)
+            } catch (restoreError) {
+              console.warn('Failed to restore sheet view position:', restoreError)
+            }
+            syncSelectionState()
+            setLoading(false)
+          })
+        } else {
+          syncSelectionState()
+          if (!disposed) setLoading(false)
+        }
 
         const persistSnapshot = async () => {
           persistQueuedRef.current = true
@@ -2444,12 +2548,17 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
         const selectionPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SelectionChanged, () => {
           const selection = syncSelectionState()
+          scheduleSheetViewMemoryPersist()
           if (!selection || selection.includesHeaderRow || selection.rowIndex < 0) {
             wsClient.sendCellPresence(sheetId, 'viewing')
             return
           }
           const columnIndex = latestSheetRef.current.columns?.findIndex((column) => column.key === selection.columnKey) ?? -1
           if (columnIndex >= 0) sendPresenceForCell('selected', selection.rowIndex + 1, columnIndex)
+        })
+
+        const scrollPositionDisposable = univerAPI.addEvent(univerAPI.Event.Scroll, () => {
+          scheduleSheetViewMemoryPersist()
         })
 
         const beforeEditPresenceDisposable = univerAPI.addEvent(univerAPI.Event.BeforeSheetEditStart, (params) => {
@@ -2476,8 +2585,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         })
 
         cleanup = () => {
+          persistSheetViewMemory()
           disposable.dispose()
           selectionPresenceDisposable.dispose()
+          scrollPositionDisposable.dispose()
           beforeEditPresenceDisposable.dispose()
           editStartedPresenceDisposable.dispose()
           editEndedPresenceDisposable.dispose()
@@ -2486,6 +2597,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           persistQueuedRef.current = false
           persistInFlightRef.current = null
           if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
+          if (sheetViewMemorySaveTimerRef.current) { clearTimeout(sheetViewMemorySaveTimerRef.current); sheetViewMemorySaveTimerRef.current = null }
+          if (sheetViewRestoreFrameRef.current !== null) { window.cancelAnimationFrame(sheetViewRestoreFrameRef.current); sheetViewRestoreFrameRef.current = null }
           if (remotePatchResetTimerRef.current) { clearTimeout(remotePatchResetTimerRef.current); remotePatchResetTimerRef.current = null }
           applyingRemotePatchRef.current = false
           persistedWorksheetDataRef.current = null
@@ -2512,7 +2625,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     mount()
     return () => { disposed = true; cleanup?.() }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
-  }, [sheetId, workbookId, reloadToken, canInitializeEditor, requestProtectionHighlightRefresh])
+  }, [sheetId, workbookId, reloadToken, canInitializeEditor, persistSheetViewMemory, requestProtectionHighlightRefresh, scheduleSheetViewMemoryPersist])
 
   useEffect(() => {
     try {

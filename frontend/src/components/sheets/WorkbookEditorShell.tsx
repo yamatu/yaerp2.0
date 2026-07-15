@@ -34,6 +34,27 @@ interface SheetContextMenuState {
 
 type SheetStateAction = 'lock' | 'unlock' | 'archive' | 'unarchive' | 'hide' | 'unhide'
 
+function lastViewedSheetStorageKey(userId: number, workbookId: string) {
+  return `yaerp:workbook-view:${userId}:${workbookId}:last-sheet`
+}
+
+function readLastViewedSheetId(userId: number, workbookId: string) {
+  try {
+    const value = Number(window.localStorage.getItem(lastViewedSheetStorageKey(userId, workbookId)))
+    return Number.isInteger(value) && value > 0 ? value : null
+  } catch {
+    return null
+  }
+}
+
+function rememberLastViewedSheet(userId: number, workbookId: string, sheetId: number) {
+  try {
+    window.localStorage.setItem(lastViewedSheetStorageKey(userId, workbookId), String(sheetId))
+  } catch {
+    // Browsing still works when storage is unavailable.
+  }
+}
+
 export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Props) {
   const router = useRouter()
   const { workbook, loading, error, refresh, refreshSilently } = useWorkbook(workbookId)
@@ -171,12 +192,22 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
   useEffect(() => {
     if (loading || !workbook) return
+    if (!currentUser?.id) return
     if (sheetIds.length === 0) return
 
     if (requestedSheetId === null || !sheetIds.includes(requestedSheetId)) {
-      router.replace(`/sheets/${workbookId}/${sheetIds[0]}`)
+      const rememberedSheetId = readLastViewedSheetId(currentUser.id, workbookId)
+      const targetSheetId = rememberedSheetId && sheetIds.includes(rememberedSheetId)
+        ? rememberedSheetId
+        : sheetIds[0]
+      router.replace(`/sheets/${workbookId}/${targetSheetId}`)
     }
-  }, [loading, requestedSheetId, router, sheetIds, workbook, workbookId])
+  }, [currentUser?.id, loading, requestedSheetId, router, sheetIds, workbook, workbookId])
+
+  useEffect(() => {
+    if (!currentUser?.id || !activeSheet?.id) return
+    rememberLastViewedSheet(currentUser.id, workbookId, activeSheet.id)
+  }, [activeSheet?.id, currentUser?.id, workbookId])
 
   const filteredSheets = useMemo(() => {
     const keyword = sheetSearchQuery.trim().toLowerCase()

@@ -70,6 +70,39 @@ func (h *SheetHandler) broadcastSheetReload(c *gin.Context, sheetIDs ...int64) {
 	}
 }
 
+func (h *SheetHandler) broadcastSheetSync(c *gin.Context, sheetIDs ...int64) {
+	if h.broadcaster == nil {
+		return
+	}
+
+	excludeClientID := c.GetHeader("X-Client-Id")
+	if excludeClientID == "" {
+		return
+	}
+	userID := c.GetInt64("user_id")
+	seen := make(map[int64]struct{}, len(sheetIDs))
+	for _, sheetID := range sheetIDs {
+		if sheetID <= 0 {
+			continue
+		}
+		if _, ok := seen[sheetID]; ok {
+			continue
+		}
+		seen[sheetID] = struct{}{}
+
+		payload, err := json.Marshal(gin.H{
+			"type":    "sheet_sync",
+			"sheetId": sheetID,
+			"userId":  userID,
+		})
+		if err != nil {
+			log.Printf("failed to marshal sheet sync payload for sheet %d: %v", sheetID, err)
+			continue
+		}
+		h.broadcaster.BroadcastToSheetExceptClientID(sheetID, payload, excludeClientID)
+	}
+}
+
 func (h *SheetHandler) broadcastProtectionUpdated(c *gin.Context, sheetIDs ...int64) {
 	if h.broadcaster == nil {
 		return
@@ -616,7 +649,7 @@ func (h *SheetHandler) UpdateProtection(c *gin.Context) {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
 	h.broadcastProtectionUpdated(c, affectedSheetIDs...)
-	h.broadcastSheetReload(c, affectedSheetIDs...)
+	h.broadcastSheetSync(c, affectedSheetIDs...)
 
 	response.OK(c, gin.H{
 		"sheet":       updatedSheet,
@@ -656,7 +689,7 @@ func (h *SheetHandler) UpdateProtectionBatch(c *gin.Context) {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
 	h.broadcastProtectionUpdated(c, affectedSheetIDs...)
-	h.broadcastSheetReload(c, affectedSheetIDs...)
+	h.broadcastSheetSync(c, affectedSheetIDs...)
 
 	response.OK(c, gin.H{
 		"sheet":       updatedSheet,

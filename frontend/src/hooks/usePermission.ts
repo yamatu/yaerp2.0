@@ -62,8 +62,11 @@ export function usePermission(sheetId: number) {
       }
 
       if (active) {
-        setLoading(true)
-        if (loadedSheetIdRef.current !== sheetId) setPermissions(null)
+        const loadingNewSheet = loadedSheetIdRef.current !== sheetId
+        if (loadingNewSheet) {
+          setLoading(true)
+          setPermissions(null)
+        }
       }
 
       try {
