@@ -114,6 +114,12 @@ export function normalizeCellValue(input: string, column?: ColumnDef): unknown {
       const numeric = Number(trimmed.replace(/[^0-9.-]/g, ''))
       return Number.isFinite(numeric) && trimmed !== '' ? numeric : trimmed
     }
+    case 'percentage': {
+      const hasPercentSign = trimmed.includes('%')
+      const numeric = Number(trimmed.replace(/[%\s,]/g, ''))
+      if (!Number.isFinite(numeric) || trimmed === '') return trimmed
+      return hasPercentSign ? numeric / 100 : numeric
+    }
     default:
       return trimmed
   }

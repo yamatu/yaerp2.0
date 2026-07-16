@@ -189,7 +189,7 @@ export interface AdvancedFilterConfig {
 export interface ColumnDef {
   key: string
   name: string
-  type: 'text' | 'number' | 'currency' | 'formula' | 'date' | 'select' | 'image'
+  type: 'text' | 'number' | 'currency' | 'percentage' | 'formula' | 'date' | 'select' | 'image'
   width?: number
   required?: boolean
   validation?: Record<string, unknown>

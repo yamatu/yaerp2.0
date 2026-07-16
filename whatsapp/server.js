@@ -20,6 +20,7 @@ const STARTUP_TIMEOUT_MS = Number(process.env.WHATSAPP_STARTUP_TIMEOUT_MS || 120
 const INITIALIZATION_CANCEL_GRACE_MS = Number(process.env.WHATSAPP_INITIALIZATION_CANCEL_GRACE_MS || 2000)
 const CHAT_LIST_CACHE_MS = Number(process.env.WHATSAPP_CHAT_LIST_CACHE_MS || 10000)
 const CHAT_METADATA_CACHE_MS = Number(process.env.WHATSAPP_CHAT_METADATA_CACHE_MS || 10 * 60 * 1000)
+const CHAT_CONTACT_NAMES_CACHE_MS = Number(process.env.WHATSAPP_CHAT_CONTACT_NAMES_CACHE_MS || 2 * 60 * 1000)
 const CHAT_METADATA_LIMIT = Number(process.env.WHATSAPP_CHAT_METADATA_LIMIT || 30)
 const CHAT_METADATA_TIMEOUT_MS = Number(process.env.WHATSAPP_CHAT_METADATA_TIMEOUT_MS || 8000)
 const AVATAR_MAX_BYTES = Number(process.env.WHATSAPP_AVATAR_MAX_BYTES || 5 * 1024 * 1024)
@@ -61,7 +62,9 @@ function getSession(value) {
       startupTimer: null,
       chatListPromise: null,
       chatMetadataPromise: null,
-      chatCache: { items: [], loadedAt: 0, metadataLoadedAt: 0, metadata: new Map() },
+      chatContactNamesPromise: null,
+      chatCache: { items: [], loadedAt: 0, metadataLoadedAt: 0, contactNamesLoadedAt: 0, metadata: new Map() },
+      avatarUrlCache: new Map(),
       state: createState(),
     })
   }
@@ -131,7 +134,9 @@ function scheduleStartupTimer(session, client) {
 function resetChatCache(session) {
   session.chatListPromise = null
   session.chatMetadataPromise = null
-  session.chatCache = { items: [], loadedAt: 0, metadataLoadedAt: 0, metadata: new Map() }
+  session.chatContactNamesPromise = null
+  session.chatCache = { items: [], loadedAt: 0, metadataLoadedAt: 0, contactNamesLoadedAt: 0, metadata: new Map() }
+  session.avatarUrlCache = new Map()
 }
 
 function invalidateChatList(session) {
@@ -175,8 +180,9 @@ async function safeProfilePic(client, contactId) {
 }
 
 async function fetchProfilePicData(session, contactId) {
-  const sourceUrl = await safeProfilePic(session.client, contactId)
+  const sourceUrl = session.avatarUrlCache?.get(contactId) || await safeProfilePic(session.client, contactId)
   if (!sourceUrl) return null
+  session.avatarUrlCache?.set(contactId, sourceUrl)
   const page = session.client?.pupPage
   if (page) {
     try {
@@ -547,6 +553,54 @@ async function getContactChatFallback(session, limit) {
     .map(serializeContactAsChat)
 }
 
+function isGenericChatName(name, chatId) {
+  const normalizedName = String(name || '').trim().toLowerCase()
+  const comparable = comparableChatId(chatId)
+  if (!normalizedName) return true
+  if (normalizedName === comparable.serialized || normalizedName === comparable.local) return true
+  return normalizedName.replace(/[^a-z0-9]+/g, '') === comparable.local.replace(/[^a-z0-9]+/g, '')
+}
+
+function refreshChatContactNames(session, force = false) {
+  if (session.chatContactNamesPromise || session.state.status !== 'ready') return session.chatContactNamesPromise
+  if (!force && Date.now() - session.chatCache.contactNamesLoadedAt < CHAT_CONTACT_NAMES_CACHE_MS) return null
+
+  const client = session.client
+  session.chatContactNamesPromise = withTimeout(client.getContacts(), 20000, 'refresh chat contact names').then((contacts) => {
+    if (session.client !== client || session.state.status !== 'ready') return
+    const names = new Map()
+    contacts.forEach((contact) => {
+      if (contact.isMe || !serializeId(contact.id)) return
+      const explicitName = String(contact.name || contact.pushname || contact.shortName || '').trim()
+      const fallbackName = String(contact.number || '').trim()
+      const candidate = explicitName || fallbackName
+      if (!candidate) return
+      const comparable = comparableChatId(contact.id)
+      const keys = [comparable.serialized, comparable.local, fallbackName.toLowerCase()].filter(Boolean)
+      keys.forEach((key) => names.set(key, { name: candidate, explicit: Boolean(explicitName) }))
+    })
+
+    session.chatCache.items = session.chatCache.items.map((item) => {
+      if (item.isGroup) return item
+      const comparable = comparableChatId(item.id)
+      const match = names.get(comparable.serialized) || names.get(comparable.local)
+      if (!match || (!match.explicit && !isGenericChatName(item.name, item.id))) return item
+      const nextItem = { ...item, name: match.name }
+      session.chatCache.metadata.set(item.id, {
+        ...(session.chatCache.metadata.get(item.id) || {}),
+        name: match.name,
+      })
+      return nextItem
+    })
+    session.chatCache.contactNamesLoadedAt = Date.now()
+  }).catch((error) => {
+    console.error(`Chat contact name refresh failed (${session.id}):`, error.message)
+  }).finally(() => {
+    session.chatContactNamesPromise = null
+  })
+  return session.chatContactNamesPromise
+}
+
 async function resolveChat(session, chatId) {
   let directError = null
   try {
@@ -569,6 +623,7 @@ async function resolveChat(session, chatId) {
 async function enrichChat(session, chat) {
   const basic = serializeChatBasic(chat)
   basic.profilePicUrl = await safeProfilePic(session.client, basic.id)
+  if (basic.profilePicUrl) session.avatarUrlCache?.set(basic.id, basic.profilePicUrl)
   basic.about = ''
   basic.description = ''
   basic.participantCount = 0
@@ -578,6 +633,7 @@ async function enrichChat(session, chat) {
   } else {
     try {
       const contact = await chat.getContact()
+      basic.name = contact.name || contact.pushname || contact.shortName || contact.number || basic.name
       basic.about = await contact.getAbout() || ''
     } catch { /* Contact about may be private. */ }
   }
@@ -597,7 +653,7 @@ function refreshChatMetadata(session, chats) {
     try {
       const enriched = await withTimeout(enrichChat(session, chat), CHAT_METADATA_TIMEOUT_MS, `chat metadata ${serializeId(chat.id)}`)
       const { id, name, isGroup, unreadCount, timestamp, pinned, archived, isMuted, lastMessage, ...metadata } = enriched
-      session.chatCache.metadata.set(id, metadata)
+      session.chatCache.metadata.set(id, { ...metadata, name })
     } catch (error) {
       console.error(`Chat metadata refresh failed (${session.id}/${serializeId(chat.id)}):`, error.message)
     }
@@ -613,9 +669,13 @@ function refreshChatMetadata(session, chats) {
   return session.chatMetadataPromise
 }
 
-async function getChatList(session, limit, waitForMetadata = false) {
+async function getChatList(session, limit, waitForMetadata = false, forceContactNames = false) {
   const now = Date.now()
   if (session.chatCache.items.length > 0 && now - session.chatCache.loadedAt < CHAT_LIST_CACHE_MS) {
+    if (waitForMetadata) {
+      const namesRefresh = refreshChatContactNames(session, forceContactNames)
+      if (namesRefresh) await namesRefresh
+    }
     return mergeChatMetadata(session, session.chatCache.items).slice(0, limit)
   }
   if (!session.chatListPromise) {
@@ -631,10 +691,14 @@ async function getChatList(session, limit, waitForMetadata = false) {
       const selected = chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, Math.max(limit, 200))
       session.chatCache.items = mergeChatMetadata(session, selected.map(serializeChatBasic))
       session.chatCache.loadedAt = Date.now()
+      const namesRefresh = refreshChatContactNames(session, forceContactNames)
+      const pendingMetadata = []
+      if (namesRefresh) pendingMetadata.push(namesRefresh)
       if (Date.now() - session.chatCache.metadataLoadedAt >= CHAT_METADATA_CACHE_MS) {
         const refresh = refreshChatMetadata(session, selected)
-        if (waitForMetadata && refresh) await refresh
+        if (refresh) pendingMetadata.push(refresh)
       }
+      if (waitForMetadata && pendingMetadata.length > 0) await Promise.all(pendingMetadata)
       return session.chatCache.items
     }).catch(async (error) => {
       if (session.chatCache.items.length === 0) {
@@ -738,10 +802,11 @@ app.get('/sessions/:sessionId/chats', requireSession, requireReady, async (req, 
   try {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200)))
     const waitForMetadata = req.query.metadata === '1' || req.query.metadata === 'true'
+    const forceContactNames = req.query.refresh_names === '1' || req.query.refresh_names === 'true'
     if (waitForMetadata && req.whatsappSession.chatCache.metadata.size === 0) {
       req.whatsappSession.chatCache.loadedAt = 0
     }
-    res.json(await getChatList(req.whatsappSession, limit, waitForMetadata))
+    res.json(await getChatList(req.whatsappSession, limit, waitForMetadata, forceContactNames))
   } catch (error) { next(error) }
 })
 app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (req, res, next) => {
@@ -749,12 +814,17 @@ app.get('/sessions/:sessionId/contacts', requireSession, requireReady, async (re
     const basic = req.query.basic === '1' || req.query.basic === 'true'
     const limit = Math.min(2000, Math.max(1, Number(req.query.limit || 1000)))
     const contacts = (await req.whatsappSession.client.getContacts()).filter((contact) => contact.isWAContact).slice(0, limit)
-    res.json(await mapWithConcurrency(contacts, 8, async (contact) => ({
-      id: serializeId(contact.id), number: contact.number || '',
-      name: contact.name || contact.pushname || contact.shortName || contact.number || '',
-      isBusiness: Boolean(contact.isBusiness), isMyContact: Boolean(contact.isMyContact),
-      profilePicUrl: basic ? '' : await safeProfilePic(req.whatsappSession.client, serializeId(contact.id)),
-    })))
+    res.json(await mapWithConcurrency(contacts, 8, async (contact) => {
+      const id = serializeId(contact.id)
+      const profilePicUrl = basic ? '' : await safeProfilePic(req.whatsappSession.client, id)
+      if (profilePicUrl) req.whatsappSession.avatarUrlCache?.set(id, profilePicUrl)
+      return {
+        id, number: contact.number || '',
+        name: contact.name || contact.pushname || contact.shortName || contact.number || '',
+        isBusiness: Boolean(contact.isBusiness), isMyContact: Boolean(contact.isMyContact),
+        profilePicUrl,
+      }
+    }))
   } catch (error) { next(error) }
 })
 app.get('/sessions/:sessionId/avatars/:contactId', requireSession, requireReady, async (req, res, next) => {

@@ -470,14 +470,17 @@ func (s *WhatsAppService) SyncContactsToChannels(userID int64, request *model.Wh
 			continue
 		}
 		if existingLink, err := s.repo.FindChannelLink(account.ID, contactID); err == nil {
+			previousAvatarURL := strings.TrimSpace(existingLink.WhatsAppChatAvatarURL)
 			existingLink.WhatsAppChatName = truncateWhatsAppChannelName(whatsAppFirstNonEmpty(contact.Name, contact.Number, contactID))
 			existingLink.WhatsAppChatAvatarURL = contact.ProfilePicURL
 			_ = s.repo.UpsertChannelLink(existingLink)
-			if strings.TrimSpace(contact.ProfilePicURL) != "" {
-				if channel, channelErr := s.channelRepo.GetChannel(existingLink.ChannelID, account.UserID); channelErr == nil && channel.AvatarAttachmentID == nil {
-					if avatarErr := s.syncWhatsAppChannelAvatar(account, existingLink.ChannelID, contactID, existingLink.WhatsAppChatName); avatarErr != nil {
-						result.Errors = appendWhatsAppSyncError(result.Errors, existingLink.WhatsAppChatName+" 头像", avatarErr)
-					}
+			shouldSyncAvatar := strings.TrimSpace(contact.ProfilePicURL) != "" && previousAvatarURL != strings.TrimSpace(contact.ProfilePicURL)
+			if channel, channelErr := s.channelRepo.GetChannel(existingLink.ChannelID, account.UserID); channelErr == nil && channel.AvatarAttachmentID == nil {
+				shouldSyncAvatar = strings.TrimSpace(contact.ProfilePicURL) != ""
+			}
+			if shouldSyncAvatar {
+				if avatarErr := s.syncWhatsAppChannelAvatar(account, existingLink.ChannelID, contactID, existingLink.WhatsAppChatName); avatarErr != nil {
+					result.Errors = appendWhatsAppSyncError(result.Errors, existingLink.WhatsAppChatName+" 头像", avatarErr)
 				}
 			}
 			result.Skipped++
@@ -1116,7 +1119,7 @@ func (s *WhatsAppService) listChatsForAccount(account *model.WhatsAppAccount) ([
 		return nil, err
 	}
 	chats := make([]model.WhatsAppChat, 0)
-	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/chats?metadata=1", nil, &chats, 45*time.Second); err != nil {
+	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/chats?metadata=1&refresh_names=1", nil, &chats, 45*time.Second); err != nil {
 		return nil, err
 	}
 	return chats, nil
@@ -1209,6 +1212,16 @@ func (s *WhatsAppService) syncWhatsAppChannelAvatar(account *model.WhatsAppAccou
 	}
 	if len(data) == 0 || len(data) > 5*1024*1024 {
 		return fmt.Errorf("WhatsApp 头像数据无效")
+	}
+	channel, channelErr := s.channelRepo.GetChannel(channelID, account.UserID)
+	if channelErr == nil && channel.AvatarAttachmentID != nil {
+		existing, existingErr := s.uploadSvc.ensureContentHash(*channel.AvatarAttachmentID)
+		if existingErr == nil {
+			sum := sha256.Sum256(data)
+			if existing.ContentHash == hex.EncodeToString(sum[:]) {
+				return nil
+			}
+		}
 	}
 	mimeType := strings.TrimSpace(avatar.Mimetype)
 	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {

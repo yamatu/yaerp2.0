@@ -366,6 +366,7 @@ export default function ChannelsPage() {
   const [syncWhatsAppInbound, setSyncWhatsAppInbound] = useState(true)
   const [syncWhatsAppOutbound, setSyncWhatsAppOutbound] = useState(true)
   const [loadingWhatsApp, setLoadingWhatsApp] = useState(false)
+  const [refreshingWhatsAppChats, setRefreshingWhatsAppChats] = useState(false)
   const [savingWhatsApp, setSavingWhatsApp] = useState(false)
   const [syncingWhatsAppHistory, setSyncingWhatsAppHistory] = useState(false)
   const [syncingWhatsAppContacts, setSyncingWhatsAppContacts] = useState(false)
@@ -406,6 +407,7 @@ export default function ChannelsPage() {
   const soundEnabledRef = useRef(soundEnabled)
   const audioContextRef = useRef<AudioContext | null>(null)
   const whatsAppRequestSequenceRef = useRef(0)
+  const whatsAppSearchRefreshRef = useRef('')
   const latestMessageIdsRef = useRef<Map<number, number>>(new Map())
   const channelsInitializedRef = useRef(false)
 
@@ -477,6 +479,39 @@ export default function ChannelsPage() {
     })
   }, [whatsAppChatSearch, whatsAppChats])
   const selectedWhatsAppAccount = whatsAppAccounts.find((account) => String(account.id) === selectedWhatsAppAccountId) || null
+
+  const refreshSelectedWhatsAppChats = useCallback(async () => {
+    if (!selectedWhatsAppAccount || selectedWhatsAppAccount.status !== 'ready' || refreshingWhatsAppChats) return
+    const requestSequence = ++whatsAppRequestSequenceRef.current
+    setRefreshingWhatsAppChats(true)
+    try {
+      const response = currentUser && isAdmin(currentUser)
+        ? await api.get<WhatsAppChat[]>(`/admin/whatsapp/accounts/${selectedWhatsAppAccount.user_id}/chats`)
+        : await api.get<WhatsAppChat[]>('/whatsapp/chats')
+      if (requestSequence !== whatsAppRequestSequenceRef.current) return
+      if (response.code === 0 && response.data) setWhatsAppChats(response.data)
+    } catch {
+      if (requestSequence === whatsAppRequestSequenceRef.current) setError('刷新 WhatsApp 联系人失败')
+    } finally {
+      if (requestSequence === whatsAppRequestSequenceRef.current) setRefreshingWhatsAppChats(false)
+    }
+  }, [currentUser, refreshingWhatsAppChats, selectedWhatsAppAccount])
+
+  useEffect(() => {
+    const keyword = normalizeWhatsAppSearchText(whatsAppChatSearch)
+    if (!keyword) {
+      whatsAppSearchRefreshRef.current = ''
+      return
+    }
+    if (!isManageOpen || loadingWhatsApp || refreshingWhatsAppChats || selectedWhatsAppAccount?.status !== 'ready' || whatsAppChats.length === 0 || filteredWhatsAppChats.length > 0) return
+    const refreshKey = `${selectedWhatsAppAccount.id}:${keyword}`
+    if (whatsAppSearchRefreshRef.current === refreshKey) return
+    const timer = window.setTimeout(() => {
+      whatsAppSearchRefreshRef.current = refreshKey
+      void refreshSelectedWhatsAppChats()
+    }, 450)
+    return () => window.clearTimeout(timer)
+  }, [filteredWhatsAppChats.length, isManageOpen, loadingWhatsApp, refreshSelectedWhatsAppChats, refreshingWhatsAppChats, selectedWhatsAppAccount, whatsAppChatSearch, whatsAppChats.length])
 
   const filteredTableWorkbooks = useMemo(() => {
     const keyword = tableSearch.trim().toLowerCase()
@@ -1660,6 +1695,8 @@ export default function ChannelsPage() {
   const loadWhatsAppLink = async (channelId: number) => {
     const requestSequence = ++whatsAppRequestSequenceRef.current
     setLoadingWhatsApp(true)
+    setRefreshingWhatsAppChats(false)
+    whatsAppSearchRefreshRef.current = ''
     setWhatsAppChatSearch('')
     try {
       const [linkResponse, accountsResponse] = await Promise.all([
@@ -1703,6 +1740,8 @@ export default function ChannelsPage() {
     const requestSequence = ++whatsAppRequestSequenceRef.current
     setSelectedWhatsAppAccountId(accountId)
     setSelectedWhatsAppChatId('')
+    setRefreshingWhatsAppChats(false)
+    whatsAppSearchRefreshRef.current = ''
     setWhatsAppChatSearch('')
     setWhatsAppChats([])
     const account = whatsAppAccounts.find((item) => String(item.id) === accountId)
@@ -2436,7 +2475,7 @@ export default function ChannelsPage() {
                     )}
                     <button type="button" onClick={() => setActiveChannelId(channel.id)} className="flex min-w-0 flex-1 gap-3 px-4 py-3 text-left">
                       <div className={`flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full ${channel.id === activeChannelId ? 'bg-[#008069] text-white' : 'bg-slate-200 text-slate-500'}`}>
-                        {channel.avatar_url ? <img src={channel.avatar_url} alt="" className="h-full w-full object-cover" /> : channel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <Hash className="h-4 w-4" />}
+                        <WhatsAppAvatarImage src={channel.avatar_url} alt={channel.name} fallback={channel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <span className="text-xs font-semibold">{initials(channel.name)}</span>} />
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
@@ -2484,7 +2523,7 @@ export default function ChannelsPage() {
                       <ChevronLeft className="h-5 w-5" />
                     </button>
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-[#008069] text-white">
-                      {whatsAppLink?.whatsapp_chat_avatar_url ? <img src={whatsAppLink.whatsapp_chat_avatar_url} alt="" className="h-full w-full object-cover" /> : activeChannel.avatar_url ? <img src={activeChannel.avatar_url} alt="" className="h-full w-full object-cover" /> : activeChannel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <Hash className="h-4 w-4" />}
+                      <WhatsAppAvatarImage src={activeChannel.avatar_url || whatsAppLink?.whatsapp_chat_avatar_url} alt={activeChannel.name} fallback={activeChannel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <span className="text-xs font-semibold">{initials(activeChannel.name)}</span>} />
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-semibold text-slate-900">{activeChannel.name}</div>
@@ -3279,8 +3318,8 @@ export default function ChannelsPage() {
                 <section className="border-b border-slate-200 p-5">
                   <div className="mb-3 text-sm font-semibold text-slate-800">频道信息</div>
                   <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                    <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-sky-600 text-white">
-                      {activeChannel.avatar_url ? <img src={activeChannel.avatar_url} alt="" className="h-full w-full object-cover" /> : <Hash className="h-5 w-5" />}
+                    <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-600 text-white">
+                      <WhatsAppAvatarImage src={activeChannel.avatar_url} alt={activeChannel.name} fallback={<span className="text-sm font-semibold">{initials(activeChannel.name)}</span>} />
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-semibold text-slate-800">频道头像</div>
@@ -3388,11 +3427,14 @@ export default function ChannelsPage() {
                     <div className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">该员工账号没有可用的联系人或群组。</div>
                   ) : (
                     <>
-                      <label className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-emerald-300 focus-within:bg-white">
+                      <div className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-emerald-300 focus-within:bg-white">
                         <Search className="h-4 w-4 shrink-0" />
                         <input type="search" value={whatsAppChatSearch} onChange={(event) => setWhatsAppChatSearch(event.target.value)} placeholder="搜索姓名、号码或最近消息" autoComplete="off" className="min-w-0 flex-1 bg-transparent outline-none" />
                         <span className="shrink-0 text-[11px] text-slate-400">{filteredWhatsAppChats.length}/{whatsAppChats.length}</span>
-                      </label>
+                        <button type="button" onClick={() => void refreshSelectedWhatsAppChats()} disabled={refreshingWhatsAppChats} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-white hover:text-emerald-700 disabled:opacity-50" title="重新识别 WhatsApp 联系人姓名" aria-label="刷新 WhatsApp 联系人">
+                          <RefreshCw className={`h-3.5 w-3.5 ${refreshingWhatsAppChats ? 'animate-spin' : ''}`} />
+                        </button>
+                      </div>
                       <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border border-slate-200 p-1">
                         {filteredWhatsAppChats.length === 0 ? (
                           <div className="flex min-h-24 items-center justify-center px-4 text-center text-sm text-slate-400">没有匹配的 WhatsApp 联系人或群组</div>

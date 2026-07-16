@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RotateCcw, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
+import { BarChart3, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useWorkbooks } from '@/hooks/useSheet'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
@@ -36,6 +36,76 @@ interface PanelSize {
 const DEFAULT_PANEL_SIZE: PanelSize = { width: 576, height: 720 }
 const MIN_PANEL_WIDTH = 360
 const MIN_PANEL_HEIGHT = 420
+
+type AIIdeaIcon = 'sparkles' | 'table' | 'chart' | 'wand'
+
+interface AIIdea {
+  label: string
+  icon: AIIdeaIcon
+  buildPrompt: (target: string) => string
+}
+
+const AI_IDEA_BANK: AIIdea[] = [
+  { label: '异常检查', icon: 'sparkles', buildPrompt: (target) => `检查「${target}」中的异常值、重复记录和缺失字段，并按影响程度给出处理建议` },
+  { label: '跨表核对', icon: 'table', buildPrompt: (target) => `核对「${target}」与相关工作表中的金额、数量和名称，列出不一致的记录` },
+  { label: '趋势洞察', icon: 'chart', buildPrompt: (target) => `分析「${target}」的时间趋势、环比变化和主要波动原因，并给出结论` },
+  { label: '自动排版', icon: 'wand', buildPrompt: (target) => `优化「${target}」的表头、数字格式、颜色层级和列宽，先给我预览方案` },
+  { label: '经营周报', icon: 'chart', buildPrompt: (target) => `根据「${target}」生成本周经营摘要，突出关键指标、风险和待跟进事项` },
+  { label: '回款分析', icon: 'table', buildPrompt: (target) => `从「${target}」识别应收、已收和逾期情况，按客户汇总并标记高风险记录` },
+  { label: '库存预警', icon: 'sparkles', buildPrompt: (target) => `检查「${target}」中的库存与出入库变化，找出缺货、积压和异常波动项目` },
+  { label: '供应商对比', icon: 'chart', buildPrompt: (target) => `根据「${target}」比较供应商的采购金额、交付和异常情况，给出排序与建议` },
+  { label: '任务拆分', icon: 'wand', buildPrompt: (target) => `把「${target}」中的待办事项按负责人、优先级和截止时间整理成可执行清单` },
+  { label: '字段清理', icon: 'table', buildPrompt: (target) => `检查「${target}」的字段格式和命名，统一日期、金额、编号并找出脏数据` },
+  { label: '客户画像', icon: 'sparkles', buildPrompt: (target) => `基于「${target}」按客户汇总交易、频次和金额，识别重点客户与流失风险` },
+  { label: '管理摘要', icon: 'chart', buildPrompt: (target) => `把「${target}」整理成管理层可快速阅读的摘要，包含结论、图表建议和行动项` },
+]
+
+type ToolTraceRenderItem =
+  | { kind: 'single'; trace: AIChatToolTrace; sourceIndex: number }
+  | { kind: 'query-sheet-group'; traces: AIChatToolTrace[]; sourceIndex: number }
+
+function normalizeSearchText(value: string | null | undefined) {
+  return (value || '').normalize('NFKC').toLocaleLowerCase('zh-CN').trim()
+}
+
+function shuffleIdeas(seed: number) {
+  const ideas = [...AI_IDEA_BANK]
+  let state = seed || 1
+  for (let index = ideas.length - 1; index > 0; index -= 1) {
+    state = (state * 1664525 + 1013904223) >>> 0
+    const swapIndex = state % (index + 1)
+    ;[ideas[index], ideas[swapIndex]] = [ideas[swapIndex], ideas[index]]
+  }
+  return ideas
+}
+
+function groupToolTraces(traces: AIChatToolTrace[]): ToolTraceRenderItem[] {
+  const querySheetTraces = traces.filter((trace) => trace.name === 'query_sheet')
+  if (querySheetTraces.length <= 1) {
+    return traces.map((trace, sourceIndex) => ({ kind: 'single', trace, sourceIndex }))
+  }
+
+  const items: ToolTraceRenderItem[] = []
+  let queryGroupAdded = false
+  traces.forEach((trace, sourceIndex) => {
+    if (trace.name === 'query_sheet') {
+      if (!queryGroupAdded) {
+        items.push({ kind: 'query-sheet-group', traces: querySheetTraces, sourceIndex })
+        queryGroupAdded = true
+      }
+      return
+    }
+    items.push({ kind: 'single', trace, sourceIndex })
+  })
+  return items
+}
+
+function ideaIcon(icon: AIIdeaIcon) {
+  if (icon === 'table') return <Table2 className="h-3 w-3" />
+  if (icon === 'chart') return <BarChart3 className="h-3 w-3" />
+  if (icon === 'wand') return <Wand2 className="h-3 w-3" />
+  return <Sparkles className="h-3 w-3" />
+}
 
 function getThinkingProgress(elapsedSeconds: number) {
   if (elapsedSeconds < 3) return { label: '正在理解问题', detail: '分析你的需求和当前对话', progress: 18 + elapsedSeconds * 6 }
@@ -297,6 +367,105 @@ function ToolTraceCard({ trace }: { trace: AIChatToolTrace }) {
   )
 }
 
+function QuerySheetTraceItem({ trace, index }: { trace: AIChatToolTrace; index: number }) {
+  const [open, setOpen] = useState(false)
+  const data = trace.data as Record<string, unknown> | undefined
+  const sheetName = typeof data?.sheet_name === 'string' && data.sheet_name.trim()
+    ? data.sheet_name.trim()
+    : typeof data?.sheet_id === 'number'
+      ? `Sheet #${data.sheet_id}`
+      : `读取记录 ${index + 1}`
+  const returned = typeof data?.returned_rows === 'number' ? data.returned_rows : Array.isArray(data?.rows) ? data.rows.length : 0
+  const total = typeof data?.total_rows === 'number' ? data.total_rows : Array.isArray(data?.rows) ? data.rows.length : 0
+
+  return (
+    <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)} className="group/query-item overflow-hidden rounded-lg border border-slate-200 bg-white">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform group-open/query-item:rotate-90" />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-semibold text-slate-800">{sheetName}</div>
+          <div className={`mt-0.5 truncate text-[11px] ${trace.status === 'success' ? 'text-emerald-600' : 'text-rose-600'}`}>
+            {trace.summary || (trace.status === 'success' ? '读取成功' : '读取失败')}
+          </div>
+        </div>
+        <span className="shrink-0 rounded-md bg-slate-100 px-2 py-1 text-[10px] tabular-nums text-slate-500">
+          {returned}/{total} 行
+        </span>
+      </summary>
+      {open && (
+        <div className="border-t border-slate-200 bg-slate-50/70 px-3 py-3">
+          {renderTracePreview(trace)}
+          {renderTraceData(trace)}
+        </div>
+      )}
+    </details>
+  )
+}
+
+function QuerySheetTraceGroup({ traces }: { traces: AIChatToolTrace[] }) {
+  const [open, setOpen] = useState(false)
+  const sheetIds = Array.from(new Set(traces.flatMap((trace) => {
+    const data = trace.data as Record<string, unknown> | undefined
+    const dataSheetId = typeof data?.sheet_id === 'number' ? data.sheet_id : null
+    return [...(trace.touched_sheet_ids || []), ...(dataSheetId ? [dataSheetId] : [])]
+  })))
+  const returnedRows = traces.reduce((sum, trace) => {
+    const data = trace.data as Record<string, unknown> | undefined
+    return sum + (typeof data?.returned_rows === 'number' ? data.returned_rows : Array.isArray(data?.rows) ? data.rows.length : 0)
+  }, 0)
+  const totalRowsBySheet = new Map<string, number>()
+  traces.forEach((trace, index) => {
+    const data = trace.data as Record<string, unknown> | undefined
+    const key = typeof data?.sheet_id === 'number'
+      ? `id:${data.sheet_id}`
+      : typeof data?.sheet_name === 'string'
+        ? `name:${data.sheet_name}`
+        : `trace:${index}`
+    const total = typeof data?.total_rows === 'number' ? data.total_rows : Array.isArray(data?.rows) ? data.rows.length : 0
+    totalRowsBySheet.set(key, Math.max(totalRowsBySheet.get(key) || 0, total))
+  })
+  const totalRows = Array.from(totalRowsBySheet.values()).reduce((sum, total) => sum + total, 0)
+  const hasMoreCount = traces.filter((trace) => (trace.data as Record<string, unknown> | undefined)?.has_more === true).length
+  const failedCount = traces.filter((trace) => trace.status !== 'success').length
+  const visibleSheetIds = sheetIds.slice(0, 3)
+
+  return (
+    <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)} className="group/query-traces overflow-hidden rounded-lg border border-slate-200 bg-white">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${failedCount === 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+            <Bot className="h-4 w-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-slate-900">读取工作表</div>
+            <div className={`line-clamp-2 text-xs ${failedCount === 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+              已合并 {traces.length} 次读取 · {totalRowsBySheet.size} 张工作表 · 返回 {returnedRows}/{totalRows} 行{hasMoreCount > 0 ? ` · ${hasMoreCount} 张仍有后续数据` : ''}{failedCount > 0 ? ` · ${failedCount} 次失败` : ''}
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {visibleSheetIds.map((sheetId) => (
+            <span key={sheetId} className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
+              Sheet #{sheetId}
+            </span>
+          ))}
+          {sheetIds.length > visibleSheetIds.length && (
+            <span className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
+              +{sheetIds.length - visibleSheetIds.length}
+            </span>
+          )}
+          <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-open/query-traces:rotate-90" />
+        </div>
+      </summary>
+      {open && (
+        <div className="space-y-2 border-t border-slate-200 bg-slate-50/60 p-2.5">
+          {traces.map((trace, index) => <QuerySheetTraceItem key={`${trace.name}-${index}`} trace={trace} index={index} />)}
+        </div>
+      )}
+    </details>
+  )
+}
+
 export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const userId = getStoredUser()?.id ?? 0
   const [messages, setMessages] = useState<PersistedMessage[]>([])
@@ -314,6 +483,13 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [panelSize, setPanelSize] = useState<PanelSize>(DEFAULT_PANEL_SIZE)
   const [resizing, setResizing] = useState(false)
   const [contextPickerOpen, setContextPickerOpen] = useState(false)
+  const [contextWorkbookSearch, setContextWorkbookSearch] = useState('')
+  const [contextOnlyMine, setContextOnlyMine] = useUserPreference(
+    userId,
+    'ai.context-only-mine',
+    false,
+    isBooleanPreference
+  )
   const [composerExpanded, setComposerExpanded] = useUserPreference(
     userId,
     'ai.composer-expanded',
@@ -323,6 +499,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
   const [loadingContextWorkbookId, setLoadingContextWorkbookId] = useState<number | null>(null)
+  const [suggestionSeed, setSuggestionSeed] = useState(0)
   const { workbooks } = useWorkbooks()
   const messagesScrollRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -337,6 +514,47 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     () => messages.map((item) => ({ role: item.role, content: item.content })),
     [messages]
   )
+
+  const filteredContextWorkbooks = useMemo(() => {
+    const keyword = normalizeSearchText(contextWorkbookSearch)
+    return [...workbooks]
+      .filter((workbook) => !contextOnlyMine || workbook.owner_id === userId)
+      .filter((workbook) => {
+        if (!keyword) return true
+        return [workbook.name, workbook.description, workbook.owner_name, ...(workbook.sheets || []).map((sheet) => sheet.name)]
+          .some((value) => normalizeSearchText(value).includes(keyword))
+      })
+      .sort((left, right) => {
+        const ownerOrder = Number(right.owner_id === userId) - Number(left.owner_id === userId)
+        return ownerOrder || right.updated_at.localeCompare(left.updated_at) || left.name.localeCompare(right.name, 'zh-CN')
+      })
+  }, [contextOnlyMine, contextWorkbookSearch, userId, workbooks])
+
+  const filteredContextSheets = useMemo(() => {
+    if (!contextWorkbook) return []
+    const keyword = normalizeSearchText(contextWorkbookSearch)
+    const workbookMatches = [contextWorkbook.name, contextWorkbook.description, contextWorkbook.owner_name]
+      .some((value) => normalizeSearchText(value).includes(keyword))
+    if (!keyword || workbookMatches) return contextWorkbook.sheets || []
+    return (contextWorkbook.sheets || []).filter((sheet) => normalizeSearchText(sheet.name).includes(keyword))
+  }, [contextWorkbook, contextWorkbookSearch])
+
+  const suggestionTarget = useMemo(() => {
+    if (contextWorkbook) {
+      const selectedSheets = (contextWorkbook.sheets || [])
+        .filter((sheet) => contextSheetIds.includes(sheet.id))
+        .map((sheet) => sheet.name)
+      return selectedSheets.length > 0
+        ? `${contextWorkbook.name} / ${selectedSheets.slice(0, 2).join('、')}${selectedSheets.length > 2 ? `等 ${selectedSheets.length} 张工作表` : ''}`
+        : contextWorkbook.name
+    }
+    return workbooks.find((workbook) => workbook.owner_id === userId)?.name || workbooks[0]?.name || '当前可访问的表格'
+  }, [contextSheetIds, contextWorkbook, userId, workbooks])
+
+  const dynamicSuggestions = useMemo(() => shuffleIdeas(suggestionSeed).slice(0, 3).map((idea) => ({
+    ...idea,
+    prompt: idea.buildPrompt(suggestionTarget),
+  })), [suggestionSeed, suggestionTarget])
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     messagesEndRef.current?.scrollIntoView({ behavior })
@@ -366,9 +584,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       setTimeout(() => textareaRef.current?.focus(), 100)
     }
     if (open) {
+      setSuggestionSeed(Date.now())
       setTimeout(() => scrollToBottom('auto'), 80)
     }
   }, [open, scrollToBottom])
+
+  useEffect(() => {
+    if (!contextOnlyMine || !contextWorkbook || contextWorkbook.owner_id === userId) return
+    setContextWorkbook(null)
+    setContextSheetIds([])
+  }, [contextOnlyMine, contextWorkbook, userId])
 
   useEffect(() => {
     if (!open || assistants.length > 0) return
@@ -752,9 +977,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
 
               {message.role === 'assistant' && Array.isArray(message.toolTraces) && message.toolTraces.length > 0 && (
                 <div className="w-full space-y-2">
-                  {message.toolTraces.map((trace, index) => (
-                    <ToolTraceCard key={`${message.id}-trace-${index}`} trace={trace} />
-                  ))}
+                  {groupToolTraces(message.toolTraces).map((item) => item.kind === 'query-sheet-group'
+                    ? <QuerySheetTraceGroup key={`${message.id}-query-sheet-group-${item.sourceIndex}`} traces={item.traces} />
+                    : <ToolTraceCard key={`${message.id}-trace-${item.sourceIndex}`} trace={item.trace} />)}
                 </div>
               )}
 
@@ -831,22 +1056,28 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       </div>
 
       <div className="border-t border-slate-200 px-3 py-3">
-        <div className="mb-3 flex flex-wrap gap-2">
-          {[
-            { label: '查询表格', prompt: '帮我查询当前可访问的工作簿和工作表' },
-            { label: '财务报表', prompt: '请根据我指定的来源工作表创建一个新的财务分析工作簿' },
-            { label: '总结网页', prompt: '请根据我指定的多个工作簿生成一个经营总结网页' },
-          ].map((item) => (
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          {dynamicSuggestions.map((item) => (
             <button
               key={item.label}
               type="button"
               onClick={() => setInputValue(item.prompt)}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 transition hover:border-slate-300 hover:bg-white"
+              title={item.prompt}
             >
-              {item.label === '财务报表' ? <FileSpreadsheet className="h-3 w-3" /> : item.label === '总结网页' ? <BarChart3 className="h-3 w-3" /> : <Sparkles className="h-3 w-3" />}
+              {ideaIcon(item.icon)}
               {item.label}
             </button>
           ))}
+          <button
+            type="button"
+            onClick={() => setSuggestionSeed(Date.now())}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+            aria-label="换一批 AI 建议"
+            title="换一批建议"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+          </button>
           <Link href="/ai/summaries" className="ml-auto inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium text-sky-700 hover:bg-sky-50"><BarChart3 className="h-3 w-3" />总结中心</Link>
         </div>
         <div className="relative mb-2">
@@ -864,23 +1095,61 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             )}
           </div>
           {contextPickerOpen && (
-            <div className="absolute bottom-full left-0 z-30 mb-2 grid max-h-80 w-[min(520px,calc(100vw-40px))] grid-cols-[minmax(150px,0.9fr)_minmax(170px,1.1fr)] overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
-              <div className="min-h-0 overflow-y-auto border-r border-slate-200 p-1.5">
-                <div className="px-2 py-1.5 text-[11px] font-semibold text-slate-400">工作簿</div>
-                {workbooks.map((workbook) => (
-                  <button key={workbook.id} type="button" onClick={() => void selectContextWorkbook(workbook)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition ${contextWorkbook?.id === workbook.id ? 'bg-amber-50 text-amber-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    {loadingContextWorkbookId === workbook.id ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <FileSpreadsheet className="h-3.5 w-3.5 shrink-0" />}
-                    <span className="min-w-0 flex-1 truncate">{workbook.name}</span>
-                    <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-300" />
-                  </button>
-                ))}
+            <div className="absolute bottom-full left-0 z-30 mb-2 flex max-h-[min(25rem,calc(100vh-180px))] w-[min(560px,calc(100vw-40px))] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+              <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 p-2">
+                <div className="flex h-9 min-w-[180px] flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-xs text-slate-500 focus-within:border-amber-300 focus-within:bg-white">
+                  <Search className="h-3.5 w-3.5 shrink-0" />
+                  <input
+                    type="text"
+                    value={contextWorkbookSearch}
+                    onChange={(event) => setContextWorkbookSearch(event.target.value)}
+                    placeholder="搜索工作簿或工作表"
+                    aria-label="搜索工作簿或工作表"
+                    autoComplete="off"
+                    className="min-w-0 flex-1 bg-transparent outline-none"
+                  />
+                  {contextWorkbookSearch && (
+                    <button type="button" onClick={() => setContextWorkbookSearch('')} className="text-slate-400 hover:text-slate-700" title="清除搜索">
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setContextOnlyMine((current) => !current)}
+                  aria-pressed={contextOnlyMine}
+                  className={`inline-flex h-9 shrink-0 items-center gap-2 rounded-lg border px-3 text-xs font-medium transition ${contextOnlyMine ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}
+                >
+                  <span className={`flex h-4 w-4 items-center justify-center rounded border ${contextOnlyMine ? 'border-amber-400 bg-amber-400 text-white' : 'border-slate-300'}`}>
+                    {contextOnlyMine && <Check className="h-3 w-3" />}
+                  </span>
+                  仅看自己的工作簿
+                </button>
               </div>
-              <div className="min-h-0 overflow-y-auto p-1.5">
-                <div className="flex items-center justify-between px-2 py-1.5 text-[11px] font-semibold text-slate-400"><span>工作表</span>{contextWorkbook && <button type="button" onClick={() => setContextSheetIds([])} className="font-medium text-amber-700">选择整个工作簿</button>}</div>
-                {!contextWorkbook ? <div className="px-2 py-8 text-center text-xs text-slate-400">先选择工作簿</div> : (contextWorkbook.sheets || []).map((sheet) => {
-                  const selected = contextSheetIds.includes(sheet.id)
-                  return <button key={sheet.id} type="button" onClick={() => toggleContextSheet(sheet.id)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition ${selected ? 'bg-amber-50 text-amber-900' : 'text-slate-600 hover:bg-slate-50'}`}><span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded border ${selected ? 'border-amber-400 bg-amber-400 text-white' : 'border-slate-200'}`}>{selected && <Check className="h-3 w-3" />}</span><span className="min-w-0 flex-1 truncate">{sheet.name}</span></button>
-                })}
+              <div className="grid min-h-0 flex-1 grid-cols-[minmax(150px,0.9fr)_minmax(170px,1.1fr)] overflow-hidden">
+                <div className="min-h-0 overflow-y-auto border-r border-slate-200 p-1.5">
+                  <div className="flex items-center justify-between px-2 py-1.5 text-[11px] font-semibold text-slate-400"><span>工作簿</span><span className="font-normal">{filteredContextWorkbooks.length}</span></div>
+                  {filteredContextWorkbooks.length === 0 ? (
+                    <div className="px-3 py-10 text-center text-xs text-slate-400">没有匹配的工作簿</div>
+                  ) : filteredContextWorkbooks.map((workbook) => (
+                    <button key={workbook.id} type="button" onClick={() => void selectContextWorkbook(workbook)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition ${contextWorkbook?.id === workbook.id ? 'bg-amber-50 text-amber-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                      {loadingContextWorkbookId === workbook.id ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" /> : <FileSpreadsheet className="h-3.5 w-3.5 shrink-0" />}
+                      <span className="min-w-0 flex-1"><span className="block truncate">{workbook.name}</span>{!contextOnlyMine && workbook.owner_id !== userId && <span className="mt-0.5 block truncate text-[10px] text-slate-400">{workbook.owner_name || '其他成员'}</span>}</span>
+                      <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-300" />
+                    </button>
+                  ))}
+                </div>
+                <div className="min-h-0 overflow-y-auto p-1.5">
+                  <div className="flex items-center justify-between px-2 py-1.5 text-[11px] font-semibold text-slate-400"><span>工作表</span>{contextWorkbook && <button type="button" onClick={() => setContextSheetIds([])} className="font-medium text-amber-700">选择整个工作簿</button>}</div>
+                  {!contextWorkbook ? (
+                    <div className="px-2 py-8 text-center text-xs text-slate-400">先选择工作簿</div>
+                  ) : filteredContextSheets.length === 0 ? (
+                    <div className="px-2 py-8 text-center text-xs text-slate-400">没有匹配的工作表</div>
+                  ) : filteredContextSheets.map((sheet) => {
+                    const selected = contextSheetIds.includes(sheet.id)
+                    return <button key={sheet.id} type="button" onClick={() => toggleContextSheet(sheet.id)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition ${selected ? 'bg-amber-50 text-amber-900' : 'text-slate-600 hover:bg-slate-50'}`}><span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded border ${selected ? 'border-amber-400 bg-amber-400 text-white' : 'border-slate-200'}`}>{selected && <Check className="h-3 w-3" />}</span><span className="min-w-0 flex-1 truncate">{sheet.name}</span></button>
+                  })}
+                </div>
               </div>
             </div>
           )}

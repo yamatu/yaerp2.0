@@ -68,7 +68,7 @@ func TestBuildWorkbookImportSheetSnapshotPreservesExcelStructure(t *testing.T) {
 	if got := snapshot.Worksheet.CellData["1"]["1"].Value; got != int64(120) {
 		t.Fatalf("numeric value was not imported as a number: %#v", got)
 	}
-	if got := snapshot.Worksheet.CellData["3"]["1"].Formula; got != "SUM(B2:B3)" {
+	if got := snapshot.Worksheet.CellData["3"]["1"].Formula; got != "=SUM(B2:B3)" {
 		t.Fatalf("formula was not imported: %#v", got)
 	}
 	if len(snapshot.Worksheet.MergeData) != 1 {
@@ -89,5 +89,72 @@ func TestBuildWorkbookImportSheetSnapshotPreservesExcelStructure(t *testing.T) {
 	}
 	if snapshot.Worksheet.Freeze.YSplit != 1 || snapshot.Worksheet.Freeze.StartRow != 1 {
 		t.Fatalf("freeze pane was not imported: %#v", snapshot.Worksheet.Freeze)
+	}
+}
+
+func TestNormalizeExcelNumberFormatPatternRemovesExcelSpacingTokens(t *testing.T) {
+	got := normalizeExcelNumberFormatPattern(`0_);[Red]\(0\)`)
+	if got != `0;[Red](0)` {
+		t.Fatalf("normalized pattern = %q, want %q", got, `0;[Red](0)`)
+	}
+
+	got = normalizeExcelNumberFormatPattern(`_-[$¥-804]* #,##0.00_-;\-[$¥-804]* #,##0.00_-`)
+	if got != `"¥"#,##0.00;-"¥"#,##0.00` {
+		t.Fatalf("accounting pattern = %q", got)
+	}
+}
+
+func TestBuildWorkbookImportSheetSnapshotPreservesBuiltInAndColumnFormats(t *testing.T) {
+	file := excelize.NewFile()
+	defer func() { _ = file.Close() }()
+
+	sheetName := file.GetSheetName(0)
+	dateStyle, err := file.NewStyle(&excelize.Style{NumFmt: 14})
+	if err != nil {
+		t.Fatalf("create date style: %v", err)
+	}
+	percentageStyle, err := file.NewStyle(&excelize.Style{NumFmt: 10})
+	if err != nil {
+		t.Fatalf("create percentage style: %v", err)
+	}
+	accountingPattern := `0_);[Red]\(0\)`
+	accountingStyle, err := file.NewStyle(&excelize.Style{CustomNumFmt: &accountingPattern})
+	if err != nil {
+		t.Fatalf("create accounting style: %v", err)
+	}
+
+	if err := file.SetColStyle(sheetName, "A", dateStyle); err != nil {
+		t.Fatalf("set column style: %v", err)
+	}
+	_ = file.SetCellValue(sheetName, "A1", 45658)
+	_ = file.SetCellValue(sheetName, "B1", 0.125)
+	_ = file.SetCellStyle(sheetName, "B1", "B1", percentageStyle)
+	_ = file.SetCellValue(sheetName, "C1", 431.7)
+	_ = file.SetCellStyle(sheetName, "C1", "C1", accountingStyle)
+
+	snapshot, err := buildWorkbookImportSheetSnapshot(file, sheetName, 0)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+
+	columnStyleRef, ok := snapshot.Worksheet.ColumnData["0"].Style.(string)
+	if !ok || columnStyleRef == "" {
+		t.Fatalf("column default style missing: %#v", snapshot.Worksheet.ColumnData["0"])
+	}
+	if pattern := snapshot.Styles[columnStyleRef].N; pattern == nil || pattern.Pattern != "mm-dd-yy" {
+		t.Fatalf("column date pattern = %#v", pattern)
+	}
+	if snapshot.Columns[0].Type != "date" {
+		t.Fatalf("column A type = %q", snapshot.Columns[0].Type)
+	}
+	if snapshot.Columns[1].Type != "percentage" {
+		t.Fatalf("column B type = %q", snapshot.Columns[1].Type)
+	}
+	cellStyleRef, ok := snapshot.Worksheet.CellData["0"]["2"].Style.(string)
+	if !ok || cellStyleRef == "" {
+		t.Fatalf("cell accounting style missing")
+	}
+	if pattern := snapshot.Styles[cellStyleRef].N; pattern == nil || pattern.Pattern != `0;[Red](0)` {
+		t.Fatalf("cell accounting pattern = %#v", pattern)
 	}
 }

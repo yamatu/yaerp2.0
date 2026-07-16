@@ -467,7 +467,7 @@ func writeSheetExportHeaderForIndexes(file *excelize.File, sheetName string, col
 func setSheetExportCell(file *excelize.File, sheetName, axis string, cell univerExportCell, column *sheetColumnPayload) error {
 	formula := sanitizeExcelString(strings.TrimSpace(cell.Formula))
 	if formula != "" {
-		if err := file.SetCellFormula(sheetName, axis, formula); err == nil {
+		if err := file.SetCellFormula(sheetName, axis, strings.TrimPrefix(formula, "=")); err == nil {
 			return nil
 		}
 	}

@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
-import { AlertCircle, ChevronDown, ChevronUp, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, ImagePlus, LocateFixed, Lock, Printer, Rows3, Save, Search, Shield, Square, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import { AlertCircle, ChevronDown, ChevronUp, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, LocateFixed, Lock, Printer, Rows3, Save, Search, Shield, Square, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, type ICellData, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -18,7 +18,7 @@ import { usePermission } from '@/hooks/usePermission'
 import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl } from '@/lib/imageTransform'
-import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
+import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
@@ -54,6 +54,22 @@ interface PDFPreviewState {
 type PDFExportScope = 'current' | 'selected' | 'workbook'
 type PDFPaperSize = 'a4' | 'a3' | 'letter' | 'legal'
 type PDFOrientation = 'portrait' | 'landscape'
+type NumberFormatScope = 'selection' | 'row' | 'column' | 'sheet'
+
+const NUMBER_FORMAT_PRESETS = [
+  { id: 'general', label: '常规', pattern: 'General', sample: '431.7' },
+  { id: 'text', label: '文本', pattern: '@', sample: '00123' },
+  { id: 'integer', label: '整数', pattern: '0', sample: '432' },
+  { id: 'decimal', label: '两位小数', pattern: '0.00', sample: '431.70' },
+  { id: 'thousands', label: '千分位', pattern: '#,##0.00', sample: '12,431.70' },
+  { id: 'cny', label: '人民币', pattern: '¥#,##0.00;-¥#,##0.00', sample: '¥431.70' },
+  { id: 'usd', label: '美元', pattern: '$#,##0.00;-$#,##0.00', sample: '$431.70' },
+  { id: 'percentage', label: '百分比', pattern: '0.00%', sample: '43.17%' },
+  { id: 'date', label: '日期', pattern: 'yyyy-MM-dd', sample: '2026-07-16' },
+  { id: 'datetime', label: '日期时间', pattern: 'yyyy-MM-dd hh:mm', sample: '2026-07-16 14:30' },
+  { id: 'time', label: '时间', pattern: 'hh:mm:ss', sample: '14:30:00' },
+  { id: 'scientific', label: '科学计数', pattern: '0.00E+00', sample: '4.32E+02' },
+] as const
 
 function FloatingToolHint({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -528,13 +544,29 @@ function wrapWorksheetData(
   savedStyles?: Record<string, unknown>
 ): IWorkbookData {
   const worksheetSnapshot = cloneJsonSnapshot(worksheetData)
+  const snapshotCells = worksheetSnapshot.cellData as Record<string, Record<string, { f?: unknown; s?: unknown } | undefined> | undefined> | undefined
+  Object.values(snapshotCells || {}).forEach((row) => {
+    Object.values(row || {}).forEach((cell) => {
+      if (!cell) return
+      if (typeof cell.f === 'string' && cell.f.trim() && !cell.f.trim().startsWith('=')) {
+        cell.f = `=${cell.f.trim()}`
+      }
+      if (cell.s && typeof cell.s === 'object') {
+        const style = cell.s as Record<string, unknown>
+        if (style.n && typeof style.n === 'object') {
+          const numberFormat = style.n as Record<string, unknown>
+          numberFormat.pattern = normalizeUniverNumberFormatPattern(String(numberFormat.pattern || ''))
+        }
+      }
+    })
+  })
   const sheetKey = worksheetSnapshot.id || `sheet-${sheet.id}`
   return {
     id: `workbook-${workbookId}-sheet-${sheet.id}`,
     name: sheet.name || 'Workbook',
     appVersion: '0.5.0',
     locale,
-    styles: cloneJsonSnapshot((savedStyles || {}) as IWorkbookData['styles']),
+    styles: cloneJsonSnapshot(normalizeUniverStyleMap(savedStyles) as IWorkbookData['styles']),
     sheetOrder: [sheetKey],
     sheets: {
       [sheetKey]: {
@@ -858,13 +890,13 @@ async function toImageFile(img: GalleryImage): Promise<File> {
 
 function mergeUniverStyleMap(base: Record<string, unknown> | undefined, next: Record<string, unknown> | undefined) {
   if (!next || Object.keys(next).length === 0) {
-    return base || {}
+    return normalizeUniverStyleMap(base)
   }
 
-  return {
+  return normalizeUniverStyleMap({
     ...(base || {}),
     ...next,
-  }
+  })
 }
 
 function jsonSnapshot(value: unknown) {
@@ -1037,6 +1069,8 @@ function applyWorksheetSnapshotPresentation(
   const sheetFacade = worksheet as {
     getRange: (row: number, column: number, rowCount: number, columnCount: number) => { setValue: (value: ICellData) => unknown }
     setRowHeight: (row: number, height: number) => unknown
+    setRowDefaultStyle?: (row: number, style: Record<string, unknown> | string | null) => unknown
+    setColumnDefaultStyle?: (column: number, style: Record<string, unknown> | string | null) => unknown
   }
   const cellData = snapshot.cellData as Record<string, Record<string, unknown> | undefined> | undefined
   const previousCellData = previousSnapshot?.cellData as Record<string, Record<string, unknown> | undefined> | undefined
@@ -1050,6 +1084,9 @@ function applyWorksheetSnapshotPresentation(
       if (!Number.isInteger(columnIndex) || columnIndex < 0) return
       const style = resolveSnapshotCellStyle((rawCell as { s?: unknown }).s, styles)
       const previousCell = previousCellData?.[rowKey]?.[columnKey]
+      const rawStyle = (rawCell as { s?: unknown }).s
+      const previousRawStyle = previousCell && typeof previousCell === 'object' ? (previousCell as { s?: unknown }).s : undefined
+      if (areJsonSnapshotsEqual(rawStyle, previousRawStyle)) return
       const hadPreviousStyle = Boolean(previousCell && typeof previousCell === 'object' && (previousCell as { s?: unknown }).s)
       if (!style && !hadPreviousStyle) return
       const nextCell = cloneJsonSnapshot(rawCell as ICellData)
@@ -1060,12 +1097,24 @@ function applyWorksheetSnapshotPresentation(
     })
   })
 
-  const rowData = snapshot.rowData as Record<string, { h?: unknown } | undefined> | undefined
+  const rowData = snapshot.rowData as Record<string, { h?: unknown; s?: unknown } | undefined> | undefined
+  const previousRowData = previousSnapshot?.rowData as Record<string, { h?: unknown; s?: unknown } | undefined> | undefined
   Object.entries(rowData || {}).forEach(([rowKey, row]) => {
     const rowIndex = Number(rowKey)
-    if (Number.isInteger(rowIndex) && rowIndex >= 0 && typeof row?.h === 'number') {
+    if (Number.isInteger(rowIndex) && rowIndex >= 0 && typeof row?.h === 'number' && row.h !== previousRowData?.[rowKey]?.h) {
       sheetFacade.setRowHeight(rowIndex, row.h)
     }
+    if (Number.isInteger(rowIndex) && rowIndex >= 0 && row?.s !== undefined && !areJsonSnapshotsEqual(row.s, previousRowData?.[rowKey]?.s)) {
+      sheetFacade.setRowDefaultStyle?.(rowIndex, resolveSnapshotCellStyle(row.s, styles) || null)
+    }
+  })
+
+  const columnData = snapshot.columnData as Record<string, { s?: unknown } | undefined> | undefined
+  const previousColumnData = previousSnapshot?.columnData as Record<string, { s?: unknown } | undefined> | undefined
+  Object.entries(columnData || {}).forEach(([columnKey, column]) => {
+    const columnIndex = Number(columnKey)
+    if (!Number.isInteger(columnIndex) || columnIndex < 0 || column?.s === undefined || areJsonSnapshotsEqual(column.s, previousColumnData?.[columnKey]?.s)) return
+    sheetFacade.setColumnDefaultStyle?.(columnIndex, resolveSnapshotCellStyle(column.s, styles) || null)
   })
 }
 
@@ -1158,6 +1207,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   )
   const [hasFilter, setHasFilter] = useState(false)
   const [actionError, setActionError] = useState('')
+  const [showNumberFormatPanel, setShowNumberFormatPanel] = useState(false)
+  const [numberFormatScope, setNumberFormatScope] = useState<NumberFormatScope>('selection')
+  const [numberFormatPreset, setNumberFormatPreset] = useState('general')
+  const [customNumberFormat, setCustomNumberFormat] = useState('General')
+  const [applyingNumberFormat, setApplyingNumberFormat] = useState(false)
   const [dragImportActive, setDragImportActive] = useState(false)
   const [dragImportUploading, setDragImportUploading] = useState(false)
   const [dragImportProgress, setDragImportProgress] = useState(0)
@@ -1916,6 +1970,79 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [editLocked, persistCurrentSheet, syncFilterState])
 
+  const openNumberFormatPanel = useCallback(() => {
+    const selection = syncSelectionState()
+    const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook?.()?.getActiveSheet?.()
+    const activeRange = worksheet?.getActiveRange?.() || worksheet?.getSelection?.()?.getActiveRange?.()
+    const currentPattern = normalizeUniverNumberFormatPattern(activeRange?.getNumberFormat?.() || 'General') || 'General'
+    const matchedPreset = NUMBER_FORMAT_PRESETS.find((preset) => preset.pattern === currentPattern)
+    setNumberFormatPreset(matchedPreset?.id || 'custom')
+    setCustomNumberFormat(currentPattern)
+    setNumberFormatScope(selection?.isEntireColumnSelection ? 'column' : selection?.isEntireRowSelection ? 'row' : 'selection')
+    setShowNumberFormatPanel(true)
+  }, [syncSelectionState])
+
+  const handleApplyNumberFormat = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能修改单元格格式。')
+      return
+    }
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    const activeRange = worksheet?.getActiveRange?.() || worksheet?.getSelection?.()?.getActiveRange?.()
+    if (!worksheet || !activeRange) {
+      setActionError('请先选择需要设置格式的单元格、行或列。')
+      return
+    }
+
+    const pattern = normalizeUniverNumberFormatPattern(customNumberFormat) || 'General'
+    const selectionRange = activeRange.getRange()
+    const dataRange = worksheet.getDataRange?.()
+    const usedRange = dataRange?.getRange?.() || selectionRange
+    const mergeDefaultStyle = (current: unknown) => {
+      const style = current && typeof current === 'object'
+        ? cloneJsonSnapshot(current as Record<string, unknown>)
+        : {}
+      if (pattern === 'General') delete style.n
+      else style.n = { pattern }
+      return Object.keys(style).length > 0 ? style : null
+    }
+
+    setApplyingNumberFormat(true)
+    setActionError('')
+    try {
+      if (numberFormatScope === 'selection') {
+        activeRange.setNumberFormat(pattern)
+      } else if (numberFormatScope === 'row') {
+        const startRow = selectionRange.startRow
+        const endRow = selectionRange.endRow
+        for (let row = startRow; row <= endRow; row += 1) {
+          worksheet.setRowDefaultStyle(row, mergeDefaultStyle(worksheet.getRowDefaultStyle(row)))
+        }
+        worksheet.getRange(startRow, usedRange.startColumn, endRow - startRow + 1, usedRange.endColumn - usedRange.startColumn + 1).setNumberFormat(pattern)
+      } else if (numberFormatScope === 'column') {
+        const startColumn = selectionRange.startColumn
+        const endColumn = selectionRange.endColumn
+        for (let column = startColumn; column <= endColumn; column += 1) {
+          worksheet.setColumnDefaultStyle(column, mergeDefaultStyle(worksheet.getColumnDefaultStyle(column)))
+        }
+        worksheet.getRange(usedRange.startRow, startColumn, usedRange.endRow - usedRange.startRow + 1, endColumn - startColumn + 1).setNumberFormat(pattern)
+      } else {
+        worksheet.setDefaultStyle(mergeDefaultStyle(worksheet.getDefaultStyle()))
+        dataRange?.setNumberFormat(pattern)
+      }
+
+      await persistCurrentSheet()
+      setCustomNumberFormat(pattern)
+      setShowNumberFormatPanel(false)
+    } catch (formatError) {
+      console.error('Failed to apply number format:', formatError)
+      setActionError(formatError instanceof Error ? formatError.message : '设置单元格格式失败，请稍后再试。')
+    } finally {
+      setApplyingNumberFormat(false)
+    }
+  }, [customNumberFormat, editLocked, numberFormatScope, persistCurrentSheet])
+
   const handleProtectionRangeChange = useCallback(async (scope: ProtectionScope, action: 'lock' | 'unlock', hidden?: boolean) => {
     if (editLocked) {
       setActionError('当前账号只有查看权限，不能修改保护状态。')
@@ -2163,7 +2290,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         applyWorksheetSnapshotPresentation(
           worksheet,
           serverSnapshot,
-          nextConfig.univerStyles as Record<string, unknown> | undefined,
+          normalizeUniverStyleMap(nextConfig.univerStyles as Record<string, unknown> | undefined),
           baselineSnapshot
         )
 
@@ -2683,7 +2810,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               const savedSheet = cloneJsonSnapshot(saved.sheets[savedSheetId] as Partial<IWorksheetData>)
               if (!savedSheet) continue
 
-              const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [])
+              const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [], saved.styles as Record<string, unknown> | undefined)
               const currentConfig = parseSheetConfig(snap.config)
               const previousSheet = persistedWorksheetDataRef.current ||
                 (currentConfig.univerSheetData && typeof currentConfig.univerSheetData === 'object'
@@ -3359,7 +3486,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     )
   }
 
-  const showFabs = !showImagePicker && !univerHasOverlay
+  const showFabs = !showImagePicker && !univerHasOverlay && !showNumberFormatPanel
   const currentRowProtection = selectionState
     ? protectionSnapshot.rows.find((item) => item.row_index === selectionState.rowIndex) || null
     : null
@@ -3585,6 +3712,18 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
             <div className="flex flex-col items-end gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
+              <FloatingToolHint label="数字与默认格式">
+                <button
+                  type="button"
+                  onClick={openNumberFormatPanel}
+                  disabled={editLocked}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-sky-200 bg-sky-50 text-sky-700 shadow-lg transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="数字与默认格式"
+                  aria-label="数字与默认格式"
+                >
+                  <Hash className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
               <FloatingToolHint label="保护设置">
                 <button
                   type="button"
@@ -3738,6 +3877,65 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             >
               {toolbarExpanded ? <ChevronUp className="h-5 w-5" /> : <Wrench className="h-5 w-5" />}
             </button>
+          </div>
+        </div>
+      )}
+
+      {showNumberFormatPanel && (
+        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !applyingNumberFormat) setShowNumberFormatPanel(false) }}>
+          <div className="flex max-h-[90vh] w-[min(680px,96vw)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><Hash className="h-4 w-4 text-sky-600" />数字与单元格默认格式</div>
+                <div className="mt-1 truncate text-xs text-slate-400">当前范围：{selectionState?.rangeLabel || '当前选区'}</div>
+              </div>
+              <button type="button" onClick={() => setShowNumberFormatPanel(false)} disabled={applyingNumberFormat} className="ui-tooltip inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-40" title="关闭" aria-label="关闭数字格式设置" data-tooltip="关闭"><X className="h-4 w-4" /></button>
+            </div>
+
+            <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
+              <div>
+                <div className="mb-2 text-xs font-semibold text-slate-700">应用范围</div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {([
+                    ['selection', '当前选区'],
+                    ['row', '整行默认'],
+                    ['column', '整列默认'],
+                    ['sheet', '工作表默认'],
+                  ] as Array<[NumberFormatScope, string]>).map(([scope, label]) => (
+                    <button key={scope} type="button" onClick={() => setNumberFormatScope(scope)} className={`h-9 rounded-lg border px-2 text-xs font-semibold transition ${numberFormatScope === scope ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}>{label}</button>
+                  ))}
+                </div>
+                <p className="mt-2 text-xs leading-5 text-slate-400">整行、整列和工作表默认格式会同时作用于已有数据，并成为以后新输入单元格的默认格式。</p>
+              </div>
+
+              <div>
+                <div className="mb-2 text-xs font-semibold text-slate-700">常用格式</div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {NUMBER_FORMAT_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => { setNumberFormatPreset(preset.id); setCustomNumberFormat(preset.pattern) }}
+                      className={`min-h-14 rounded-lg border px-3 py-2 text-left transition ${numberFormatPreset === preset.id ? 'border-sky-300 bg-sky-50 ring-1 ring-sky-100' : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'}`}
+                    >
+                      <span className={`block text-xs font-semibold ${numberFormatPreset === preset.id ? 'text-sky-700' : 'text-slate-700'}`}>{preset.label}</span>
+                      <span className="mt-1 block truncate text-[11px] text-slate-400">{preset.sample}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <label className="block">
+                <span className="mb-2 block text-xs font-semibold text-slate-700">自定义格式代码</span>
+                <input value={customNumberFormat} onChange={(event) => { setCustomNumberFormat(event.target.value); setNumberFormatPreset('custom') }} onKeyDown={(event) => { if (event.key === 'Enter' && !applyingNumberFormat) void handleApplyNumberFormat() }} placeholder="例如：#,##0.00;[Red]-#,##0.00" className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-sm text-slate-700 outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100" />
+                <p className="mt-2 text-xs leading-5 text-slate-400">“常规”不会把普通数字显示为日期；文本使用 @；公式直接以 = 开头输入，例如 =SUM(A1:A10)。</p>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
+              <button type="button" onClick={() => setShowNumberFormatPanel(false)} disabled={applyingNumberFormat} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40">取消</button>
+              <button type="button" onClick={() => void handleApplyNumberFormat()} disabled={applyingNumberFormat || !customNumberFormat.trim()} className="inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-40">{applyingNumberFormat ? '应用中...' : '应用格式'}</button>
+            </div>
           </div>
         </div>
       )}

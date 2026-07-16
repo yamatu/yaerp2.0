@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -402,11 +403,14 @@ func buildWorkbookImportSheetSnapshot(file *excelize.File, sheetName string, she
 		}
 	}
 
-	columnData := buildWorkbookImportColumnData(file, sheetName, startCol, endCol)
+	columnData, err := buildWorkbookImportColumnData(file, sheetName, startCol, endCol, styles, styleIDs)
+	if err != nil {
+		return nil, err
+	}
 	rowData := buildWorkbookImportRowData(file, sheetName, startRow, endRow)
 	mergeData := buildWorkbookImportMergeData(file, sheetName, startCol, startRow, endCol, endRow)
 	freeze := buildWorkbookImportFreeze(file, sheetName)
-	columns := buildWorkbookImportColumns(columnCount, columnData)
+	columns := buildWorkbookImportColumns(columnCount, columnData, cellData, styles)
 	worksheetID := fmt.Sprintf("import-sheet-%d", sheetIndex+1)
 
 	worksheet := workbookImportWorksheet{
@@ -528,7 +532,7 @@ func buildWorkbookImportCell(file *excelize.File, sheetName, axis string, styles
 		cell.Value = value
 	}
 	if strings.TrimSpace(formula) != "" {
-		cell.Formula = formula
+		cell.Formula = normalizeUniverFormula(formula)
 	}
 	if styleRef != "" {
 		cell.Style = styleRef
@@ -579,6 +583,10 @@ func workbookImportCellStyleRef(file *excelize.File, sheetName, axis string, sty
 	if err != nil {
 		return "", fmt.Errorf("读取 %s!%s 样式失败: %w", sheetName, axis, err)
 	}
+	return workbookImportStyleRef(file, styleID, styles, styleIDs)
+}
+
+func workbookImportStyleRef(file *excelize.File, styleID int, styles map[string]univerStyleData, styleIDs map[int]string) (string, error) {
 	if styleID <= 0 {
 		return "", nil
 	}
@@ -600,18 +608,32 @@ func workbookImportCellStyleRef(file *excelize.File, sheetName, axis string, sty
 	return ref, nil
 }
 
-func buildWorkbookImportColumnData(file *excelize.File, sheetName string, startCol, endCol int) map[string]univerExportColumn {
+func buildWorkbookImportColumnData(file *excelize.File, sheetName string, startCol, endCol int, styles map[string]univerStyleData, styleIDs map[int]string) (map[string]univerExportColumn, error) {
 	columnData := make(map[string]univerExportColumn)
 	for col := startCol; col <= endCol; col++ {
 		targetCol := col - startCol
 		colName, _ := excelize.ColumnNumberToName(col)
+		column := univerExportColumn{}
 		width, err := file.GetColWidth(sheetName, colName)
-		if err != nil || width <= 0 {
-			continue
+		if err == nil && width > 0 {
+			column.Width = excelColumnWidthToUniver(width)
 		}
-		columnData[strconv.Itoa(targetCol)] = univerExportColumn{Width: excelColumnWidthToUniver(width)}
+		styleID, styleErr := file.GetColStyle(sheetName, colName)
+		if styleErr != nil {
+			return nil, fmt.Errorf("读取 %s!%s 列默认样式失败: %w", sheetName, colName, styleErr)
+		}
+		styleRef, styleErr := workbookImportStyleRef(file, styleID, styles, styleIDs)
+		if styleErr != nil {
+			return nil, styleErr
+		}
+		if styleRef != "" {
+			column.Style = styleRef
+		}
+		if column.Width > 0 || column.Style != nil {
+			columnData[strconv.Itoa(targetCol)] = column
+		}
 	}
-	return columnData
+	return columnData, nil
 }
 
 func buildWorkbookImportRowData(file *excelize.File, sheetName string, startRow, endRow int) map[string]univerExportRow {
@@ -668,7 +690,35 @@ func buildWorkbookImportFreeze(file *excelize.File, sheetName string) univerExpo
 	}
 }
 
-func buildWorkbookImportColumns(columnCount int, columnData map[string]univerExportColumn) []sheetColumnPayload {
+func buildWorkbookImportColumns(columnCount int, columnData map[string]univerExportColumn, cellData map[string]map[string]univerExportCell, styles map[string]univerStyleData) []sheetColumnPayload {
+	inferredTypes := make([]string, columnCount)
+	currencyCodes := make([]string, columnCount)
+	for index := 0; index < columnCount; index++ {
+		if column, ok := columnData[strconv.Itoa(index)]; ok {
+			pattern := workbookImportNumberPattern(column.Style, styles)
+			inferredTypes[index], currencyCodes[index] = inferWorkbookImportColumnFormat(pattern)
+		}
+	}
+	for _, row := range cellData {
+		for columnKey, cell := range row {
+			index, err := strconv.Atoi(columnKey)
+			if err != nil || index < 0 || index >= columnCount {
+				continue
+			}
+			if strings.TrimSpace(cell.Formula) != "" {
+				inferredTypes[index] = "formula"
+				continue
+			}
+			candidate, currencyCode := inferWorkbookImportColumnFormat(workbookImportNumberPattern(cell.Style, styles))
+			if workbookImportColumnTypePriority(candidate) > workbookImportColumnTypePriority(inferredTypes[index]) {
+				inferredTypes[index] = candidate
+			}
+			if currencyCodes[index] == "" {
+				currencyCodes[index] = currencyCode
+			}
+		}
+	}
+
 	columns := make([]sheetColumnPayload, 0, columnCount)
 	for index := 0; index < columnCount; index++ {
 		key := fmt.Sprintf("col_%d", index+1)
@@ -676,14 +726,91 @@ func buildWorkbookImportColumns(columnCount int, columnData map[string]univerExp
 		if column, ok := columnData[strconv.Itoa(index)]; ok && column.Width > 0 {
 			width = column.Width
 		}
+		columnType := inferredTypes[index]
+		if columnType == "" {
+			columnType = "text"
+		}
 		columns = append(columns, sheetColumnPayload{
-			Key:   key,
-			Name:  columnIndexLabel(index),
-			Type:  "text",
-			Width: width,
+			Key:          key,
+			Name:         columnIndexLabel(index),
+			Type:         columnType,
+			Width:        width,
+			CurrencyCode: currencyCodes[index],
 		})
 	}
 	return columns
+}
+
+func normalizeUniverFormula(formula string) string {
+	trimmed := strings.TrimSpace(formula)
+	if trimmed == "" || strings.HasPrefix(trimmed, "=") {
+		return trimmed
+	}
+	return "=" + trimmed
+}
+
+func workbookImportNumberPattern(styleRef any, styles map[string]univerStyleData) string {
+	ref, ok := styleRef.(string)
+	if !ok || strings.TrimSpace(ref) == "" {
+		return ""
+	}
+	style, ok := styles[ref]
+	if !ok || style.N == nil {
+		return ""
+	}
+	return strings.TrimSpace(style.N.Pattern)
+}
+
+func inferWorkbookImportColumnFormat(pattern string) (string, string) {
+	lower := strings.ToLower(strings.TrimSpace(pattern))
+	if lower == "" || lower == "general" || lower == "@" || lower == "@@@" {
+		return "", ""
+	}
+	if strings.Contains(lower, "%") {
+		return "percentage", ""
+	}
+	if excelDateFormatTokenPattern.MatchString(lower) || strings.Contains(lower, "[h]") || strings.Contains(lower, "am/pm") || strings.Contains(lower, "a/p") {
+		return "date", ""
+	}
+	if strings.ContainsAny(pattern, "$¥€£₹₩₽") {
+		currencyCode := ""
+		switch {
+		case strings.Contains(pattern, "¥"):
+			currencyCode = "CNY"
+		case strings.Contains(pattern, "€"):
+			currencyCode = "EUR"
+		case strings.Contains(pattern, "£"):
+			currencyCode = "GBP"
+		case strings.Contains(pattern, "₹"):
+			currencyCode = "INR"
+		case strings.Contains(pattern, "₩"):
+			currencyCode = "KRW"
+		case strings.Contains(pattern, "₽"):
+			currencyCode = "RUB"
+		case strings.Contains(pattern, "$"):
+			currencyCode = "USD"
+		}
+		return "currency", currencyCode
+	}
+	if strings.ContainsAny(lower, "0#?") {
+		return "number", ""
+	}
+	return "", ""
+}
+
+func workbookImportColumnTypePriority(columnType string) int {
+	switch columnType {
+	case "formula":
+		return 5
+	case "date":
+		return 4
+	case "currency", "percentage":
+		return 3
+	case "number":
+		return 2
+	default:
+		return 0
+	}
 }
 
 func normalizeImportedExcelSheetName(sheetName string, index int) string {
@@ -711,10 +838,83 @@ func convertExcelStyleToUniverStyle(style *excelize.Style) univerStyleData {
 	if border := convertExcelBordersToUniver(style.Border); border != nil {
 		result.Bd = border
 	}
-	if style.CustomNumFmt != nil && strings.TrimSpace(*style.CustomNumFmt) != "" {
-		result.N = &univerNumberFormat{Pattern: strings.TrimSpace(*style.CustomNumFmt)}
+	if pattern := excelStyleNumberFormatPattern(style); pattern != "" && !strings.EqualFold(pattern, "General") {
+		result.N = &univerNumberFormat{Pattern: pattern}
 	}
 	return result
+}
+
+var excelLocaleCurrencyPattern = regexp.MustCompile(`\[\$([^\]-]*)(?:-[^\]]+)?\]`)
+var excelDateFormatTokenPattern = regexp.MustCompile(`(?i)(^|[^a-z])(y{2,4}|m{1,4}|d{1,4}|h{1,2}|s{1,2})([^a-z]|$)`)
+
+func excelStyleNumberFormatPattern(style *excelize.Style) string {
+	if style == nil {
+		return ""
+	}
+	if style.CustomNumFmt != nil && strings.TrimSpace(*style.CustomNumFmt) != "" {
+		return normalizeExcelNumberFormatPattern(*style.CustomNumFmt)
+	}
+	return normalizeExcelNumberFormatPattern(excelBuiltinNumberFormatPattern(style.NumFmt))
+}
+
+func normalizeExcelNumberFormatPattern(pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return ""
+	}
+
+	var normalized strings.Builder
+	inQuote := false
+	for index := 0; index < len(pattern); index++ {
+		current := pattern[index]
+		if current == '"' {
+			inQuote = !inQuote
+			normalized.WriteByte(current)
+			continue
+		}
+		if inQuote {
+			normalized.WriteByte(current)
+			continue
+		}
+		if current == '_' || current == '*' {
+			if index+1 < len(pattern) {
+				index++
+			}
+			continue
+		}
+		if current == '\\' && index+1 < len(pattern) {
+			next := pattern[index+1]
+			switch next {
+			case '(', ')', '-', '+', ' ', '_', '*':
+				normalized.WriteByte(next)
+				index++
+				continue
+			}
+		}
+		normalized.WriteByte(current)
+	}
+
+	result := excelLocaleCurrencyPattern.ReplaceAllStringFunc(strings.TrimSpace(normalized.String()), func(token string) string {
+		matches := excelLocaleCurrencyPattern.FindStringSubmatch(token)
+		if len(matches) < 2 || strings.TrimSpace(matches[1]) == "" {
+			return ""
+		}
+		return `"` + strings.TrimSpace(matches[1]) + `"`
+	})
+	return strings.TrimSpace(result)
+}
+
+func excelBuiltinNumberFormatPattern(numFmt int) string {
+	patterns := map[int]string{
+		0: "General", 1: "0", 2: "0.00", 3: "#,##0", 4: "#,##0.00",
+		9: "0%", 10: "0.00%", 11: "0.00E+00", 12: "# ?/?", 13: "# ??/??",
+		14: "mm-dd-yy", 15: "d-mmm-yy", 16: "d-mmm", 17: "mmm-yy",
+		18: "h:mm AM/PM", 19: "h:mm:ss AM/PM", 20: "h:mm", 21: "h:mm:ss", 22: "m/d/yy h:mm",
+		37: "#,##0;(#,##0)", 38: "#,##0;[Red](#,##0)",
+		39: "#,##0.00;(#,##0.00)", 40: "#,##0.00;[Red](#,##0.00)",
+		45: "mm:ss", 46: "[h]:mm:ss", 47: "mmss.0", 48: "##0.0E+0", 49: "@",
+	}
+	return patterns[numFmt]
 }
 
 func convertExcelFontToUniver(font *excelize.Font) *univerStyleData {

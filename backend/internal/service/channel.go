@@ -724,8 +724,20 @@ func (s *ChannelService) CreateMessage(userID, channelID int64, input ChannelMes
 				}
 				directoryID = &directory.ID
 			}
-			if err := s.uploadSvc.SaveImageToGallery(attachment.ID, directoryID, &channelID, userID); err != nil {
+			effectiveAttachmentID, duplicate, err := s.uploadSvc.SaveImageToGalleryDeduplicated(attachment.ID, directoryID, &channelID, userID)
+			if err != nil {
 				return nil, err
+			}
+			if duplicate && effectiveAttachmentID != attachment.ID {
+				if err := s.uploadSvc.DeleteFile(attachment.ID); err != nil {
+					return nil, err
+				}
+				attachmentID = &effectiveAttachmentID
+				canonical, getErr := s.uploadSvc.GetAttachment(effectiveAttachmentID)
+				if getErr != nil {
+					return nil, getErr
+				}
+				attachmentMime = canonical.MimeType
 			}
 		}
 	}
