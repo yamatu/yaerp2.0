@@ -6,27 +6,30 @@ import (
 )
 
 type Workbook struct {
-	ID           int64           `json:"id" db:"id"`
-	Name         string          `json:"name" db:"name"`
-	Description  *string         `json:"description" db:"description"`
-	OwnerID      int64           `json:"owner_id" db:"owner_id"`
-	OwnerName    *string         `json:"owner_name,omitempty" db:"owner_name"`
-	FolderID     *int64          `json:"folder_id,omitempty" db:"folder_id"`
-	Metadata     json.RawMessage `json:"metadata" db:"metadata"`
-	IsTemplate   bool            `json:"is_template" db:"is_template"`
-	Status       int             `json:"status" db:"status"`
-	IsLocked     bool            `json:"is_locked,omitempty"`
-	IsHidden     bool            `json:"is_hidden,omitempty"`
-	IsPublic     bool            `json:"is_public,omitempty"`
-	LockedByID   *int64          `json:"locked_by_id,omitempty"`
-	LockedByName *string         `json:"locked_by_name,omitempty"`
-	LockedAt     *time.Time      `json:"locked_at,omitempty"`
-	HiddenByID   *int64          `json:"hidden_by_id,omitempty"`
-	HiddenByName *string         `json:"hidden_by_name,omitempty"`
-	HiddenAt     *time.Time      `json:"hidden_at,omitempty"`
-	CreatedAt    time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at" db:"updated_at"`
-	Sheets       []Sheet         `json:"sheets,omitempty"`
+	ID            int64           `json:"id" db:"id"`
+	Name          string          `json:"name" db:"name"`
+	Description   *string         `json:"description" db:"description"`
+	OwnerID       int64           `json:"owner_id" db:"owner_id"`
+	OwnerName     *string         `json:"owner_name,omitempty" db:"owner_name"`
+	FolderID      *int64          `json:"folder_id,omitempty" db:"folder_id"`
+	Metadata      json.RawMessage `json:"metadata" db:"metadata"`
+	IsTemplate    bool            `json:"is_template" db:"is_template"`
+	Status        int             `json:"status" db:"status"`
+	IsLocked      bool            `json:"is_locked,omitempty"`
+	IsHidden      bool            `json:"is_hidden,omitempty"`
+	IsPublic      bool            `json:"is_public,omitempty"`
+	LockedByID    *int64          `json:"locked_by_id,omitempty"`
+	LockedByName  *string         `json:"locked_by_name,omitempty"`
+	LockedAt      *time.Time      `json:"locked_at,omitempty"`
+	HiddenByID    *int64          `json:"hidden_by_id,omitempty"`
+	HiddenByName  *string         `json:"hidden_by_name,omitempty"`
+	HiddenAt      *time.Time      `json:"hidden_at,omitempty"`
+	DeletedAt     *time.Time      `json:"deleted_at,omitempty" db:"deleted_at"`
+	DeletedByID   *int64          `json:"deleted_by_id,omitempty" db:"deleted_by"`
+	DeletedByName *string         `json:"deleted_by_name,omitempty" db:"deleted_by_name"`
+	CreatedAt     time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at" db:"updated_at"`
+	Sheets        []Sheet         `json:"sheets,omitempty"`
 }
 
 type Sheet struct {

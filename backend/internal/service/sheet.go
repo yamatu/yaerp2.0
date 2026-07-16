@@ -392,7 +392,7 @@ func (s *SheetService) DeleteWorkbookForUser(userID, id int64) error {
 		}
 	}
 
-	return s.sheetRepo.DeleteWorkbook(id)
+	return s.sheetRepo.SoftDeleteWorkbook(id, userID)
 }
 
 func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action string) (*model.Workbook, error) {

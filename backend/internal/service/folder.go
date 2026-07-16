@@ -76,7 +76,7 @@ func (s *FolderService) DeleteForUser(userID, id int64) error {
 		return ErrFolderManageDenied
 	}
 
-	return s.folderRepo.Delete(id)
+	return s.folderRepo.SoftDelete(id, userID)
 }
 
 func (s *FolderService) ListContents(parentID *int64, userID int64) (*model.FolderContents, error) {

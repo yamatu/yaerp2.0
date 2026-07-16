@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
@@ -70,6 +72,7 @@ func main() {
 	departmentRepo := repo.NewDepartmentRepo(db)
 	attachRepo := repo.NewAttachmentRepo(db)
 	folderRepo := repo.NewFolderRepo(db)
+	recycleBinRepo := repo.NewRecycleBinRepo(db)
 	channelRepo := repo.NewChannelRepo(db)
 	whatsAppRepo := repo.NewWhatsAppRepo(db)
 	scheduleRepo := repo.NewAIScheduleRepo(db)
@@ -97,7 +100,10 @@ func main() {
 	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
 	channelService.SetImportService(importService)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
+	recycleBinService := service.NewRecycleBinService(recycleBinRepo, permService)
 	backupService := service.NewBackupService(cfg, db, minioClient)
+	go recycleBinService.StartCleanup(context.Background(), 6*time.Hour)
+	go backupService.StartAutomaticBackups(context.Background())
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
 	aiService := service.NewAIService(cfg, db, sheetRepo, sheetService, permService, uploadService, scheduleService)
 	channelService.SetAIService(aiService)
@@ -149,6 +155,7 @@ func main() {
 	permHandler := handler.NewPermissionHandler(permService)
 	departmentHandler := handler.NewDepartmentHandler(departmentService)
 	folderHandler := handler.NewFolderHandler(folderService)
+	recycleBinHandler := handler.NewRecycleBinHandler(recycleBinService)
 	backupHandler := handler.NewBackupHandler(backupService)
 	aiHandler := handler.NewAIHandler(aiService, hub)
 
@@ -305,6 +312,13 @@ func main() {
 		api.PUT("/folders/:id/shares", folderHandler.SetShares)
 		api.PUT("/workbooks/:id/move", folderHandler.MoveWorkbook)
 
+		// Recycle bin
+		api.GET("/recycle-bin", recycleBinHandler.List)
+		api.POST("/recycle-bin/workbooks/:id/restore", recycleBinHandler.RestoreWorkbook)
+		api.DELETE("/recycle-bin/workbooks/:id", recycleBinHandler.DeleteWorkbook)
+		api.POST("/recycle-bin/folders/:id/restore", recycleBinHandler.RestoreFolder)
+		api.DELETE("/recycle-bin/folders/:id", recycleBinHandler.DeleteFolder)
+
 		// AI Chat
 		api.GET("/ai/assistants", aiHandler.ListAvailableAssistants)
 		api.POST("/ai/chat", aiHandler.Chat)
@@ -365,6 +379,8 @@ func main() {
 			admin.GET("/admin/backup/config", backupHandler.DownloadConfig)
 			admin.GET("/admin/backup/combined", backupHandler.DownloadCombined)
 			admin.POST("/admin/backup/restore", backupHandler.RestoreDatabase)
+			admin.GET("/admin/backup/automatic", backupHandler.AutomaticStatus)
+			admin.POST("/admin/backup/automatic/run", backupHandler.RunAutomaticBackup)
 
 			// AI Config (admin)
 			admin.GET("/admin/ai/config", aiHandler.GetConfig)

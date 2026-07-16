@@ -52,7 +52,7 @@ func (r *SheetRepo) ListWorkbookNames(ownerID int64, folderID *int64) ([]string,
 	rows, err := r.db.Query(
 		`SELECT name
 		 FROM workbooks
-		 WHERE owner_id = $1 AND folder_id IS NOT DISTINCT FROM $2
+		 WHERE owner_id = $1 AND folder_id IS NOT DISTINCT FROM $2 AND deleted_at IS NULL
 		 ORDER BY id`,
 		ownerID, folderID,
 	)
@@ -83,7 +83,7 @@ func (r *SheetRepo) DuplicateWorkbook(sourceWorkbookID int64, clone *model.Workb
 	defer tx.Rollback()
 
 	var sourceExists int
-	if err := tx.QueryRow(`SELECT 1 FROM workbooks WHERE id = $1 FOR SHARE`, sourceWorkbookID).Scan(&sourceExists); err != nil {
+	if err := tx.QueryRow(`SELECT 1 FROM workbooks WHERE id = $1 AND deleted_at IS NULL FOR SHARE`, sourceWorkbookID).Scan(&sourceExists); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("workbook %d not found", sourceWorkbookID)
 		}
@@ -162,7 +162,7 @@ func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id
-		 WHERE w.id = $1`, id,
+		 WHERE w.id = $1 AND w.deleted_at IS NULL`, id,
 	).Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("workbook %d not found", id)
@@ -175,10 +175,10 @@ func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 
 func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workbook, int64, error) {
 	var total int64
-	countQuery := `SELECT COUNT(*) FROM workbooks`
+	countQuery := `SELECT COUNT(*) FROM workbooks WHERE deleted_at IS NULL`
 	countArgs := make([]interface{}, 0, 1)
 	if ownerID != nil {
-		countQuery += ` WHERE owner_id = $1`
+		countQuery += ` AND owner_id = $1`
 		countArgs = append(countArgs, *ownerID)
 	}
 	err := r.db.QueryRow(countQuery, countArgs...).Scan(&total)
@@ -191,8 +191,9 @@ func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workb
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id`
 	args := make([]interface{}, 0, 3)
+	query += ` WHERE w.deleted_at IS NULL`
 	if ownerID != nil {
-		query += ` WHERE w.owner_id = $1`
+		query += ` AND w.owner_id = $1`
 		args = append(args, *ownerID)
 		query += ` ORDER BY w.updated_at DESC, w.id DESC LIMIT $2 OFFSET $3`
 		args = append(args, size, offset)
@@ -224,7 +225,7 @@ func (r *SheetRepo) UpdateWorkbook(wb *model.Workbook) error {
 	wb.UpdatedAt = time.Now()
 	result, err := r.db.Exec(
 		`UPDATE workbooks SET name = $1, description = $2, metadata = $3, updated_at = $4
-		 WHERE id = $5`,
+		 WHERE id = $5 AND deleted_at IS NULL`,
 		wb.Name, wb.Description, wb.Metadata, wb.UpdatedAt, wb.ID,
 	)
 	if err != nil {
@@ -242,7 +243,7 @@ func (r *SheetRepo) ListWorkbooksInAssignmentGroup(sourceWorkbookID int64) ([]mo
 		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id
-		 WHERE w.id = $1 OR w.metadata->>'source_workbook_id' = $2
+		 WHERE w.deleted_at IS NULL AND (w.id = $1 OR w.metadata->>'source_workbook_id' = $2)
 		 ORDER BY CASE WHEN w.id = $1 THEN 0 ELSE 1 END, w.id`,
 		sourceWorkbookID, strconv.FormatInt(sourceWorkbookID, 10),
 	)
@@ -269,6 +270,23 @@ func (r *SheetRepo) DeleteWorkbook(id int64) error {
 	result, err := r.db.Exec(`DELETE FROM workbooks WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("delete workbook: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("workbook %d not found", id)
+	}
+	return nil
+}
+
+func (r *SheetRepo) SoftDeleteWorkbook(id, userID int64) error {
+	result, err := r.db.Exec(
+		`UPDATE workbooks
+		 SET deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
+		 WHERE id = $1 AND deleted_at IS NULL`,
+		id, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("move workbook to recycle bin: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {

@@ -60,6 +60,11 @@ type BackupConfig struct {
 	IncludeObjectStorage bool
 	ObjectPrefix         string
 	PublicBaseURL        string
+	AutomaticEnabled     bool
+	Directory            string
+	HostDirectory        string
+	IntervalHours        int
+	RetentionDays        int
 }
 
 type WhatsAppConfig struct {
@@ -107,6 +112,11 @@ func Load() *Config {
 			IncludeObjectStorage: getEnv("BACKUP_INCLUDE_OBJECT_STORAGE", "true") == "true",
 			ObjectPrefix:         getEnv("BACKUP_OBJECT_PREFIX", "uploads/"),
 			PublicBaseURL:        getEnv("BACKUP_PUBLIC_BASE_URL", ""),
+			AutomaticEnabled:     getEnv("BACKUP_AUTO_ENABLED", "true") == "true",
+			Directory:            getEnv("BACKUP_DIRECTORY", "/backups"),
+			HostDirectory:        getEnv("BACKUP_HOST_DIR", "./backups"),
+			IntervalHours:        getPositiveEnvInt("BACKUP_INTERVAL_HOURS", 24),
+			RetentionDays:        getPositiveEnvInt("BACKUP_RETENTION_DAYS", 30),
 		},
 		WhatsApp: WhatsAppConfig{
 			ServiceURL:     getEnv("WHATSAPP_SERVICE_URL", "http://whatsapp:3010"),
@@ -129,4 +139,12 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func getPositiveEnvInt(key string, fallback int) int {
+	value := getEnvInt(key, fallback)
+	if value <= 0 {
+		return fallback
+	}
+	return value
 }

@@ -51,6 +51,9 @@ export interface Workbook {
   hidden_by_id?: number
   hidden_by_name?: string
   hidden_at?: string
+  deleted_at?: string
+  deleted_by_id?: number
+  deleted_by_name?: string
   created_at: string
   updated_at: string
   sheets?: Sheet[]
@@ -303,6 +306,9 @@ export interface Folder {
   access_level?: 'view' | 'edit' | 'owner' | 'admin'
   can_write?: boolean
   can_manage?: boolean
+  deleted_at?: string
+  deleted_by_id?: number
+  deleted_by_name?: string
   created_at: string
   updated_at: string
 }
@@ -317,6 +323,12 @@ export interface FolderShareUser {
 export interface FolderContents {
   folders: Folder[]
   workbooks: Workbook[]
+}
+
+export interface RecycleBinContents {
+  folders: Folder[]
+  workbooks: Workbook[]
+  retention_days: number
 }
 
 export interface GalleryDirectory {

@@ -28,6 +28,8 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    volumes:
+      - ${BACKUP_HOST_DIR:-./backups}:/backups
     depends_on:
       postgres:
         condition: service_healthy

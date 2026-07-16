@@ -3,16 +3,19 @@ package model
 import "time"
 
 type Folder struct {
-	ID          int64     `json:"id" db:"id"`
-	Name        string    `json:"name" db:"name"`
-	ParentID    *int64    `json:"parent_id" db:"parent_id"`
-	OwnerID     int64     `json:"owner_id" db:"owner_id"`
-	OwnerName   *string   `json:"owner_name,omitempty" db:"owner_name"`
-	AccessLevel string    `json:"access_level,omitempty" db:"access_level"`
-	CanWrite    bool      `json:"can_write,omitempty" db:"can_write"`
-	CanManage   bool      `json:"can_manage,omitempty" db:"can_manage"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+	ID            int64      `json:"id" db:"id"`
+	Name          string     `json:"name" db:"name"`
+	ParentID      *int64     `json:"parent_id" db:"parent_id"`
+	OwnerID       int64      `json:"owner_id" db:"owner_id"`
+	OwnerName     *string    `json:"owner_name,omitempty" db:"owner_name"`
+	AccessLevel   string     `json:"access_level,omitempty" db:"access_level"`
+	CanWrite      bool       `json:"can_write,omitempty" db:"can_write"`
+	CanManage     bool       `json:"can_manage,omitempty" db:"can_manage"`
+	DeletedAt     *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+	DeletedByID   *int64     `json:"deleted_by_id,omitempty" db:"deleted_by"`
+	DeletedByName *string    `json:"deleted_by_name,omitempty" db:"deleted_by_name"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 type FolderVisibility struct {
@@ -57,4 +60,10 @@ type SetFolderSharesRequest struct {
 type FolderContents struct {
 	Folders   []Folder   `json:"folders"`
 	Workbooks []Workbook `json:"workbooks"`
+}
+
+type RecycleBinContents struct {
+	Folders       []Folder   `json:"folders"`
+	Workbooks     []Workbook `json:"workbooks"`
+	RetentionDays int        `json:"retention_days"`
 }

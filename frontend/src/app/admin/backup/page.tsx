@@ -1,7 +1,7 @@
 'use client'
 
-import { AlertTriangle, Archive, Database, Download, FileJson, Upload } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { AlertTriangle, Archive, Clock3, Database, Download, FileJson, HardDrive, RefreshCw, Upload } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AdminShell } from '@/components/admin/AdminShell'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
@@ -15,6 +15,23 @@ interface BackupCard {
   description: string
   endpoint: string
   filename: string
+}
+
+interface AutomaticBackupStatus {
+  enabled: boolean
+  directory: string
+  host_directory: string
+  interval_hours: number
+  retention_days: number
+  latest_file?: string
+  latest_at?: string
+  latest_size?: number
+}
+
+function formatFileSize(size = 0) {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
 const backupCards: BackupCard[] = [
@@ -57,9 +74,54 @@ export default function BackupPage() {
   const [restoring, setRestoring] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [automaticStatus, setAutomaticStatus] = useState<AutomaticBackupStatus | null>(null)
+  const [loadingAutomaticStatus, setLoadingAutomaticStatus] = useState(true)
+  const [runningAutomaticBackup, setRunningAutomaticBackup] = useState(false)
   const restoreInputRef = useRef<HTMLInputElement>(null)
 
   const getToken = () => (typeof window !== 'undefined' ? localStorage.getItem('access_token') : null)
+
+  const loadAutomaticStatus = useCallback(async () => {
+    setLoadingAutomaticStatus(true)
+    try {
+      const token = getToken()
+      const response = await fetch(`${API_BASE}/admin/backup/automatic`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      const payload = await response.json() as { code?: number; message?: string; data?: AutomaticBackupStatus }
+      if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || '读取自动备份状态失败')
+      setAutomaticStatus(payload.data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '读取自动备份状态失败')
+    } finally {
+      setLoadingAutomaticStatus(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadAutomaticStatus()
+  }, [loadAutomaticStatus])
+
+  const runAutomaticBackup = async () => {
+    setRunningAutomaticBackup(true)
+    setError('')
+    setSuccess('')
+    try {
+      const token = getToken()
+      const response = await fetch(`${API_BASE}/admin/backup/automatic/run`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      const payload = await response.json() as { code?: number; message?: string; data?: AutomaticBackupStatus }
+      if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || '自动备份执行失败')
+      setAutomaticStatus(payload.data)
+      setSuccess('数据库备份已写入宿主机备份目录。')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '自动备份执行失败')
+    } finally {
+      setRunningAutomaticBackup(false)
+    }
+  }
 
   const handleDownload = async (card: BackupCard) => {
     setLoadingKey(card.key)
@@ -171,6 +233,35 @@ export default function BackupPage() {
               {success}
             </div>
           )}
+
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-700"><HardDrive className="h-5 w-5" /></div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-base font-semibold text-slate-950">宿主机自动数据库备份</h2>
+                    <span className={`rounded-lg px-2 py-1 text-xs font-medium ${automaticStatus?.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{automaticStatus?.enabled ? '已启用' : '未启用'}</span>
+                  </div>
+                  {loadingAutomaticStatus ? (
+                    <div className="mt-2 flex items-center gap-2 text-sm text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" />正在读取备份状态</div>
+                  ) : automaticStatus ? (
+                    <div className="mt-2 grid gap-x-6 gap-y-1 text-sm text-slate-500 sm:grid-cols-2">
+                      <span>宿主机目录：<strong className="font-medium text-slate-700">{automaticStatus.host_directory}</strong></span>
+                      <span>周期：每 {automaticStatus.interval_hours} 小时</span>
+                      <span>保留：{automaticStatus.retention_days} 天</span>
+                      <span>容器目录：{automaticStatus.directory}</span>
+                      <span className="sm:col-span-2">最近备份：{automaticStatus.latest_at ? `${new Date(automaticStatus.latest_at).toLocaleString('zh-CN')} · ${automaticStatus.latest_file} · ${formatFileSize(automaticStatus.latest_size)}` : '尚未生成'}</span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button type="button" onClick={() => void loadAutomaticStatus()} disabled={loadingAutomaticStatus || runningAutomaticBackup} className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-50" title="刷新状态" aria-label="刷新状态" data-tooltip="刷新状态"><RefreshCw className={`h-4 w-4 ${loadingAutomaticStatus ? 'animate-spin' : ''}`} /></button>
+                <button type="button" onClick={() => void runAutomaticBackup()} disabled={runningAutomaticBackup} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-3 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"><Clock3 className="h-4 w-4" />{runningAutomaticBackup ? '备份中...' : '立即备份'}</button>
+              </div>
+            </div>
+          </section>
 
           <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-6">

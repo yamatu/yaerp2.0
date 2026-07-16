@@ -38,7 +38,7 @@ func (r *FolderRepo) GetByID(id int64) (*model.Folder, error) {
 		`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
 		 FROM folders f
 		 LEFT JOIN users u ON u.id = f.owner_id
-		 WHERE f.id = $1`, id,
+		 WHERE f.id = $1 AND f.deleted_at IS NULL`, id,
 	).Scan(&f.ID, &f.Name, &f.ParentID, &f.OwnerID, &f.OwnerName, &f.CreatedAt, &f.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("folder %d not found", id)
@@ -52,7 +52,7 @@ func (r *FolderRepo) GetByID(id int64) (*model.Folder, error) {
 func (r *FolderRepo) Update(f *model.Folder) error {
 	f.UpdatedAt = time.Now()
 	result, err := r.db.Exec(
-		`UPDATE folders SET name = $1, updated_at = $2 WHERE id = $3`,
+		`UPDATE folders SET name = $1, updated_at = $2 WHERE id = $3 AND deleted_at IS NULL`,
 		f.Name, f.UpdatedAt, f.ID,
 	)
 	if err != nil {
@@ -77,6 +77,43 @@ func (r *FolderRepo) Delete(id int64) error {
 	return nil
 }
 
+func (r *FolderRepo) SoftDelete(id, userID int64) error {
+	deletedAt := time.Now()
+	var folderCount int
+	var workbookCount int
+	err := r.db.QueryRow(
+		`WITH RECURSIVE folder_tree AS (
+			SELECT id
+			FROM folders
+			WHERE id = $1 AND deleted_at IS NULL
+			UNION ALL
+			SELECT child.id
+			FROM folders child
+			INNER JOIN folder_tree parent ON child.parent_id = parent.id
+			WHERE child.deleted_at IS NULL
+		), marked_folders AS (
+			UPDATE folders
+			SET deleted_at = $3, deleted_by = $2, updated_at = $3
+			WHERE id IN (SELECT id FROM folder_tree)
+			RETURNING id
+		), marked_workbooks AS (
+			UPDATE workbooks
+			SET deleted_at = $3, deleted_by = $2, updated_at = $3
+			WHERE folder_id IN (SELECT id FROM folder_tree) AND deleted_at IS NULL
+			RETURNING id
+		)
+		SELECT (SELECT COUNT(*) FROM marked_folders), (SELECT COUNT(*) FROM marked_workbooks)`,
+		id, userID, deletedAt,
+	).Scan(&folderCount, &workbookCount)
+	if err != nil {
+		return fmt.Errorf("move folder to recycle bin: %w", err)
+	}
+	if folderCount == 0 {
+		return fmt.Errorf("folder %d not found", id)
+	}
+	return nil
+}
+
 func (r *FolderRepo) ListSubFolders(parentID *int64) ([]model.Folder, error) {
 	var queryRows *sql.Rows
 	var err error
@@ -86,7 +123,7 @@ func (r *FolderRepo) ListSubFolders(parentID *int64) ([]model.Folder, error) {
 			`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
 			 FROM folders f
 			 LEFT JOIN users u ON u.id = f.owner_id
-			 WHERE f.parent_id IS NULL
+			 WHERE f.parent_id IS NULL AND f.deleted_at IS NULL
 			 ORDER BY f.name`,
 		)
 	} else {
@@ -94,7 +131,7 @@ func (r *FolderRepo) ListSubFolders(parentID *int64) ([]model.Folder, error) {
 			`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
 			 FROM folders f
 			 LEFT JOIN users u ON u.id = f.owner_id
-			 WHERE f.parent_id = $1
+			 WHERE f.parent_id = $1 AND f.deleted_at IS NULL
 			 ORDER BY f.name`, *parentID,
 		)
 	}
@@ -191,7 +228,7 @@ func (r *FolderRepo) ListDirectlySharedFolders(userID int64) ([]model.Folder, er
 		 FROM folder_shares fs
 		 INNER JOIN folders f ON f.id = fs.folder_id
 		 LEFT JOIN users u ON u.id = f.owner_id
-		 WHERE fs.user_id = $1 AND f.owner_id <> $1
+		 WHERE fs.user_id = $1 AND f.owner_id <> $1 AND f.deleted_at IS NULL
 		 ORDER BY f.updated_at DESC, f.id DESC`,
 		userID,
 	)
@@ -221,7 +258,7 @@ func (r *FolderRepo) ListWorkbooksInFolder(folderID *int64) ([]model.Workbook, e
 			`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 			 FROM workbooks w
 			 LEFT JOIN users u ON u.id = w.owner_id
-			 WHERE w.folder_id IS NULL
+			 WHERE w.folder_id IS NULL AND w.deleted_at IS NULL
 			 ORDER BY name`,
 		)
 	} else {
@@ -229,7 +266,7 @@ func (r *FolderRepo) ListWorkbooksInFolder(folderID *int64) ([]model.Workbook, e
 			`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 			 FROM workbooks w
 			 LEFT JOIN users u ON u.id = w.owner_id
-			 WHERE w.folder_id = $1
+			 WHERE w.folder_id = $1 AND w.deleted_at IS NULL
 			 ORDER BY name`, *folderID,
 		)
 	}
@@ -251,7 +288,7 @@ func (r *FolderRepo) ListWorkbooksInFolder(folderID *int64) ([]model.Workbook, e
 
 func (r *FolderRepo) MoveWorkbook(workbookID int64, folderID *int64) error {
 	result, err := r.db.Exec(
-		`UPDATE workbooks SET folder_id = $1, updated_at = NOW() WHERE id = $2`,
+		`UPDATE workbooks SET folder_id = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`,
 		folderID, workbookID,
 	)
 	if err != nil {

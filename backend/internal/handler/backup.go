@@ -76,3 +76,21 @@ func (h *BackupHandler) RestoreDatabase(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "database restored successfully"})
 }
+
+func (h *BackupHandler) AutomaticStatus(c *gin.Context) {
+	status, err := h.backupService.GetAutomaticBackupStatus()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": status})
+}
+
+func (h *BackupHandler) RunAutomaticBackup(c *gin.Context) {
+	status, err := h.backupService.CreateAutomaticDatabaseBackup()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "database backup created", "data": status})
+}

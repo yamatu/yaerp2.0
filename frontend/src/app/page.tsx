@@ -47,7 +47,6 @@ import {
   EXCEL_IMPORT_ACCEPT,
   EXCEL_IMPORT_FORMATS_LABEL,
   isSupportedExcelImportFile,
-  stripExcelImportExtension,
   uploadNewWorkbookXlsx,
 } from '@/components/spreadsheet/ImportXlsxButton'
 import api from '@/lib/api'
@@ -57,6 +56,53 @@ import type { AuthUser, Channel, Folder, FolderShareUser, PageData, User, Workbo
 interface WorkbookImportSource {
   filename?: string
   attachment_id?: number | null
+}
+
+interface ExcelImportEntry {
+  file: File
+  relativePath: string
+}
+
+interface LegacyFileSystemEntry {
+  isFile: boolean
+  isDirectory: boolean
+  name: string
+}
+
+interface LegacyFileSystemFileEntry extends LegacyFileSystemEntry {
+  file: (success: (file: File) => void, failure?: (error: DOMException) => void) => void
+}
+
+interface LegacyFileSystemDirectoryEntry extends LegacyFileSystemEntry {
+  createReader: () => {
+    readEntries: (success: (entries: LegacyFileSystemEntry[]) => void, failure?: (error: DOMException) => void) => void
+  }
+}
+
+function readDroppedFile(entry: LegacyFileSystemFileEntry) {
+  return new Promise<File>((resolve, reject) => entry.file(resolve, reject))
+}
+
+async function readAllDirectoryEntries(entry: LegacyFileSystemDirectoryEntry) {
+  const reader = entry.createReader()
+  const entries: LegacyFileSystemEntry[] = []
+  while (true) {
+    const batch = await new Promise<LegacyFileSystemEntry[]>((resolve, reject) => reader.readEntries(resolve, reject))
+    if (batch.length === 0) return entries
+    entries.push(...batch)
+  }
+}
+
+async function collectDroppedExcelEntries(entry: LegacyFileSystemEntry, parentPath = ''): Promise<ExcelImportEntry[]> {
+  const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name
+  if (entry.isFile) {
+    const file = await readDroppedFile(entry as LegacyFileSystemFileEntry)
+    return [{ file, relativePath }]
+  }
+  if (!entry.isDirectory) return []
+  const children = await readAllDirectoryEntries(entry as LegacyFileSystemDirectoryEntry)
+  const nested = await Promise.all(children.map((child) => collectDroppedExcelEntries(child, relativePath)))
+  return nested.flat()
 }
 
 function ownResourceFilterStorageKey(userId: number) {
@@ -503,10 +549,16 @@ export default function HomePage() {
     }
   }
 
-  const handleImportWorkbookFolder = async (selectedFiles: FileList) => {
+  const handleImportWorkbookEntries = async (selectedEntries: ExcelImportEntry[]) => {
     if (!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder) return
-    const files = Array.from(selectedFiles).filter(isSupportedExcelImportFile)
-    if (files.length === 0) {
+    const entries = selectedEntries
+      .filter((entry) => isSupportedExcelImportFile(entry.file))
+      .map((entry) => {
+        const relativePath = (entry.relativePath || entry.file.name).replaceAll('\\', '/')
+        const parts = relativePath.split('/').map((part) => part.trim()).filter(Boolean)
+        return { file: entry.file, parts, directoryParts: parts.slice(0, -1) }
+      })
+    if (entries.length === 0) {
       setWorkbookImportError(`所选文件夹中没有 ${EXCEL_IMPORT_FORMATS_LABEL} 格式的工作簿。`)
       if (workbookFolderImportInputRef.current) workbookFolderImportInputRef.current.value = ''
       return
@@ -515,14 +567,9 @@ export default function HomePage() {
     setImportingWorkbookFolder(true)
     setWorkbookImportProgress(0)
     setWorkbookImportError('')
-    setWorkbookFolderImportStatus(`正在分析 ${files.length} 个 Excel 工作簿`)
+    setWorkbookFolderImportStatus(`正在分析 ${entries.length} 个 Excel 工作簿`)
 
     try {
-      const entries = files.map((file) => {
-        const relativePath = (file.webkitRelativePath || file.name).replaceAll('\\', '/')
-        const parts = relativePath.split('/').map((part) => part.trim()).filter(Boolean)
-        return { file, parts, directoryParts: parts.length > 1 ? parts.slice(0, -1) : [stripExcelImportExtension(file.name)] }
-      })
       const directoryPaths = Array.from(new Set(entries.flatMap((entry) => entry.directoryParts.map((_, index) => entry.directoryParts.slice(0, index + 1).join('/')))))
         .sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right, 'zh-CN'))
       const folderIDs = new Map<string, number>()
@@ -536,26 +583,26 @@ export default function HomePage() {
         const response = await api.post<Folder>('/folders', { name: parts.at(-1), parent_id: parentID ?? null })
         if (response.code !== 0 || !response.data?.id) throw new Error(response.message || `创建目录 ${directoryPath} 失败`)
         folderIDs.set(directoryPath, response.data.id)
-        setWorkbookImportProgress(Math.round(((index + 1) / Math.max(1, directoryPaths.length + files.length)) * 100))
+        setWorkbookImportProgress(Math.round(((index + 1) / Math.max(1, directoryPaths.length + entries.length)) * 100))
       }
 
       for (let index = 0; index < entries.length; index += 1) {
         const entry = entries[index]
         const directoryPath = entry.directoryParts.join('/')
-        const folderID = folderIDs.get(directoryPath)
-        if (!folderID) throw new Error(`找不到导入目录 ${directoryPath}`)
+        const folderID = directoryPath ? folderIDs.get(directoryPath) : currentFolderId
+        if (directoryPath && !folderID) throw new Error(`找不到导入目录 ${directoryPath}`)
         setWorkbookFolderImportStatus(`正在导入 ${index + 1}/${entries.length}：${entry.parts.join('/')}`)
         await uploadNewWorkbookXlsx(entry.file, {
-          folderId: folderID,
+          folderId: folderID ?? null,
           onProgress: (fileProgress) => {
             const completedUnits = directoryPaths.length + index + fileProgress / 100
-            setWorkbookImportProgress(Math.round((completedUnits / (directoryPaths.length + files.length)) * 100))
+            setWorkbookImportProgress(Math.round((completedUnits / (directoryPaths.length + entries.length)) * 100))
           },
         })
       }
 
       setWorkbookImportProgress(100)
-      setWorkbookFolderImportStatus(`已按原目录结构导入 ${files.length} 个 Excel 工作簿`)
+      setWorkbookFolderImportStatus(`已按原目录结构导入 ${entries.length} 个 Excel 工作簿`)
       await Promise.all([refresh(), refreshFolder()])
       setWorkbookPage(1)
     } catch (err) {
@@ -567,53 +614,34 @@ export default function HomePage() {
         setWorkbookFolderImportStatus('')
       }, 1200)
       if (workbookFolderImportInputRef.current) workbookFolderImportInputRef.current.value = ''
+      if (workbookImportInputRef.current) workbookImportInputRef.current.value = ''
     }
   }
 
-  const handleImportDroppedWorkbooks = async (droppedFiles: File[]) => {
+  const handleImportWorkbookFolder = async (selectedFiles: FileList) => {
+    await handleImportWorkbookEntries(Array.from(selectedFiles).map((file) => ({
+      file,
+      relativePath: file.webkitRelativePath || file.name,
+    })))
+  }
+
+  const handleImportDroppedWorkbooks = async (droppedEntries: ExcelImportEntry[]) => {
     if (!canWriteCurrentFolder) {
       setWorkbookImportError('当前文件夹为只读，不能上传 Excel。')
       return
     }
     if (importingWorkbook || importingWorkbookFolder) return
 
-    const files = droppedFiles.filter(isSupportedExcelImportFile)
-    if (files.length === 0) {
+    const entries = droppedEntries.filter((entry) => isSupportedExcelImportFile(entry.file))
+    if (entries.length === 0) {
       setWorkbookImportError(`请拖入 ${EXCEL_IMPORT_FORMATS_LABEL} 格式的文件。`)
       return
     }
-    if (files.length === 1) {
-      await handleImportWorkbookXlsx(files[0])
+    if (entries.length === 1 && !entries[0].relativePath.includes('/')) {
+      await handleImportWorkbookXlsx(entries[0].file)
       return
     }
-
-    setImportingWorkbookFolder(true)
-    setWorkbookImportProgress(0)
-    setWorkbookImportError('')
-    try {
-      for (let index = 0; index < files.length; index += 1) {
-        const file = files[index]
-        setWorkbookFolderImportStatus(`正在导入 ${index + 1}/${files.length}：${file.name}`)
-        await uploadNewWorkbookXlsx(file, {
-          folderId: currentFolderId,
-          onProgress: (fileProgress) => {
-            setWorkbookImportProgress(Math.round(((index + fileProgress / 100) / files.length) * 100))
-          },
-        })
-      }
-      setWorkbookImportProgress(100)
-      setWorkbookFolderImportStatus(`已导入 ${files.length} 个 Excel 工作簿`)
-      await Promise.all([refresh(), refreshFolder()])
-      setWorkbookPage(1)
-    } catch (err) {
-      setWorkbookImportError(err instanceof Error ? err.message : 'Excel 批量导入失败。')
-    } finally {
-      setImportingWorkbookFolder(false)
-      window.setTimeout(() => {
-        setWorkbookImportProgress(0)
-        setWorkbookFolderImportStatus('')
-      }, 1200)
-    }
+    await handleImportWorkbookEntries(entries)
   }
 
   const handleWorkbookDragEnter = (event: React.DragEvent<HTMLElement>) => {
@@ -644,7 +672,20 @@ export default function HomePage() {
     event.stopPropagation()
     workbookDropDepthRef.current = 0
     setWorkbookDropActive(false)
-    void handleImportDroppedWorkbooks(Array.from(event.dataTransfer.files || []))
+    const fileEntries = Array.from(event.dataTransfer.items || [])
+      .map((item) => (item as unknown as { webkitGetAsEntry?: () => LegacyFileSystemEntry | null }).webkitGetAsEntry?.() || null)
+      .filter((entry): entry is LegacyFileSystemEntry => entry !== null)
+    const fallbackFiles = Array.from(event.dataTransfer.files || [])
+    void (async () => {
+      try {
+        const nested = fileEntries.length > 0
+          ? (await Promise.all(fileEntries.map((entry) => collectDroppedExcelEntries(entry)))).flat()
+          : fallbackFiles.map((file) => ({ file, relativePath: file.name }))
+        await handleImportDroppedWorkbooks(nested)
+      } catch (err) {
+        setWorkbookImportError(err instanceof Error ? err.message : '读取拖入的 Excel 目录失败。')
+      }
+    })()
   }
 
   const handleDownloadWorkbookSource = async (event: React.MouseEvent, workbook: Workbook) => {
@@ -782,7 +823,7 @@ export default function HomePage() {
     e.stopPropagation()
     const workbook = workbooks.find((item) => item.id === workbookId) || contents.workbooks.find((item) => item.id === workbookId)
     if (workbook && !canDeleteWorkbook(workbook)) return
-    if (!confirm('确定要删除此工作簿吗？其下所有工作表和数据将一并删除。')) return
+    if (!confirm('确定要将此工作簿移入回收站吗？删除后保留 30 天，可在回收站中还原。')) return
     try {
       await api.delete(`/workbooks/${workbookId}`)
       await Promise.all([refresh(), refreshFolder()])
@@ -896,7 +937,7 @@ export default function HomePage() {
   }
 
   const handleDeleteFolder = async (folderId: number, folderName: string) => {
-    if (!confirm(`确定要删除文件夹「${folderName}」吗？文件夹中的工作簿会回到根目录。`)) return
+    if (!confirm(`确定要将文件夹「${folderName}」移入回收站吗？目录结构和其中的工作簿会保留 30 天。`)) return
     try {
       await deleteFolder(folderId)
       await refresh()
@@ -1030,6 +1071,9 @@ export default function HomePage() {
                   <Images className="h-4 w-4" />
                   图库
                 </button>
+                <button type="button" onClick={() => router.push('/recycle-bin')} className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-slate-900" title="回收站" aria-label="回收站" data-tooltip="回收站">
+                  <Trash2 className="h-4 w-4" />
+                </button>
                 <button type="button" onClick={() => router.push('/whatsapp')} className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 px-3 text-sm font-medium text-emerald-700 transition hover:bg-emerald-50">
                   <MessageCircle className="h-4 w-4" />
                   WhatsApp
@@ -1087,7 +1131,7 @@ export default function HomePage() {
                     <FileSpreadsheet className="h-6 w-6" />
                   </div>
                   <div className="mt-3 text-sm font-semibold text-slate-900">松开即可导入 Excel</div>
-                  <div className="mt-1 text-xs text-slate-500">支持同时拖入多个文件</div>
+                  <div className="mt-1 text-xs text-slate-500">支持同时拖入多个 Excel 文件或多个目录，并保留目录层级</div>
                 </div>
               </div>
             )}
@@ -1156,12 +1200,12 @@ export default function HomePage() {
                   ref={workbookImportInputRef}
                   type="file"
                   accept={EXCEL_IMPORT_ACCEPT}
+                  multiple
                   className="hidden"
                   onChange={(event) => {
-                    const file = event.target.files?.[0]
-                    if (file) {
-                      void handleImportWorkbookXlsx(file)
-                    }
+                    const files = Array.from(event.target.files || [])
+                    if (files.length === 1) void handleImportWorkbookXlsx(files[0])
+                    if (files.length > 1) void handleImportDroppedWorkbooks(files.map((file) => ({ file, relativePath: file.name })))
                   }}
                 />
                 <button

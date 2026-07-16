@@ -10,6 +10,7 @@ import {
   BellOff,
   Bot,
   Check,
+  CheckSquare,
   CheckCheck,
   ChevronDown,
   ChevronLeft,
@@ -20,11 +21,13 @@ import {
   Download,
   FileText,
   FileUp,
+  Folder,
   FlipHorizontal2,
   FlipVertical2,
   GripVertical,
   Globe2,
   Hash,
+  Home,
   Image as ImageIcon,
   ImagePlus,
   Images,
@@ -61,6 +64,8 @@ import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppAvatarImage } from '@/components/whatsapp/WhatsAppAvatarImage'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useWorkbooks } from '@/hooks/useSheet'
+import { useFileManager } from '@/hooks/useFileManager'
+import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
@@ -259,6 +264,7 @@ function MessageReadReceipts({ message }: { message: ChannelMessage }) {
 
 export default function ChannelsPage() {
   const { workbooks } = useWorkbooks()
+  const tableFileManager = useFileManager()
   const [currentUser] = useState(() => getStoredUser())
   const [channels, setChannels] = useState<Channel[]>([])
   const [activeChannelId, setActiveChannelId] = useState<number | null>(() => {
@@ -268,6 +274,24 @@ export default function ChannelsPage() {
   const [messages, setMessages] = useState<ChannelMessage[]>([])
   const [directories, setDirectories] = useState<GalleryDirectory[]>([])
   const [currentUserId] = useState<number | null>(() => getStoredUser()?.id || null)
+  const [tablePickerOnlyMine, setTablePickerOnlyMine, tablePickerOnlyMineLoaded] = useUserPreference(
+    currentUserId,
+    'channels.table-picker-only-mine',
+    false,
+    isBooleanPreference
+  )
+  const [rememberedTableFolderId, setRememberedTableFolderId, rememberedTableFolderLoaded] = useUserPreference<number | null>(
+    currentUserId,
+    'channels.table-picker-folder-id',
+    null,
+    isNullablePositiveIntegerPreference
+  )
+  const [rememberedTableWorkbookId, setRememberedTableWorkbookId, rememberedTableWorkbookLoaded] = useUserPreference<number | null>(
+    currentUserId,
+    'channels.table-picker-workbook-id',
+    null,
+    isNullablePositiveIntegerPreference
+  )
   const [loadingChannels, setLoadingChannels] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
   const [showScrollToLatest, setShowScrollToLatest] = useState(false)
@@ -515,11 +539,20 @@ export default function ChannelsPage() {
 
   const filteredTableWorkbooks = useMemo(() => {
     const keyword = tableSearch.trim().toLowerCase()
-    return [...workbooks]
+    const source = keyword ? workbooks : tableFileManager.contents.workbooks
+    return [...source]
+      .filter((workbook) => !tablePickerOnlyMine || workbook.owner_id === currentUserId)
       .filter((workbook) => !keyword || [workbook.name, workbook.owner_name, workbook.description]
         .some((value) => value?.toLowerCase().includes(keyword)))
       .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || left.name.localeCompare(right.name, 'zh-CN'))
-  }, [tableSearch, workbooks])
+  }, [currentUserId, tableFileManager.contents.workbooks, tablePickerOnlyMine, tableSearch, workbooks])
+
+  const tablePickerFolders = useMemo(
+    () => tableFileManager.contents.folders
+      .filter((folder) => !tablePickerOnlyMine || folder.owner_id === currentUserId)
+      .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN')),
+    [currentUserId, tableFileManager.contents.folders, tablePickerOnlyMine]
+  )
 
   const tablePickerPageSize = 30
   const totalTablePickerPages = Math.max(1, Math.ceil(filteredTableWorkbooks.length / tablePickerPageSize))
@@ -534,10 +567,48 @@ export default function ChannelsPage() {
     return galleryImages.filter((image) => image.filename.toLowerCase().includes(keyword))
   }, [galleryImageSearch, galleryImages])
 
-  const selectedPickerWorkbook = workbooks.find((workbook) => String(workbook.id) === tablePickerWorkbookId) || null
+  const selectedPickerWorkbook = workbooks.find((workbook) => (
+    String(workbook.id) === tablePickerWorkbookId
+    && (!tablePickerOnlyMine || workbook.owner_id === currentUserId)
+  )) || null
   const canPublishSelectedPickerWorkbook = Boolean(
     currentUser && selectedPickerWorkbook && (currentUser.id === selectedPickerWorkbook.owner_id || isAdmin(currentUser))
   )
+
+  const selectTablePickerWorkbook = useCallback((workbook: Workbook | null) => {
+    setTablePickerWorkbookId(workbook ? String(workbook.id) : '')
+    setRememberedTableWorkbookId(workbook?.id || null)
+    setTablePickerSheetId('')
+    setMakePendingTablePublic(Boolean(workbook?.is_public))
+  }, [setRememberedTableWorkbookId])
+
+  const navigateTablePickerFolder = useCallback(async (folderId: number | null) => {
+    setTableSearch('')
+    setTablePickerPage(1)
+    setRememberedTableFolderId(folderId)
+    await tableFileManager.navigateTo(folderId)
+  }, [setRememberedTableFolderId, tableFileManager.navigateTo])
+
+  const toggleTablePickerOnlyMine = useCallback(() => {
+    const nextValue = !tablePickerOnlyMine
+    setTablePickerOnlyMine(nextValue)
+    if (!nextValue) return
+    if (selectedPickerWorkbook && selectedPickerWorkbook.owner_id !== currentUserId) {
+      selectTablePickerWorkbook(null)
+    }
+    const currentFolder = tableFileManager.breadcrumb.at(-1)
+    if (currentFolder && currentFolder.owner_id !== currentUserId) {
+      void navigateTablePickerFolder(null)
+    }
+  }, [
+    currentUserId,
+    navigateTablePickerFolder,
+    selectTablePickerWorkbook,
+    selectedPickerWorkbook,
+    setTablePickerOnlyMine,
+    tableFileManager.breadcrumb,
+    tablePickerOnlyMine,
+  ])
 
   const availableDirectories = useMemo(
     () => directories.filter((directory) => !directory.channel_id || directory.channel_id === activeChannelId),
@@ -979,17 +1050,70 @@ export default function ChannelsPage() {
   }, [activeChannelId, highlightMessageId, messages])
 
   useEffect(() => {
-    if (!isTablePickerOpen) return
-    const initialWorkbookId = pendingTable?.workbook.id || workbooks[0]?.id
-    setTablePickerWorkbookId(initialWorkbookId ? String(initialWorkbookId) : '')
+    if (!isTablePickerOpen || !tablePickerOnlyMineLoaded || !rememberedTableFolderLoaded || !rememberedTableWorkbookLoaded) return
+    const preferredWorkbookId = pendingTable?.workbook.id || rememberedTableWorkbookId
+    const initialWorkbook = workbooks.find((workbook) => (
+      workbook.id === preferredWorkbookId
+      && (!tablePickerOnlyMine || workbook.owner_id === currentUserId)
+    )) || null
+    setTablePickerWorkbookId(initialWorkbook ? String(initialWorkbook.id) : '')
     setTablePickerSheetId(pendingTable?.sheet ? String(pendingTable.sheet.id) : '')
     if (!pendingTable) {
-      const initialWorkbook = workbooks.find((workbook) => workbook.id === initialWorkbookId)
       setMakePendingTablePublic(Boolean(initialWorkbook?.is_public))
     }
     setTableSearch('')
     setTablePickerPage(1)
-  }, [isTablePickerOpen, pendingTable, workbooks])
+    const initialFolderId = pendingTable?.workbook.folder_id ?? rememberedTableFolderId
+    void tableFileManager.navigateTo(initialFolderId || null)
+  }, [
+    currentUserId,
+    isTablePickerOpen,
+    pendingTable,
+    rememberedTableFolderId,
+    rememberedTableFolderLoaded,
+    rememberedTableWorkbookId,
+    rememberedTableWorkbookLoaded,
+    tableFileManager.navigateTo,
+    tablePickerOnlyMine,
+    tablePickerOnlyMineLoaded,
+    workbooks,
+  ])
+
+  useEffect(() => {
+    if (!isTablePickerOpen || tableSearch.trim() || tableFileManager.loading) return
+    const selectedIsVisible = filteredTableWorkbooks.some((workbook) => String(workbook.id) === tablePickerWorkbookId)
+    if (selectedIsVisible) return
+    selectTablePickerWorkbook(filteredTableWorkbooks[0] || null)
+  }, [
+    filteredTableWorkbooks,
+    isTablePickerOpen,
+    selectTablePickerWorkbook,
+    tableFileManager.loading,
+    tablePickerWorkbookId,
+    tableSearch,
+  ])
+
+  useEffect(() => {
+    if (!isTablePickerOpen || !tableFileManager.error || tableFileManager.currentFolderId === null) return
+    setRememberedTableFolderId(null)
+    void tableFileManager.navigateTo(null)
+  }, [isTablePickerOpen, setRememberedTableFolderId, tableFileManager.currentFolderId, tableFileManager.error, tableFileManager.navigateTo])
+
+  useEffect(() => {
+    if (!isTablePickerOpen || !tablePickerOnlyMine || tableFileManager.currentFolderId === null) return
+    const currentFolder = tableFileManager.breadcrumb.at(-1)
+    if (!currentFolder || currentFolder.owner_id === currentUserId) return
+    setRememberedTableFolderId(null)
+    void tableFileManager.navigateTo(null)
+  }, [
+    currentUserId,
+    isTablePickerOpen,
+    setRememberedTableFolderId,
+    tableFileManager.breadcrumb,
+    tableFileManager.currentFolderId,
+    tableFileManager.navigateTo,
+    tablePickerOnlyMine,
+  ])
 
   useEffect(() => {
     setTablePickerPage(1)
@@ -3082,29 +3206,54 @@ export default function ChannelsPage() {
 
         {isTablePickerOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTablePickerOpen(false) }}>
-            <div className="flex max-h-[86vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+            <div className="flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">发送表格</div>
-                  <div className="mt-1 text-xs text-slate-400">共 {workbooks.length} 个工作簿，可搜索并选择整个工作簿或其中一个工作表</div>
+                  <div className="mt-1 text-xs text-slate-400">按主页文件夹浏览工作簿，也可跨目录搜索并选择工作表</div>
                 </div>
                 <button type="button" onClick={() => setIsTablePickerOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
-              <div className="grid min-h-0 flex-1 grid-rows-[minmax(220px,38vh)_minmax(0,1fr)] md:grid-cols-[320px_minmax(0,1fr)] md:grid-rows-none">
+              <div className="grid min-h-0 flex-1 grid-rows-[minmax(240px,42vh)_minmax(0,1fr)] md:grid-cols-[360px_minmax(0,1fr)] md:grid-rows-none">
                 <div className="flex min-h-0 flex-col border-b border-slate-200 md:border-b-0 md:border-r">
                   <div className="border-b border-slate-100 p-3">
                     <label className="flex h-9 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:ring-1 focus-within:ring-sky-300">
                       <Search className="h-4 w-4" />
-                      <input value={tableSearch} onChange={(event) => setTableSearch(event.target.value)} placeholder="搜索工作簿" className="min-w-0 flex-1 bg-transparent outline-none" />
+                      <input value={tableSearch} onChange={(event) => setTableSearch(event.target.value)} placeholder="跨文件夹搜索工作簿" className="min-w-0 flex-1 bg-transparent outline-none" />
                     </label>
-                    <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
-                      <span>匹配 {filteredTableWorkbooks.length} 个</span>
-                      <span>按最近更新排序</span>
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <button type="button" onClick={toggleTablePickerOnlyMine} className={`inline-flex h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${tablePickerOnlyMine ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`} aria-pressed={tablePickerOnlyMine}>
+                        {tablePickerOnlyMine ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                        仅看自己的表
+                      </button>
+                      <span className="text-[11px] text-slate-400">{tableSearch.trim() ? `匹配 ${filteredTableWorkbooks.length} 个` : `${tablePickerFolders.length} 个文件夹 · ${filteredTableWorkbooks.length} 个工作簿`}</span>
                     </div>
+                    {!tableSearch.trim() && (
+                      <div className="mt-2 flex min-w-0 items-center gap-1 overflow-x-auto text-xs [scrollbar-width:none]">
+                        <button type="button" onClick={() => void navigateTablePickerFolder(null)} className={`inline-flex h-7 shrink-0 items-center gap-1 rounded-lg px-2 ${tableFileManager.currentFolderId === null ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100'}`} title="根目录"><Home className="h-3.5 w-3.5" />主页</button>
+                        {tableFileManager.breadcrumb.map((folder) => (
+                          <div key={folder.id} className="flex shrink-0 items-center gap-1">
+                            <ChevronRight className="h-3.5 w-3.5 text-slate-300" />
+                            <button type="button" onClick={() => void navigateTablePickerFolder(folder.id)} className={`max-w-32 truncate rounded-lg px-2 py-1 ${folder.id === tableFileManager.currentFolderId ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-100'}`}>{folder.name}</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]">
+                    {!tableSearch.trim() && tablePickerFolders.map((folder) => (
+                      <button key={folder.id} type="button" onClick={() => void navigateTablePickerFolder(folder.id)} className="flex w-full items-center gap-3 border-b border-slate-100 px-3 py-2.5 text-left hover:bg-amber-50/60">
+                        <Folder className="h-4 w-4 shrink-0 text-amber-600" />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium text-slate-700">{folder.name}</div>
+                          <div className="mt-0.5 truncate text-[11px] text-slate-400">{folder.owner_name || `用户 #${folder.owner_id}`}</div>
+                        </div>
+                        <ChevronRight className="h-4 w-4 shrink-0 text-slate-300" />
+                      </button>
+                    ))}
+                    {tableFileManager.loading && !tableSearch.trim() && <div className="flex items-center gap-2 p-4 text-sm text-slate-400"><RefreshCw className="h-4 w-4 animate-spin" />正在读取文件夹</div>}
                     {paginatedTableWorkbooks.map((workbook) => (
-                      <button key={workbook.id} type="button" onClick={() => { setTablePickerWorkbookId(String(workbook.id)); setTablePickerSheetId(''); setMakePendingTablePublic(Boolean(workbook.is_public)) }} className={`flex w-full items-center gap-3 border-b border-slate-100 px-3 py-2.5 text-left ${String(workbook.id) === tablePickerWorkbookId ? 'bg-sky-50' : 'hover:bg-slate-50'}`}>
+                      <button key={workbook.id} type="button" onClick={() => selectTablePickerWorkbook(workbook)} className={`flex w-full items-center gap-3 border-b border-slate-100 px-3 py-2.5 text-left ${String(workbook.id) === tablePickerWorkbookId ? 'bg-sky-50' : 'hover:bg-slate-50'}`}>
                         <Table2 className={`h-4 w-4 shrink-0 ${String(workbook.id) === tablePickerWorkbookId ? 'text-sky-600' : 'text-slate-400'}`} />
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-sm font-medium text-slate-700">{workbook.name}</div>
@@ -3116,7 +3265,7 @@ export default function ChannelsPage() {
                         {String(workbook.id) === tablePickerWorkbookId && <Check className="h-4 w-4 shrink-0 text-sky-600" />}
                       </button>
                     ))}
-                    {filteredTableWorkbooks.length === 0 && <div className="p-4 text-sm text-slate-400">没有匹配的工作簿</div>}
+                    {!tableFileManager.loading && filteredTableWorkbooks.length === 0 && (tableSearch.trim() || tablePickerFolders.length === 0) && <div className="p-4 text-sm text-slate-400">{tableSearch.trim() ? '没有匹配的工作簿' : '当前目录中没有可发送的工作簿'}</div>}
                   </div>
                   {totalTablePickerPages > 1 && (
                     <div className="flex h-11 shrink-0 items-center justify-between border-t border-slate-200 px-3 text-xs text-slate-500">
