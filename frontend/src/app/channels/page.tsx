@@ -20,10 +20,13 @@ import {
   Download,
   FileText,
   FileUp,
+  FlipHorizontal2,
+  FlipVertical2,
   GripVertical,
   Globe2,
   Hash,
   Image as ImageIcon,
+  ImagePlus,
   Images,
   Languages,
   MessageSquare,
@@ -36,6 +39,7 @@ import {
   RefreshCw,
   Reply,
   RotateCcw,
+  RotateCw,
   Save,
   Search,
   Send,
@@ -60,6 +64,7 @@ import { useWorkbooks } from '@/hooks/useSheet'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
+import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
 import { wsClient } from '@/lib/ws'
 import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, WhatsAppContactSyncResult, WhatsAppHistorySyncResult, Workbook, WorkbookImportResult } from '@/types'
 
@@ -108,6 +113,16 @@ function readStoredNumber(key: string) {
 
 function hasDraggedFiles(dataTransfer: DataTransfer) {
   return Array.from(dataTransfer.types || []).includes('Files')
+}
+
+function normalizeWhatsAppSearchText(value: string | null | undefined) {
+  return (value || '').normalize('NFKC').toLocaleLowerCase('zh-CN').trim()
+}
+
+function compactWhatsAppSearchText(value: string | null | undefined) {
+  return normalizeWhatsAppSearchText(value)
+    .replace(/@(c|g)\.us$/i, '')
+    .replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
 function authHeaders(): Record<string, string> {
@@ -284,9 +299,9 @@ export default function ChannelsPage() {
   const [newChannelDescription, setNewChannelDescription] = useState('')
 
   const [messageText, setMessageText] = useState('')
-  const [pendingFile, setPendingFile] = useState<File | null>(null)
-  const [pendingFilePreviewUrl, setPendingFilePreviewUrl] = useState('')
-  const [pendingGalleryImage, setPendingGalleryImage] = useState<GalleryImage | null>(null)
+  const [pendingFiles, setPendingFiles] = useState<File[]>([])
+  const [pendingFilePreviewUrls, setPendingFilePreviewUrls] = useState<string[]>([])
+  const [pendingGalleryImages, setPendingGalleryImages] = useState<GalleryImage[]>([])
   const [savePendingImage, setSavePendingImage] = useState(false)
   const [selectedDirectoryId, setSelectedDirectoryId] = useState('')
   const [pendingTable, setPendingTable] = useState<PendingTable | null>(null)
@@ -309,7 +324,7 @@ export default function ChannelsPage() {
   const [galleryPickerMode, setGalleryPickerMode] = useState<GalleryPickerMode>('message')
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([])
   const [galleryImageSearch, setGalleryImageSearch] = useState('')
-  const [selectedGalleryImageId, setSelectedGalleryImageId] = useState('')
+  const [selectedGalleryImageIds, setSelectedGalleryImageIds] = useState<number[]>([])
   const [loadingGalleryImages, setLoadingGalleryImages] = useState(false)
   const [renamingGalleryImage, setRenamingGalleryImage] = useState<GalleryImage | null>(null)
   const [galleryRenameValue, setGalleryRenameValue] = useState('')
@@ -364,6 +379,7 @@ export default function ChannelsPage() {
 
   const [previewImageMessage, setPreviewImageMessage] = useState<ChannelMessage | null>(null)
   const [imageZoom, setImageZoom] = useState(1)
+  const [transformingMessageImage, setTransformingMessageImage] = useState<ImageTransform | null>(null)
   const [previewDirectoryId, setPreviewDirectoryId] = useState('')
   const [savingImage, setSavingImage] = useState(false)
   const [savedImageIds, setSavedImageIds] = useState<number[]>([])
@@ -376,6 +392,7 @@ export default function ChannelsPage() {
   const [reorderingPins, setReorderingPins] = useState(false)
 
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const imageInputRef = useRef<HTMLInputElement | null>(null)
   const channelAvatarInputRef = useRef<HTMLInputElement | null>(null)
   const messageInputRef = useRef<HTMLTextAreaElement | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -446,9 +463,18 @@ export default function ChannelsPage() {
   }, [activeChannelId, forwardSearch, sortedChannels])
 
   const filteredWhatsAppChats = useMemo(() => {
-    const keyword = whatsAppChatSearch.trim().toLowerCase()
+    const keyword = normalizeWhatsAppSearchText(whatsAppChatSearch)
     if (!keyword) return whatsAppChats
-    return whatsAppChats.filter((chat) => chat.name.toLowerCase().includes(keyword) || chat.id.toLowerCase().includes(keyword))
+    const terms = keyword.split(/\s+/).filter(Boolean)
+    return whatsAppChats.filter((chat) => {
+      const values = [chat.name, chat.id, chat.description, chat.about, chat.lastMessage]
+      const searchable = values.map(normalizeWhatsAppSearchText).join(' ')
+      const compactSearchable = values.map(compactWhatsAppSearchText).join(' ')
+      return terms.every((term) => {
+        const compactTerm = compactWhatsAppSearchText(term)
+        return searchable.includes(term) || (compactTerm !== '' && compactSearchable.includes(compactTerm))
+      })
+    })
   }, [whatsAppChatSearch, whatsAppChats])
   const selectedWhatsAppAccount = whatsAppAccounts.find((account) => String(account.id) === selectedWhatsAppAccountId) || null
 
@@ -723,8 +749,8 @@ export default function ChannelsPage() {
     setSelectedDirectoryId('')
     setSavePendingImage(false)
     setMessageText('')
-    setPendingFile(null)
-    setPendingGalleryImage(null)
+    setPendingFiles([])
+    setPendingGalleryImages([])
     setPendingTable(null)
     setMakePendingTablePublic(false)
     setReplyingToMessage(null)
@@ -734,6 +760,7 @@ export default function ChannelsPage() {
     externalDragDepthRef.current = 0
     setIsExternalFileDragging(false)
     if (fileInputRef.current) fileInputRef.current.value = ''
+    if (imageInputRef.current) imageInputRef.current.value = ''
     if (!activeChannelId) {
       void loadMessages(null)
       setChannelAIMembers([])
@@ -803,11 +830,11 @@ export default function ChannelsPage() {
   useEffect(() => {
     if (!isGalleryPickerOpen) return
     setGalleryImageSearch('')
-    setSelectedGalleryImageId(galleryPickerMode === 'channel-avatar'
-      ? (activeChannel?.avatar_attachment_id ? String(activeChannel.avatar_attachment_id) : '')
-      : (pendingGalleryImage ? String(pendingGalleryImage.id) : ''))
+    setSelectedGalleryImageIds(galleryPickerMode === 'channel-avatar'
+      ? (activeChannel?.avatar_attachment_id ? [activeChannel.avatar_attachment_id] : [])
+      : pendingGalleryImages.map((image) => image.id))
     void loadGalleryImages()
-  }, [activeChannel?.avatar_attachment_id, galleryPickerMode, isGalleryPickerOpen, loadGalleryImages, pendingGalleryImage])
+  }, [activeChannel?.avatar_attachment_id, galleryPickerMode, isGalleryPickerOpen, loadGalleryImages, pendingGalleryImages])
 
   useEffect(() => {
     if (!notice) return
@@ -867,14 +894,12 @@ export default function ChannelsPage() {
   }, [activeChannelId, loadChannels, loadMessages, markChannelRead])
 
   useEffect(() => {
-    if (!pendingFile || !pendingFile.type.startsWith('image/')) {
-      setPendingFilePreviewUrl('')
-      return
-    }
-    const previewUrl = URL.createObjectURL(pendingFile)
-    setPendingFilePreviewUrl(previewUrl)
-    return () => URL.revokeObjectURL(previewUrl)
-  }, [pendingFile])
+    const previewUrls = pendingFiles.map((file) => file.type.startsWith('image/') ? URL.createObjectURL(file) : '')
+    setPendingFilePreviewUrls(previewUrls)
+    return () => previewUrls.forEach((url) => {
+      if (url) URL.revokeObjectURL(url)
+    })
+  }, [pendingFiles])
 
   useEffect(() => {
     const viewport = messagesViewportRef.current
@@ -1036,21 +1061,41 @@ export default function ChannelsPage() {
       }
       return
     }
-    const hasMessage = messageText.trim() || pendingFile || pendingGalleryImage || pendingTable
+    const hasMessage = messageText.trim() || pendingFiles.length > 0 || pendingGalleryImages.length > 0 || pendingTable
     if (!hasMessage) return
     if (selectedAskAssistantId && !messageText.trim()) {
       setError('向机器人提问时需要输入文字问题。')
+      return
+    }
+    if (selectedAskAssistantId && pendingFiles.length + pendingGalleryImages.length > 1) {
+      setError('机器人每次只能读取一张图片，请移除多余图片后再发送。')
       return
     }
     setSending(true)
     setAskingAI(Boolean(selectedAskAssistantId))
     setError('')
     shouldStickToBottomRef.current = true
+    let sentAttachmentCount = 0
+    const preserveUnsentAttachments = async () => {
+      const totalAttachments = pendingFiles.length || pendingGalleryImages.length
+      if (sentAttachmentCount <= 0 || totalAttachments === 0 || sentAttachmentCount >= totalAttachments) return
+      setMessageText('')
+      if (pendingFiles.length > 0) {
+        setPendingFiles(pendingFiles.slice(sentAttachmentCount))
+      } else {
+        setPendingGalleryImages(pendingGalleryImages.slice(sentAttachmentCount))
+      }
+      setPendingTable(null)
+      setMakePendingTablePublic(false)
+      setReplyingToMessage(null)
+      setNotice(`已发送 ${sentAttachmentCount} 张图片，剩余 ${totalAttachments - sentAttachmentCount} 张待重试`)
+      await Promise.all([loadMessages(activeChannelId, true), loadChannels(true)])
+    }
     try {
       if (selectedAskAssistantId) {
-        let attachmentId = pendingGalleryImage?.id
-        if (pendingFile) {
-          const uploadRes = await api.upload(pendingFile)
+        let attachmentId = pendingGalleryImages[0]?.id
+        if (pendingFiles[0]) {
+          const uploadRes = await api.upload(pendingFiles[0])
           if (uploadRes.code !== 0 || !uploadRes.data?.id) {
             setError(uploadRes.message || '附件上传失败')
             return
@@ -1070,12 +1115,13 @@ export default function ChannelsPage() {
           return
         }
         setMessageText('')
-        setPendingFile(null)
-        setPendingGalleryImage(null)
+        setPendingFiles([])
+        setPendingGalleryImages([])
         setPendingTable(null)
         setMakePendingTablePublic(false)
         setReplyingToMessage(null)
         if (fileInputRef.current) fileInputRef.current.value = ''
+        if (imageInputRef.current) imageInputRef.current.value = ''
         if (activeChannel?.channel_type !== 'ai_private') setSelectedAskAssistantId(null)
         notifyDataChanged({
           source: 'ai',
@@ -1086,42 +1132,55 @@ export default function ChannelsPage() {
         return
       }
 
-      const formData = new FormData()
-      formData.append('content', messageText.trim())
-      if (pendingFile) formData.append('file', pendingFile)
-      if (pendingGalleryImage) formData.append('attachment_id', String(pendingGalleryImage.id))
-      if (pendingTable) {
-        formData.append('linked_workbook_id', String(pendingTable.workbook.id))
-        if (pendingTable.sheet) formData.append('linked_sheet_id', String(pendingTable.sheet.id))
-        if (makePendingTablePublic) formData.append('make_workbook_public', 'true')
-      }
-      if (replyingToMessage) formData.append('reply_to_message_id', String(replyingToMessage.id))
-      if (pendingFile?.type.startsWith('image/') && savePendingImage) {
-        formData.append('save_to_gallery', 'true')
-        if (selectedDirectoryId) formData.append('gallery_directory_id', selectedDirectoryId)
-      }
-      const res = await fetch(`${API_BASE}/channels/${activeChannelId}/messages`, {
-        method: 'POST',
-        headers: authHeaders(),
-        body: formData,
-      })
-      const data = await res.json()
-      if (!res.ok || data.code !== 0) {
-        setError(data.message || '发送失败')
-        return
+      const attachmentsToSend: Array<{ file?: File; galleryImage?: GalleryImage }> = pendingFiles.length > 0
+        ? pendingFiles.map((file) => ({ file }))
+        : pendingGalleryImages.length > 0
+          ? pendingGalleryImages.map((galleryImage) => ({ galleryImage }))
+          : [{}]
+      for (let index = 0; index < attachmentsToSend.length; index += 1) {
+        const { file, galleryImage } = attachmentsToSend[index]
+        const isFirstMessage = index === 0
+        const formData = new FormData()
+        formData.append('content', isFirstMessage ? messageText.trim() : '')
+        if (file) formData.append('file', file)
+        if (galleryImage) formData.append('attachment_id', String(galleryImage.id))
+        if (isFirstMessage && pendingTable) {
+          formData.append('linked_workbook_id', String(pendingTable.workbook.id))
+          if (pendingTable.sheet) formData.append('linked_sheet_id', String(pendingTable.sheet.id))
+          if (makePendingTablePublic) formData.append('make_workbook_public', 'true')
+        }
+        if (isFirstMessage && replyingToMessage) formData.append('reply_to_message_id', String(replyingToMessage.id))
+        if (file?.type.startsWith('image/') && savePendingImage) {
+          formData.append('save_to_gallery', 'true')
+          if (selectedDirectoryId) formData.append('gallery_directory_id', selectedDirectoryId)
+        }
+        const res = await fetch(`${API_BASE}/channels/${activeChannelId}/messages`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: formData,
+        })
+        const data = await res.json()
+        if (!res.ok || data.code !== 0) {
+          await preserveUnsentAttachments()
+          setError(data.message || '发送失败')
+          return
+        }
+        if (file || galleryImage) sentAttachmentCount += 1
       }
       setMessageText('')
-      setPendingFile(null)
-      setPendingGalleryImage(null)
+      setPendingFiles([])
+      setPendingGalleryImages([])
       setPendingTable(null)
       setMakePendingTablePublic(false)
       setReplyingToMessage(null)
       setSavePendingImage(false)
       setSelectedDirectoryId('')
       if (fileInputRef.current) fileInputRef.current.value = ''
+      if (imageInputRef.current) imageInputRef.current.value = ''
       await Promise.all([loadMessages(activeChannelId, true), loadChannels(true), loadDirectories()])
-    } catch {
-      setError('发送失败')
+    } catch (sendError) {
+      await preserveUnsentAttachments()
+      setError(sendError instanceof Error ? sendError.message : '发送失败')
     } finally {
       setSending(false)
       setAskingAI(false)
@@ -1134,13 +1193,23 @@ export default function ChannelsPage() {
     void sendMessage()
   }
 
-  const selectPendingFile = (file: File | null) => {
-    if (!file) return
+  const selectPendingFiles = (files: File[]) => {
+    const selectedFiles = files.filter((file) => file.size > 0)
+    if (selectedFiles.length === 0) return
     if (editingMessage) {
       setError('编辑消息时不能添加附件')
       return
     }
+    if (selectedFiles.length > 1 && selectedFiles.some((file) => !file.type.startsWith('image/'))) {
+      setError('批量上传仅支持图片，其他文件请单独发送。')
+      return
+    }
+    if (selectedAskAssistantId && selectedFiles.length > 1) {
+      setError('机器人每次只能读取一张图片。')
+      return
+    }
     if (selectedAskAssistantId) {
+      const file = selectedFiles[0]
       const isImage = file.type.startsWith('image/')
       if (isImage && !selectedAskAssistant?.supports_vision) {
         setError('当前机器人未启用图片理解能力。')
@@ -1151,10 +1220,23 @@ export default function ChannelsPage() {
         return
       }
     }
-    setPendingFile(file)
-    setPendingGalleryImage(null)
+    const allImages = selectedFiles.every((file) => file.type.startsWith('image/'))
+    let nextFiles = selectedFiles
+    if (allImages && !selectedAskAssistantId && pendingFiles.every((file) => file.type.startsWith('image/'))) {
+      const next = [...pendingFiles]
+      for (const file of selectedFiles) {
+        if (!next.some((item) => item.name === file.name && item.size === file.size && item.lastModified === file.lastModified)) {
+          next.push(file)
+        }
+      }
+      nextFiles = next
+    }
+    setPendingFiles(nextFiles)
+    setPendingGalleryImages([])
     setSavePendingImage(false)
     setSelectedDirectoryId('')
+    setError('')
+    if (nextFiles.length > 1) setNotice(`已选择 ${nextFiles.length} 张图片，将按顺序发送`)
     window.requestAnimationFrame(() => messageInputRef.current?.focus())
   }
 
@@ -1187,31 +1269,72 @@ export default function ChannelsPage() {
     setIsExternalFileDragging(false)
     const files = Array.from(event.dataTransfer.files || [])
     if (files.length === 0) return
-    selectPendingFile(files[0])
-    if (files.length > 1) setNotice(`已添加 ${files[0].name}，每条消息可发送一个外部文件`)
+    if (files.length > 1 && files.every((file) => file.type.startsWith('image/'))) {
+      selectPendingFiles(files)
+      return
+    }
+    selectPendingFiles([files[0]])
+    if (files.length > 1) setNotice(`已添加 ${files[0].name}；批量拖拽仅支持图片`)
   }
 
-  const clearPendingFile = () => {
-    setPendingFile(null)
+  const clearPendingFiles = () => {
+    setPendingFiles([])
     setSavePendingImage(false)
     setSelectedDirectoryId('')
     if (fileInputRef.current) fileInputRef.current.value = ''
+    if (imageInputRef.current) imageInputRef.current.value = ''
+  }
+
+  const removePendingFile = (index: number) => {
+    const next = pendingFiles.filter((_, itemIndex) => itemIndex !== index)
+    setPendingFiles(next)
+    if (next.length === 0) {
+      setSavePendingImage(false)
+      setSelectedDirectoryId('')
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      if (imageInputRef.current) imageInputRef.current.value = ''
+    }
+  }
+
+  const clearPendingGalleryImages = () => {
+    setPendingGalleryImages([])
+  }
+
+  const removePendingGalleryImage = (imageId: number) => {
+    setPendingGalleryImages((current) => current.filter((image) => image.id !== imageId))
   }
 
   const confirmGallerySelection = async () => {
-    const selected = galleryImages.find((image) => String(image.id) === selectedGalleryImageId)
-    if (!selected) return
+    const selected = selectedGalleryImageIds
+      .map((imageId) => galleryImages.find((image) => image.id === imageId))
+      .filter((image): image is GalleryImage => Boolean(image))
+    if (selected.length === 0) return
     if (galleryPickerMode === 'channel-avatar') {
-      await setChannelAvatar(selected.id)
+      await setChannelAvatar(selected[0].id)
       setIsGalleryPickerOpen(false)
       return
     }
-    setPendingGalleryImage(selected)
-    setPendingFile(null)
+    if (selectedAskAssistantId && selected.length > 1) {
+      setError('机器人每次只能读取一张图库图片。')
+      return
+    }
+    setPendingGalleryImages(selected)
+    setPendingFiles([])
     setSavePendingImage(false)
     setSelectedDirectoryId('')
     if (fileInputRef.current) fileInputRef.current.value = ''
+    if (imageInputRef.current) imageInputRef.current.value = ''
     setIsGalleryPickerOpen(false)
+  }
+
+  const toggleGalleryImageSelection = (imageId: number) => {
+    if (galleryPickerMode === 'channel-avatar' || selectedAskAssistantId) {
+      setSelectedGalleryImageIds([imageId])
+      return
+    }
+    setSelectedGalleryImageIds((current) => current.includes(imageId)
+      ? current.filter((id) => id !== imageId)
+      : [...current, imageId])
   }
 
   const confirmTableSelection = () => {
@@ -1348,8 +1471,8 @@ export default function ChannelsPage() {
     setContextMenu(null)
     setReplyingToMessage(null)
     setSelectedAskAssistantId(null)
-    setPendingFile(null)
-    setPendingGalleryImage(null)
+    setPendingFiles([])
+    setPendingGalleryImages([])
     setPendingTable(null)
     setEditingMessage(message)
     setMessageText(message.content)
@@ -1537,6 +1660,7 @@ export default function ChannelsPage() {
   const loadWhatsAppLink = async (channelId: number) => {
     const requestSequence = ++whatsAppRequestSequenceRef.current
     setLoadingWhatsApp(true)
+    setWhatsAppChatSearch('')
     try {
       const [linkResponse, accountsResponse] = await Promise.all([
         api.get<WhatsAppChannelLink | null>(`/channels/${channelId}/whatsapp-link`),
@@ -1579,6 +1703,7 @@ export default function ChannelsPage() {
     const requestSequence = ++whatsAppRequestSequenceRef.current
     setSelectedWhatsAppAccountId(accountId)
     setSelectedWhatsAppChatId('')
+    setWhatsAppChatSearch('')
     setWhatsAppChats([])
     const account = whatsAppAccounts.find((item) => String(item.id) === accountId)
     if (!account || account.status !== 'ready') {
@@ -1758,7 +1883,7 @@ export default function ChannelsPage() {
   }
 
   const selectAssistantForQuestion = (assistantID: number, message?: ChannelMessage) => {
-    if (pendingFile || pendingGalleryImage || pendingTable) {
+    if (pendingFiles.length > 0 || pendingGalleryImages.length > 0 || pendingTable) {
       setError('当前已有待发送附件，请先移除附件再向机器人提问。')
       setContextMenu(null)
       return
@@ -1866,6 +1991,52 @@ export default function ChannelsPage() {
     }
   }
 
+  const handleTransformMessageImage = async (transform: ImageTransform) => {
+    const message = previewImageMessage
+    if (!message?.attachment_url || !message.attachment_id || transformingMessageImage) return
+    setTransformingMessageImage(transform)
+    setError('')
+    try {
+      const file = await transformRemoteImage(
+        message.attachment_url,
+        message.attachment_filename || 'channel-image',
+        message.attachment_mime_type || 'image/png',
+        transform,
+      )
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await api.form<ChannelMessage>(`/channels/${message.channel_id}/messages/${message.id}/image`, formData, 'PUT')
+      if (res.code !== 0 || !res.data) {
+        setError(res.message || `${imageTransformLabel(transform)}失败`)
+        return
+      }
+      const updated = res.data
+      setMessages((current) => current.map((item) => item.id === updated.id ? updated : item))
+      setHistoryResults((current) => current.map((item) => item.id === updated.id ? {
+        ...item,
+        attachment_url: updated.attachment_url,
+        attachment_filename: updated.attachment_filename,
+        attachment_mime_type: updated.attachment_mime_type,
+        attachment_size: updated.attachment_size,
+      } : item))
+      setGalleryImages((current) => current.map((image) => image.id === updated.attachment_id ? {
+        ...image,
+        url: updated.attachment_url || image.url,
+        thumbnail_url: imageThumbnailUrl(updated.attachment_url || image.url, 320),
+        filename: updated.attachment_filename || image.filename,
+        mime_type: updated.attachment_mime_type || image.mime_type,
+        size: updated.attachment_size ?? image.size,
+      } : image))
+      setPreviewImageMessage(updated)
+      setImageZoom(1)
+      setNotice(`${imageTransformLabel(transform)}完成，图片已自动保存`)
+    } catch (error) {
+      setError(error instanceof Error ? error.message : `${imageTransformLabel(transform)}失败`)
+    } finally {
+      setTransformingMessageImage(null)
+    }
+  }
+
   const openHistorySearch = (channelId?: number) => {
     const nextChannelId = channelId ? String(channelId) : ''
     if (nextChannelId !== historyChannelId) {
@@ -1955,7 +2126,7 @@ export default function ChannelsPage() {
       }
       const renamed = res.data
       setGalleryImages((current) => current.map((image) => image.id === renamed.id ? renamed : image))
-      setPendingGalleryImage((current) => current?.id === renamed.id ? renamed : current)
+      setPendingGalleryImages((current) => current.map((image) => image.id === renamed.id ? renamed : image))
       setMessages((current) => current.map((message) => message.attachment_id === renamed.id
         ? { ...message, attachment_filename: renamed.filename }
         : message))
@@ -2214,7 +2385,7 @@ export default function ChannelsPage() {
                   ) : historyResults.map((result) => (
                     <button key={`${result.channel_id}-${result.id}`} type="button" onClick={() => selectHistoryResult(result)} className={`flex w-full gap-3 border-b border-slate-100 px-4 py-3 text-left transition hover:bg-slate-50 ${highlightMessageId === result.id ? 'bg-sky-50' : ''}`}>
                       <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-slate-100 text-slate-500">
-                        {isImageMessage(result) ? <img src={result.attachment_url} alt="" className="h-full w-full object-cover" /> : <MessageSquare className="h-4 w-4" />}
+                        {isImageMessage(result) ? <img src={imageThumbnailUrl(result.attachment_url, 160)} alt="" className="h-full w-full object-cover" /> : <MessageSquare className="h-4 w-4" />}
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
@@ -2424,7 +2595,7 @@ export default function ChannelsPage() {
                                     className={`relative mt-2 block max-w-full cursor-grab touch-pan-y overflow-hidden rounded-lg border border-slate-200 bg-white p-1 text-left shadow-sm transition active:cursor-grabbing ${draggingMessageId === message.id ? 'opacity-50' : 'hover:border-sky-300'}`}
                                     title="查看图片"
                                   >
-                                    <img src={message.attachment_url} alt={message.attachment_filename || '频道图片'} className="max-h-72 max-w-full object-contain" />
+                                    <img src={imageThumbnailUrl(message.attachment_url, 640)} alt={message.attachment_filename || '频道图片'} className="max-h-72 max-w-full object-contain" loading="lazy" decoding="async" />
                                     {savedImageIds.includes(message.id) && (
                                       <span className="absolute bottom-2 right-2 rounded-lg bg-emerald-600 px-2 py-1 text-[11px] text-white">已保存</span>
                                     )}
@@ -2524,30 +2695,54 @@ export default function ChannelsPage() {
                           <button type="button" onClick={() => setReplyingToMessage(null)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-slate-700" title="取消回复"><X className="h-3.5 w-3.5" /></button>
                         </div>
                       )}
-                      {(pendingFile || pendingGalleryImage || pendingTable) && (
+                      {(pendingFiles.length > 0 || pendingGalleryImages.length > 0 || pendingTable) && (
                         <div className="flex flex-wrap gap-2 border-b border-slate-100 bg-slate-50 p-2">
-                          {pendingFile && (
-                            <div className="flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white p-2">
-                              {pendingFilePreviewUrl ? (
-                                <img src={pendingFilePreviewUrl} alt={pendingFile.name} className="h-9 w-9 rounded-lg object-cover" />
-                              ) : (
-                                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500"><Paperclip className="h-4 w-4" /></div>
+                          {pendingFiles.length > 0 && (
+                            <div className="min-w-0 basis-full">
+                              {pendingFiles.length > 1 && (
+                                <div className="mb-1.5 flex items-center justify-between gap-3 px-0.5 text-[11px] text-slate-500">
+                                  <span>已选择 {pendingFiles.length} 张图片，将按顺序发送</span>
+                                  <button type="button" onClick={clearPendingFiles} className="shrink-0 font-medium text-rose-500 hover:text-rose-700">全部移除</button>
+                                </div>
                               )}
-                              <div className="min-w-0">
-                                <div className="max-w-56 truncate text-xs font-semibold text-slate-700">{pendingFile.name}</div>
-                                <div className="text-[11px] text-slate-400">{formatFileSize(pendingFile.size)}</div>
+                              <div className="flex max-w-full gap-2 overflow-x-auto pb-1">
+                                {pendingFiles.map((file, index) => (
+                                  <div key={`${file.name}-${file.size}-${file.lastModified}-${index}`} className="flex w-52 shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-white p-2">
+                                    {pendingFilePreviewUrls[index] ? (
+                                      <img src={pendingFilePreviewUrls[index]} alt={file.name} className="h-9 w-9 shrink-0 rounded-lg object-cover" />
+                                    ) : (
+                                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500"><Paperclip className="h-4 w-4" /></div>
+                                    )}
+                                    <div className="min-w-0 flex-1">
+                                      <div className="truncate text-xs font-semibold text-slate-700">{file.name}</div>
+                                      <div className="text-[11px] text-slate-400">{formatFileSize(file.size)}</div>
+                                    </div>
+                                    <button type="button" onClick={() => removePendingFile(index)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title={`移除 ${file.name}`}><X className="h-3.5 w-3.5" /></button>
+                                  </div>
+                                ))}
                               </div>
-                              <button type="button" onClick={clearPendingFile} className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="移除文件"><X className="h-3.5 w-3.5" /></button>
                             </div>
                           )}
-                          {pendingGalleryImage && (
-                            <div className="flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-emerald-100 bg-white p-2">
-                              <img src={pendingGalleryImage.url} alt={pendingGalleryImage.filename} className="h-9 w-9 rounded-lg bg-slate-100 object-cover" />
-                              <div className="min-w-0">
-                                <div className="max-w-56 truncate text-xs font-semibold text-slate-700">{pendingGalleryImage.filename}</div>
-                                <div className="text-[11px] text-emerald-600">来自图库</div>
+                          {pendingGalleryImages.length > 0 && (
+                            <div className="min-w-0 basis-full">
+                              {pendingGalleryImages.length > 1 && (
+                                <div className="mb-1.5 flex items-center justify-between gap-3 px-0.5 text-[11px] text-emerald-700">
+                                  <span>已从图库选择 {pendingGalleryImages.length} 张图片</span>
+                                  <button type="button" onClick={clearPendingGalleryImages} className="shrink-0 font-medium text-rose-500 hover:text-rose-700">全部移除</button>
+                                </div>
+                              )}
+                              <div className="flex max-w-full gap-2 overflow-x-auto pb-1">
+                                {pendingGalleryImages.map((image) => (
+                                  <div key={image.id} className="flex w-52 shrink-0 items-center gap-2 rounded-lg border border-emerald-100 bg-white p-2">
+                                    <img src={image.thumbnail_url || imageThumbnailUrl(image.url, 160)} alt={image.filename} className="h-9 w-9 shrink-0 rounded-lg bg-slate-100 object-cover" />
+                                    <div className="min-w-0 flex-1">
+                                      <div className="truncate text-xs font-semibold text-slate-700">{image.filename}</div>
+                                      <div className="text-[11px] text-emerald-600">来自图库</div>
+                                    </div>
+                                    <button type="button" onClick={() => removePendingGalleryImage(image.id)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title={`移除 ${image.filename}`}><X className="h-3.5 w-3.5" /></button>
+                                  </div>
+                                ))}
                               </div>
-                              <button type="button" onClick={() => setPendingGalleryImage(null)} className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="移除图库图片"><X className="h-3.5 w-3.5" /></button>
                             </div>
                           )}
                           {pendingTable && (
@@ -2579,9 +2774,13 @@ export default function ChannelsPage() {
                               </select>
                             </label>
                           )}
-                          <input ref={fileInputRef} type="file" className="hidden" onChange={(event) => selectPendingFile(event.target.files?.[0] || null)} />
+                          <input ref={fileInputRef} type="file" className="hidden" onChange={(event) => selectPendingFiles(Array.from(event.target.files || []))} />
+                          <input ref={imageInputRef} type="file" accept="image/*" multiple={!selectedAskAssistantId} className="hidden" onChange={(event) => selectPendingFiles(Array.from(event.target.files || []))} />
                           <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_files && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加机器人可读取的图片或文件' : '发送文件'}>
                             <Paperclip className="h-4 w-4" />
+                          </button>
+                          <button type="button" onClick={() => imageInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加一张机器人可读取的图片' : '从手机相册选择多张图片'}>
+                            <ImagePlus className="h-4 w-4" />
                           </button>
                           <button type="button" onClick={() => setIsTablePickerOpen(true)} disabled={sending || Boolean(editingMessage) || workbooks.length === 0} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '选择机器人需要读取的工作簿或工作表' : '发送工作簿或工作表'}>
                             <Table2 className="h-4 w-4" />
@@ -2589,7 +2788,7 @@ export default function ChannelsPage() {
                           <button type="button" onClick={() => { setGalleryPickerMode('message'); setIsGalleryPickerOpen(true) }} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '从图库选择机器人需要查看的图片' : '从图库选择图片'}>
                             <Images className="h-4 w-4" />
                           </button>
-                          {pendingFile?.type.startsWith('image/') && (
+                          {pendingFiles.length > 0 && pendingFiles.every((file) => file.type.startsWith('image/')) && (
                             <>
                               <button type="button" onClick={() => { setSavePendingImage((current) => !current); if (savePendingImage) setSelectedDirectoryId('') }} className={`ml-1 inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs transition ${savePendingImage ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="是否保存到图库">
                                 {savePendingImage ? <Check className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
@@ -2604,7 +2803,7 @@ export default function ChannelsPage() {
                             </>
                           )}
                         </div>
-                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && !pendingFile && !pendingGalleryImage && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={editingMessage ? '保存修改' : askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : '发送'}>
+                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && pendingFiles.length === 0 && pendingGalleryImages.length === 0 && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={editingMessage ? '保存修改' : askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : pendingFiles.length + pendingGalleryImages.length > 1 ? `发送 ${pendingFiles.length + pendingGalleryImages.length} 张图片` : '发送'}>
                           {askingAI ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                         </button>
                       </div>
@@ -2711,7 +2910,7 @@ export default function ChannelsPage() {
                     {historyResults.map((result) => (
                       <button key={`panel-${result.channel_id}-${result.id}`} type="button" onClick={() => selectHistoryResult(result)} className="flex w-full gap-3 border-b border-slate-100 px-3 py-3 text-left last:border-b-0 hover:bg-slate-50">
                         <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-slate-100 text-slate-500">
-                          {isImageMessage(result) ? <img src={result.attachment_url} alt="" className="h-full w-full object-cover" /> : <MessageSquare className="h-4 w-4" />}
+                          {isImageMessage(result) ? <img src={imageThumbnailUrl(result.attachment_url, 160)} alt="" className="h-full w-full object-cover" /> : <MessageSquare className="h-4 w-4" />}
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2 text-[11px] text-slate-400">
@@ -2944,7 +3143,7 @@ export default function ChannelsPage() {
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">{galleryPickerMode === 'channel-avatar' ? '选择频道头像' : '从图库选择图片'}</div>
-                  <div className="mt-1 text-xs text-slate-400">{galleryPickerMode === 'channel-avatar' ? '仅显示你当前有权查看的图库图片' : '选择已经保存到图库的图片作为消息发送'}</div>
+                  <div className="mt-1 text-xs text-slate-400">{galleryPickerMode === 'channel-avatar' ? '仅显示你当前有权查看的图库图片' : selectedAskAssistantId ? '机器人每次只能读取一张图片' : '可多选已经保存到图库的图片并批量发送'}</div>
                 </div>
                 <button type="button" onClick={() => setIsGalleryPickerOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
@@ -2967,12 +3166,12 @@ export default function ChannelsPage() {
                 ) : (
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
                     {filteredGalleryImages.map((image) => {
-                      const selected = String(image.id) === selectedGalleryImageId
+                      const selected = selectedGalleryImageIds.includes(image.id)
                       return (
                         <div key={image.id} className={`group relative overflow-hidden rounded-lg border bg-slate-50 text-left transition ${selected ? 'border-emerald-500 ring-2 ring-emerald-100' : 'border-slate-200 hover:border-emerald-300'}`}>
-                          <button type="button" onClick={() => setSelectedGalleryImageId(String(image.id))} className="block w-full text-left">
+                          <button type="button" onClick={() => toggleGalleryImageSelection(image.id)} className="block w-full text-left">
                             <div className="aspect-square overflow-hidden bg-slate-100">
-                              <img src={image.url} alt={image.filename} className="h-full w-full object-cover transition group-hover:scale-105" />
+                              <img src={image.thumbnail_url || imageThumbnailUrl(image.url, 320)} alt={image.filename} className="h-full w-full object-cover transition group-hover:scale-105" loading="lazy" decoding="async" />
                             </div>
                             <div className="px-2 py-2 pr-9">
                               <div className="truncate text-xs font-semibold text-slate-700">{image.filename}</div>
@@ -2991,10 +3190,10 @@ export default function ChannelsPage() {
               </div>
 
               <div className="flex items-center justify-between border-t border-slate-200 px-5 py-4">
-                <span className="text-xs text-slate-400">共 {galleryImages.length} 张已保存图片</span>
+                <span className="text-xs text-slate-400">{selectedGalleryImageIds.length > 0 ? `已选择 ${selectedGalleryImageIds.length} 张` : `共 ${galleryImages.length} 张已保存图片`}</span>
                 <div className="flex gap-2">
                   <button type="button" onClick={() => setIsGalleryPickerOpen(false)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-                  <button type="button" onClick={() => void confirmGallerySelection()} disabled={!selectedGalleryImageId} className="h-9 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40">{galleryPickerMode === 'channel-avatar' ? '设为频道头像' : '添加到消息'}</button>
+                  <button type="button" onClick={() => void confirmGallerySelection()} disabled={selectedGalleryImageIds.length === 0} className="h-9 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40">{galleryPickerMode === 'channel-avatar' ? '设为频道头像' : selectedGalleryImageIds.length > 1 ? `添加 ${selectedGalleryImageIds.length} 张` : '添加到消息'}</button>
                 </div>
               </div>
             </div>
@@ -3191,10 +3390,13 @@ export default function ChannelsPage() {
                     <>
                       <label className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-emerald-300 focus-within:bg-white">
                         <Search className="h-4 w-4 shrink-0" />
-                        <input value={whatsAppChatSearch} onChange={(event) => setWhatsAppChatSearch(event.target.value)} placeholder="搜索 WhatsApp 联系人或群组" className="min-w-0 flex-1 bg-transparent outline-none" />
+                        <input type="search" value={whatsAppChatSearch} onChange={(event) => setWhatsAppChatSearch(event.target.value)} placeholder="搜索姓名、号码或最近消息" autoComplete="off" className="min-w-0 flex-1 bg-transparent outline-none" />
+                        <span className="shrink-0 text-[11px] text-slate-400">{filteredWhatsAppChats.length}/{whatsAppChats.length}</span>
                       </label>
                       <div className="mt-2 max-h-52 overflow-y-auto rounded-lg border border-slate-200 p-1">
-                        {filteredWhatsAppChats.map((chat) => (
+                        {filteredWhatsAppChats.length === 0 ? (
+                          <div className="flex min-h-24 items-center justify-center px-4 text-center text-sm text-slate-400">没有匹配的 WhatsApp 联系人或群组</div>
+                        ) : filteredWhatsAppChats.map((chat) => (
                           <button key={chat.id} type="button" onClick={() => setSelectedWhatsAppChatId(chat.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-50' : 'hover:bg-slate-50'}`}>
                             <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ${selectedWhatsAppChatId === chat.id ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'}`}><WhatsAppAvatarImage src={chat.profilePicUrl} fallback={chat.isGroup ? <Users className="h-3.5 w-3.5" /> : <MessageCircle className="h-3.5 w-3.5" />} /></div>
                             <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-slate-800">{chat.name}</div><div className="truncate text-xs text-slate-400">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</div></div>
@@ -3321,26 +3523,31 @@ export default function ChannelsPage() {
         )}
 
         {previewImageMessage?.attachment_url && (
-          <div className="fixed inset-0 z-[60] flex flex-col bg-slate-950/95" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreviewImageMessage(null) }}>
+          <div className="fixed inset-0 z-[60] flex flex-col bg-slate-950/95" onMouseDown={(event) => { if (event.target === event.currentTarget && !transformingMessageImage) setPreviewImageMessage(null) }}>
             <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-3 text-white md:px-5">
               <div className="min-w-0 truncate text-sm text-slate-300">{previewImageMessage.attachment_filename || '频道图片'}</div>
               <div className="flex items-center gap-1">
                 <button type="button" onClick={() => setImageZoom((value) => Math.max(0.5, value - 0.25))} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="缩小"><ZoomOut className="h-4 w-4" /></button>
                 <button type="button" onClick={() => setImageZoom(1)} className="inline-flex h-9 min-w-12 items-center justify-center rounded-lg px-2 text-xs text-slate-300 hover:bg-white/10 hover:text-white" title="恢复原始缩放">{Math.round(imageZoom * 100)}%</button>
                 <button type="button" onClick={() => setImageZoom((value) => Math.min(3, value + 0.25))} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="放大"><ZoomIn className="h-4 w-4" /></button>
-                <button type="button" onClick={() => setImageZoom(1)} className="hidden h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white sm:inline-flex" title="重置"><RotateCcw className="h-4 w-4" /></button>
                 <a href={previewImageMessage.attachment_url} download={previewImageMessage.attachment_filename || 'channel-image'} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="下载图片"><Download className="h-4 w-4" /></a>
-                <button type="button" onClick={() => setPreviewImageMessage(null)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="关闭"><X className="h-5 w-5" /></button>
+                <button type="button" onClick={() => setPreviewImageMessage(null)} disabled={Boolean(transformingMessageImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="关闭"><X className="h-5 w-5" /></button>
               </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto p-4" onWheel={(event) => { if (!event.ctrlKey && !event.metaKey) return; event.preventDefault(); setImageZoom((value) => Math.min(3, Math.max(0.5, value + (event.deltaY < 0 ? 0.15 : -0.15)))) }}>
               <div className="flex min-h-full min-w-full items-center justify-center">
-                <img src={previewImageMessage.attachment_url} alt={previewImageMessage.attachment_filename || '频道图片'} className="max-h-[calc(100vh-9rem)] max-w-[calc(100vw-2rem)] object-contain transition-transform duration-150" style={{ transform: `scale(${imageZoom})` }} />
+                <img src={previewImageMessage.attachment_url} alt={previewImageMessage.attachment_filename || '频道图片'} className={`max-h-[calc(100vh-9rem)] max-w-[calc(100vw-2rem)] object-contain transition duration-150 ${transformingMessageImage ? 'opacity-60' : ''}`} style={{ transform: `scale(${imageZoom})` }} />
               </div>
             </div>
 
             <div className="flex shrink-0 flex-wrap items-center justify-center gap-2 border-t border-white/10 bg-slate-950 px-3 py-3">
+              <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
+                <button type="button" onClick={() => void handleTransformMessageImage('rotate-left')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
+                <button type="button" onClick={() => void handleTransformMessageImage('rotate-right')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
+                <button type="button" onClick={() => void handleTransformMessageImage('flip-horizontal')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
+                <button type="button" onClick={() => void handleTransformMessageImage('flip-vertical')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
+              </div>
               <select value={previewDirectoryId} onChange={(event) => setPreviewDirectoryId(event.target.value)} className="h-9 max-w-56 rounded-lg border border-white/15 bg-slate-900 px-3 text-sm text-slate-200 outline-none">
                 <option value="">频道默认目录</option>
                 {availableDirectories.map((directory) => <option key={directory.id} value={directory.id}>{directory.name}</option>)}
@@ -3349,6 +3556,7 @@ export default function ChannelsPage() {
                 <Save className="h-4 w-4" />
                 {savedImageIds.includes(previewImageMessage.id) ? '已保存到图库' : savingImage ? '保存中...' : '保存到图库'}
               </button>
+              {transformingMessageImage && <span className="inline-flex h-9 items-center gap-2 px-2 text-xs text-slate-300"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingMessageImage)}并保存中...</span>}
             </div>
           </div>
         )}

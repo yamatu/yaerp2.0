@@ -575,6 +575,32 @@ func (h *ChannelHandler) SaveMessageImage(c *gin.Context) {
 	response.OKMsg(c, "image saved")
 }
 
+func (h *ChannelHandler) ReplaceMessageImage(c *gin.Context) {
+	channelID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid channel id")
+		return
+	}
+	messageID, err := parseIDParam(c, "messageId")
+	if err != nil {
+		response.BadRequest(c, "invalid message id")
+		return
+	}
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "file is required")
+		return
+	}
+	defer file.Close()
+
+	message, err := h.channelService.ReplaceMessageImage(c.GetInt64("user_id"), channelID, messageID, file, header)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, message)
+}
+
 func (h *ChannelHandler) ListGalleryDirectories(c *gin.Context) {
 	directories, err := h.uploadService.ListGalleryDirectories(c.GetInt64("user_id"), parseOptionalQueryInt64(c, "channel_id"))
 	if err != nil {
@@ -703,9 +729,30 @@ func (h *ChannelHandler) RenameGalleryImage(c *gin.Context) {
 	response.OK(c, attachment)
 }
 
+func (h *ChannelHandler) ReplaceGalleryImage(c *gin.Context) {
+	attachmentID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "invalid attachment id")
+		return
+	}
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "file is required")
+		return
+	}
+	defer file.Close()
+
+	attachment, err := h.channelService.ReplaceGalleryImage(c.GetInt64("user_id"), attachmentID, file, header)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, attachment)
+}
+
 func respondChannelError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, service.ErrChannelAccessDenied), errors.Is(err, service.ErrChannelManageDenied), errors.Is(err, service.ErrGalleryImageRenameDenied), errors.Is(err, service.ErrMessageRecallDenied), errors.Is(err, service.ErrMessageEditDenied):
+	case errors.Is(err, service.ErrChannelAccessDenied), errors.Is(err, service.ErrChannelManageDenied), errors.Is(err, service.ErrGalleryImageRenameDenied), errors.Is(err, service.ErrGalleryImageEditDenied), errors.Is(err, service.ErrMessageImageEditDenied), errors.Is(err, service.ErrMessageRecallDenied), errors.Is(err, service.ErrMessageEditDenied):
 		response.Forbidden(c, err.Error())
 	default:
 		response.Error(c, http.StatusBadRequest, err.Error())

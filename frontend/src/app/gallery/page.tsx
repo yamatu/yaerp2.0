@@ -4,6 +4,8 @@ import { useEffect, useState, useRef, useCallback, type MouseEvent as ReactMouse
 import {
   ArrowLeft,
   Download,
+  FlipHorizontal2,
+  FlipVertical2,
   FolderPlus,
   Globe2,
   ImagePlus,
@@ -11,6 +13,9 @@ import {
   LockKeyhole,
   MessageCircle,
   Pencil,
+  RefreshCw,
+  RotateCcw,
+  RotateCw,
   Search,
   ShieldCheck,
   Trash2,
@@ -22,6 +27,7 @@ import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
+import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
 import type { AuthUser, GalleryDirectory, GalleryDirectoryAccess, GalleryImage, User } from '@/types'
 
 export default function GalleryPage() {
@@ -31,6 +37,8 @@ export default function GalleryPage() {
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [preview, setPreview] = useState<GalleryImage | null>(null)
+  const [transformingImage, setTransformingImage] = useState<ImageTransform | null>(null)
+  const [transformError, setTransformError] = useState('')
   const [deleting, setDeleting] = useState<number | null>(null)
   const [renaming, setRenaming] = useState<GalleryImage | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -258,6 +266,29 @@ export default function GalleryPage() {
     }
   }
 
+  const handleTransformImage = async (transform: ImageTransform) => {
+    if (!preview || transformingImage) return
+    setTransformingImage(transform)
+    setTransformError('')
+    try {
+      const file = await transformRemoteImage(preview.url, preview.filename, preview.mime_type, transform)
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await api.form<GalleryImage>(`/gallery/images/${preview.id}/content`, formData, 'PUT')
+      if (res.code !== 0 || !res.data) {
+        setTransformError(res.message || `${imageTransformLabel(transform)}失败`)
+        return
+      }
+      const updated = res.data
+      setImages((current) => current.map((image) => image.id === updated.id ? updated : image))
+      setPreview(updated)
+    } catch (error) {
+      setTransformError(error instanceof Error ? error.message : `${imageTransformLabel(transform)}失败`)
+    } finally {
+      setTransformingImage(null)
+    }
+  }
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -272,7 +303,7 @@ export default function GalleryPage() {
     <AuthGuard>
       <div className="min-h-screen bg-[linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
         {/* Header */}
-        <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
+        <div className="mx-auto max-w-7xl px-3 py-5 sm:px-6 sm:py-8">
           <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-4">
               <a
@@ -300,7 +331,7 @@ export default function GalleryPage() {
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={uploading}
-              className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50 sm:w-auto"
             >
               <ImagePlus className="h-4 w-4" />
               {uploading ? '上传中...' : '上传图片'}
@@ -399,7 +430,7 @@ export default function GalleryPage() {
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-4 md:grid-cols-4 lg:grid-cols-5">
                 {images.map((img) => (
                   <div
                     key={img.id}
@@ -408,25 +439,23 @@ export default function GalleryPage() {
                     <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600" title="重命名图片">
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
-                    <button type="button" onClick={() => setPreview(img)} className="block aspect-square w-full overflow-hidden bg-slate-100 text-left" title="查看图片">
+                    <button type="button" onClick={() => { setPreview(img); setTransformError('') }} className="block aspect-square w-full overflow-hidden bg-slate-100 text-left" title="查看图片">
                       <img
-                        src={img.url}
+                        src={img.thumbnail_url || imageThumbnailUrl(img.url, 320)}
                         alt={img.filename}
                         className="h-full w-full object-cover transition group-hover:scale-105"
                         loading="lazy"
                       />
                     </button>
-                    <div className="p-3">
+                    <div className="p-2 sm:p-3">
                       <p className="truncate text-xs font-semibold text-slate-800">{img.filename}</p>
                       <p className="mt-1 truncate text-[11px] text-slate-500">上传者：{img.uploader_name || `用户 #${img.uploader_id}`}</p>
-                      <div className="mt-2 flex items-center justify-between gap-2">
-                        <span className="text-[10px] text-slate-400">{formatSize(img.size)}</span>
-                        <div className="flex items-center gap-1.5">
-                          <button type="button" onClick={() => setPreview(img)} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-600" title="查看大图" aria-label={`查看 ${img.filename}`}><ZoomIn className="h-3.5 w-3.5" /></button>
-                          <a href={downloadURL(img)} download={img.filename} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-600" title="下载图片" aria-label={`下载 ${img.filename}`}><Download className="h-3.5 w-3.5" /></a>
-                          <button type="button" onClick={() => setWhatsAppResource({ attachmentId: img.id, title: img.filename, defaultContent: img.filename })} className="flex h-8 w-8 items-center justify-center rounded-lg border border-emerald-200 text-emerald-600 transition hover:bg-emerald-50" title="发送到 WhatsApp" aria-label={`发送 ${img.filename} 到 WhatsApp`}><MessageCircle className="h-3.5 w-3.5" /></button>
-                          {admin && <button type="button" onClick={() => handleDelete(img.id)} disabled={deleting === img.id} className="flex h-8 w-8 items-center justify-center rounded-lg border border-rose-200 text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50" title="删除图片" aria-label={`删除 ${img.filename}`}><Trash2 className="h-3.5 w-3.5" /></button>}
-                        </div>
+                      <span className="mt-1.5 block text-[10px] text-slate-400">{formatSize(img.size)}</span>
+                      <div className={`mt-2 grid gap-1.5 ${admin ? 'grid-cols-4' : 'grid-cols-3'}`}>
+                        <button type="button" onClick={() => { setPreview(img); setTransformError('') }} className="flex h-8 w-full items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-600" title="查看大图" aria-label={`查看 ${img.filename}`}><ZoomIn className="h-3.5 w-3.5" /></button>
+                        <a href={downloadURL(img)} download={img.filename} className="flex h-8 w-full items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-600" title="下载原图" aria-label={`下载原图 ${img.filename}`}><Download className="h-3.5 w-3.5" /></a>
+                        <button type="button" onClick={() => setWhatsAppResource({ attachmentId: img.id, title: img.filename, defaultContent: img.filename })} className="flex h-8 w-full items-center justify-center rounded-lg border border-emerald-200 text-emerald-600 transition hover:bg-emerald-50" title="发送到 WhatsApp" aria-label={`发送 ${img.filename} 到 WhatsApp`}><MessageCircle className="h-3.5 w-3.5" /></button>
+                        {admin && <button type="button" onClick={() => handleDelete(img.id)} disabled={deleting === img.id} className="flex h-8 w-full items-center justify-center rounded-lg border border-rose-200 text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50" title="删除图片" aria-label={`删除 ${img.filename}`}><Trash2 className="h-3.5 w-3.5" /></button>}
                       </div>
                     </div>
                   </div>
@@ -539,7 +568,11 @@ export default function GalleryPage() {
         {preview && (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-            onClick={() => setPreview(null)}
+            onClick={() => {
+              if (transformingImage) return
+              setPreview(null)
+              setTransformError('')
+            }}
           >
             <div
               className="relative flex max-h-[92vh] w-[min(94vw,1100px)] flex-col items-center"
@@ -547,8 +580,9 @@ export default function GalleryPage() {
             >
               <button
                 type="button"
-                onClick={() => setPreview(null)}
-                className="absolute -right-3 -top-3 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-white text-slate-700 shadow-lg transition hover:bg-slate-100"
+                onClick={() => { setPreview(null); setTransformError('') }}
+                disabled={Boolean(transformingImage)}
+                className="absolute -right-3 -top-3 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-white text-slate-700 shadow-lg transition hover:bg-slate-100 disabled:opacity-40"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -557,13 +591,25 @@ export default function GalleryPage() {
                 alt={preview.filename}
                 className="max-h-[72vh] max-w-full rounded-lg object-contain shadow-2xl"
               />
-              <div className="mt-3 flex w-full max-w-2xl flex-wrap items-center justify-between gap-3 rounded-lg bg-black/35 px-3 py-2.5 text-left backdrop-blur-sm">
-                <div className="min-w-0 flex-1">
+              <div className="mt-3 flex w-full max-w-2xl flex-col items-stretch gap-2 rounded-lg bg-black/35 px-3 py-2.5 text-left backdrop-blur-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+                <div className="min-w-0 sm:flex-1">
                   <p className="truncate text-sm font-medium text-white">{preview.filename}</p>
                   <p className="mt-0.5 truncate text-xs text-white/60">上传者：{preview.uploader_name || `用户 #${preview.uploader_id}`} · {formatSize(preview.size)}</p>
                 </div>
-                <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"><Download className="h-4 w-4" />下载图片</a>
+                <div className="flex w-full items-center justify-between gap-1 sm:w-auto sm:justify-end sm:gap-1.5">
+                  <button type="button" onClick={() => void handleTransformImage('rotate-left')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存" aria-label="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformImage('rotate-right')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存" aria-label="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformImage('flip-horizontal')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存" aria-label="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformImage('flip-vertical')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存" aria-label="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
+                  <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"><Download className="h-4 w-4" />下载图片</a>
+                </div>
               </div>
+              {(transformingImage || transformError) && (
+                <div className={`mt-2 flex min-h-8 items-center gap-2 rounded-lg px-3 text-xs ${transformError ? 'bg-rose-500/20 text-rose-100' : 'bg-white/10 text-white/75'}`}>
+                  {transformingImage && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
+                  {transformError || (transformingImage ? `${imageTransformLabel(transformingImage)}并保存中...` : '')}
+                </div>
+              )}
             </div>
           </div>
         )}

@@ -39,7 +39,7 @@ func (r *ChannelRepo) CreateBackup(backup *model.ChannelBackup) error {
 	).Scan(&backup.ID, &backup.CreatedAt)
 }
 
-func (r *ChannelRepo) ListBackups(userID int64, includeAll bool) ([]model.ChannelBackup, error) {
+func (r *ChannelRepo) ListBackups(userID int64) ([]model.ChannelBackup, error) {
 	rows, err := r.db.Query(
 		`SELECT b.id, b.source_channel_id, b.source_channel_name, b.created_by,
 		        COALESCE(u.username, ''), b.filename, b.attachment_id, b.message_count, b.size,
@@ -48,12 +48,13 @@ func (r *ChannelRepo) ListBackups(userID int64, includeAll bool) ([]model.Channe
 		   FROM channel_backups b
 		   LEFT JOIN users u ON u.id = b.created_by
 		   LEFT JOIN channel_backup_restores br ON br.backup_id = b.id
-		  WHERE $1 OR b.created_by = $2 OR EXISTS (
+		  WHERE b.created_by = $1 OR EXISTS (
 		        SELECT 1 FROM channels c
-		         WHERE c.id = b.source_channel_id AND c.owner_id = $2
+		        LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.user_id = $1
+		         WHERE c.id = b.source_channel_id AND (c.owner_id = $1 OR cm.user_id IS NOT NULL)
 		  )
 		  GROUP BY b.id, u.username
-		  ORDER BY b.created_at DESC`, includeAll, userID,
+		  ORDER BY b.created_at DESC`, userID,
 	)
 	if err != nil {
 		return nil, err

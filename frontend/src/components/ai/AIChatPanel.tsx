@@ -191,9 +191,28 @@ function renderTracePreview(trace: AIChatToolTrace) {
   if (trace.name === 'query_sheet' && Array.isArray(data.rows)) {
     const previewRows = data.rows.slice(0, 3)
     return (
-      <pre className="overflow-x-auto rounded-xl bg-slate-950 px-3 py-2 text-[11px] leading-5 text-slate-100">
-        {JSON.stringify(previewRows, null, 2)}
-      </pre>
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
+          <span className="rounded-lg bg-slate-100 px-2 py-1 font-medium">
+            本页 {String(data.returned_rows ?? data.rows.length)} 行 / 共 {String(data.total_rows ?? data.rows.length)} 行
+          </span>
+          {data.has_more === true && (
+            <span className="rounded-lg bg-amber-50 px-2 py-1 font-medium text-amber-700">
+              还有后续数据
+            </span>
+          )}
+          {data.profile_included === true && (
+            <span className="rounded-lg bg-sky-50 px-2 py-1 font-medium text-sky-700">
+              已生成全表概况
+            </span>
+          )}
+        </div>
+        {previewRows.length > 0 && (
+          <pre className="max-h-48 overflow-auto rounded-lg bg-slate-950 px-3 py-2 text-[11px] leading-5 text-slate-100">
+            {JSON.stringify(previewRows, null, 2)}
+          </pre>
+        )}
+      </div>
     )
   }
 
@@ -224,15 +243,55 @@ function renderTraceData(trace: AIChatToolTrace) {
   if (trace.data === undefined) return null
 
   return (
-    <details className="group mt-3 rounded-xl border border-slate-200 bg-slate-50">
+    <details className="group/data mt-3 rounded-xl border border-slate-200 bg-slate-50">
       <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-slate-600">
-        <span className="group-open:hidden">查看工具数据</span>
-        <span className="hidden group-open:inline">收起工具数据</span>
+        <span className="group-open/data:hidden">查看精简工具数据</span>
+        <span className="hidden group-open/data:inline">收起精简工具数据</span>
       </summary>
       <div className="border-t border-slate-200 px-3 py-3">
         <pre className="overflow-x-auto rounded-xl bg-slate-950 px-3 py-2 text-[11px] leading-5 text-slate-100">
           {JSON.stringify(trace.data, null, 2)}
         </pre>
+      </div>
+    </details>
+  )
+}
+
+function ToolTraceCard({ trace }: { trace: AIChatToolTrace }) {
+  const touchedSheetIds = Array.isArray(trace.touched_sheet_ids) ? trace.touched_sheet_ids : []
+  const visibleSheetIds = touchedSheetIds.slice(0, 3)
+
+  return (
+    <details className="group/trace overflow-hidden rounded-lg border border-slate-200 bg-white">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${trace.status === 'success' ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+            {trace.name === 'schedule_daily_report' ? <Clock3 className="h-4 w-4" /> : trace.name === 'preview_spreadsheet_plan' ? <Wand2 className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
+          </div>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-slate-900">{toolTitle(trace.name)}</div>
+            <div className={`line-clamp-2 text-xs ${trace.status === 'success' ? 'text-emerald-600' : 'text-rose-600'}`}>
+              {trace.summary || (trace.status === 'success' ? '执行成功' : '执行失败')}
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {visibleSheetIds.map((sheetId) => (
+            <span key={sheetId} className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
+              Sheet #{sheetId}
+            </span>
+          ))}
+          {touchedSheetIds.length > visibleSheetIds.length && (
+            <span className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
+              +{touchedSheetIds.length - visibleSheetIds.length}
+            </span>
+          )}
+          <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-open/trace:rotate-90" />
+        </div>
+      </summary>
+      <div className="border-t border-slate-200 bg-slate-50/60 px-3 py-3">
+        {renderTracePreview(trace)}
+        {renderTraceData(trace)}
       </div>
     </details>
   )
@@ -694,32 +753,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               {message.role === 'assistant' && Array.isArray(message.toolTraces) && message.toolTraces.length > 0 && (
                 <div className="w-full space-y-2">
                   {message.toolTraces.map((trace, index) => (
-                    <div key={`${message.id}-trace-${index}`} className="rounded-lg border border-slate-200 bg-white px-3 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2">
-                          <div className={`flex h-8 w-8 items-center justify-center rounded-lg ${trace.status === 'success' ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
-                            {trace.name === 'schedule_daily_report' ? <Clock3 className="h-4 w-4" /> : trace.name === 'preview_spreadsheet_plan' ? <Wand2 className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
-                          </div>
-                          <div>
-                            <div className="text-sm font-semibold text-slate-900">{toolTitle(trace.name)}</div>
-                            <div className={`text-xs ${trace.status === 'success' ? 'text-emerald-600' : 'text-rose-600'}`}>{trace.summary || (trace.status === 'success' ? '执行成功' : '执行失败')}</div>
-                          </div>
-                        </div>
-                        {trace.touched_sheet_ids && trace.touched_sheet_ids.length > 0 && (
-                          <div className="flex flex-wrap justify-end gap-1">
-                            {trace.touched_sheet_ids.map((sheetId) => (
-                              <span key={sheetId} className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-500">
-                                Sheet #{sheetId}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="mt-3">
-                        {renderTracePreview(trace)}
-                        {renderTraceData(trace)}
-                      </div>
-                    </div>
+                    <ToolTraceCard key={`${message.id}-trace-${index}`} trace={trace} />
                   ))}
                 </div>
               )}

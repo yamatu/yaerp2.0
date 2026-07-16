@@ -168,6 +168,7 @@ func main() {
 		auth.POST("/refresh", authHandler.RefreshToken)
 	}
 	r.GET("/api/files/:id/content", uploadHandler.ServeFile)
+	r.GET("/api/files/:id/thumbnail", uploadHandler.ServeThumbnail)
 	r.GET("/api/whatsapp/avatar/:userId/:chatId", whatsAppHandler.ServeAvatar)
 	r.POST("/api/internal/whatsapp/events", whatsAppHandler.Webhook)
 
@@ -240,6 +241,7 @@ func main() {
 		api.PUT("/gallery/directories/:id/access", channelHandler.UpdateGalleryDirectoryAccess)
 		api.POST("/gallery/upload", channelHandler.UploadGalleryImage)
 		api.PUT("/gallery/images/:id/name", channelHandler.RenameGalleryImage)
+		api.PUT("/gallery/images/:id/content", channelHandler.ReplaceGalleryImage)
 		api.GET("/sheets/template", importHandler.DownloadTemplate)
 		api.POST("/workbooks/:id/import/xlsx", importHandler.ImportXLSX)
 
@@ -271,6 +273,7 @@ func main() {
 		api.POST("/channels/:id/messages/:messageId/translate", channelHandler.TranslateMessage)
 		api.POST("/channels/:id/messages/:messageId/import-workbook", channelHandler.ImportMessageWorkbook)
 		api.POST("/channels/:id/messages/:messageId/save-image", channelHandler.SaveMessageImage)
+		api.PUT("/channels/:id/messages/:messageId/image", channelHandler.ReplaceMessageImage)
 		api.POST("/channels/:id/backups", channelHandler.CreateBackup)
 		api.POST("/channels/:id/backups/:backupId/restore", channelHandler.RestoreBackup)
 		api.GET("/channels/:id/whatsapp-link", whatsAppHandler.GetChannelLink)

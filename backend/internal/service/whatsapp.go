@@ -1281,6 +1281,9 @@ func (s *WhatsAppService) requireChannelAccess(userID, channelID int64) error {
 }
 
 func (s *WhatsAppService) requireChannelManage(userID, channelID int64) error {
+	if err := s.requireChannelAccess(userID, channelID); err != nil {
+		return err
+	}
 	channel, err := s.channelRepo.GetChannel(channelID, userID)
 	if err != nil {
 		return err

@@ -74,6 +74,8 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const [addingSheet, setAddingSheet] = useState(false)
   const [newSheetName, setNewSheetName] = useState('')
   const [fullscreen, setFullscreen] = useState(false)
+  const [isMobileLayout, setIsMobileLayout] = useState(false)
+  const [mobileSheetPanelOpen, setMobileSheetPanelOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useUserPreference(
     currentUser?.id,
     'workbook.sidebar-collapsed',
@@ -116,6 +118,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   const sheets = workbook?.sheets || []
   const isAdminUser = Boolean(currentUser && isAdmin(currentUser))
   const canManageWorkbook = Boolean(currentUser && (isAdmin(currentUser) || currentUser.id === workbook?.owner_id))
+  const compactSidebar = !isMobileLayout && sidebarCollapsed
 
   const handleSidebarDroppedXlsxImport = useCallback(async (file: File) => {
     if (!canManageWorkbook) {
@@ -200,6 +203,17 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   }, [])
 
   useEffect(() => {
+    const mediaQuery = window.matchMedia('(max-width: 767px)')
+    const updateLayout = () => {
+      setIsMobileLayout(mediaQuery.matches)
+      if (!mediaQuery.matches) setMobileSheetPanelOpen(false)
+    }
+    updateLayout()
+    mediaQuery.addEventListener('change', updateLayout)
+    return () => mediaQuery.removeEventListener('change', updateLayout)
+  }, [])
+
+  useEffect(() => {
     const handleFullscreenChange = () => {
       setFullscreen(Boolean(document.fullscreenElement))
     }
@@ -234,6 +248,10 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
     if (!currentUser?.id || !activeSheet?.id) return
     rememberLastViewedSheet(currentUser.id, workbookId, activeSheet.id)
   }, [activeSheet?.id, currentUser?.id, workbookId])
+
+  useEffect(() => {
+    if (isMobileLayout) setMobileSheetPanelOpen(false)
+  }, [activeSheet?.id, isMobileLayout])
 
   const filteredSheets = useMemo(() => {
     const keyword = sheetSearchQuery.trim().toLowerCase()
@@ -621,17 +639,17 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
   return (
     <AuthGuard>
       <div ref={rootRef} className={`flex flex-col bg-slate-50 ${fullscreen ? 'fixed inset-0 z-50' : 'h-screen'}`}>
-        <div className="flex min-h-[68px] items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
-          <div className="flex min-w-0 items-center gap-3">
+        <div className="flex min-h-[56px] items-center justify-between gap-2 border-b border-slate-200 bg-white px-2 py-2 sm:min-h-[68px] sm:px-4 sm:py-3">
+          <div className="flex min-w-0 items-center gap-1.5 sm:gap-3">
             <button
               type="button"
-              onClick={() => setSidebarCollapsed((current) => !current)}
+              onClick={() => isMobileLayout ? setMobileSheetPanelOpen((current) => !current) : setSidebarCollapsed((current) => !current)}
               className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
-              title={sidebarCollapsed ? '展开工作表目录' : '折叠工作表目录'}
-              aria-label={sidebarCollapsed ? '展开工作表目录' : '折叠工作表目录'}
-              data-tooltip={sidebarCollapsed ? '展开工作表目录' : '折叠工作表目录'}
+              title={isMobileLayout ? (mobileSheetPanelOpen ? '关闭工作表目录' : '打开工作表目录') : compactSidebar ? '展开工作表目录' : '折叠工作表目录'}
+              aria-label={isMobileLayout ? (mobileSheetPanelOpen ? '关闭工作表目录' : '打开工作表目录') : compactSidebar ? '展开工作表目录' : '折叠工作表目录'}
+              data-tooltip={isMobileLayout ? (mobileSheetPanelOpen ? '关闭工作表目录' : '打开工作表目录') : compactSidebar ? '展开工作表目录' : '折叠工作表目录'}
             >
-              {sidebarCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+              {(isMobileLayout ? !mobileSheetPanelOpen : compactSidebar) ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
             </button>
             <div ref={addSheetPopoverRef} className="relative shrink-0">
               <button
@@ -682,23 +700,23 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
               type="button"
               onClick={() => void handleDeleteSheet()}
               disabled={!activeSheet || sheetActionLoading || permissionLoading || !canDeleteActiveSheet}
-              className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-40"
+              className="ui-tooltip hidden h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-40 sm:inline-flex"
               title="删除当前工作表"
               aria-label="删除当前工作表"
               data-tooltip="删除当前工作表"
             >
               <Trash2 className="h-4 w-4" />
             </button>
-            <Link href="/" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-sm leading-none text-slate-500 transition hover:bg-slate-100 hover:text-slate-900">
+            <Link href="/" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2 text-sm leading-none text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 sm:px-2.5">
               <ArrowLeft className="h-4 w-4" />
-              返回
+              <span className="hidden sm:inline">返回</span>
             </Link>
-            <div className="h-5 w-px bg-slate-200" />
+            <div className="hidden h-5 w-px bg-slate-200 sm:block" />
             <div className="flex min-w-0 flex-col justify-center">
-              <div className="text-[11px] font-semibold uppercase leading-4 tracking-[0.28em] text-sky-600">Workbook</div>
-              <h1 className="max-w-[320px] truncate text-sm font-semibold leading-5 text-slate-900">{workbook.name}</h1>
+              <div className="hidden text-[11px] font-semibold uppercase leading-4 tracking-[0.28em] text-sky-600 sm:block">Workbook</div>
+              <h1 className="max-w-[110px] truncate text-sm font-semibold leading-5 text-slate-900 sm:max-w-[320px]">{workbook.name}</h1>
               {activeSheet && (
-                <div className="mt-1 flex flex-wrap gap-2">
+                <div className="mt-1 hidden flex-wrap gap-2 sm:flex">
                   {workbook.is_locked && (
                     <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-700">
                       <Lock className="h-3 w-3" /> 工作簿已锁定
@@ -734,7 +752,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
             {activeSheet && (
               <button type="button" onClick={() => setWhatsAppResource({ sheetId: activeSheet.id, title: `${workbook.name} / ${activeSheet.name}`, defaultContent: `工作表：${workbook.name} / ${activeSheet.name}` })} className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-emerald-200 text-emerald-600 transition hover:bg-emerald-50" title="发送当前工作表到 WhatsApp" aria-label="发送当前工作表到 WhatsApp" data-tooltip="发送到 WhatsApp"><MessageCircle className="h-4 w-4" /></button>
             )}
@@ -743,7 +761,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 type="button"
                 onClick={() => void handleUpdateWorkbookState(workbook.is_public ? 'unpublish' : 'publish')}
                 disabled={sheetActionLoading}
-                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${workbook.is_public ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100' : 'border-slate-200 text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}
+                className={`hidden items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 md:inline-flex ${workbook.is_public ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100' : 'border-slate-200 text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}
                 title={workbook.is_public ? '取消公共访问' : '设为公共工作簿'}
               >
                 <Globe2 className="h-3.5 w-3.5" />
@@ -755,7 +773,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 type="button"
                 onClick={() => void handleUpdateWorkbookState(workbook.is_locked ? 'unlock' : 'lock')}
                 disabled={sheetActionLoading}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                className="hidden items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50 md:inline-flex"
               >
                 {workbook.is_locked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
                 {workbook.is_locked ? '解除工作簿锁定' : '锁定工作簿'}
@@ -766,7 +784,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                 type="button"
                 onClick={() => void handleUpdateWorkbookState(workbook.is_hidden ? 'unhide' : 'hide')}
                 disabled={sheetActionLoading}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                className="hidden items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50 md:inline-flex"
               >
                 <EyeOff className="h-3.5 w-3.5" />
                 {workbook.is_hidden ? '恢复工作簿可见' : '设为工作簿不可见'}
@@ -804,9 +822,15 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
           </div>
         )}
 
-        <div className="flex min-h-0 flex-1">
-          <aside className={`flex shrink-0 flex-col border-r border-slate-200 bg-white transition-[width] duration-200 ${sidebarCollapsed ? 'w-[88px]' : 'w-[320px]'}`}>
-            {sidebarCollapsed ? (
+        <div className="relative flex min-h-0 flex-1 overflow-hidden">
+          {isMobileLayout && mobileSheetPanelOpen && (
+            <button type="button" aria-label="关闭工作表目录" onClick={() => setMobileSheetPanelOpen(false)} className="absolute inset-0 z-30 bg-slate-950/25" />
+          )}
+          <aside
+            className={`flex shrink-0 flex-col border-r border-slate-200 bg-white transition-[width,transform] duration-200 ${isMobileLayout ? 'absolute inset-y-0 left-0 z-40 w-[min(86vw,320px)] shadow-2xl' : compactSidebar ? 'w-[88px]' : 'w-[320px]'}`}
+            style={isMobileLayout ? { transform: mobileSheetPanelOpen ? 'translateX(0)' : 'translateX(-100%)' } : undefined}
+          >
+            {compactSidebar ? (
               <div className="flex h-[72px] items-center justify-center border-b border-slate-200 px-2">
                 <div className="flex h-11 w-11 flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-center">
                   <span className="text-xs font-semibold leading-none text-slate-700">{filteredSheets.length}</span>
@@ -856,11 +880,17 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                     <button type="button" onClick={() => setSelectedSheetIds([])} className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg text-amber-700 hover:bg-white" title="清除工作表选择" aria-label="清除工作表选择" data-tooltip="清除选择" data-tooltip-side="left"><X className="h-3.5 w-3.5" /></button>
                   </div>
                 )}
+                {isMobileLayout && activeSheet && (
+                  <button type="button" onClick={() => void handleDeleteSheet()} disabled={sheetActionLoading || permissionLoading || !canDeleteActiveSheet} className="mt-3 inline-flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white text-xs font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40">
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除当前工作表
+                  </button>
+                )}
               </div>
             )}
 
             <div
-              className={`relative min-h-0 flex-1 overflow-y-auto ${sidebarCollapsed ? 'px-2 py-3' : 'p-3'}`}
+              className={`relative min-h-0 flex-1 overflow-y-auto ${compactSidebar ? 'px-2 py-3' : 'p-3'}`}
               onDragEnter={handleSidebarDragEnter}
               onDragOver={handleSidebarDragOver}
               onDragLeave={handleSidebarDragLeave}
@@ -892,20 +922,20 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                   </div>
                 </div>
               )}
-              <div className={sidebarCollapsed ? 'flex flex-col items-center gap-2' : 'space-y-2'}>
+              <div className={compactSidebar ? 'flex flex-col items-center gap-2' : 'space-y-2'}>
                 {visibleSheets.map((sheet) => {
                   const sheetLabel = sheet.name?.trim() || `工作表 ${sheets.findIndex((item) => item.id === sheet.id) + 1}`
                   const isActive = sheet.id === activeSheet?.id
                   const isSelected = selectedSheetIds.includes(sheet.id)
                   const isRenaming = renamingSheetId === sheet.id
-                  const canRenameThisSheet = canManageWorkbook && !sidebarCollapsed
+                  const canRenameThisSheet = canManageWorkbook && !compactSidebar
 
                   return (
                     <div
                       key={sheet.id}
                       onClickCapture={(event) => handleSheetCardClickCapture(event, sheet)}
                       onContextMenu={(event) => openSheetContextMenu(event, sheet)}
-                      className={`${sidebarCollapsed ? 'flex h-14 w-14 items-center justify-center rounded-2xl border p-0' : 'block rounded-2xl border px-3 py-3'} transition ${
+                      className={`${compactSidebar ? 'flex h-14 w-14 items-center justify-center rounded-2xl border p-0' : 'block rounded-2xl border px-3 py-3'} transition ${
                         isSelected
                           ? 'border-amber-300 bg-amber-100 shadow-sm ring-1 ring-amber-200'
                           : isActive
@@ -913,17 +943,17 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                           : 'border-slate-200 bg-slate-50/70 hover:border-slate-300 hover:bg-white'
                       }`}
                     >
-                      <div className={sidebarCollapsed ? 'flex items-center justify-center' : 'flex items-center gap-3'}>
+                      <div className={compactSidebar ? 'flex items-center justify-center' : 'flex items-center gap-3'}>
                         <Link
                           href={`/sheets/${workbookId}/${sheet.id}`}
                           prefetch={false}
-                          className={`flex shrink-0 items-center justify-center rounded-xl ${sidebarCollapsed ? 'h-10 w-10' : 'h-9 w-9'} ${isSelected ? 'bg-amber-400 text-amber-950' : isActive ? 'bg-white text-sky-700' : 'bg-white text-slate-500'}`}
+                          className={`flex shrink-0 items-center justify-center rounded-xl ${compactSidebar ? 'h-10 w-10' : 'h-9 w-9'} ${isSelected ? 'bg-amber-400 text-amber-950' : isActive ? 'bg-white text-sky-700' : 'bg-white text-slate-500'}`}
                           aria-label={`打开工作表 ${sheetLabel}`}
-                          title={sidebarCollapsed ? `${sheetLabel}；Ctrl + 单击多选` : undefined}
+                          title={compactSidebar ? `${sheetLabel}；Ctrl + 单击多选` : undefined}
                         >
                           {isSelected ? <Check className="h-4 w-4" /> : <FileSpreadsheet className="h-4 w-4" />}
                         </Link>
-                        <div className={`min-w-0 flex-1 ${sidebarCollapsed ? 'hidden' : ''}`}>
+                        <div className={`min-w-0 flex-1 ${compactSidebar ? 'hidden' : ''}`}>
                           {isRenaming ? (
                             <form
                               className="flex items-center gap-1.5"
@@ -1014,8 +1044,8 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                   )
                 })}
                 {filteredSheets.length === 0 && (
-                  <div className={`rounded-2xl border border-dashed border-slate-300 bg-slate-50 text-center text-sm text-slate-500 ${sidebarCollapsed ? 'flex h-14 w-14 items-center justify-center p-0' : 'px-4 py-8'}`}>
-                    {sidebarCollapsed ? <Search className="h-4 w-4 text-slate-300" /> : '未找到匹配的工作表'}
+                  <div className={`rounded-2xl border border-dashed border-slate-300 bg-slate-50 text-center text-sm text-slate-500 ${compactSidebar ? 'flex h-14 w-14 items-center justify-center p-0' : 'px-4 py-8'}`}>
+                    {compactSidebar ? <Search className="h-4 w-4 text-slate-300" /> : '未找到匹配的工作表'}
                   </div>
                 )}
               </div>

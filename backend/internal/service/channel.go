@@ -19,6 +19,8 @@ var (
 	ErrChannelAccessDenied      = errors.New("channel access denied")
 	ErrChannelManageDenied      = errors.New("channel manage denied")
 	ErrGalleryImageRenameDenied = errors.New("没有权限重命名这张图片")
+	ErrGalleryImageEditDenied   = errors.New("没有权限修改这张图库图片")
+	ErrMessageImageEditDenied   = errors.New("没有权限修改这条消息中的图片")
 	ErrMessageRecallDenied      = errors.New("只能撤回自己发送的消息")
 	ErrMessageRecallExpired     = errors.New("消息发送超过 3 分钟，无法撤回")
 	ErrMessageEditDenied        = errors.New("只能编辑自己发送的消息")
@@ -155,7 +157,7 @@ func (s *ChannelService) ListChannels(userID int64) ([]model.Channel, error) {
 	if err != nil {
 		return nil, err
 	}
-	channels, err := s.channelRepo.ListChannels(userID, isAdmin)
+	channels, err := s.channelRepo.ListChannels(userID)
 	if err != nil {
 		return nil, err
 	}
@@ -633,11 +635,7 @@ func (s *ChannelService) SearchMessages(userID int64, filter model.ChannelMessag
 		filter.Size = 50
 	}
 
-	isAdmin, err := s.permSvc.IsAdmin(userID)
-	if err != nil {
-		return nil, 0, err
-	}
-	results, total, err := s.channelRepo.SearchMessages(userID, isAdmin, filter)
+	results, total, err := s.channelRepo.SearchMessages(userID, filter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -937,26 +935,8 @@ func (s *ChannelService) SaveMessageImage(userID, channelID, messageID int64, di
 }
 
 func (s *ChannelService) RenameGalleryImage(userID, attachmentID int64, filename string) (*AttachmentWithURL, error) {
-	isGalleryImage, err := s.channelRepo.IsGalleryImage(attachmentID)
-	if err != nil {
+	if err := s.requireGalleryImageManage(userID, attachmentID, ErrGalleryImageRenameDenied); err != nil {
 		return nil, err
-	}
-	if !isGalleryImage {
-		return nil, fmt.Errorf("图片不在图库中")
-	}
-
-	isAdmin, err := s.permSvc.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	if !isAdmin {
-		allowed, err := s.channelRepo.CanManageGalleryImage(attachmentID, userID)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, ErrGalleryImageRenameDenied
-		}
 	}
 
 	attachment, err := s.uploadSvc.GetAttachment(attachmentID)
@@ -976,23 +956,99 @@ func (s *ChannelService) RenameGalleryImage(userID, attachmentID int64, filename
 	return s.uploadSvc.RenameAttachment(attachmentID, cleaned)
 }
 
+func (s *ChannelService) ReplaceGalleryImage(userID, attachmentID int64, file multipart.File, header *multipart.FileHeader) (*AttachmentWithURL, error) {
+	if err := s.requireGalleryImageManage(userID, attachmentID, ErrGalleryImageEditDenied); err != nil {
+		return nil, err
+	}
+	return s.uploadSvc.ReplaceImageContent(attachmentID, file, header)
+}
+
+func (s *ChannelService) ReplaceMessageImage(userID, channelID, messageID int64, file multipart.File, header *multipart.FileHeader) (*model.ChannelMessage, error) {
+	channel, err := s.requireChannelAccess(userID, channelID)
+	if err != nil {
+		return nil, err
+	}
+	message, err := s.channelRepo.GetMessage(messageID)
+	if err != nil {
+		return nil, err
+	}
+	if message.ChannelID != channelID || message.RecalledAt != nil || message.AttachmentID == nil || message.AttachmentMimeType == nil || !isImageMimeType(*message.AttachmentMimeType) {
+		return nil, fmt.Errorf("该消息不包含可修改的图片")
+	}
+
+	isAdmin, err := s.permSvc.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	allowed := isAdmin || channel.OwnerID == userID || (message.SenderType == "user" && message.SenderID == userID)
+	if !allowed {
+		isGalleryImage, galleryErr := s.channelRepo.IsGalleryImage(*message.AttachmentID)
+		if galleryErr != nil {
+			return nil, galleryErr
+		}
+		if isGalleryImage {
+			allowed, galleryErr = s.channelRepo.CanManageGalleryImage(*message.AttachmentID, userID)
+			if galleryErr != nil {
+				return nil, galleryErr
+			}
+		}
+	}
+	if !allowed {
+		return nil, ErrMessageImageEditDenied
+	}
+
+	if _, err := s.uploadSvc.ReplaceImageContent(*message.AttachmentID, file, header); err != nil {
+		return nil, err
+	}
+	updated, err := s.channelRepo.GetMessage(message.ID)
+	if err != nil {
+		return nil, err
+	}
+	s.attachMessageURL(updated)
+	s.notifyMessageChanged(updated)
+	return updated, nil
+}
+
+func (s *ChannelService) requireGalleryImageManage(userID, attachmentID int64, deniedError error) error {
+	isGalleryImage, err := s.channelRepo.IsGalleryImage(attachmentID)
+	if err != nil {
+		return err
+	}
+	if !isGalleryImage {
+		return fmt.Errorf("图片不在图库中")
+	}
+
+	isAdmin, err := s.permSvc.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if !isAdmin {
+		allowed, err := s.channelRepo.CanManageGalleryImage(attachmentID, userID)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return deniedError
+		}
+	}
+	return nil
+}
+
 func (s *ChannelService) requireChannelAccess(userID, channelID int64) (*model.Channel, error) {
 	channel, err := s.channelRepo.GetChannel(channelID, userID)
 	if err != nil {
 		return nil, err
 	}
-	isAdmin, err := s.permSvc.IsAdmin(userID)
+	allowed, err := s.channelRepo.IsChannelMember(channelID, userID)
 	if err != nil {
 		return nil, err
 	}
-	if !isAdmin {
-		allowed, err := s.channelRepo.IsChannelMember(channelID, userID)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, ErrChannelAccessDenied
-		}
+	if !allowed {
+		return nil, ErrChannelAccessDenied
+	}
+	isAdmin, err := s.permSvc.IsAdmin(userID)
+	if err != nil {
+		return nil, err
 	}
 	channel.CanManage = isAdmin || channel.OwnerID == userID
 	return channel, nil

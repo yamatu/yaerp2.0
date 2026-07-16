@@ -79,7 +79,31 @@ func (h *UploadHandler) ServeFile(c *gin.Context) {
 		disposition = "attachment"
 	}
 	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": attachment.Filename}))
+	if c.Query("v") != "" {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	}
 	c.DataFromReader(http.StatusOK, attachment.Size, attachment.MimeType, reader, nil)
+}
+
+func (h *UploadHandler) ServeThumbnail(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid file id")
+		return
+	}
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "320"))
+	data, contentType, err := h.uploadService.OpenThumbnail(id, c.Query("signature"), size)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidFileSignature):
+			response.Forbidden(c, "invalid file signature")
+		default:
+			response.NotFound(c, err.Error())
+		}
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Data(http.StatusOK, contentType, data)
 }
 
 func (h *UploadHandler) ListImages(c *gin.Context) {

@@ -550,9 +550,15 @@ func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs [
 		if err != nil {
 			return "", nil, fmt.Errorf("filter rows for sheet %d: %w", sheet.ID, err)
 		}
-		rowItems := make([]map[string]interface{}, 0, len(previewRows))
+		contextRows := make([]aiPreviewRow, 0, len(previewRows))
+		for _, row := range previewRows {
+			if len(row.Data) > 0 {
+				contextRows = append(contextRows, row)
+			}
+		}
+		rowItems := make([]map[string]interface{}, 0, minInt(len(contextRows), 200))
 		currentValues := make(map[string]interface{})
-		for index, row := range previewRows {
+		for index, row := range contextRows {
 			if index >= 200 {
 				break
 			}
@@ -577,13 +583,22 @@ func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs [
 			ColumnNames:   columnNames,
 			CurrentValues: currentValues,
 		}
+		var nextStartRow any
+		if len(rowItems) < len(contextRows) && len(rowItems) > 0 {
+			nextStartRow = rowItems[len(rowItems)-1]["row"].(int) + 1
+		}
 
 		sheetsPayload = append(sheetsPayload, map[string]interface{}{
-			"sheet_id":   sheet.ID,
-			"sheet_name": sheet.Name,
-			"columns":    columns,
-			"row_base":   0,
-			"rows":       rowItems,
+			"sheet_id":       sheet.ID,
+			"sheet_name":     sheet.Name,
+			"columns":        columns,
+			"row_base":       0,
+			"rows":           rowItems,
+			"returned_rows":  len(rowItems),
+			"total_rows":     len(contextRows),
+			"has_more":       len(rowItems) < len(contextRows),
+			"next_start_row": nextStartRow,
+			"profile":        buildAISheetProfile(parsedColumns, contextRows, nil),
 		})
 	}
 
@@ -778,34 +793,53 @@ func enrichSpreadsheetOperations(operations []SpreadsheetOperation, meta map[int
 }
 
 func buildAIPreviewRows(sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) []aiPreviewRow {
-	snapshotRows := extractRowsFromSnapshot(sheet.Config, columns)
-	if len(snapshotRows) > 0 {
-		result := make([]aiPreviewRow, 0, len(snapshotRows))
-		for _, sr := range snapshotRows {
-			dataRowIndex := sr.RowIndex - 1
-			result = append(result, aiPreviewRow{
-				Row:        dataRowIndex,
-				SourceRow:  sr.RowIndex,
-				DisplayRow: sr.RowIndex + 1,
-				Data:       toStringAnyMap(sr.Data),
-			})
-		}
-		return result
-	}
-
 	rowBase := getSheetRowBase(rows)
-	result := make([]aiPreviewRow, 0, len(rows))
+	merged := make(map[int]aiPreviewRow, len(rows))
+	sourceRowToNormalized := make(map[int]int, len(rows))
 	for _, row := range rows {
 		data := make(map[string]interface{})
 		_ = json.Unmarshal(row.Data, &data)
 		normalizedRowIndex := row.RowIndex - rowBase
-		result = append(result, aiPreviewRow{
+		sourceRowToNormalized[row.RowIndex] = normalizedRowIndex
+		merged[normalizedRowIndex] = aiPreviewRow{
 			Row:        normalizedRowIndex,
 			SourceRow:  row.RowIndex,
 			DisplayRow: normalizedRowIndex + 2,
 			Data:       data,
-		})
+		}
 	}
+
+	// Univer snapshots can be partial (for example, a formatting operation may
+	// only materialize one row). Overlay snapshot cells instead of replacing all
+	// rows from the rows table, otherwise AI queries silently lose untouched rows.
+	for _, snapshotRow := range extractRowsFromSnapshot(sheet.Config, columns) {
+		dataRowIndex := snapshotRow.RowIndex - 1
+		sourceRowIndex := snapshotRow.RowIndex - 1
+		if normalizedRowIndex, ok := sourceRowToNormalized[sourceRowIndex]; ok {
+			dataRowIndex = normalizedRowIndex
+		}
+		data := make(map[string]interface{}, len(snapshotRow.Data))
+		if current, ok := merged[dataRowIndex]; ok {
+			for key, value := range current.Data {
+				data[key] = value
+			}
+		}
+		for key, value := range snapshotRow.Data {
+			data[key] = value
+		}
+		merged[dataRowIndex] = aiPreviewRow{
+			Row:        dataRowIndex,
+			SourceRow:  sourceRowIndex,
+			DisplayRow: dataRowIndex + 2,
+			Data:       data,
+		}
+	}
+
+	result := make([]aiPreviewRow, 0, len(merged))
+	for _, row := range merged {
+		result = append(result, row)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Row < result[j].Row })
 	return result
 }
 

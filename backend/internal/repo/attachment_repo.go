@@ -99,6 +99,27 @@ func (r *AttachmentRepo) UpdateFilename(id int64, filename string) error {
 	return nil
 }
 
+func (r *AttachmentRepo) ReplaceContent(id int64, filename, mimeType string, size int64, objectKey, contentHash string) error {
+	result, err := r.db.Exec(
+		`UPDATE attachments
+		    SET filename = $1,
+		        mime_type = $2,
+		        size = $3,
+		        object_key = $4,
+		        content_hash = $5
+		  WHERE id = $6`,
+		filename, mimeType, size, objectKey, contentHash, id,
+	)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *AttachmentRepo) ListByMimePrefix(prefix string, page, size int) ([]*model.Attachment, int64, error) {
 	return r.ListByMimePrefixFiltered(prefix, page, size, nil, nil)
 }
@@ -123,7 +144,16 @@ func (r *AttachmentRepo) ListAccessibleByMimePrefixFiltered(prefix string, page,
 	}
 	where += ` AND (
 			a.uploader_id = $2
-			OR EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
+			OR (
+				EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
+				AND (
+					COALESCE(gi.channel_id, gd.channel_id) IS NULL
+					OR EXISTS (
+						SELECT 1 FROM channel_members cm
+						WHERE cm.channel_id = COALESCE(gi.channel_id, gd.channel_id) AND cm.user_id = $2
+					)
+				)
+			)
 			OR (gi.directory_id IS NULL AND gi.saved_by = $2)
 			OR gd.owner_id = $2
 			OR gd.visibility = 'public'

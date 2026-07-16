@@ -348,6 +348,7 @@ export interface GalleryImage {
   uploader_name?: string
   created_at: string
   url: string
+  thumbnail_url?: string
 }
 
 export interface Channel {

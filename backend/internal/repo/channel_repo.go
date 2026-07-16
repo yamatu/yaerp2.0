@@ -63,7 +63,7 @@ func (r *ChannelRepo) CreateChannel(channel *model.Channel) error {
 	return tx.Commit()
 }
 
-func (r *ChannelRepo) ListChannels(userID int64, includeAll bool) ([]model.Channel, error) {
+func (r *ChannelRepo) ListChannels(userID int64) ([]model.Channel, error) {
 	rows, err := r.db.Query(
 		`SELECT c.id, c.name, c.description, c.owner_id, COALESCE(u.username, ''), c.avatar_attachment_id,
 		        c.channel_type, c.ai_assistant_id, COALESCE(primary_ai.name, ''),
@@ -93,11 +93,11 @@ func (r *ChannelRepo) ListChannels(userID int64, includeAll bool) ([]model.Chann
 		        LIMIT 1
 		   ) latest ON TRUE
 		  WHERE (c.channel_type = 'ai_private' AND c.owner_id = $1)
-		     OR (c.channel_type <> 'ai_private' AND ($2 OR c.owner_id = $1 OR cm_self.user_id IS NOT NULL))
+		     OR (c.channel_type <> 'ai_private' AND (c.owner_id = $1 OR cm_self.user_id IS NOT NULL))
 		  ORDER BY COALESCE(cm_self.is_pinned, FALSE) DESC,
 		           CASE WHEN COALESCE(cm_self.is_pinned, FALSE) THEN COALESCE(cm_self.pin_sort_order, 0) ELSE 0 END,
 		           c.updated_at DESC, c.id DESC`,
-		userID, includeAll,
+		userID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
@@ -161,10 +161,7 @@ func (r *ChannelRepo) IsChannelMember(channelID, userID int64) (bool, error) {
 			LEFT JOIN channel_members cm ON cm.channel_id = c.id AND cm.user_id = $2
 				WHERE c.id = $1 AND (
 				    (c.channel_type = 'ai_private' AND c.owner_id = $2)
-				    OR (c.channel_type <> 'ai_private' AND (c.owner_id = $2 OR cm.user_id IS NOT NULL OR EXISTS (
-				        SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
-				         WHERE ur.user_id = $2 AND r.code = 'admin'
-				    )))
+				    OR (c.channel_type <> 'ai_private' AND (c.owner_id = $2 OR cm.user_id IS NOT NULL))
 				)
 		)`,
 		channelID, userID,
@@ -625,15 +622,15 @@ func (r *ChannelRepo) ListMessages(channelID int64, page, size int) ([]model.Cha
 	return messages, total, rows.Err()
 }
 
-func (r *ChannelRepo) SearchMessages(userID int64, includeAll bool, filter model.ChannelMessageSearchFilter) ([]model.ChannelMessageSearchResult, int64, error) {
+func (r *ChannelRepo) SearchMessages(userID int64, filter model.ChannelMessageSearchFilter) ([]model.ChannelMessageSearchResult, int64, error) {
 	where := []string{`m.recalled_at IS NULL`, `(
-		(c.channel_type = 'ai_private' AND c.owner_id = $2)
-		OR (c.channel_type <> 'ai_private' AND ($1 OR c.owner_id = $2 OR EXISTS (
+		(c.channel_type = 'ai_private' AND c.owner_id = $1)
+		OR (c.channel_type <> 'ai_private' AND (c.owner_id = $1 OR EXISTS (
 			SELECT 1 FROM channel_members cm
-			WHERE cm.channel_id = c.id AND cm.user_id = $2
+			WHERE cm.channel_id = c.id AND cm.user_id = $1
 		)))
 	)`}
-	args := []any{includeAll, userID}
+	args := []any{userID}
 	addCondition := func(condition string, value any) {
 		args = append(args, value)
 		where = append(where, fmt.Sprintf(condition, len(args)))
@@ -738,10 +735,18 @@ func (r *ChannelRepo) ListGalleryDirectories(userID int64, channelID *int64) ([]
 	                  (gd.owner_id = $1 OR EXISTS (
 	                      SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
 	                       WHERE ur.user_id = $1 AND r.code = 'admin'
+	                         AND (gd.channel_id IS NULL OR EXISTS (
+	                             SELECT 1 FROM channel_members cm
+	                              WHERE cm.channel_id = gd.channel_id AND cm.user_id = $1
+	                         ))
 	                  )) AS can_manage,
 	                  (gd.owner_id = $1 OR EXISTS (
 	                      SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
 	                       WHERE ur.user_id = $1 AND r.code = 'admin'
+	                         AND (gd.channel_id IS NULL OR EXISTS (
+	                             SELECT 1 FROM channel_members cm
+	                              WHERE cm.channel_id = gd.channel_id AND cm.user_id = $1
+	                         ))
 	                  ) OR EXISTS (
 	                      SELECT 1 FROM gallery_directory_permissions gdp
 	                       WHERE gdp.directory_id = gd.id AND gdp.user_id = $1 AND gdp.can_edit
@@ -757,6 +762,10 @@ func (r *ChannelRepo) ListGalleryDirectories(userID int64, channelID *int64) ([]
 	              OR EXISTS (
 	                  SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
 	                   WHERE ur.user_id = $1 AND r.code = 'admin'
+	                     AND (gd.channel_id IS NULL OR EXISTS (
+	                         SELECT 1 FROM channel_members cm
+	                          WHERE cm.channel_id = gd.channel_id AND cm.user_id = $1
+	                     ))
 	              )
 	              OR EXISTS (
 	                  SELECT 1 FROM gallery_directory_permissions gdp
@@ -809,7 +818,14 @@ func (r *ChannelRepo) CanViewGalleryDirectory(directoryID, userID int64) (bool, 
 		    SELECT 1 FROM gallery_directories gd
 		     WHERE gd.id = $1 AND (
 		         gd.owner_id = $2 OR gd.visibility = 'public'
-		         OR EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
+		         OR EXISTS (
+		             SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+		              WHERE ur.user_id = $2 AND r.code = 'admin'
+		                AND (gd.channel_id IS NULL OR EXISTS (
+		                    SELECT 1 FROM channel_members cm
+		                     WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2
+		                ))
+		         )
 		         OR EXISTS (SELECT 1 FROM gallery_directory_permissions gdp WHERE gdp.directory_id = gd.id AND gdp.user_id = $2 AND (gdp.can_view OR gdp.can_edit))
 		         OR (gd.visibility = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2))
 		     )
@@ -825,7 +841,14 @@ func (r *ChannelRepo) CanEditGalleryDirectory(directoryID, userID int64) (bool, 
 		    SELECT 1 FROM gallery_directories gd
 		     WHERE gd.id = $1 AND (
 		         gd.owner_id = $2
-		         OR EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
+		         OR EXISTS (
+		             SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+		              WHERE ur.user_id = $2 AND r.code = 'admin'
+		                AND (gd.channel_id IS NULL OR EXISTS (
+		                    SELECT 1 FROM channel_members cm
+		                     WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2
+		                ))
+		         )
 		         OR EXISTS (SELECT 1 FROM gallery_directory_permissions gdp WHERE gdp.directory_id = gd.id AND gdp.user_id = $2 AND gdp.can_edit)
 		         OR (gd.visibility = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2))
 		     )
@@ -841,7 +864,14 @@ func (r *ChannelRepo) CanManageGalleryDirectory(directoryID, userID int64) (bool
 		    SELECT 1 FROM gallery_directories gd
 		     WHERE gd.id = $1 AND (
 		         gd.owner_id = $2
-		         OR EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
+		         OR EXISTS (
+		             SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+		              WHERE ur.user_id = $2 AND r.code = 'admin'
+		                AND (gd.channel_id IS NULL OR EXISTS (
+		                    SELECT 1 FROM channel_members cm
+		                     WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2
+		                ))
+		         )
 		     )
 		)`, directoryID, userID,
 	).Scan(&allowed)
@@ -1041,12 +1071,21 @@ func (r *ChannelRepo) CanAccessGalleryImage(attachmentID, userID int64) (bool, e
 		    SELECT 1 FROM attachments a
 		     WHERE a.id = $1 AND (
 		         a.uploader_id = $2
-		         OR EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
 		         OR EXISTS (
 		             SELECT 1 FROM gallery_images gi
 		             LEFT JOIN gallery_directories gd ON gd.id = gi.directory_id
 		              WHERE gi.attachment_id = a.id AND (
 		                  gd.owner_id = $2 OR gd.visibility = 'public'
+		                  OR (
+		                      EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = $2 AND r.code = 'admin')
+		                      AND (
+		                          COALESCE(gi.channel_id, gd.channel_id) IS NULL
+		                          OR EXISTS (
+		                              SELECT 1 FROM channel_members cm
+		                               WHERE cm.channel_id = COALESCE(gi.channel_id, gd.channel_id) AND cm.user_id = $2
+		                          )
+		                      )
+		                  )
 		                  OR EXISTS (SELECT 1 FROM gallery_directory_permissions gdp WHERE gdp.directory_id = gd.id AND gdp.user_id = $2 AND (gdp.can_view OR gdp.can_edit))
 		                  OR (gd.visibility = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2))
 		                  OR (gi.directory_id IS NULL AND gi.saved_by = $2)

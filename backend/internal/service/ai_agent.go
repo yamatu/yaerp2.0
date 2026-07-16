@@ -233,7 +233,7 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 				Name:            call.Function.Name,
 				Status:          "success",
 				Summary:         result.Summary,
-				Data:            result.Data,
+				Data:            compactAITraceData(result.Data),
 				TouchedSheetIDs: result.TouchedSheetIDs,
 			})
 
@@ -404,7 +404,7 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 			"content": fmt.Sprintf(
 				"你是 YaERP 智能表格 Agent。你必须优先使用工具来查询或修改表格，不要编造不存在的数据。"+
 					"所有工具都按当前登录账号执行；不得尝试读取、推断或写入该账号无权访问的工作簿、工作表、行、列或单元格。只读账号只能查询，不能写回来源表。"+
-					"当用户只提供工作簿名、工作表名或业务关键词时，先调用 get_user_context 或 search_spreadsheets 定位准确 ID，再调用 query_sheet 读取实际单元格内容。"+
+					"当用户只提供工作簿名、工作表名或业务关键词时，先调用 get_user_context 或 search_spreadsheets 定位准确 ID，再调用 query_sheet 读取实际单元格内容。query_sheet 是分页工具：必须检查 total_rows、returned_rows、has_more 和 next_start_row；用户要求完整读取、逐行核对或基于全表下结论时，不得只读取第一行或第一页。优先使用 profile 理解全表分布，需要精确逐行数据时按 next_start_row 继续读取；统计问题优先使用 calculate_sheet_metrics，检索问题优先使用 search_sheet_rows 或 lookup_sheet_records。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
@@ -452,13 +452,14 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 				"limit": map[string]any{"type": "integer"},
 			},
 		}),
-		buildToolDefinition("query_sheet", "Query sheet columns and rows.", map[string]any{
+		buildToolDefinition("query_sheet", "Read a page of visible sheet rows and an optional full-sheet profile. Check has_more and next_start_row before concluding that the sheet has been fully read.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"sheet_id":    map[string]any{"type": "integer"},
-				"start_row":   map[string]any{"type": "integer"},
-				"limit":       map[string]any{"type": "integer"},
-				"column_keys": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"sheet_id":        map[string]any{"type": "integer"},
+				"start_row":       map[string]any{"type": "integer", "description": "0-based data row to start from. Use next_start_row from the previous response for pagination."},
+				"limit":           map[string]any{"type": "integer", "description": "Rows per page. Default 100, maximum 200. Do not use 1 unless the user explicitly asks for one row."},
+				"column_keys":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"include_profile": map[string]any{"type": "boolean", "description": "Include a compact profile calculated from all visible rows. Defaults to true on the first page."},
 			},
 			"required": []string{"sheet_id"},
 		}),
@@ -859,11 +860,175 @@ func sortedTouchedSheetIDs(items map[int64]struct{}) []int64 {
 	return result
 }
 
-func buildQuerySheetSummary(sheetName string, rowCount, columnCount int) string {
-	if rowCount == 0 && columnCount > 0 {
+func buildQuerySheetSummary(sheetName string, returnedRows, totalRows, columnCount int, hasMore bool) string {
+	if totalRows == 0 && columnCount > 0 {
 		return fmt.Sprintf("已查询工作表 %s：当前只有表头/列定义，共 %d 列，没有数据行", sheetName, columnCount)
 	}
-	return fmt.Sprintf("已查询工作表 %s，返回 %d 行数据", sheetName, rowCount)
+	if hasMore {
+		return fmt.Sprintf("已查询工作表 %s，返回 %d/%d 行数据，仍有后续数据", sheetName, returnedRows, totalRows)
+	}
+	return fmt.Sprintf("已查询工作表 %s，返回 %d/%d 行数据，已到最后一页", sheetName, returnedRows, totalRows)
+}
+
+func compactAITraceData(data any) any {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return data
+	}
+	var normalized any
+	if err := json.Unmarshal(encoded, &normalized); err != nil {
+		return data
+	}
+	return compactAITraceValue(normalized, 0)
+}
+
+func compactAITraceValue(value any, depth int) any {
+	if depth > 5 {
+		return "[nested data omitted]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(typed)+1)
+		truncated := make(map[string]any)
+		for key, item := range typed {
+			if items, ok := item.([]any); ok {
+				limit := aiTraceCollectionLimit(key)
+				shown := minInt(len(items), limit)
+				preview := make([]any, 0, shown)
+				for index := 0; index < shown; index++ {
+					preview = append(preview, compactAITraceValue(items[index], depth+1))
+				}
+				result[key] = preview
+				if len(items) > shown {
+					truncated[key] = map[string]any{"shown": shown, "total": len(items), "omitted": len(items) - shown}
+				}
+				continue
+			}
+			result[key] = compactAITraceValue(item, depth+1)
+		}
+		if len(truncated) > 0 {
+			result["_trace_truncated"] = truncated
+		}
+		return result
+	case []any:
+		shown := minInt(len(typed), 10)
+		result := make([]any, 0, shown)
+		for index := 0; index < shown; index++ {
+			result = append(result, compactAITraceValue(typed[index], depth+1))
+		}
+		return result
+	case string:
+		if len([]rune(typed)) > 2000 {
+			return string([]rune(typed)[:2000]) + "...[truncated]"
+		}
+		return typed
+	default:
+		return typed
+	}
+}
+
+func aiTraceCollectionLimit(key string) int {
+	switch key {
+	case "rows", "matches", "workbooks", "sheets":
+		return 5
+	case "columns":
+		return 20
+	case "operations", "pending_operations":
+		return 10
+	default:
+		return 10
+	}
+}
+
+func buildAISheetProfile(columns []sheetColumnPayload, rows []aiPreviewRow, requestedColumns []string) map[string]any {
+	selectedColumns := columns
+	if len(requestedColumns) > 0 {
+		selectedColumns = make([]sheetColumnPayload, 0, len(requestedColumns))
+		seen := make(map[string]struct{}, len(requestedColumns))
+		for _, reference := range requestedColumns {
+			key, _ := resolveColumnReference(reference, columns)
+			if key == "" {
+				key = strings.TrimSpace(reference)
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			for _, column := range columns {
+				if column.Key == key {
+					selectedColumns = append(selectedColumns, column)
+					seen[key] = struct{}{}
+					break
+				}
+			}
+		}
+	}
+
+	profiles := make([]map[string]any, 0, len(selectedColumns))
+	for _, column := range selectedColumns {
+		nonEmpty := 0
+		numericValues := make([]float64, 0, len(rows))
+		valueCounts := make(map[string]int)
+		for _, row := range rows {
+			value, ok := row.Data[column.Key]
+			if !ok || value == nil || strings.TrimSpace(fmt.Sprintf("%v", value)) == "" {
+				continue
+			}
+			nonEmpty++
+			displayValue := strings.TrimSpace(fmt.Sprintf("%v", value))
+			if runes := []rune(displayValue); len(runes) > 120 {
+				displayValue = string(runes[:120]) + "..."
+			}
+			valueCounts[displayValue]++
+			if number, ok := toFloat64(value); ok {
+				numericValues = append(numericValues, number)
+			}
+		}
+
+		type valueCount struct {
+			Value string
+			Count int
+		}
+		counts := make([]valueCount, 0, len(valueCounts))
+		for value, count := range valueCounts {
+			counts = append(counts, valueCount{Value: value, Count: count})
+		}
+		sort.Slice(counts, func(i, j int) bool {
+			if counts[i].Count == counts[j].Count {
+				return counts[i].Value < counts[j].Value
+			}
+			return counts[i].Count > counts[j].Count
+		})
+		topValues := make([]map[string]any, 0, minInt(len(counts), 5))
+		for index := 0; index < len(counts) && index < 5; index++ {
+			topValues = append(topValues, map[string]any{"value": counts[index].Value, "count": counts[index].Count})
+		}
+
+		profile := map[string]any{
+			"key":            column.Key,
+			"name":           column.Name,
+			"type":           column.Type,
+			"non_empty":      nonEmpty,
+			"empty":          len(rows) - nonEmpty,
+			"distinct_count": len(valueCounts),
+			"top_values":     topValues,
+		}
+		if len(numericValues) > 0 {
+			profile["numeric"] = map[string]any{
+				"count": len(numericValues),
+				"sum":   sumFloat64(numericValues),
+				"avg":   sumFloat64(numericValues) / float64(len(numericValues)),
+				"min":   minFloat64(numericValues),
+				"max":   maxFloat64(numericValues),
+			}
+		}
+		profiles = append(profiles, profile)
+	}
+
+	return map[string]any{
+		"total_rows":      len(rows),
+		"column_count":    len(selectedColumns),
+		"column_profiles": profiles,
+	}
 }
 
 func (s *AIService) toolGetUserContext(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -897,34 +1062,42 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 		return nil, err
 	}
 	startRow, _ := intArgWithDefault(args, "start_row", 0)
-	limit, _ := intArgWithDefault(args, "limit", 50)
+	if startRow < 0 {
+		startRow = 0
+	}
+	limit, _ := intArgWithDefault(args, "limit", 100)
 	if limit <= 0 || limit > 200 {
-		limit = 50
+		limit = 100
 	}
 	columnKeys := stringSliceArg(args, "column_keys")
 	columnFilter := make(map[string]struct{}, len(columnKeys))
-	for _, key := range columnKeys {
-		columnFilter[key] = struct{}{}
-	}
-
 	columns, err := parseSheetColumns(sheet.Columns)
 	if err != nil {
 		return nil, err
 	}
+	for _, reference := range columnKeys {
+		key, _ := resolveColumnReference(reference, columns)
+		if key == "" {
+			key = strings.TrimSpace(reference)
+		}
+		if key != "" {
+			columnFilter[key] = struct{}{}
+		}
+	}
+	includeProfile := startRow == 0
+	if value, exists := args["include_profile"]; exists {
+		if parsed, ok := value.(bool); ok {
+			includeProfile = parsed
+		}
+	}
 
-	rawPreviewRows := buildAIPreviewRows(sheet, columns, rows)
 	visiblePreviewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
 	if err != nil {
 		return nil, err
 	}
-	filteredRows := make([]map[string]any, 0, limit)
-	visibleRowCount := 0
+	projectedRows := make([]aiPreviewRow, 0, len(visiblePreviewRows))
 	for _, row := range visiblePreviewRows {
 		if len(row.Data) == 0 {
-			continue
-		}
-		visibleRowCount++
-		if row.Row < startRow {
 			continue
 		}
 		data := row.Data
@@ -940,27 +1113,65 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 		if len(data) == 0 {
 			continue
 		}
-		filteredRows = append(filteredRows, map[string]any{
+		row.Data = data
+		projectedRows = append(projectedRows, row)
+	}
+
+	pageRows := make([]map[string]any, 0, limit)
+	pageEndIndex := len(projectedRows)
+	for index, row := range projectedRows {
+		if row.Row < startRow {
+			continue
+		}
+		pageRows = append(pageRows, map[string]any{
 			"row":         row.Row,
 			"source_row":  row.SourceRow,
 			"display_row": row.DisplayRow,
-			"data":        data,
+			"data":        row.Data,
 		})
-		if len(filteredRows) >= limit {
+		if len(pageRows) >= limit {
+			pageEndIndex = index + 1
 			break
 		}
 	}
+	hasMore := pageEndIndex < len(projectedRows)
+	var nextStartRow any
+	if hasMore && len(pageRows) > 0 {
+		lastRow, _ := pageRows[len(pageRows)-1]["row"].(int)
+		nextStartRow = lastRow + 1
+	}
 
-	return &toolExecutionResult{Data: map[string]any{
-		"sheet_id":    sheet.ID,
-		"sheet_name":  sheet.Name,
-		"columns":     columns,
-		"header_row":  columns,
-		"rows":        filteredRows,
-		"total_rows":  visibleRowCount,
-		"header_only": len(rawPreviewRows) == 0 && len(columns) > 0,
-		"data_source": map[bool]string{true: "snapshot", false: "rows"}[len(extractRowsFromSnapshot(sheet.Config, columns)) > 0],
-	}, Summary: buildQuerySheetSummary(sheet.Name, len(filteredRows), len(columns))}, nil
+	snapshotRows := extractRowsFromSnapshot(sheet.Config, columns)
+	dataSource := "rows"
+	if len(snapshotRows) > 0 && len(rows) > 0 {
+		dataSource = "snapshot+rows"
+	} else if len(snapshotRows) > 0 {
+		dataSource = "snapshot"
+	}
+	data := map[string]any{
+		"sheet_id":         sheet.ID,
+		"sheet_name":       sheet.Name,
+		"columns":          columns,
+		"header_row":       columns,
+		"rows":             pageRows,
+		"start_row":        startRow,
+		"returned_rows":    len(pageRows),
+		"total_rows":       len(projectedRows),
+		"has_more":         hasMore,
+		"next_start_row":   nextStartRow,
+		"header_only":      len(projectedRows) == 0 && len(columns) > 0,
+		"data_source":      dataSource,
+		"profile_included": includeProfile,
+	}
+	if includeProfile {
+		data["profile"] = buildAISheetProfile(columns, projectedRows, columnKeys)
+	}
+
+	return &toolExecutionResult{
+		Data:            data,
+		TouchedSheetIDs: []int64{sheet.ID},
+		Summary:         buildQuerySheetSummary(sheet.Name, len(pageRows), len(projectedRows), len(columns), hasMore),
+	}, nil
 }
 
 func (s *AIService) toolSearchSpreadsheets(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -2883,13 +3094,23 @@ func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayloa
 			if !ok {
 				continue
 			}
-			// Extract the actual value from the cell object {v: ..., f: ...}
+			// Extract the displayed value first and retain formulas that do not
+			// have a cached value yet. Primitive cells are accepted for older data.
 			cellMap, ok := cellValue.(map[string]interface{})
 			if !ok {
+				data[colKey] = cellValue
 				continue
 			}
-			if v, exists := cellMap["v"]; exists {
-				data[colKey] = v
+			if value, exists := cellMap["v"]; exists && value != nil {
+				data[colKey] = value
+				continue
+			}
+			if formula, exists := cellMap["f"].(string); exists && strings.TrimSpace(formula) != "" {
+				formula = strings.TrimSpace(formula)
+				if !strings.HasPrefix(formula, "=") {
+					formula = "=" + formula
+				}
+				data[colKey] = formula
 			}
 		}
 		if len(data) > 0 {

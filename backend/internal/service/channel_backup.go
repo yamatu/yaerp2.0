@@ -139,11 +139,7 @@ func (s *ChannelService) CreateBackup(userID, channelID int64) (*model.ChannelBa
 }
 
 func (s *ChannelService) ListBackups(userID int64) ([]model.ChannelBackup, error) {
-	isAdmin, err := s.permSvc.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	backups, err := s.channelRepo.ListBackups(userID, isAdmin)
+	backups, err := s.channelRepo.ListBackups(userID)
 	if err != nil {
 		return nil, err
 	}
@@ -344,11 +340,7 @@ func (s *ChannelService) accessibleBackup(userID, backupID int64) (*model.Channe
 	if err != nil {
 		return nil, err
 	}
-	isAdmin, err := s.permSvc.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	if isAdmin || (backup.CreatedBy != nil && *backup.CreatedBy == userID) {
+	if backup.CreatedBy != nil && *backup.CreatedBy == userID {
 		return backup, nil
 	}
 	if backup.SourceChannelID != nil {

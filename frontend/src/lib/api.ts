@@ -115,6 +115,10 @@ class ApiClient {
     return this.request<T>(endpoint, { method: 'DELETE' })
   }
 
+  form<T>(endpoint: string, body: FormData, method: 'POST' | 'PUT' = 'POST') {
+    return this.request<T>(endpoint, { method, body })
+  }
+
   download(endpoint: string, options: RequestInit = {}) {
     return this.requestRaw(endpoint, options)
   }

@@ -17,6 +17,7 @@ import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
 import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
+import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
@@ -40,6 +41,7 @@ interface GalleryImage {
   id: number
   filename: string
   url: string
+  thumbnail_url?: string
   size: number
 }
 
@@ -2580,6 +2582,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         const workbookApi = univerAPI.createUniverSheet(workbookData)
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
+        if (containerRef.current.offsetWidth <= 600) {
+          try {
+            const activeWorksheet = workbookApi.getActiveSheet()
+            const currentZoom = activeWorksheet.getZoom?.() || 1
+            if (currentZoom > 0.8) activeWorksheet.zoom?.(0.8)
+          } catch (zoomError) {
+            console.warn('Failed to apply mobile sheet zoom:', zoomError)
+          }
+        }
         syncFilterState()
         const rememberedView = readSheetViewMemory(profile?.id, sheetId)
         if (rememberedView) {
@@ -3489,7 +3500,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   return (
     <div
-      style={{ width: '100%', height: '100%', position: 'relative' }}
+      className="mobile-sheet-editor"
+      style={{ width: '100%', height: '100%', position: 'relative', touchAction: 'pan-x pan-y', overscrollBehavior: 'contain' }}
       onDragEnter={handleContainerDragEnter}
       onDragOver={handleContainerDragOver}
       onDragLeave={handleContainerDragLeave}
@@ -4225,7 +4237,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                       className="group relative aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-50 transition hover:border-sky-400 hover:ring-2 hover:ring-sky-100"
                     >
                       <img
-                        src={img.url}
+                        src={img.thumbnail_url || imageThumbnailUrl(img.url, 320)}
                         alt={img.filename}
                         className="h-full w-full object-cover"
                         loading="lazy"
