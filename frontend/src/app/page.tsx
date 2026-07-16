@@ -11,6 +11,7 @@ import {
   ChevronRight,
   Copy,
   Download,
+  FileSpreadsheet,
   FolderIcon,
   FolderKanban,
   FolderPlus,
@@ -41,7 +42,14 @@ import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
 import { useWorkbooks } from '@/hooks/useSheet'
 import { useFileManager } from '@/hooks/useFileManager'
-import { uploadNewWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
+import {
+  ensureExcelDownloadFilename,
+  EXCEL_IMPORT_ACCEPT,
+  EXCEL_IMPORT_FORMATS_LABEL,
+  isSupportedExcelImportFile,
+  stripExcelImportExtension,
+  uploadNewWorkbookXlsx,
+} from '@/components/spreadsheet/ImportXlsxButton'
 import api from '@/lib/api'
 import { clearTokens, fetchCurrentUser, getStoredUser, isAdmin } from '@/lib/auth'
 import type { AuthUser, Channel, Folder, FolderShareUser, PageData, User, Workbook } from '@/types'
@@ -137,8 +145,10 @@ export default function HomePage() {
   const [editWorkbookName, setEditWorkbookName] = useState('')
   const workbookImportInputRef = useRef<HTMLInputElement | null>(null)
   const workbookFolderImportInputRef = useRef<HTMLInputElement | null>(null)
+  const workbookDropDepthRef = useRef(0)
   const [importingWorkbook, setImportingWorkbook] = useState(false)
   const [importingWorkbookFolder, setImportingWorkbookFolder] = useState(false)
+  const [workbookDropActive, setWorkbookDropActive] = useState(false)
   const [workbookImportProgress, setWorkbookImportProgress] = useState(0)
   const [workbookFolderImportStatus, setWorkbookFolderImportStatus] = useState('')
   const [workbookImportError, setWorkbookImportError] = useState('')
@@ -495,9 +505,9 @@ export default function HomePage() {
 
   const handleImportWorkbookFolder = async (selectedFiles: FileList) => {
     if (!canWriteCurrentFolder || importingWorkbook || importingWorkbookFolder) return
-    const files = Array.from(selectedFiles).filter((file) => file.name.toLowerCase().endsWith('.xlsx'))
+    const files = Array.from(selectedFiles).filter(isSupportedExcelImportFile)
     if (files.length === 0) {
-      setWorkbookImportError('所选文件夹中没有 XLSX 工作簿。')
+      setWorkbookImportError(`所选文件夹中没有 ${EXCEL_IMPORT_FORMATS_LABEL} 格式的工作簿。`)
       if (workbookFolderImportInputRef.current) workbookFolderImportInputRef.current.value = ''
       return
     }
@@ -511,7 +521,7 @@ export default function HomePage() {
       const entries = files.map((file) => {
         const relativePath = (file.webkitRelativePath || file.name).replaceAll('\\', '/')
         const parts = relativePath.split('/').map((part) => part.trim()).filter(Boolean)
-        return { file, parts, directoryParts: parts.length > 1 ? parts.slice(0, -1) : [file.name.replace(/\.xlsx$/i, '')] }
+        return { file, parts, directoryParts: parts.length > 1 ? parts.slice(0, -1) : [stripExcelImportExtension(file.name)] }
       })
       const directoryPaths = Array.from(new Set(entries.flatMap((entry) => entry.directoryParts.map((_, index) => entry.directoryParts.slice(0, index + 1).join('/')))))
         .sort((left, right) => left.split('/').length - right.split('/').length || left.localeCompare(right, 'zh-CN'))
@@ -560,6 +570,83 @@ export default function HomePage() {
     }
   }
 
+  const handleImportDroppedWorkbooks = async (droppedFiles: File[]) => {
+    if (!canWriteCurrentFolder) {
+      setWorkbookImportError('当前文件夹为只读，不能上传 Excel。')
+      return
+    }
+    if (importingWorkbook || importingWorkbookFolder) return
+
+    const files = droppedFiles.filter(isSupportedExcelImportFile)
+    if (files.length === 0) {
+      setWorkbookImportError(`请拖入 ${EXCEL_IMPORT_FORMATS_LABEL} 格式的文件。`)
+      return
+    }
+    if (files.length === 1) {
+      await handleImportWorkbookXlsx(files[0])
+      return
+    }
+
+    setImportingWorkbookFolder(true)
+    setWorkbookImportProgress(0)
+    setWorkbookImportError('')
+    try {
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index]
+        setWorkbookFolderImportStatus(`正在导入 ${index + 1}/${files.length}：${file.name}`)
+        await uploadNewWorkbookXlsx(file, {
+          folderId: currentFolderId,
+          onProgress: (fileProgress) => {
+            setWorkbookImportProgress(Math.round(((index + fileProgress / 100) / files.length) * 100))
+          },
+        })
+      }
+      setWorkbookImportProgress(100)
+      setWorkbookFolderImportStatus(`已导入 ${files.length} 个 Excel 工作簿`)
+      await Promise.all([refresh(), refreshFolder()])
+      setWorkbookPage(1)
+    } catch (err) {
+      setWorkbookImportError(err instanceof Error ? err.message : 'Excel 批量导入失败。')
+    } finally {
+      setImportingWorkbookFolder(false)
+      window.setTimeout(() => {
+        setWorkbookImportProgress(0)
+        setWorkbookFolderImportStatus('')
+      }, 1200)
+    }
+  }
+
+  const handleWorkbookDragEnter = (event: React.DragEvent<HTMLElement>) => {
+    if (!Array.from(event.dataTransfer.types || []).includes('Files')) return
+    event.preventDefault()
+    workbookDropDepthRef.current += 1
+    if (canWriteCurrentFolder && !importingWorkbook && !importingWorkbookFolder) {
+      setWorkbookDropActive(true)
+    }
+  }
+
+  const handleWorkbookDragOver = (event: React.DragEvent<HTMLElement>) => {
+    if (!Array.from(event.dataTransfer.types || []).includes('Files')) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = canWriteCurrentFolder ? 'copy' : 'none'
+  }
+
+  const handleWorkbookDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    if (!Array.from(event.dataTransfer.types || []).includes('Files')) return
+    event.preventDefault()
+    workbookDropDepthRef.current = Math.max(0, workbookDropDepthRef.current - 1)
+    if (workbookDropDepthRef.current === 0) setWorkbookDropActive(false)
+  }
+
+  const handleWorkbookDrop = (event: React.DragEvent<HTMLElement>) => {
+    if (!Array.from(event.dataTransfer.types || []).includes('Files')) return
+    event.preventDefault()
+    event.stopPropagation()
+    workbookDropDepthRef.current = 0
+    setWorkbookDropActive(false)
+    void handleImportDroppedWorkbooks(Array.from(event.dataTransfer.files || []))
+  }
+
   const handleDownloadWorkbookSource = async (event: React.MouseEvent, workbook: Workbook) => {
     event.stopPropagation()
     if (downloadingSourceWorkbookId !== null) return
@@ -570,7 +657,7 @@ export default function HomePage() {
       const source = getWorkbookImportSource(workbook)
       const hasSource = hasWorkbookSourceXlsx(workbook)
       const fallbackBase = sanitizeDownloadFilename(source?.filename || workbook.name || 'workbook')
-      const fallbackFilename = fallbackBase.toLowerCase().endsWith('.xlsx') ? fallbackBase : `${fallbackBase}.xlsx`
+      const fallbackFilename = ensureExcelDownloadFilename(fallbackBase)
       const response = await api.download(hasSource
         ? `/workbooks/${workbook.id}/source/xlsx`
         : `/workbooks/${workbook.id}/export?filename=${encodeURIComponent(fallbackFilename)}`)
@@ -986,7 +1073,24 @@ export default function HomePage() {
             </section>
           )}
 
-          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+          <section
+            className="relative rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5"
+            onDragEnter={handleWorkbookDragEnter}
+            onDragOver={handleWorkbookDragOver}
+            onDragLeave={handleWorkbookDragLeave}
+            onDrop={handleWorkbookDrop}
+          >
+            {workbookDropActive && (
+              <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-lg border-2 border-dashed border-sky-300 bg-sky-50/95 p-6 text-center shadow-inner backdrop-blur-sm">
+                <div>
+                  <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-lg bg-white text-sky-700 shadow-sm">
+                    <FileSpreadsheet className="h-6 w-6" />
+                  </div>
+                  <div className="mt-3 text-sm font-semibold text-slate-900">松开即可导入 Excel</div>
+                  <div className="mt-1 text-xs text-slate-500">支持同时拖入多个文件</div>
+                </div>
+              </div>
+            )}
             <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
@@ -1051,7 +1155,7 @@ export default function HomePage() {
                 <input
                   ref={workbookImportInputRef}
                   type="file"
-                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  accept={EXCEL_IMPORT_ACCEPT}
                   className="hidden"
                   onChange={(event) => {
                     const file = event.target.files?.[0]
@@ -1072,7 +1176,7 @@ export default function HomePage() {
                 <input
                   ref={workbookFolderImportInputRef}
                   type="file"
-                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  accept={EXCEL_IMPORT_ACCEPT}
                   multiple
                   className="hidden"
                   {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}

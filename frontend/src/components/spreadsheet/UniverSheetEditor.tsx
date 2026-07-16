@@ -22,7 +22,7 @@ import { wsClient } from '@/lib/ws'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
-import ImportXlsxButton, { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
+import ImportXlsxButton, { ensureExcelDownloadFilename, EXCEL_IMPORT_FORMATS_LABEL, isSupportedExcelImportFile, uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import type { AuthUser, CellUpdate, ColumnDef, Department, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
 
 interface Props {
@@ -1736,7 +1736,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   const handleDroppedXlsxImport = useCallback(async (file: File) => {
     if (!canImportWorkbook) {
-      setActionError('Current account does not have permission to import XLSX.')
+      setActionError('当前账号没有导入 Excel 的权限。')
       return
     }
 
@@ -1795,12 +1795,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     event.preventDefault()
     dragDepthRef.current = 0
     setDragImportActive(false)
-    const xlsxFile = files.find((item) => item.name.toLowerCase().endsWith('.xlsx'))
-    if (!xlsxFile) {
-      setActionError('Only .xlsx files can be dropped here.')
+    const excelFile = files.find(isSupportedExcelImportFile)
+    if (!excelFile) {
+      setActionError(`请拖入 ${EXCEL_IMPORT_FORMATS_LABEL} 格式的文件。`)
       return
     }
-    void handleDroppedXlsxImport(xlsxFile)
+    void handleDroppedXlsxImport(excelFile)
   }, [canImportWorkbook, dragImportUploading, handleDroppedXlsxImport])
 
   const openCustomProtectionPanel = useCallback((options?: { showAll?: boolean }) => {
@@ -3175,7 +3175,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     try {
       const rawFallbackName = originalWorkbookXlsxFilename || latestSheetRef.current.name || '工作簿'
       const fallbackBase = sanitizeDownloadFilename(rawFallbackName)
-      const fallbackFilename = fallbackBase.toLowerCase().endsWith('.xlsx') ? fallbackBase : `${fallbackBase}.xlsx`
+      const fallbackFilename = ensureExcelDownloadFilename(fallbackBase)
       const response = await api.download(`/workbooks/${workbookId}/source/xlsx`)
       if (!response.ok) {
         let message = '下载原始 Excel 失败，请稍后再试。'
@@ -3547,10 +3547,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               <Columns3 className="h-6 w-6" />
             </div>
             <div className="mt-4 text-base font-semibold text-slate-900">
-              {dragImportUploading ? 'Importing XLSX...' : 'Drop XLSX file to import'}
+              {dragImportUploading ? '正在导入 Excel...' : '拖放 Excel 文件到这里导入'}
             </div>
             <div className="mt-2 text-sm leading-6 text-slate-500">
-              The file will be imported into this workbook and a new sheet will be created automatically.
+              导入后会在当前工作簿中自动创建新的工作表。
             </div>
             {dragImportUploading && (
               <div className="mx-auto mt-5 max-w-xs">

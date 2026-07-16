@@ -7,7 +7,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { Archive, ArchiveRestore, ArrowLeft, Check, Copy, Eye, EyeOff, FileSpreadsheet, Globe2, Lock, Maximize2, MessageCircle, Minimize2, PanelLeftClose, PanelLeftOpen, PencilLine, Plus, Search, Trash2, Unlock, X } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/whatsapp/WhatsAppSendDialog'
-import { uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
+import { EXCEL_IMPORT_FORMATS_LABEL, isSupportedExcelImportFile, uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import { useWorkbook } from '@/hooks/useSheet'
 import { usePermission } from '@/hooks/usePermission'
 import { useSheetWebSocket } from '@/hooks/useSheetWebSocket'
@@ -119,7 +119,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
 
   const handleSidebarDroppedXlsxImport = useCallback(async (file: File) => {
     if (!canManageWorkbook) {
-      setSheetActionError('Current account does not have permission to import XLSX.')
+      setSheetActionError('当前账号没有导入 Excel 的权限。')
       return
     }
 
@@ -178,12 +178,12 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
     event.preventDefault()
     sidebarDragDepthRef.current = 0
     setSidebarDragImportActive(false)
-    const xlsxFile = files.find((item) => item.name.toLowerCase().endsWith('.xlsx'))
-    if (!xlsxFile) {
-      setSheetActionError('Only .xlsx files can be dropped here.')
+    const excelFile = files.find(isSupportedExcelImportFile)
+    if (!excelFile) {
+      setSheetActionError(`请拖入 ${EXCEL_IMPORT_FORMATS_LABEL} 格式的文件。`)
       return
     }
-    void handleSidebarDroppedXlsxImport(xlsxFile)
+    void handleSidebarDroppedXlsxImport(excelFile)
   }, [canManageWorkbook, handleSidebarDroppedXlsxImport, sidebarDragImportUploading])
 
   const activeSheet = useMemo(() => {
@@ -873,7 +873,7 @@ export default function WorkbookEditorShell({ workbookId, requestedSheetId }: Pr
                       <FileSpreadsheet className="h-7 w-7" />
                     </div>
                     <div className="mt-4 text-sm font-semibold text-slate-900">
-                      {sidebarDragImportUploading ? '正在导入 XLSX...' : '将 XLSX 拖到这里导入到当前工作簿'}
+                      {sidebarDragImportUploading ? '正在导入 Excel...' : '将 Excel 文件拖到这里导入'}
                     </div>
                     <div className="mt-2 text-xs leading-5 text-slate-500">
                       导入后会自动创建工作表并跳转到新表。

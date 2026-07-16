@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,7 +75,7 @@ type workbookImportSheetSnapshot struct {
 	ColumnCount int
 }
 
-func (s *SheetImportService) ImportWorkbookXLSX(userID int64, file multipart.File, filename, requestedWorkbookName string, folderID *int64) (*WorkbookImportResult, error) {
+func (s *SheetImportService) ImportWorkbookXLSX(userID int64, file multipart.File, filename, requestedWorkbookName string, folderID *int64, source *SpreadsheetImportSource) (*WorkbookImportResult, error) {
 	data, err := io.ReadAll(file)
 	if err != nil {
 		return nil, fmt.Errorf("读取导入文件失败: %w", err)
@@ -84,7 +83,13 @@ func (s *SheetImportService) ImportWorkbookXLSX(userID int64, file multipart.Fil
 	if len(data) == 0 {
 		return nil, fmt.Errorf("导入文件为空")
 	}
-	return s.importWorkbookXLSXData(userID, data, filename, requestedWorkbookName, folderID)
+	sourceFilename := filename
+	sourceData := data
+	if source != nil {
+		sourceFilename = source.Filename
+		sourceData = source.Data
+	}
+	return s.importWorkbookXLSXData(userID, data, filename, sourceFilename, sourceData, requestedWorkbookName, folderID)
 }
 
 func (s *SheetImportService) ImportStoredWorkbookXLSX(userID, attachmentID int64, requestedWorkbookName string, folderID *int64) (*WorkbookImportResult, error) {
@@ -93,27 +98,27 @@ func (s *SheetImportService) ImportStoredWorkbookXLSX(userID, attachmentID int64
 		return nil, err
 	}
 	defer reader.Close()
-	if !strings.EqualFold(filepath.Ext(attachment.Filename), ".xlsx") {
-		return nil, fmt.Errorf("只有 XLSX 附件可以保存为工作簿")
+	if !IsNativeExcelImportFilename(attachment.Filename) {
+		return nil, fmt.Errorf("只有 XLSX、XLSM、XLTX 或 XLTM 附件可以保存为工作簿")
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, (20<<20)+1))
 	if err != nil {
 		return nil, fmt.Errorf("读取附件失败: %w", err)
 	}
 	if len(data) > 20<<20 {
-		return nil, fmt.Errorf("XLSX 附件不能超过 20MB")
+		return nil, fmt.Errorf("Excel 附件不能超过 20MB")
 	}
-	return s.importWorkbookXLSXData(userID, data, attachment.Filename, requestedWorkbookName, folderID)
+	return s.importWorkbookXLSXData(userID, data, attachment.Filename, attachment.Filename, data, requestedWorkbookName, folderID)
 }
 
-func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, filename, requestedWorkbookName string, folderID *int64) (*WorkbookImportResult, error) {
+func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, importFilename, sourceFilename string, sourceData []byte, requestedWorkbookName string, folderID *int64) (*WorkbookImportResult, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("导入文件为空")
 	}
 
-	xlsx, err := excelize.OpenReader(bytes.NewReader(data))
+	xlsx, err := openNativeExcelImportFile(data, importFilename)
 	if err != nil {
-		return nil, fmt.Errorf("解析 XLSX 失败: %w", err)
+		return nil, err
 	}
 	defer func() { _ = xlsx.Close() }()
 
@@ -126,16 +131,16 @@ func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, f
 	}
 
 	importedAt := time.Now().Format(time.RFC3339)
-	attachmentID, attachmentURL := s.storeImportedWorkbookAttachment(userID, filename, data)
-	workbookName := resolveImportedWorkbookName(requestedWorkbookName, filename)
-	description := fmt.Sprintf("由 Excel 文件 %s 导入", filepath.Base(filename))
+	attachmentID, attachmentURL := s.storeImportedWorkbookAttachment(userID, sourceFilename, sourceData)
+	workbookName := resolveImportedWorkbookName(requestedWorkbookName, sourceFilename)
+	description := fmt.Sprintf("由 Excel 文件 %s 导入", filepath.Base(sourceFilename))
 	metadata, err := json.Marshal(map[string]any{
 		"importSource": map[string]any{
-			"filename":       filename,
+			"filename":       sourceFilename,
 			"imported_at":    importedAt,
 			"attachment_id":  attachmentID,
 			"attachment_url": attachmentURL,
-			"mode":           "xlsx_univer_snapshot",
+			"mode":           "excel_univer_snapshot",
 		},
 	})
 	if err != nil {
@@ -168,7 +173,7 @@ func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, f
 			_ = s.sheetRepo.DeleteWorkbook(workbook.ID)
 			return nil, fmt.Errorf("序列化工作表列结构失败: %w", err)
 		}
-		configJSON, err := marshalWorkbookImportSheetConfig(filename, importedAt, attachmentID, attachmentURL, snapshot)
+		configJSON, err := marshalWorkbookImportSheetConfig(sourceFilename, importedAt, attachmentID, attachmentURL, snapshot)
 		if err != nil {
 			_ = s.sheetRepo.DeleteWorkbook(workbook.ID)
 			return nil, err
@@ -207,7 +212,7 @@ func (s *SheetImportService) storeImportedWorkbookAttachment(userID int64, filen
 	if s.uploadSvc == nil {
 		return nil, ""
 	}
-	attachment, url, err := s.uploadSvc.UploadBytes(filename, sheetExportContentType, data, userID)
+	attachment, url, err := s.uploadSvc.UploadBytes(filename, excelImportContentType(filename), data, userID)
 	if err != nil {
 		return nil, ""
 	}
@@ -249,7 +254,7 @@ func (s *SheetImportService) BuildWorkbookSourceXLSXFile(userID, workbookID int6
 	filename := normalizeWorkbookSourceXLSXFilename(source.Filename, workbook.Name)
 	contentType := strings.TrimSpace(attachment.MimeType)
 	if contentType == "" {
-		contentType = sheetExportContentType
+		contentType = excelImportContentType(filename)
 	}
 
 	return &WorkbookSourceXLSXFile{
@@ -317,7 +322,7 @@ func normalizeWorkbookSourceXLSXFilename(filename, workbookName string) string {
 		base = strings.TrimSpace(workbookName)
 	}
 	base = sanitizeDownloadFilename(base)
-	if !strings.EqualFold(filepath.Ext(base), ".xlsx") {
+	if !IsSupportedExcelImportFilename(base) {
 		base += ".xlsx"
 	}
 	return base
@@ -341,7 +346,7 @@ func marshalWorkbookImportSheetConfig(filename, importedAt string, attachmentID 
 			"imported_at":    importedAt,
 			"attachment_id":  attachmentID,
 			"attachment_url": attachmentURL,
-			"mode":           "xlsx_univer_snapshot",
+			"mode":           "excel_univer_snapshot",
 		},
 		"univerSheetData": snapshot.Worksheet,
 		"univerStyles":    snapshot.Styles,

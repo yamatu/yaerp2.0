@@ -343,7 +343,8 @@ func (s *AIService) addAttachmentContext(userID int64, assistant *activeAIAssist
 
 func readAIAttachmentText(filename, mimeType string, reader io.Reader) (string, error) {
 	lowerName := strings.ToLower(filename)
-	if strings.HasSuffix(lowerName, ".xlsx") || strings.Contains(strings.ToLower(mimeType), "spreadsheetml") {
+	lowerMimeType := strings.ToLower(mimeType)
+	if IsNativeExcelImportFilename(lowerName) || strings.Contains(lowerMimeType, "spreadsheetml") || strings.Contains(lowerMimeType, "macroenabled") {
 		workbook, err := excelize.OpenReader(reader)
 		if err != nil {
 			return "", fmt.Errorf("读取 Excel 文件失败: %w", err)
@@ -378,7 +379,7 @@ func readAIAttachmentText(filename, mimeType string, reader io.Reader) (string, 
 		strings.Contains(strings.ToLower(mimeType), "xml") ||
 		strings.HasSuffix(lowerName, ".csv") || strings.HasSuffix(lowerName, ".md") || strings.HasSuffix(lowerName, ".json")
 	if !allowedText {
-		return "", fmt.Errorf("暂不支持读取文件 %s；当前支持文本、CSV、JSON、XML 和 XLSX", filename)
+		return "", fmt.Errorf("暂不支持读取文件 %s；当前支持文本、CSV、JSON、XML、XLSX、XLSM、XLTX 和 XLTM", filename)
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, 2*1024*1024+1))
 	if err != nil {

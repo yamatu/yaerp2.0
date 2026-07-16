@@ -167,10 +167,13 @@ function canEditMessage(message: ChannelMessage, currentUserId: number | null) {
     && Date.now() - new Date(message.created_at).getTime() <= 3 * 60 * 1000
 }
 
-function isXlsxMessage(message: ChannelMessage) {
+function isExcelWorkbookMessage(message: ChannelMessage) {
+  const filename = message.attachment_filename?.toLowerCase() || ''
+  const mimeType = message.attachment_mime_type?.toLowerCase() || ''
   return Boolean(message.attachment_url && (
-    message.attachment_filename?.toLowerCase().endsWith('.xlsx')
-    || message.attachment_mime_type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    ['.xlsx', '.xlsm', '.xltx', '.xltm'].some((extension) => filename.endsWith(extension))
+    || mimeType.includes('spreadsheetml')
+    || mimeType.includes('macroenabled')
   ))
 }
 
@@ -1405,7 +1408,7 @@ export default function ChannelsPage() {
   }
 
   const handleImportWorkbook = async (message: ChannelMessage) => {
-    if (!isXlsxMessage(message) || message.linked_workbook_id || importingWorkbookMessageId) return
+    if (!isExcelWorkbookMessage(message) || message.linked_workbook_id || importingWorkbookMessageId) return
     setImportingWorkbookMessageId(message.id)
     setContextMenu(null)
     setError('')
@@ -2440,7 +2443,7 @@ export default function ChannelsPage() {
                                       </div>
                                       <ArrowRight className="h-4 w-4 shrink-0 text-slate-400" />
                                     </a>
-                                    {isXlsxMessage(message) && !message.linked_workbook_id && (
+                                    {isExcelWorkbookMessage(message) && !message.linked_workbook_id && (
                                       <button type="button" onClick={() => void handleImportWorkbook(message)} disabled={importingWorkbookMessageId === message.id} className="flex h-9 w-full items-center justify-center gap-2 border-t border-slate-100 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50">
                                         {importingWorkbookMessageId === message.id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Table2 className="h-3.5 w-3.5" />}
                                         {importingWorkbookMessageId === message.id ? '正在导入' : '保存为系统工作簿'}
@@ -3388,7 +3391,7 @@ export default function ChannelsPage() {
                     <button type="button" onClick={() => { const message = contextMenu.message; setContextMenu(null); if (message) void handleSaveImage(message, '') }} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-slate-700 hover:bg-slate-50"><Save className="h-4 w-4 text-slate-400" />保存到图库</button>
                   </>
                 )}
-                {!contextMenu.message.recalled_at && isXlsxMessage(contextMenu.message) && !contextMenu.message.linked_workbook_id && (
+                {!contextMenu.message.recalled_at && isExcelWorkbookMessage(contextMenu.message) && !contextMenu.message.linked_workbook_id && (
                   <button type="button" onClick={() => { const message = contextMenu.message; if (message) void handleImportWorkbook(message) }} disabled={importingWorkbookMessageId === contextMenu.message.id} className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-sm text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"><Table2 className="h-4 w-4" />保存为系统工作簿</button>
                 )}
                 {!contextMenu.message.recalled_at && contextMenu.message.sender_type !== 'whatsapp' && (

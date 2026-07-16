@@ -36,6 +36,84 @@ interface Props {
   onError?: (message: string) => void
 }
 
+export const EXCEL_IMPORT_EXTENSIONS = ['.xlsx', '.xlsm', '.xls', '.xltx', '.xltm'] as const
+export const EXCEL_IMPORT_FORMATS_LABEL = 'XLSX、XLSM、XLS、XLTX、XLTM'
+export const EXCEL_IMPORT_ACCEPT = [
+  ...EXCEL_IMPORT_EXTENSIONS,
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel.sheet.macroEnabled.12',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.template',
+  'application/vnd.ms-excel.template.macroEnabled.12',
+].join(',')
+
+const EXCEL_IMPORT_MAX_BYTES = 20 * 1024 * 1024
+
+export function getExcelImportExtension(filename: string) {
+  const normalized = filename.trim().toLowerCase()
+  return EXCEL_IMPORT_EXTENSIONS.find((extension) => normalized.endsWith(extension)) || null
+}
+
+export function isSupportedExcelImportFile(file: Pick<File, 'name'>) {
+  return getExcelImportExtension(file.name) !== null
+}
+
+export function stripExcelImportExtension(filename: string) {
+  const extension = getExcelImportExtension(filename)
+  return extension ? filename.slice(0, -extension.length) : filename
+}
+
+export function ensureExcelDownloadFilename(filename: string) {
+  return getExcelImportExtension(filename) ? filename : `${filename}.xlsx`
+}
+
+async function prepareExcelImportUpload(file: File) {
+  const extension = getExcelImportExtension(file.name)
+  if (!extension) {
+    throw new Error(`仅支持 ${EXCEL_IMPORT_FORMATS_LABEL} 格式。`)
+  }
+  if (file.size > EXCEL_IMPORT_MAX_BYTES) {
+    throw new Error('文件大小不能超过 20MB。')
+  }
+  if (extension !== '.xls') {
+    return { importFile: file, sourceFile: null as File | null }
+  }
+
+  try {
+    const XLSX = await import('xlsx')
+    const source = await file.arrayBuffer()
+    const workbook = XLSX.read(source, {
+      type: 'array',
+      cellDates: true,
+      cellFormula: true,
+      cellStyles: true,
+    })
+    if (workbook.SheetNames.length === 0) {
+      throw new Error('文件中没有可导入的工作表。')
+    }
+    const converted = XLSX.write(workbook, {
+      type: 'array',
+      bookType: 'xlsx',
+      compression: true,
+      cellStyles: true,
+    }) as ArrayBuffer
+    const importFile = new File(
+      [converted],
+      `${stripExcelImportExtension(file.name)}.xlsx`,
+      { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    )
+    if (importFile.size > EXCEL_IMPORT_MAX_BYTES) {
+      throw new Error('旧版 Excel 转换后超过 20MB，无法导入。')
+    }
+    return { importFile, sourceFile: file }
+  } catch (error) {
+    if (error instanceof Error && (error.message.includes('20MB') || error.message.includes('工作表'))) {
+      throw error
+    }
+    throw new Error('无法解析该 XLS 文件，请确认文件未损坏或未加密。')
+  }
+}
+
 function parseFilenameFromDisposition(disposition: string | null, fallback: string) {
   if (!disposition) return fallback
 
@@ -68,16 +146,14 @@ export async function uploadWorkbookXlsx(
   file: File,
   options: UploadWorkbookXlsxOptions = {}
 ) {
-  if (!file.name.toLowerCase().endsWith('.xlsx')) {
-    throw new Error('Only .xlsx files are supported.')
-  }
-  if (file.size > 20 * 1024 * 1024) {
-    throw new Error('File size must be 20MB or smaller.')
-  }
+  const prepared = await prepareExcelImportUpload(file)
 
   const token = typeof window === 'undefined' ? null : localStorage.getItem('access_token')
   const formData = new FormData()
-  formData.append('file', file)
+  formData.append('file', prepared.importFile)
+  if (prepared.sourceFile) {
+    formData.append('source_file', prepared.sourceFile)
+  }
   options.onProgress?.(0)
 
   const responseText = await new Promise<string>((resolve, reject) => {
@@ -114,16 +190,14 @@ export async function uploadNewWorkbookXlsx(
   file: File,
   options: UploadWorkbookXlsxOptions = {}
 ) {
-  if (!file.name.toLowerCase().endsWith('.xlsx')) {
-    throw new Error('Only .xlsx files are supported.')
-  }
-  if (file.size > 20 * 1024 * 1024) {
-    throw new Error('File size must be 20MB or smaller.')
-  }
+  const prepared = await prepareExcelImportUpload(file)
 
   const token = typeof window === 'undefined' ? null : localStorage.getItem('access_token')
   const formData = new FormData()
-  formData.append('file', file)
+  formData.append('file', prepared.importFile)
+  if (prepared.sourceFile) {
+    formData.append('source_file', prepared.sourceFile)
+  }
   if (options.folderId !== undefined && options.folderId !== null) {
     formData.append('folder_id', String(options.folderId))
   }
@@ -203,7 +277,7 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
 
   const handleFileUpload = async (file: File) => {
     if (!canImport) {
-      reportError('Current account does not have permission to import XLSX.')
+      reportError('当前账号没有导入 Excel 的权限。')
       return
     }
 
@@ -257,7 +331,7 @@ export default function ImportXlsxButton({ workbookId, canImport, onImported, on
           <input
             ref={inputRef}
             type="file"
-            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            accept={EXCEL_IMPORT_ACCEPT}
             className="hidden"
             onChange={(event) => {
               const file = event.target.files?.[0]

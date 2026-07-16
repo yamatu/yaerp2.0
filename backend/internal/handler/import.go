@@ -3,9 +3,9 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -41,8 +41,13 @@ func (h *ImportHandler) ImportWorkbookXLSX(c *gin.Context) {
 		response.BadRequest(c, "file size must be <= 20MB")
 		return
 	}
-	if !strings.EqualFold(filepath.Ext(header.Filename), ".xlsx") {
-		response.BadRequest(c, "only .xlsx files are supported")
+	if !service.IsNativeExcelImportFilename(header.Filename) {
+		response.BadRequest(c, "only .xlsx, .xlsm, .xltx and .xltm files are supported")
+		return
+	}
+	source, err := readLegacyExcelImportSource(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
 		return
 	}
 
@@ -56,7 +61,7 @@ func (h *ImportHandler) ImportWorkbookXLSX(c *gin.Context) {
 		folderID = &parsedFolderID
 	}
 
-	result, err := h.importService.ImportWorkbookXLSX(userID, file, header.Filename, c.PostForm("workbook_name"), folderID)
+	result, err := h.importService.ImportWorkbookXLSX(userID, file, header.Filename, c.PostForm("workbook_name"), folderID, source)
 	if err != nil {
 		var importErr *service.SheetImportError
 		if errors.As(err, &importErr) {
@@ -128,12 +133,17 @@ func (h *ImportHandler) ImportXLSX(c *gin.Context) {
 		response.BadRequest(c, "file size must be <= 20MB")
 		return
 	}
-	if !strings.EqualFold(filepath.Ext(header.Filename), ".xlsx") {
-		response.BadRequest(c, "only .xlsx files are supported")
+	if !service.IsNativeExcelImportFilename(header.Filename) {
+		response.BadRequest(c, "only .xlsx, .xlsm, .xltx and .xltm files are supported")
+		return
+	}
+	source, err := readLegacyExcelImportSource(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
 		return
 	}
 
-	result, err := h.importService.ImportXLSX(userID, workbookID, file, header.Filename, c.PostForm("sheet_name"))
+	result, err := h.importService.ImportXLSX(userID, workbookID, file, header.Filename, c.PostForm("sheet_name"), source)
 	if err != nil {
 		var importErr *service.SheetImportError
 		if errors.As(err, &importErr) {
@@ -157,6 +167,36 @@ func (h *ImportHandler) ImportXLSX(c *gin.Context) {
 		"attachment_id":  result.AttachmentID,
 		"attachment_url": result.AttachmentURL,
 	})
+}
+
+func readLegacyExcelImportSource(c *gin.Context) (*service.SpreadsheetImportSource, error) {
+	file, header, err := c.Request.FormFile("source_file")
+	if errors.Is(err, http.ErrMissingFile) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("invalid source file")
+	}
+	defer file.Close()
+
+	if !service.IsLegacyExcelImportFilename(header.Filename) {
+		return nil, fmt.Errorf("source file must use the .xls format")
+	}
+	if header.Size <= 0 {
+		return nil, fmt.Errorf("source file is empty")
+	}
+	if header.Size > 20<<20 {
+		return nil, fmt.Errorf("source file size must be <= 20MB")
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, (20<<20)+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read source file")
+	}
+	if len(data) > 20<<20 {
+		return nil, fmt.Errorf("source file size must be <= 20MB")
+	}
+	return &service.SpreadsheetImportSource{Filename: header.Filename, Data: data}, nil
 }
 
 func (h *ImportHandler) DownloadTemplate(c *gin.Context) {
