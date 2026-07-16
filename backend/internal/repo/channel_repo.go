@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/lib/pq"
+
 	"yaerp/internal/model"
 )
 
@@ -1039,29 +1041,120 @@ func (r *ChannelRepo) IsGalleryImage(attachmentID int64) (bool, error) {
 }
 
 func (r *ChannelRepo) CanManageGalleryImage(attachmentID, userID int64) (bool, error) {
-	var allowed bool
+	count, err := r.CountManageableGalleryImages([]int64{attachmentID}, userID)
+	return count == 1, err
+}
+
+func (r *ChannelRepo) CountManageableGalleryImages(attachmentIDs []int64, userID int64) (int64, error) {
+	if len(attachmentIDs) == 0 {
+		return 0, nil
+	}
+	var count int64
 	err := r.db.QueryRow(
-		`SELECT EXISTS(
-			SELECT 1
-			  FROM attachments a
-			 WHERE a.id = $1
-			   AND (
-			       a.uploader_id = $2
-			       OR EXISTS (
-			           SELECT 1
-			             FROM gallery_images gi
-			             LEFT JOIN gallery_directories gd ON gd.id = gi.directory_id
-			             LEFT JOIN channels c ON c.id = COALESCE(gi.channel_id, gd.channel_id)
-			            WHERE gi.attachment_id = a.id
-			              AND (gi.saved_by = $2 OR gd.owner_id = $2 OR c.owner_id = $2
-			                  OR EXISTS (SELECT 1 FROM gallery_directory_permissions gdp WHERE gdp.directory_id = gd.id AND gdp.user_id = $2 AND gdp.can_edit)
-			                  OR (gd.visibility = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2)))
-			       )
-			   )
-		)`,
-		attachmentID, userID,
-	).Scan(&allowed)
-	return allowed, err
+		`SELECT COUNT(DISTINCT a.id)
+		   FROM attachments a
+		  WHERE a.id = ANY($1)
+		    AND EXISTS (SELECT 1 FROM gallery_images source_gi WHERE source_gi.attachment_id = a.id)
+		    AND (
+		        a.uploader_id = $2
+		        OR EXISTS (
+		            SELECT 1
+		              FROM user_roles ur
+		              JOIN roles role ON role.id = ur.role_id
+		             WHERE ur.user_id = $2 AND role.code = 'admin'
+		               AND EXISTS (
+		                   SELECT 1
+		                     FROM gallery_images admin_gi
+		                     LEFT JOIN gallery_directories admin_gd ON admin_gd.id = admin_gi.directory_id
+		                    WHERE admin_gi.attachment_id = a.id
+		                      AND (
+		                          COALESCE(admin_gi.channel_id, admin_gd.channel_id) IS NULL
+		                          OR EXISTS (
+		                              SELECT 1 FROM channel_members admin_cm
+		                               WHERE admin_cm.channel_id = COALESCE(admin_gi.channel_id, admin_gd.channel_id)
+		                                 AND admin_cm.user_id = $2
+		                          )
+		                      )
+		               )
+		        )
+		        OR EXISTS (
+		            SELECT 1
+		              FROM gallery_images gi
+		              LEFT JOIN gallery_directories gd ON gd.id = gi.directory_id
+		              LEFT JOIN channels c ON c.id = COALESCE(gi.channel_id, gd.channel_id)
+		             WHERE gi.attachment_id = a.id
+		               AND (
+		                   gi.saved_by = $2 OR gd.owner_id = $2 OR c.owner_id = $2
+		                   OR EXISTS (
+		                       SELECT 1 FROM gallery_directory_permissions gdp
+		                        WHERE gdp.directory_id = gd.id AND gdp.user_id = $2 AND gdp.can_edit
+		                   )
+		                   OR (gd.visibility = 'channel' AND EXISTS (
+		                       SELECT 1 FROM channel_members cm
+		                        WHERE cm.channel_id = gd.channel_id AND cm.user_id = $2
+		                   ))
+		               )
+		        )
+		    )`,
+		pq.Array(attachmentIDs), userID,
+	).Scan(&count)
+	return count, err
+}
+
+func (r *ChannelRepo) MoveGalleryImages(attachmentIDs []int64, directoryID, savedBy int64) (int64, int64, error) {
+	if len(attachmentIDs) == 0 {
+		return 0, 0, nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM gallery_images WHERE attachment_id = ANY($1)`, pq.Array(attachmentIDs)); err != nil {
+		return 0, 0, err
+	}
+	inserted, err := tx.Exec(
+		`INSERT INTO gallery_images (attachment_id, directory_id, channel_id, saved_by, created_at)
+		 SELECT selected.attachment_id, $2, NULL, $3, NOW()
+		   FROM unnest($1::bigint[]) AS selected(attachment_id)`,
+		pq.Array(attachmentIDs), directoryID, savedBy,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	movedCount, err := inserted.RowsAffected()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	deduplicated, err := tx.Exec(
+		`WITH ranked AS (
+		    SELECT gi.id,
+		           ROW_NUMBER() OVER (PARTITION BY a.content_hash ORDER BY gi.created_at, gi.id) AS duplicate_rank
+		      FROM gallery_images gi
+		      JOIN attachments a ON a.id = gi.attachment_id
+		     WHERE gi.directory_id = $1 AND COALESCE(a.content_hash, '') <> ''
+		)
+		DELETE FROM gallery_images gi
+		 USING ranked r
+		 WHERE gi.id = r.id AND r.duplicate_rank > 1`,
+		directoryID,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	duplicatesRemoved, err := deduplicated.RowsAffected()
+	if err != nil {
+		return 0, 0, err
+	}
+	if _, err := tx.Exec(`UPDATE gallery_directories SET updated_at = NOW() WHERE id = $1`, directoryID); err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return movedCount, duplicatesRemoved, nil
 }
 
 func (r *ChannelRepo) CanAccessGalleryImage(attachmentID, userID int64) (bool, error) {

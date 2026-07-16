@@ -349,6 +349,7 @@ export interface GalleryImage {
   created_at: string
   url: string
   thumbnail_url?: string
+  can_manage: boolean
 }
 
 export interface Channel {

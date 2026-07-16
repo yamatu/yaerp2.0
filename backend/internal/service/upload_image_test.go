@@ -91,3 +91,26 @@ func TestNormalizeThumbnailSize(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeGalleryMoveAttachmentIDs(t *testing.T) {
+	ids, err := normalizeGalleryMoveAttachmentIDs([]int64{8, 3, 8, 5})
+	if err != nil {
+		t.Fatalf("normalizeGalleryMoveAttachmentIDs() error = %v", err)
+	}
+	want := []int64{8, 3, 5}
+	if len(ids) != len(want) {
+		t.Fatalf("normalized IDs = %v, want %v", ids, want)
+	}
+	for index := range want {
+		if ids[index] != want[index] {
+			t.Fatalf("normalized IDs = %v, want %v", ids, want)
+		}
+	}
+
+	if _, err := normalizeGalleryMoveAttachmentIDs(nil); err == nil {
+		t.Fatal("expected empty selection to be rejected")
+	}
+	if _, err := normalizeGalleryMoveAttachmentIDs([]int64{1, 0}); err == nil {
+		t.Fatal("expected invalid attachment ID to be rejected")
+	}
+}

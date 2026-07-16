@@ -965,14 +965,22 @@ func (s *ChannelService) RenameGalleryImage(userID, attachmentID int64, filename
 	if utf8.RuneCountInString(cleaned) > 255 {
 		return nil, fmt.Errorf("图片名称不能超过 255 个字符")
 	}
-	return s.uploadSvc.RenameAttachment(attachmentID, cleaned)
+	result, err := s.uploadSvc.RenameAttachment(attachmentID, cleaned)
+	if result != nil {
+		result.CanManage = true
+	}
+	return result, err
 }
 
 func (s *ChannelService) ReplaceGalleryImage(userID, attachmentID int64, file multipart.File, header *multipart.FileHeader) (*AttachmentWithURL, error) {
 	if err := s.requireGalleryImageManage(userID, attachmentID, ErrGalleryImageEditDenied); err != nil {
 		return nil, err
 	}
-	return s.uploadSvc.ReplaceImageContent(attachmentID, file, header)
+	result, err := s.uploadSvc.ReplaceImageContent(attachmentID, file, header)
+	if result != nil {
+		result.CanManage = true
+	}
+	return result, err
 }
 
 func (s *ChannelService) ReplaceMessageImage(userID, channelID, messageID int64, file multipart.File, header *multipart.FileHeader) (*model.ChannelMessage, error) {

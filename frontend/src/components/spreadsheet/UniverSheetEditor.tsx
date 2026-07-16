@@ -3638,7 +3638,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
       {onlineCollaborators.length > 0 && (
-        <div className="absolute right-3 top-14 z-[22] w-[min(20rem,calc(100%-1.5rem))]">
+        <div className="absolute right-14 top-14 z-[22] w-[min(20rem,calc(100%-4.5rem))]">
           <button type="button" onClick={() => setPresenceExpanded((current) => !current)} className="ml-auto flex min-h-10 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
             <UserRoundCheck className="h-4 w-4 shrink-0 text-emerald-600" />
             <div className="flex -space-x-1.5">

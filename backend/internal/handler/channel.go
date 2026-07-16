@@ -710,6 +710,20 @@ func (h *ChannelHandler) UploadGalleryImage(c *gin.Context) {
 	response.OK(c, gin.H{"attachment": attachment, "url": url, "duplicate": duplicate})
 }
 
+func (h *ChannelHandler) MoveGalleryImages(c *gin.Context) {
+	var req model.GalleryImagesMoveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.uploadService.MoveGalleryImages(c.GetInt64("user_id"), &req)
+	if err != nil {
+		respondChannelError(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *ChannelHandler) RenameGalleryImage(c *gin.Context) {
 	attachmentID, err := parseIDParam(c, "id")
 	if err != nil {
@@ -752,7 +766,7 @@ func (h *ChannelHandler) ReplaceGalleryImage(c *gin.Context) {
 
 func respondChannelError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, service.ErrChannelAccessDenied), errors.Is(err, service.ErrChannelManageDenied), errors.Is(err, service.ErrGalleryImageRenameDenied), errors.Is(err, service.ErrGalleryImageEditDenied), errors.Is(err, service.ErrMessageImageEditDenied), errors.Is(err, service.ErrMessageRecallDenied), errors.Is(err, service.ErrMessageEditDenied):
+	case errors.Is(err, service.ErrChannelAccessDenied), errors.Is(err, service.ErrChannelManageDenied), errors.Is(err, service.ErrGalleryImageRenameDenied), errors.Is(err, service.ErrGalleryImageEditDenied), errors.Is(err, service.ErrGalleryImageMoveDenied), errors.Is(err, service.ErrGalleryDirectoryEditDenied), errors.Is(err, service.ErrMessageImageEditDenied), errors.Is(err, service.ErrMessageRecallDenied), errors.Is(err, service.ErrMessageEditDenied):
 		response.Forbidden(c, err.Error())
 	default:
 		response.Error(c, http.StatusBadRequest, err.Error())

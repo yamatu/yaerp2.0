@@ -1,11 +1,13 @@
 'use client'
 
-import { useEffect, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react'
+import { useEffect, useState, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react'
 import {
   ArrowLeft,
+  Check,
   Download,
   FlipHorizontal2,
   FlipVertical2,
+  FolderInput,
   FolderPlus,
   Globe2,
   ImagePlus,
@@ -29,6 +31,12 @@ import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
 import type { AuthUser, GalleryDirectory, GalleryDirectoryAccess, GalleryImage, User } from '@/types'
+
+interface GalleryImagesMoveResult {
+  directory_id: number
+  moved_count: number
+  duplicates_removed: number
+}
 
 export default function GalleryPage() {
   const [images, setImages] = useState<GalleryImage[]>([])
@@ -57,6 +65,12 @@ export default function GalleryPage() {
   const [loadingAccess, setLoadingAccess] = useState(false)
   const [savingAccess, setSavingAccess] = useState(false)
   const [accessError, setAccessError] = useState('')
+  const [selectedImageIds, setSelectedImageIds] = useState<number[]>([])
+  const [moveDirectoryId, setMoveDirectoryId] = useState('')
+  const [movingImages, setMovingImages] = useState(false)
+  const [selectingAllImages, setSelectingAllImages] = useState(false)
+  const [moveError, setMoveError] = useState('')
+  const [moveNotice, setMoveNotice] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [whatsAppResource, setWhatsAppResource] = useState<WhatsAppSendResource | null>(null)
 
@@ -64,6 +78,10 @@ export default function GalleryPage() {
   const admin = isAdmin(profile)
   const pageSize = 20
   const selectedDirectory = directories.find((directory) => String(directory.id) === selectedDirectoryId) || null
+  const selectedImageIdSet = useMemo(() => new Set(selectedImageIds), [selectedImageIds])
+  const movablePageImageIds = useMemo(() => images.filter((image) => image.can_manage).map((image) => image.id), [images])
+  const allMovablePageImagesSelected = movablePageImageIds.length > 0 && movablePageImageIds.every((id) => selectedImageIdSet.has(id))
+  const editableMoveDirectories = useMemo(() => directories.filter((directory) => directory.can_edit && String(directory.id) !== selectedDirectoryId), [directories, selectedDirectoryId])
   const filteredAccessUsers = accessUsers.filter((user) => {
     const keyword = accessUserSearch.trim().toLowerCase()
     return !keyword || user.username.toLowerCase().includes(keyword) || user.email.toLowerCase().includes(keyword)
@@ -78,12 +96,16 @@ export default function GalleryPage() {
     }
   }, [])
 
+  const galleryImagesPath = useCallback((targetPage: number, size: number) => {
+    const directoryParam = selectedDirectoryId ? `&directory_id=${selectedDirectoryId}` : ''
+    return `/attachments/images?page=${targetPage}&size=${size}${directoryParam}`
+  }, [selectedDirectoryId])
+
   const fetchImages = useCallback(async (p: number) => {
     setLoading(true)
     try {
-      const directoryParam = selectedDirectoryId ? `&directory_id=${selectedDirectoryId}` : ''
       const res = await api.get<{ list: GalleryImage[]; total: number; page: number; size: number }>(
-        `/attachments/images?page=${p}&size=${pageSize}${directoryParam}`
+        galleryImagesPath(p, pageSize)
       )
       if (res.code === 0 && res.data) {
         setImages(res.data.list || [])
@@ -94,7 +116,7 @@ export default function GalleryPage() {
     } finally {
       setLoading(false)
     }
-  }, [selectedDirectoryId])
+  }, [galleryImagesPath])
 
   useEffect(() => {
     fetchImages(page)
@@ -103,6 +125,13 @@ export default function GalleryPage() {
   useEffect(() => {
     fetchDirectories()
   }, [fetchDirectories])
+
+  useEffect(() => {
+    setSelectedImageIds([])
+    setMoveDirectoryId('')
+    setMoveError('')
+    setMoveNotice('')
+  }, [selectedDirectoryId])
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
@@ -169,11 +198,100 @@ export default function GalleryPage() {
     setDeleting(id)
     try {
       await api.delete(`/attachments/${id}`)
+      setSelectedImageIds((current) => current.filter((imageId) => imageId !== id))
       await fetchImages(page)
     } catch (err) {
       console.error('Delete failed:', err)
     } finally {
       setDeleting(null)
+    }
+  }
+
+  const toggleImageSelection = (image: GalleryImage) => {
+    if (!image.can_manage || movingImages) return
+    setMoveError('')
+    setMoveNotice('')
+    setSelectedImageIds((current) => current.includes(image.id)
+      ? current.filter((id) => id !== image.id)
+      : [...current, image.id])
+  }
+
+  const toggleCurrentPageSelection = () => {
+    if (movablePageImageIds.length === 0 || movingImages) return
+    setMoveError('')
+    setMoveNotice('')
+    setSelectedImageIds((current) => {
+      const next = new Set(current)
+      if (allMovablePageImagesSelected) {
+        movablePageImageIds.forEach((id) => next.delete(id))
+      } else {
+        movablePageImageIds.forEach((id) => next.add(id))
+      }
+      return Array.from(next)
+    })
+  }
+
+  const selectAllMovableImages = async () => {
+    if (selectingAllImages || movingImages || total === 0) return
+    setSelectingAllImages(true)
+    setMoveError('')
+    setMoveNotice('')
+    try {
+      const ids: number[] = []
+      let targetPage = 1
+      let expectedTotal = total
+      do {
+        const res = await api.get<{ list: GalleryImage[]; total: number; page: number; size: number }>(galleryImagesPath(targetPage, 100))
+        if (res.code !== 0 || !res.data) {
+          throw new Error(res.message || '读取图库图片失败')
+        }
+        expectedTotal = res.data.total
+        res.data.list.forEach((image) => {
+          if (image.can_manage && ids.length < 5000) ids.push(image.id)
+        })
+        targetPage += 1
+      } while ((targetPage - 1) * 100 < expectedTotal && ids.length < 5000)
+      setSelectedImageIds(Array.from(new Set(ids)))
+      if (ids.length >= 5000 && expectedTotal > ids.length) {
+        setMoveNotice(`单次最多移动 5000 张图片，已选择前 ${ids.length} 张可移动图片。`)
+      } else if (ids.length < expectedTotal) {
+        setMoveNotice(`已选择 ${ids.length} 张可移动图片，另有 ${expectedTotal - ids.length} 张仅可查看。`)
+      }
+    } catch (error) {
+      setMoveError(error instanceof Error ? error.message : '全选图片失败')
+    } finally {
+      setSelectingAllImages(false)
+    }
+  }
+
+  const handleMoveImages = async () => {
+    if (selectedImageIds.length === 0 || !moveDirectoryId || movingImages) return
+    const targetDirectory = directories.find((directory) => String(directory.id) === moveDirectoryId)
+    if (!targetDirectory?.can_edit) {
+      setMoveError('请选择有编辑权限的目标目录')
+      return
+    }
+    setMovingImages(true)
+    setMoveError('')
+    setMoveNotice('')
+    try {
+      const res = await api.put<GalleryImagesMoveResult>('/gallery/images/move', {
+        attachment_ids: selectedImageIds,
+        directory_id: targetDirectory.id,
+      })
+      if (res.code !== 0 || !res.data) {
+        setMoveError(res.message || '移动图片失败')
+        return
+      }
+      const movedCount = res.data.moved_count - res.data.duplicates_removed
+      setMoveNotice(`已将 ${Math.max(0, movedCount)} 张图片移动到「${targetDirectory.name}」${res.data.duplicates_removed > 0 ? `，并合并 ${res.data.duplicates_removed} 张重复图片` : ''}。`)
+      setSelectedImageIds([])
+      setMoveDirectoryId('')
+      await Promise.all([fetchImages(page), fetchDirectories()])
+    } catch {
+      setMoveError('移动图片失败')
+    } finally {
+      setMovingImages(false)
     }
   }
 
@@ -297,7 +415,11 @@ export default function GalleryPage() {
 
   const downloadURL = (image: GalleryImage) => `${image.url}${image.url.includes('?') ? '&' : '?'}download=1`
 
-  const totalPages = Math.ceil(total / pageSize)
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  useEffect(() => {
+    if (!loading && page > totalPages) setPage(totalPages)
+  }, [loading, page, totalPages])
 
   return (
     <AuthGuard>
@@ -404,6 +526,73 @@ export default function GalleryPage() {
             {directoryError && <div className="md:col-span-full rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{directoryError}</div>}
           </div>
 
+          {(images.length > 0 || selectedImageIds.length > 0) && (
+            <div className="mb-5 flex flex-col gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleCurrentPageSelection}
+                  disabled={movablePageImageIds.length === 0 || movingImages}
+                  className={`inline-flex h-9 items-center gap-2 rounded-lg border px-3 text-sm font-medium transition ${allMovablePageImagesSelected ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} disabled:cursor-not-allowed disabled:opacity-40`}
+                >
+                  <span className={`flex h-4 w-4 items-center justify-center rounded border ${allMovablePageImagesSelected ? 'border-sky-500 bg-sky-500 text-white' : 'border-slate-300'}`}>
+                    {allMovablePageImagesSelected && <Check className="h-3 w-3" />}
+                  </span>
+                  {allMovablePageImagesSelected ? '取消本页' : '全选本页'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void selectAllMovableImages()}
+                  disabled={selectingAllImages || movingImages || total === 0}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {selectingAllImages ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Images className="h-4 w-4" />}
+                  {selectingAllImages ? '正在全选...' : selectedDirectory ? '全选当前目录' : '全选全部图片'}
+                </button>
+                <span className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold ${selectedImageIds.length > 0 ? 'bg-sky-50 text-sky-700' : 'bg-slate-100 text-slate-500'}`}>
+                  已选 {selectedImageIds.length} 张
+                </span>
+              </div>
+
+              <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+                <select
+                  value={moveDirectoryId}
+                  onChange={(event) => { setMoveDirectoryId(event.target.value); setMoveError(''); setMoveNotice('') }}
+                  disabled={editableMoveDirectories.length === 0 || movingImages}
+                  className="h-9 min-w-0 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300 sm:w-56"
+                  aria-label="选择图片目标目录"
+                >
+                  <option value="">选择目标目录</option>
+                  {editableMoveDirectories.map((directory) => (
+                    <option key={directory.id} value={directory.id}>{directory.channel_id ? '频道 / ' : ''}{directory.name}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => void handleMoveImages()}
+                  disabled={selectedImageIds.length === 0 || !moveDirectoryId || movingImages}
+                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {movingImages ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FolderInput className="h-4 w-4" />}
+                  {movingImages ? '移动中...' : '移动图片'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setSelectedImageIds([]); setMoveDirectoryId(''); setMoveError(''); setMoveNotice('') }}
+                  disabled={selectedImageIds.length === 0 || movingImages}
+                  className="inline-flex h-9 w-9 shrink-0 self-end items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition hover:bg-slate-50 hover:text-slate-700 disabled:opacity-40 sm:self-auto"
+                  title="清除图片选择"
+                  aria-label="清除图片选择"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {moveError && <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{moveError}</div>}
+          {moveNotice && <div className="mb-4 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{moveNotice}</div>}
+
           {/* Grid */}
           {loading && images.length === 0 ? (
             <div className="flex min-h-[400px] items-center justify-center">
@@ -434,11 +623,18 @@ export default function GalleryPage() {
                 {images.map((img) => (
                   <div
                     key={img.id}
-                    className="group relative overflow-hidden rounded-lg border border-slate-200/80 bg-white shadow-sm transition hover:border-sky-200 hover:shadow-md"
+                    className={`group relative overflow-hidden rounded-lg border bg-white shadow-sm transition hover:shadow-md ${selectedImageIdSet.has(img.id) ? 'border-sky-400 ring-2 ring-sky-100' : 'border-slate-200/80 hover:border-sky-200'}`}
                   >
-                    <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600" title="重命名图片">
+                    {img.can_manage ? (
+                      <button type="button" onClick={() => toggleImageSelection(img)} className={`absolute left-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg border shadow-sm transition ${selectedImageIdSet.has(img.id) ? 'border-sky-500 bg-sky-500 text-white' : 'border-white/80 bg-white/95 text-slate-400 hover:text-sky-600'}`} title={selectedImageIdSet.has(img.id) ? '取消选择图片' : '选择图片'} aria-label={`${selectedImageIdSet.has(img.id) ? '取消选择' : '选择'} ${img.filename}`}>
+                        {selectedImageIdSet.has(img.id) && <Check className="h-4 w-4" />}
+                      </button>
+                    ) : (
+                      <span className="absolute left-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-400 shadow-sm" title="仅可查看，不能移动"><LockKeyhole className="h-3.5 w-3.5" /></span>
+                    )}
+                    {img.can_manage && <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600" title="重命名图片">
                       <Pencil className="h-3.5 w-3.5" />
-                    </button>
+                    </button>}
                     <button type="button" onClick={() => { setPreview(img); setTransformError('') }} className="block aspect-square w-full overflow-hidden bg-slate-100 text-left" title="查看图片">
                       <img
                         src={img.thumbnail_url || imageThumbnailUrl(img.url, 320)}

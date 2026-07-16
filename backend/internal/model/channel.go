@@ -256,6 +256,17 @@ type GalleryImageRenameRequest struct {
 	Filename string `json:"filename" binding:"required"`
 }
 
+type GalleryImagesMoveRequest struct {
+	AttachmentIDs []int64 `json:"attachment_ids" binding:"required,min=1"`
+	DirectoryID   int64   `json:"directory_id" binding:"required"`
+}
+
+type GalleryImagesMoveResult struct {
+	DirectoryID       int64 `json:"directory_id"`
+	MovedCount        int64 `json:"moved_count"`
+	DuplicatesRemoved int64 `json:"duplicates_removed"`
+}
+
 type WhatsAppSettings struct {
 	Enabled                 bool   `json:"enabled"`
 	AutoStart               bool   `json:"auto_start"`

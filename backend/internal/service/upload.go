@@ -34,7 +34,11 @@ type UploadService struct {
 	fileURLSecret  string
 }
 
-var ErrInvalidFileSignature = errors.New("invalid file signature")
+var (
+	ErrInvalidFileSignature       = errors.New("invalid file signature")
+	ErrGalleryImageMoveDenied     = errors.New("没有权限移动选中的图库图片")
+	ErrGalleryDirectoryEditDenied = errors.New("没有目标图库目录的编辑权限")
+)
 
 const maxReplacementImageBytes int64 = 40 << 20
 
@@ -118,6 +122,7 @@ type AttachmentWithURL struct {
 	model.Attachment
 	URL          string `json:"url"`
 	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	CanManage    bool   `json:"can_manage"`
 }
 
 func (s *UploadService) GetAttachment(id int64) (*model.Attachment, error) {
@@ -193,8 +198,23 @@ func (s *UploadService) ListImagesFiltered(userID int64, page, size int, directo
 	}
 
 	result := make([]*AttachmentWithURL, 0, len(list))
+	allManageable := false
+	if s.channelRepo != nil && len(list) > 0 {
+		attachmentIDs := make([]int64, 0, len(list))
+		for _, attachment := range list {
+			attachmentIDs = append(attachmentIDs, attachment.ID)
+		}
+		if count, countErr := s.channelRepo.CountManageableGalleryImages(attachmentIDs, userID); countErr == nil {
+			allManageable = count == int64(len(list))
+		}
+	}
 	for _, a := range list {
-		result = append(result, s.attachmentWithURLs(a))
+		item := s.attachmentWithURLs(a)
+		item.CanManage = allManageable
+		if s.channelRepo != nil && !allManageable {
+			item.CanManage, _ = s.channelRepo.CanManageGalleryImage(a.ID, userID)
+		}
+		result = append(result, item)
 	}
 	return result, total, nil
 }
@@ -248,6 +268,71 @@ func (s *UploadService) DeleteGalleryDirectory(directoryID int64) error {
 		return err
 	}
 	return nil
+}
+
+func normalizeGalleryMoveAttachmentIDs(input []int64) ([]int64, error) {
+	if len(input) == 0 {
+		return nil, fmt.Errorf("请至少选择一张图片")
+	}
+	if len(input) > 5000 {
+		return nil, fmt.Errorf("单次最多移动 5000 张图片")
+	}
+	seen := make(map[int64]struct{}, len(input))
+	ids := make([]int64, 0, len(input))
+	for _, id := range input {
+		if id <= 0 {
+			return nil, fmt.Errorf("图片 ID 无效")
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (s *UploadService) MoveGalleryImages(userID int64, req *model.GalleryImagesMoveRequest) (*model.GalleryImagesMoveResult, error) {
+	if s.channelRepo == nil {
+		return nil, fmt.Errorf("gallery directory service is unavailable")
+	}
+	if req == nil || req.DirectoryID <= 0 {
+		return nil, fmt.Errorf("请选择目标图库目录")
+	}
+	attachmentIDs, err := normalizeGalleryMoveAttachmentIDs(req.AttachmentIDs)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := s.channelRepo.GetGalleryDirectory(req.DirectoryID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("目标图库目录不存在")
+		}
+		return nil, err
+	}
+	canEdit, err := s.channelRepo.CanEditGalleryDirectory(directory.ID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !canEdit {
+		return nil, ErrGalleryDirectoryEditDenied
+	}
+	manageableCount, err := s.channelRepo.CountManageableGalleryImages(attachmentIDs, userID)
+	if err != nil {
+		return nil, err
+	}
+	if manageableCount != int64(len(attachmentIDs)) {
+		return nil, ErrGalleryImageMoveDenied
+	}
+	movedCount, duplicatesRemoved, err := s.channelRepo.MoveGalleryImages(attachmentIDs, directory.ID, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &model.GalleryImagesMoveResult{
+		DirectoryID:       directory.ID,
+		MovedCount:        movedCount,
+		DuplicatesRemoved: duplicatesRemoved,
+	}, nil
 }
 
 func (s *UploadService) SaveImageToGallery(attachmentID int64, directoryID *int64, channelID *int64, savedBy int64) error {

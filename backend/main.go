@@ -240,6 +240,7 @@ func main() {
 		api.GET("/gallery/directories/:id/access", channelHandler.GetGalleryDirectoryAccess)
 		api.PUT("/gallery/directories/:id/access", channelHandler.UpdateGalleryDirectoryAccess)
 		api.POST("/gallery/upload", channelHandler.UploadGalleryImage)
+		api.PUT("/gallery/images/move", channelHandler.MoveGalleryImages)
 		api.PUT("/gallery/images/:id/name", channelHandler.RenameGalleryImage)
 		api.PUT("/gallery/images/:id/content", channelHandler.ReplaceGalleryImage)
 		api.GET("/sheets/template", importHandler.DownloadTemplate)
