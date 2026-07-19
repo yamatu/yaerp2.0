@@ -11,6 +11,7 @@ type Message struct {
 	SheetID   int64           `json:"sheetId,omitempty"`
 	ChannelID int64           `json:"channelId,omitempty"`
 	MessageID int64           `json:"messageId,omitempty"`
+	OrderID   int64           `json:"orderId,omitempty"`
 	Row       int             `json:"row,omitempty"`
 	Col       string          `json:"col,omitempty"`
 	Value     json.RawMessage `json:"value,omitempty"`
@@ -282,6 +283,33 @@ func (h *Hub) BroadcastAll(data []byte) {
 	targets := make([]*Client, 0, len(h.clients))
 	for client := range h.clients {
 		targets = append(targets, client)
+	}
+	h.mu.RUnlock()
+	for _, client := range targets {
+		select {
+		case client.Send <- data:
+		default:
+			go func(c *Client) { h.unregister <- c }(client)
+		}
+	}
+}
+
+func (h *Hub) BroadcastToUsers(userIDs []int64, data []byte) {
+	if len(userIDs) == 0 || len(data) == 0 {
+		return
+	}
+	allowed := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID > 0 {
+			allowed[userID] = struct{}{}
+		}
+	}
+	h.mu.RLock()
+	targets := make([]*Client, 0)
+	for client := range h.clients {
+		if _, exists := allowed[client.UserID]; exists {
+			targets = append(targets, client)
+		}
 	}
 	h.mu.RUnlock()
 	for _, client := range targets {

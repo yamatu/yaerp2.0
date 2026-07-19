@@ -155,7 +155,7 @@ func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, i
 		FolderID:    folderID,
 		Metadata:    metadata,
 	}
-	if err := s.sheetService.CreateWorkbookForUser(userID, workbook); err != nil {
+	if err := s.sheetService.CreateWorkbookForUserWithSource(userID, workbook, "import", "导入 Excel 工作簿"); err != nil {
 		return nil, err
 	}
 
@@ -187,7 +187,7 @@ func (s *SheetImportService) importWorkbookXLSXData(userID int64, data []byte, i
 			Config:     configJSON,
 			Frozen:     json.RawMessage(`{"row":0,"col":0}`),
 		}
-		if err := s.sheetService.CreateSheetForUser(userID, sheet); err != nil {
+		if err := s.sheetService.CreateSheetForUserWithSource(userID, sheet, "import", "导入 Excel 工作簿"); err != nil {
 			_ = s.sheetRepo.DeleteWorkbook(workbook.ID)
 			return nil, err
 		}

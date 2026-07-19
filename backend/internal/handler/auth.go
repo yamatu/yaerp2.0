@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"io"
 	"net/http"
 
 	"yaerp/internal/model"
@@ -79,12 +81,36 @@ func (h *AuthHandler) RefreshToken(c *gin.Context) {
 }
 
 func (h *AuthHandler) Logout(c *gin.Context) {
-	userID := c.GetInt64("user_id")
-	if err := h.authService.Logout(userID); err != nil {
+	accessToken := c.GetString("access_token")
+	if accessToken == "" {
+		response.Unauthorized(c, "missing access token")
+		return
+	}
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	if err := h.authService.Logout(accessToken, body.RefreshToken); err != nil {
 		response.ServerError(c, err.Error())
 		return
 	}
 	response.OKMsg(c, "logged out")
+}
+
+func (h *AuthHandler) CreateWebSocketTicket(c *gin.Context) {
+	ticket, expiresIn, err := h.authService.CreateWebSocketTicket(
+		c.Request.Context(),
+		c.GetInt64("user_id"),
+		c.GetString("username"),
+	)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, gin.H{"ticket": ticket, "expires_in": expiresIn})
 }
 
 func (h *AuthHandler) ChangePassword(c *gin.Context) {

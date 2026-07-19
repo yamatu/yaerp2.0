@@ -69,7 +69,9 @@ import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPrefer
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
+import { consumeReturnTarget } from '@/lib/returnNavigation'
 import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
+import { matchesWhatsAppChat, matchesWhatsAppSearch, normalizeWhatsAppSearchText } from '@/lib/whatsappSearch'
 import { wsClient } from '@/lib/ws'
 import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, WhatsAppContactSyncResult, WhatsAppHistorySyncResult, Workbook, WorkbookImportResult } from '@/types'
 
@@ -118,16 +120,6 @@ function readStoredNumber(key: string) {
 
 function hasDraggedFiles(dataTransfer: DataTransfer) {
   return Array.from(dataTransfer.types || []).includes('Files')
-}
-
-function normalizeWhatsAppSearchText(value: string | null | undefined) {
-  return (value || '').normalize('NFKC').toLocaleLowerCase('zh-CN').trim()
-}
-
-function compactWhatsAppSearchText(value: string | null | undefined) {
-  return normalizeWhatsAppSearchText(value)
-    .replace(/@(c|g)\.us$/i, '')
-    .replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
 function authHeaders(): Record<string, string> {
@@ -476,31 +468,19 @@ export default function ChannelsPage() {
   )
 
   const filteredChannels = useMemo(() => {
-    const keyword = channelSearch.trim().toLowerCase()
-    if (!keyword) return sortedChannels
-    return sortedChannels.filter((channel) => [channel.name, channel.description, channel.owner_name]
-      .some((value) => value?.toLowerCase().includes(keyword)))
+    return sortedChannels.filter((channel) => matchesWhatsAppSearch(
+      [channel.name, channel.description, channel.owner_name, channel.search_text],
+      channelSearch
+    ))
   }, [channelSearch, sortedChannels])
 
   const filteredForwardChannels = useMemo(() => {
-    const keyword = forwardSearch.trim().toLowerCase()
     return sortedChannels.filter((channel) => channel.id !== activeChannelId
-      && (!keyword || channel.name.toLowerCase().includes(keyword)))
+      && matchesWhatsAppSearch([channel.name, channel.description, channel.search_text], forwardSearch))
   }, [activeChannelId, forwardSearch, sortedChannels])
 
   const filteredWhatsAppChats = useMemo(() => {
-    const keyword = normalizeWhatsAppSearchText(whatsAppChatSearch)
-    if (!keyword) return whatsAppChats
-    const terms = keyword.split(/\s+/).filter(Boolean)
-    return whatsAppChats.filter((chat) => {
-      const values = [chat.name, chat.id, chat.description, chat.about, chat.lastMessage]
-      const searchable = values.map(normalizeWhatsAppSearchText).join(' ')
-      const compactSearchable = values.map(compactWhatsAppSearchText).join(' ')
-      return terms.every((term) => {
-        const compactTerm = compactWhatsAppSearchText(term)
-        return searchable.includes(term) || (compactTerm !== '' && compactSearchable.includes(compactTerm))
-      })
-    })
+    return whatsAppChats.filter((chat) => matchesWhatsAppChat(chat, whatsAppChatSearch))
   }, [whatsAppChatSearch, whatsAppChats])
   const selectedWhatsAppAccount = whatsAppAccounts.find((account) => String(account.id) === selectedWhatsAppAccountId) || null
 
@@ -2456,10 +2436,10 @@ export default function ChannelsPage() {
       <div className="h-[100dvh] overflow-hidden bg-[#111b21] p-0 md:p-4">
         <div className="mx-auto flex h-full max-w-[1440px] flex-col overflow-hidden">
           <header className="flex h-14 shrink-0 items-center justify-between border-b border-[#334047] bg-[#202c33] px-4 text-slate-100 md:border md:border-b-0 md:border-[#334047]">
-            <a href="/" className="inline-flex items-center gap-2 text-sm text-slate-300 transition hover:text-white">
+            <button type="button" onClick={() => { window.location.href = consumeReturnTarget('/') }} className="inline-flex items-center gap-2 text-sm text-slate-300 transition hover:text-white">
               <ArrowLeft className="h-4 w-4" />
               返回首页
-            </a>
+            </button>
             <div className="flex items-center gap-1">
               <a href="/whatsapp" className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-[#25d366]" title="管理我的 WhatsApp"><MessageCircle className="h-4 w-4" /></a>
               <button type="button" onClick={() => setNotificationSettingsOpen(true)} className="relative inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-white" title="频道通知设置">

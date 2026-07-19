@@ -18,6 +18,7 @@ type Workbook struct {
 	IsLocked      bool            `json:"is_locked,omitempty"`
 	IsHidden      bool            `json:"is_hidden,omitempty"`
 	IsPublic      bool            `json:"is_public,omitempty"`
+	CanManage     bool            `json:"can_manage"`
 	LockedByID    *int64          `json:"locked_by_id,omitempty"`
 	LockedByName  *string         `json:"locked_by_name,omitempty"`
 	LockedAt      *time.Time      `json:"locked_at,omitempty"`
@@ -43,6 +44,7 @@ type Sheet struct {
 	IsLocked       bool            `json:"is_locked,omitempty"`
 	IsArchived     bool            `json:"is_archived,omitempty"`
 	IsHidden       bool            `json:"is_hidden,omitempty"`
+	AccessLevel    string          `json:"access_level,omitempty"`
 	LockedByID     *int64          `json:"locked_by_id,omitempty"`
 	LockedByName   *string         `json:"locked_by_name,omitempty"`
 	LockedAt       *time.Time      `json:"locked_at,omitempty"`

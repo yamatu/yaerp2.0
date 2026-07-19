@@ -523,6 +523,43 @@ func (r *SheetRepo) UpsertRow(sheetID int64, rowIndex int, data json.RawMessage,
 	return nil
 }
 
+func (r *SheetRepo) BatchUpdateCells(changes []model.CellUpdate, userID int64) error {
+	if len(changes) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin cell update transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(
+		`INSERT INTO rows (sheet_id, row_index, data, created_by, updated_by, created_at, updated_at)
+		 VALUES ($1, $2, jsonb_build_object($3::text, $4::jsonb), $5, $5, NOW(), NOW())
+		 ON CONFLICT (sheet_id, row_index)
+		 DO UPDATE SET
+			data = jsonb_set(COALESCE(rows.data, '{}'::jsonb), ARRAY[$3::text], $4::jsonb, true),
+			updated_by = $5,
+			updated_at = NOW()`,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare cell update: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, change := range changes {
+		if _, err := stmt.Exec(change.SheetID, change.Row, change.Col, string(change.Value), userID); err != nil {
+			return fmt.Errorf("update cell %s%d on sheet %d: %w", change.Col, change.Row+1, change.SheetID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cell updates: %w", err)
+	}
+	return nil
+}
+
 func (r *SheetRepo) GetRows(sheetID int64) ([]model.Row, error) {
 	rows, err := r.db.Query(
 		`SELECT id, sheet_id, row_index, data, updated_by, created_at, updated_at

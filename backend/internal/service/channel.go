@@ -131,6 +131,8 @@ type ChannelMessageInput struct {
 	LinkedSummaryID    *int64
 	MakeWorkbookPublic bool
 	ReplyToMessageID   *int64
+	InternalOnly       bool
+	TrustedAttachment  bool
 }
 
 func (s *ChannelService) CreateChannel(userID int64, req *model.ChannelCreateRequest) (*model.Channel, error) {
@@ -685,26 +687,28 @@ func (s *ChannelService) CreateMessage(userID, channelID int64, input ChannelMes
 		return nil, fmt.Errorf("上传文件和图库图片不能同时发送")
 	}
 	if input.AttachmentID != nil {
-		isGalleryImage, err := s.channelRepo.IsGalleryImage(*input.AttachmentID)
-		if err != nil {
-			return nil, err
-		}
-		if !isGalleryImage {
-			return nil, fmt.Errorf("所选图片不在图库中")
-		}
-		allowed, err := s.uploadSvc.CanAccessGalleryImage(userID, *input.AttachmentID)
-		if err != nil {
-			return nil, err
-		}
-		if !allowed {
-			return nil, fmt.Errorf("没有权限使用所选图库图片")
-		}
 		attachment, err := s.uploadSvc.GetAttachment(*input.AttachmentID)
 		if err != nil {
 			return nil, err
 		}
-		if !isImageMimeType(attachment.MimeType) {
-			return nil, fmt.Errorf("图库附件不是图片")
+		if !input.TrustedAttachment {
+			isGalleryImage, err := s.channelRepo.IsGalleryImage(*input.AttachmentID)
+			if err != nil {
+				return nil, err
+			}
+			if !isGalleryImage {
+				return nil, fmt.Errorf("所选图片不在图库中")
+			}
+			allowed, err := s.uploadSvc.CanAccessGalleryImage(userID, *input.AttachmentID)
+			if err != nil {
+				return nil, err
+			}
+			if !allowed {
+				return nil, fmt.Errorf("没有权限使用所选图库图片")
+			}
+			if !isImageMimeType(attachment.MimeType) {
+				return nil, fmt.Errorf("图库附件不是图片")
+			}
 		}
 		attachmentMime = attachment.MimeType
 	}
@@ -776,8 +780,43 @@ func (s *ChannelService) CreateMessage(userID, channelID int64, input ChannelMes
 		return nil, err
 	}
 	s.attachMessageURL(created)
-	s.notifyMessageCreated(userID, created)
+	if input.InternalOnly {
+		s.notifyMessageChanged(created)
+	} else {
+		s.notifyMessageCreated(userID, created)
+	}
 	return created, nil
+}
+
+func (s *ChannelService) CreateAutomationMessage(userID, channelID int64, content string, sendWhatsApp bool) (*model.ChannelMessage, error) {
+	if _, err := s.requireChannelAccess(userID, channelID); err != nil {
+		return nil, err
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, fmt.Errorf("自动化频道消息不能为空")
+	}
+	message := &model.ChannelMessage{ChannelID: channelID, SenderID: userID, SenderType: "user", Content: content}
+	if err := s.channelRepo.CreateMessage(message); err != nil {
+		return nil, err
+	}
+	_ = s.channelRepo.TouchChannel(channelID)
+	created, err := s.channelRepo.GetMessage(message.ID)
+	if err != nil {
+		return nil, err
+	}
+	s.attachMessageURL(created)
+	if sendWhatsApp {
+		s.notifyMessageCreated(userID, created)
+	} else {
+		s.notifyMessageChanged(created)
+	}
+	return created, nil
+}
+
+func (s *ChannelService) EnsureChannelAccess(userID, channelID int64) error {
+	_, err := s.requireChannelAccess(userID, channelID)
+	return err
 }
 
 func (s *ChannelService) ForwardMessage(userID, sourceChannelID, messageID int64, req *model.ChannelForwardRequest) (*model.ChannelMessage, error) {

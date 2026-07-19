@@ -15,16 +15,29 @@ type folderAccessResult struct {
 	CanManage   bool
 }
 
+type SheetPermissionMatrixOverride func(userID, sheetID int64) (bool, *model.PermissionMatrix, error)
+type WorkbookPermissionOverride func(userID, workbookID int64, action string) (bool, bool, error)
+
 type PermissionService struct {
-	permRepo       *repo.PermissionRepo
-	userRepo       *repo.UserRepo
-	sheetRepo      *repo.SheetRepo
-	folderRepo     *repo.FolderRepo
-	departmentRepo *repo.DepartmentRepo
+	permRepo         *repo.PermissionRepo
+	userRepo         *repo.UserRepo
+	sheetRepo        *repo.SheetRepo
+	folderRepo       *repo.FolderRepo
+	departmentRepo   *repo.DepartmentRepo
+	sheetOverride    SheetPermissionMatrixOverride
+	workbookOverride WorkbookPermissionOverride
 }
 
 func NewPermissionService(permRepo *repo.PermissionRepo, userRepo *repo.UserRepo, sheetRepo *repo.SheetRepo, folderRepo *repo.FolderRepo, departmentRepo *repo.DepartmentRepo) *PermissionService {
 	return &PermissionService{permRepo: permRepo, userRepo: userRepo, sheetRepo: sheetRepo, folderRepo: folderRepo, departmentRepo: departmentRepo}
+}
+
+func (s *PermissionService) SetSheetPermissionMatrixOverride(override SheetPermissionMatrixOverride) {
+	s.sheetOverride = override
+}
+
+func (s *PermissionService) SetWorkbookPermissionOverride(override WorkbookPermissionOverride) {
+	s.workbookOverride = override
 }
 
 func (s *PermissionService) SetSheetPermission(req *model.SetSheetPermissionRequest) error {
@@ -167,6 +180,19 @@ func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*m
 	for _, role := range roles {
 		if role.Code == "admin" {
 			return fullAccessMatrix(), nil
+		}
+	}
+	if s.sheetOverride != nil {
+		handled, matrix, err := s.sheetOverride(userID, sheetID)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			if matrix == nil {
+				return emptyPermissionMatrix(), nil
+			}
+			ensurePermissionMatrixLayers(matrix)
+			return matrix, nil
 		}
 	}
 
@@ -320,11 +346,27 @@ func (s *PermissionService) IsAdmin(userID int64) (bool, error) {
 }
 
 func (s *PermissionService) CanManageWorkbook(workbook *model.Workbook, userID int64) (bool, error) {
+	isAdmin, err := s.IsAdmin(userID)
+	if err != nil {
+		return false, err
+	}
+	if isAdmin {
+		return true, nil
+	}
+	if s.workbookOverride != nil {
+		handled, allowed, overrideErr := s.workbookOverride(userID, workbook.ID, "manage")
+		if overrideErr != nil {
+			return false, overrideErr
+		}
+		if handled {
+			return allowed, nil
+		}
+	}
 	if workbook.OwnerID == userID {
 		return true, nil
 	}
 
-	return s.IsAdmin(userID)
+	return false, nil
 }
 
 func (s *PermissionService) CanViewWorkbook(workbook *model.Workbook, userID int64) (bool, error) {
@@ -340,6 +382,15 @@ func (s *PermissionService) CanViewWorkbook(workbook *model.Workbook, userID int
 	}
 	if workbook.IsHidden {
 		return false, nil
+	}
+	if s.workbookOverride != nil {
+		handled, allowed, overrideErr := s.workbookOverride(userID, workbook.ID, "view")
+		if overrideErr != nil {
+			return false, overrideErr
+		}
+		if handled {
+			return allowed, nil
+		}
 	}
 	if workbook.IsPublic {
 		return true, nil

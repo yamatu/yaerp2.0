@@ -21,6 +21,7 @@ type Channel struct {
 	LastMessageID       *int64     `json:"last_message_id,omitempty" db:"last_message_id"`
 	LastMessageSenderID *int64     `json:"last_message_sender_id,omitempty" db:"last_message_sender_id"`
 	LastMessageAt       *time.Time `json:"last_message_at,omitempty" db:"last_message_at"`
+	SearchText          string     `json:"search_text,omitempty" db:"-"`
 	CanManage           bool       `json:"can_manage" db:"-"`
 	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
@@ -312,19 +313,20 @@ type WhatsAppAccount struct {
 }
 
 type WhatsAppChat struct {
-	ID               string `json:"id"`
-	Name             string `json:"name"`
-	IsGroup          bool   `json:"isGroup"`
-	UnreadCount      int    `json:"unreadCount"`
-	Timestamp        int64  `json:"timestamp"`
-	Pinned           bool   `json:"pinned"`
-	Archived         bool   `json:"archived"`
-	IsMuted          bool   `json:"isMuted"`
-	ProfilePicURL    string `json:"profilePicUrl"`
-	About            string `json:"about"`
-	Description      string `json:"description"`
-	ParticipantCount int    `json:"participantCount"`
-	LastMessage      string `json:"lastMessage"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	IsGroup          bool     `json:"isGroup"`
+	UnreadCount      int      `json:"unreadCount"`
+	Timestamp        int64    `json:"timestamp"`
+	Pinned           bool     `json:"pinned"`
+	Archived         bool     `json:"archived"`
+	IsMuted          bool     `json:"isMuted"`
+	ProfilePicURL    string   `json:"profilePicUrl"`
+	About            string   `json:"about"`
+	Description      string   `json:"description"`
+	ParticipantCount int      `json:"participantCount"`
+	LastMessage      string   `json:"lastMessage"`
+	SearchAliases    []string `json:"searchAliases,omitempty"`
 }
 
 type WhatsAppContact struct {

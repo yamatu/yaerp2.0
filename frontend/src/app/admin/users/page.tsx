@@ -40,7 +40,9 @@ export default function UsersManagementPage() {
     roleIds: [],
   })
   const [submitting, setSubmitting] = useState(false)
+  const [deletingUserId, setDeletingUserId] = useState<number | null>(null)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -135,24 +137,29 @@ export default function UsersManagementPage() {
     }
   }
 
-  const handleDelete = async (userId: number) => {
-    if (userId === currentUser?.id) {
+  const handleDelete = async (user: AuthUser) => {
+    if (user.id === currentUser?.id) {
       setError('不能删除当前登录的管理员账号')
       return
     }
 
-    if (!confirm('确定要删除此员工账号吗？')) return
+    if (!confirm(`确定要删除员工「${user.username}」吗？\n\n账号会立即失效，名下工作簿、文件夹和业务数据将转交给当前管理员。`)) return
 
-    setSubmitting(true)
+    setDeletingUserId(user.id)
     setError('')
+    setNotice('')
     try {
-      await api.delete(`/users/${userId}`)
+      const response = await api.delete(`/users/${user.id}`)
+      if (response.code !== 0) {
+        throw new Error(response.message || '删除员工账号失败')
+      }
       await fetchUsers()
+      setNotice(`员工「${user.username}」已删除，名下业务数据已转交当前管理员。`)
     } catch (err) {
       console.error('Failed to delete user:', err)
-      setError('删除员工账号失败')
+      setError(err instanceof Error ? err.message : '删除员工账号失败')
     } finally {
-      setSubmitting(false)
+      setDeletingUserId(null)
     }
   }
 
@@ -331,6 +338,11 @@ export default function UsersManagementPage() {
                 {error}
               </div>
             )}
+            {notice && (
+              <div className="mb-5 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-700">
+                {notice}
+              </div>
+            )}
 
             {loading ? (
               <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-14 text-center text-slate-500">
@@ -408,12 +420,12 @@ export default function UsersManagementPage() {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => handleDelete(user.id)}
-                                disabled={submitting || user.id === currentUser?.id || isProtectedAdmin(user)}
+                                onClick={() => handleDelete(user)}
+                                disabled={deletingUserId !== null || user.id === currentUser?.id || isProtectedAdmin(user)}
                                 className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
-                                删除
+                                {deletingUserId === user.id ? '删除中...' : '删除'}
                               </button>
                             </div>
                           </td>

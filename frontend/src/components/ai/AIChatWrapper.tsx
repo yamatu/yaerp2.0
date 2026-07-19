@@ -31,6 +31,12 @@ export default function AIChatWrapper() {
     return () => observer.disconnect()
   }, [mounted])
 
+  useEffect(() => {
+    const openComposer = () => setChatOpen(true)
+    window.addEventListener('yaerp:ai-compose', openComposer)
+    return () => window.removeEventListener('yaerp:ai-compose', openComposer)
+  }, [setChatOpen])
+
   if (!mounted || !chatPreferenceReady) return null
   if (!isAuthenticated()) return null
   if (hidden && !chatOpen) return null

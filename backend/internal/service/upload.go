@@ -129,6 +129,17 @@ func (s *UploadService) GetAttachment(id int64) (*model.Attachment, error) {
 	return s.attachmentRepo.GetByID(id)
 }
 
+func (s *UploadService) GetThumbnailURL(id int64, size int) string {
+	attachment, err := s.attachmentRepo.GetByID(id)
+	if err != nil {
+		return ""
+	}
+	if size <= 0 {
+		size = 320
+	}
+	return s.thumbnailAccessURL(attachment, size)
+}
+
 func (s *UploadService) RenameAttachment(id int64, filename string) (*AttachmentWithURL, error) {
 	if err := s.attachmentRepo.UpdateFilename(id, filename); err != nil {
 		return nil, err

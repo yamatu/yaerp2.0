@@ -128,7 +128,7 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 		Columns:    columnJSON,
 		Config:     config,
 	}
-	if err := s.sheetService.CreateSheetForUser(userID, sheet); err != nil {
+	if err := s.sheetService.CreateSheetForUserWithSource(userID, sheet, "import", "导入 Excel 工作表"); err != nil {
 		return nil, err
 	}
 
@@ -137,6 +137,9 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 			_ = s.sheetRepo.DeleteSheet(sheet.ID)
 			return nil, fmt.Errorf("写入第 %d 行数据失败: %w", excelRowNumbers[index], err)
 		}
+	}
+	if _, err := s.sheetService.CaptureCurrentVersion(userID, sheet.ID, "import", fmt.Sprintf("导入 Excel，共 %d 行", len(rowPayloads)), false); err != nil {
+		return nil, err
 	}
 
 	return &SheetImportResult{

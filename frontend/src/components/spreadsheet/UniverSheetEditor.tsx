@@ -1,8 +1,8 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
-import { AlertCircle, ChevronDown, ChevronUp, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, LocateFixed, Lock, Printer, Rows3, Save, Search, Shield, Square, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
-import { RANGE_TYPE, type ICellData, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
+import { AlertCircle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import { RANGE_TYPE, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
@@ -11,6 +11,10 @@ import { UniverSheetsFilterPreset } from '@univerjs/preset-sheets-filter'
 import UniverPresetSheetsFilterZhCN from '@univerjs/preset-sheets-filter/locales/zh-CN'
 import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-replace'
 import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
+import { UniverSheetsDataValidationPreset } from '@univerjs/preset-sheets-data-validation'
+import UniverPresetSheetsDataValidationZhCN from '@univerjs/preset-sheets-data-validation/locales/zh-CN'
+import { UniverSheetsConditionalFormattingPreset } from '@univerjs/preset-sheets-conditional-formatting'
+import UniverPresetSheetsConditionalFormattingZhCN from '@univerjs/preset-sheets-conditional-formatting/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import { CellAlertType, ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
 import api from '@/lib/api'
@@ -24,7 +28,7 @@ import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
 import ImportXlsxButton, { ensureExcelDownloadFilename, EXCEL_IMPORT_FORMATS_LABEL, isSupportedExcelImportFile, uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
-import type { AuthUser, CellUpdate, ColumnDef, Department, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
+import type { AuthUser, AutomationApprovalStep, AutomationRule, CellApprovalState, CellUpdate, CellUpdateResult, ColumnDef, Department, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
 
 interface Props {
   workbookId: string | number
@@ -55,6 +59,142 @@ type PDFExportScope = 'current' | 'selected' | 'workbook'
 type PDFPaperSize = 'a4' | 'a3' | 'letter' | 'legal'
 type PDFOrientation = 'portrait' | 'landscape'
 type NumberFormatScope = 'selection' | 'row' | 'column' | 'sheet'
+type FieldControlType = 'select' | 'checkbox' | 'none'
+
+interface ApprovalStepDraft extends AutomationApprovalStep {
+  id: string
+}
+
+interface SearchableOptionPickerTarget {
+  row: number
+  column: number
+  columnKey: string
+  columnName: string
+  options: string[]
+  optionColors?: ColumnDef['optionColors']
+  currentValue: string
+}
+
+const OPTION_COLOR_PALETTE = [
+  { backgroundColor: '#FEF3C7', textColor: '#92400E' },
+  { backgroundColor: '#DCFCE7', textColor: '#166534' },
+  { backgroundColor: '#F1F5F9', textColor: '#475569' },
+  { backgroundColor: '#DBEAFE', textColor: '#1D4ED8' },
+  { backgroundColor: '#FCE7F3', textColor: '#BE185D' },
+  { backgroundColor: '#EDE9FE', textColor: '#6D28D9' },
+]
+
+const COMMON_OPTION_COLORS: Record<string, { backgroundColor: string; textColor: string }> = {
+  '待处理': OPTION_COLOR_PALETTE[0],
+  '进行中': OPTION_COLOR_PALETTE[3],
+  '已完成': OPTION_COLOR_PALETTE[1],
+  '已取消': OPTION_COLOR_PALETTE[2],
+  '是': OPTION_COLOR_PALETTE[1],
+  '否': { backgroundColor: '#FEE2E2', textColor: '#B91C1C' },
+}
+
+function mergeLocaleBundles(...bundles: Array<Record<string, unknown>>): ILanguagePack {
+  const mergeInto = (target: Record<string, unknown>, source: Record<string, unknown>) => {
+    Object.entries(source).forEach(([key, value]) => {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const existing = target[key]
+        const child = existing && typeof existing === 'object' && !Array.isArray(existing)
+          ? existing as Record<string, unknown>
+          : {}
+        target[key] = mergeInto({ ...child }, value as Record<string, unknown>)
+      } else {
+        target[key] = value
+      }
+    })
+    return target
+  }
+  return bundles.reduce((result, bundle) => mergeInto(result, bundle), {} as Record<string, unknown>) as ILanguagePack
+}
+
+function formatApprovalValue(value: unknown) {
+  if (value === null || value === undefined || value === '') return '空'
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value)
+}
+
+function optionColorFor(column: ColumnDef, option: string, index: number): { backgroundColor: string; textColor: string } {
+  const fallback = COMMON_OPTION_COLORS[option] || OPTION_COLOR_PALETTE[index % OPTION_COLOR_PALETTE.length]
+  const configured = column.optionColors?.[option]
+  return {
+    backgroundColor: configured?.backgroundColor || fallback.backgroundColor,
+    textColor: configured?.textColor || fallback.textColor,
+  }
+}
+
+function newApprovalStep(index = 0): ApprovalStepDraft {
+  return {
+    id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+    name: index === 0 ? '负责人审批' : `审批步骤 ${index + 1}`,
+    user_ids: [],
+    department_ids: [],
+    required_approvals: 1,
+  }
+}
+
+function applyColumnDataControls(
+  univerAPI: ReturnType<typeof createUniver>['univerAPI'],
+  worksheet: any,
+  columns: ColumnDef[],
+  forceColumnKeys: Set<string> = new Set()
+) {
+  const maxRows = Math.max(worksheet.getMaxRows?.() || 200, 2)
+  columns.forEach((column, columnIndex) => {
+    const force = forceColumnKeys.has(column.key)
+    const range = worksheet.getRange(1, columnIndex, Math.max(maxRows - 1, 1), 1)
+    const isControlled = column.type === 'select' || column.type === 'checkbox'
+
+    if (!isControlled) {
+      if (force) {
+        range.setDataValidation?.(null)
+        range.clearConditionalFormatRules?.()
+      }
+      return
+    }
+
+    const options = column.type === 'checkbox'
+      ? (column.options?.length ? column.options.slice(0, 2) : ['是', '否'])
+      : (column.options || []).filter(Boolean)
+    if (options.length === 0) return
+
+    const existingValidations = range.getDataValidations?.() || []
+    if (force || existingValidations.length === 0) {
+      const builder = univerAPI.newDataValidation()
+      const validation = column.type === 'checkbox'
+        ? builder.requireCheckbox(options[0] || '是', options[1] || '否')
+        : builder.requireValueInList(options, false, true)
+      range.setDataValidation(validation.setOptions({
+        showErrorMessage: true,
+        error: `请选择：${options.join('、')}`,
+      }).build())
+    }
+
+    const existingConditionalRules = range.getConditionalFormattingRules?.() || []
+    if (force) range.clearConditionalFormatRules?.()
+    if (!force && existingConditionalRules.length > 0) return
+    options.forEach((option, optionIndex) => {
+      const color = optionColorFor(column, option, optionIndex)
+      const rule = range.createConditionalFormattingRule()
+        .whenTextEqualTo(option)
+        .setBackground(color.backgroundColor)
+        .setFontColor(color.textColor)
+        .setBold(true)
+        .build()
+      worksheet.addConditionalFormattingRule(rule)
+    })
+  })
+}
 
 const NUMBER_FORMAT_PRESETS = [
   { id: 'general', label: '常规', pattern: 'General', sample: '431.7' },
@@ -1168,6 +1308,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const schedulePersistRef = useRef<() => void>(() => undefined)
   const persistedWorksheetDataRef = useRef<Partial<IWorksheetData> | null>(null)
   const protectionHighlightDisposablesRef = useRef<UniverDisposable[]>([])
+  const approvalHighlightDisposablesRef = useRef<UniverDisposable[]>([])
   const presenceDisposablesRef = useRef<UniverDisposable[]>([])
   const protectionFocusDisposableRef = useRef<UniverDisposable | null>(null)
   const protectionFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -1180,6 +1321,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const protectionHighlightRenderGenerationRef = useRef(0)
   const protectionHighlightRendererRef = useRef<() => void>(() => undefined)
   const protectionSnapshotRef = useRef<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
+  const approvalStatesRef = useRef<CellApprovalState[]>([])
   const showProtectionHighlightsRef = useRef(false)
   const protectionHighlightsLoadingRef = useRef(true)
   const protectionHighlightBlocksCacheRef = useRef<{
@@ -1217,6 +1359,24 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [dragImportProgress, setDragImportProgress] = useState(0)
   const dragDepthRef = useRef(0)
   const [showProtectionPanel, setShowProtectionPanel] = useState(false)
+  const [showApprovalPanel, setShowApprovalPanel] = useState(false)
+  const [approvalStates, setApprovalStates] = useState<CellApprovalState[]>([])
+  const [approvalRules, setApprovalRules] = useState<AutomationRule[]>([])
+  const [approvalLoading, setApprovalLoading] = useState(false)
+  const [approvalAction, setApprovalAction] = useState('')
+  const [approvalName, setApprovalName] = useState('选区数据审批')
+  const [approvalDescription, setApprovalDescription] = useState('审批通过后才将待审内容写入正式单元格。')
+  const [approvalSteps, setApprovalSteps] = useState<ApprovalStepDraft[]>([newApprovalStep()])
+  const [approvalUserSearch, setApprovalUserSearch] = useState('')
+  const [approvalNotice, setApprovalNotice] = useState('')
+  const [showFieldControlPanel, setShowFieldControlPanel] = useState(false)
+  const [fieldControlType, setFieldControlType] = useState<FieldControlType>('select')
+  const [fieldControlOptions, setFieldControlOptions] = useState<string[]>(['待处理', '已完成', '已取消'])
+  const [fieldControlColors, setFieldControlColors] = useState<Record<string, { backgroundColor: string; textColor: string }>>({})
+  const [fieldControlSearchable, setFieldControlSearchable] = useState(false)
+  const [fieldControlApplying, setFieldControlApplying] = useState(false)
+  const [optionPickerTarget, setOptionPickerTarget] = useState<SearchableOptionPickerTarget | null>(null)
+  const [optionPickerSearch, setOptionPickerSearch] = useState('')
   const [showAllProtections, setShowAllProtections] = useState(false)
   const [selectionState, setSelectionState] = useState<SelectionState | null>(null)
   const [protectionSnapshot, setProtectionSnapshot] = useState<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
@@ -1312,6 +1472,50 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     window.addEventListener('pagehide', handlePageHide)
     return () => window.removeEventListener('pagehide', handlePageHide)
   }, [persistSheetViewMemory])
+
+  useEffect(() => {
+    if (!optionPickerTarget) return
+
+    const hiddenHosts = new Map<HTMLElement, {
+      visibility: string
+      pointerEvents: string
+      ariaHidden: string | null
+    }>()
+    const hideNativeDropdowns = () => {
+      document.querySelectorAll<HTMLElement>('.univer-dv-list-dropdown').forEach((dropdown) => {
+        const host = dropdown.closest<HTMLElement>('section') || dropdown
+        if (!hiddenHosts.has(host)) {
+          hiddenHosts.set(host, {
+            visibility: host.style.visibility,
+            pointerEvents: host.style.pointerEvents,
+            ariaHidden: host.getAttribute('aria-hidden'),
+          })
+        }
+        host.style.visibility = 'hidden'
+        host.style.pointerEvents = 'none'
+        host.setAttribute('aria-hidden', 'true')
+      })
+    }
+
+    hideNativeDropdowns()
+    const frame = window.requestAnimationFrame(hideNativeDropdowns)
+    const observer = new MutationObserver(hideNativeDropdowns)
+    observer.observe(document.body, { childList: true, subtree: true })
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      observer.disconnect()
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }))
+      window.setTimeout(() => {
+        hiddenHosts.forEach((previous, host) => {
+          host.style.visibility = previous.visibility
+          host.style.pointerEvents = previous.pointerEvents
+          if (previous.ariaHidden === null) host.removeAttribute('aria-hidden')
+          else host.setAttribute('aria-hidden', previous.ariaHidden)
+        })
+      }, 0)
+    }
+  }, [optionPickerTarget])
 
   const commitActiveCellEditor = useCallback(() => {
     const root = containerRef.current
@@ -1412,6 +1616,71 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       setProtectionLoading(false)
     }
   }, [sheetId])
+
+  const refreshApprovalStates = useCallback(async () => {
+    if (!sheetId) return
+    try {
+      const res = await api.get<CellApprovalState[]>(`/sheets/${sheetId}/approval-states`)
+      setApprovalStates(res.code === 0 && Array.isArray(res.data) ? res.data : [])
+    } catch (err) {
+      console.error('Failed to load cell approval states:', err)
+      setApprovalStates([])
+    }
+  }, [sheetId])
+
+  const refreshApprovalRules = useCallback(async () => {
+    try {
+      const res = await api.get<{ list: AutomationRule[] }>('/automation/rules?page=1&size=100')
+      const rules = res.code === 0 && Array.isArray(res.data?.list) ? res.data.list : []
+      setApprovalRules(rules.filter((rule) => rule.sheet_id === sheetId && rule.hold_changes))
+    } catch (err) {
+      console.error('Failed to load approval rules:', err)
+      setApprovalRules([])
+    }
+  }, [sheetId])
+
+  const clearApprovalHighlights = useCallback(() => {
+    approvalHighlightDisposablesRef.current.forEach((item) => item.dispose())
+    approvalHighlightDisposablesRef.current = []
+  }, [])
+
+  const renderApprovalHighlights = useCallback(() => {
+    clearApprovalHighlights()
+    const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook?.()?.getActiveSheet?.()
+    if (!worksheet) return
+    const columns = latestSheetRef.current.columns || []
+    let visibleRange: { startRow: number; endRow: number; startColumn: number; endColumn: number } | null = null
+    try {
+      const range = worksheet.getVisibleRange?.()
+      if (range) visibleRange = range
+    } catch {
+      visibleRange = null
+    }
+    approvalStatesRef.current
+      .filter((item) => item.status === 'pending')
+      .slice(0, 1000)
+      .forEach((item) => {
+        const columnIndex = columns.findIndex((column) => column.key === item.col)
+        const worksheetRow = item.row + 1
+        if (columnIndex < 0 || worksheetRow < 1) return
+        if (visibleRange && (
+          worksheetRow < visibleRange.startRow || worksheetRow > visibleRange.endRow ||
+          columnIndex < visibleRange.startColumn || columnIndex > visibleRange.endColumn
+        )) return
+        try {
+          const disposable = worksheet.getRange(worksheetRow, columnIndex, 1, 1).highlight({
+            stroke: '#D97706',
+            strokeWidth: 2,
+            strokeDash: 4,
+            isAnimationDash: false,
+            fill: 'rgba(251, 191, 36, 0.10)',
+          })
+          approvalHighlightDisposablesRef.current.push(disposable)
+        } catch {
+          // Ignore a stale coordinate while rows or columns are being rebuilt.
+        }
+      })
+  }, [clearApprovalHighlights])
 
   const clearProtectionHighlights = useCallback(() => {
     protectionHighlightRenderGenerationRef.current += 1
@@ -1629,22 +1898,23 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   useEffect(() => () => {
     clearProtectionHighlights()
+    clearApprovalHighlights()
     clearPresenceVisuals()
     protectionFocusDisposableRef.current?.dispose()
     protectionFocusDisposableRef.current = null
     if (protectionFocusTimerRef.current) clearTimeout(protectionFocusTimerRef.current)
     if (protectionHighlightRefreshTimerRef.current) clearTimeout(protectionHighlightRefreshTimerRef.current)
-  }, [clearPresenceVisuals, clearProtectionHighlights])
+  }, [clearApprovalHighlights, clearPresenceVisuals, clearProtectionHighlights])
 
   // Hide global FABs when image picker or blocking Univer dialogs are open
   useEffect(() => {
-    if (showImagePicker || univerHasOverlay || showProtectionPanel) {
+    if (showImagePicker || univerHasOverlay || showProtectionPanel || showApprovalPanel || showFieldControlPanel || optionPickerTarget) {
       document.body.classList.add('fab-hidden')
     } else {
       document.body.classList.remove('fab-hidden')
     }
     return () => { document.body.classList.remove('fab-hidden') }
-  }, [showImagePicker, showProtectionPanel, univerHasOverlay])
+  }, [optionPickerTarget, showApprovalPanel, showFieldControlPanel, showImagePicker, showProtectionPanel, univerHasOverlay])
 
   // Watch Univer blocking dialogs and side panels separately.
   useEffect(() => {
@@ -1696,12 +1966,23 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }, [sheetPresence])
 
   useEffect(() => {
+    approvalStatesRef.current = approvalStates
+    if (loading) {
+      clearApprovalHighlights()
+      return
+    }
+    window.requestAnimationFrame(renderApprovalHighlights)
+  }, [approvalStates, clearApprovalHighlights, loading, renderApprovalHighlights])
+
+  useEffect(() => {
     setLoading(true)
     setError('')
     setActionError('')
     setSelectionState(null)
     setProtectionSnapshot({ rows: [], columns: [], cells: [] })
     setShowProtectionPanel(false)
+    setShowApprovalPanel(false)
+    setShowFieldControlPanel(false)
     setShowAllProtections(false)
     setProtectionFocusNotice('')
     setProtectionUserSearch('')
@@ -1715,6 +1996,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setSelectedProtectionViewHiddenUserIds([])
     setSelectedProtectionViewHiddenDepartmentIds([])
     setSheetPresence([])
+    setApprovalStates([])
+    setApprovalRules([])
+    setApprovalNotice('')
     setPresenceExpanded(false)
     setHasFilter(false)
   }, [sheetId])
@@ -1724,7 +2008,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   }, [refreshProtectionSnapshot])
 
   useEffect(() => {
-    if (!showProtectionPanel || protectionDirectoryLoaded) return
+    void refreshApprovalStates()
+  }, [refreshApprovalStates])
+
+  useEffect(() => {
+    if ((!showProtectionPanel && !showApprovalPanel) || protectionDirectoryLoaded) return
 
     let active = true
     setProtectionUsersLoading(true)
@@ -1752,7 +2040,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     return () => {
       active = false
     }
-  }, [protectionDirectoryLoaded, protectionUsersLoadToken, showProtectionPanel])
+  }, [protectionDirectoryLoaded, protectionUsersLoadToken, showApprovalPanel, showProtectionPanel])
 
   // Manual save handler — triggers immediate persist
   const persistCurrentSheet = useCallback(async () => {
@@ -2129,6 +2417,271 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [editLocked, refreshPermissions, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionLockEditing, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
 
+  const selectedColumnKeys = useCallback((selection: SelectionState) => {
+    const columns = latestSheetRef.current.columns || []
+    const start = columns.findIndex((column) => column.key === selection.columnKey)
+    const end = columns.findIndex((column) => column.key === selection.endColumnKey)
+    if (start < 0 || end < 0) return []
+    return columns.slice(Math.min(start, end), Math.max(start, end) + 1).map((column) => column.key)
+  }, [])
+
+  const collectSelectedColumnOptions = useCallback(() => {
+    const selection = syncSelectionState()
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    const columns = latestSheetRef.current.columns || []
+    const columnIndex = selection ? columns.findIndex((column) => column.key === selection.columnKey) : -1
+    if (!worksheet || columnIndex < 0) return []
+    try {
+      const maxRows = Math.max(worksheet.getMaxRows?.() || 2, 2)
+      const values = worksheet.getRange(1, columnIndex, Math.max(maxRows - 1, 1), 1).getValues?.() || []
+      return Array.from(new Set(values.flat().map((value: unknown) => String(value ?? '').trim()).filter(Boolean))).slice(0, 500)
+    } catch {
+      return []
+    }
+  }, [syncSelectionState])
+
+  const applySupplierFieldTemplate = useCallback(() => {
+    const selection = syncSelectionState()
+    const configured = selection
+      ? latestSheetRef.current.columns?.find((column) => column.key === selection.columnKey)?.options || []
+      : []
+    const observed = collectSelectedColumnOptions()
+    const existing = Array.from(new Set([...configured, ...observed].map((option) => String(option).trim()).filter(Boolean)))
+    const options = existing.length > 0 ? existing : ['供应商 A', '供应商 B', '供应商 C']
+    setFieldControlType('select')
+    setFieldControlSearchable(true)
+    setFieldControlOptions(options)
+    setFieldControlColors(Object.fromEntries(options.map((option, index) => [option, OPTION_COLOR_PALETTE[index % OPTION_COLOR_PALETTE.length]])))
+  }, [collectSelectedColumnOptions, syncSelectionState])
+
+  const openFieldControls = useCallback(() => {
+    const selection = syncSelectionState()
+    if (!selection) {
+      setActionError('请先选择需要设置字段控件的列或单元格范围。')
+      return
+    }
+    const column = latestSheetRef.current.columns?.find((item) => item.key === selection.columnKey)
+    if (column?.type === 'checkbox') {
+      setFieldControlType('checkbox')
+      setFieldControlOptions(column.options?.slice(0, 2) || ['是', '否'])
+      setFieldControlSearchable(false)
+    } else if (column?.type === 'select') {
+      setFieldControlType('select')
+      setFieldControlOptions(column.options?.length ? column.options : ['待处理', '已完成', '已取消'])
+      setFieldControlSearchable(Boolean(column.searchable))
+    } else {
+      setFieldControlType('select')
+      setFieldControlOptions(['待处理', '已完成', '已取消'])
+      setFieldControlSearchable(false)
+    }
+    const options = column?.options?.length ? column.options : ['待处理', '已完成', '已取消']
+    setFieldControlColors(Object.fromEntries(options.map((option, index) => [option, optionColorFor(column || { key: '', name: '', type: 'text' }, option, index)])))
+    setShowFieldControlPanel(true)
+  }, [syncSelectionState])
+
+  const handleApplyFieldControl = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能配置字段控件。')
+      return
+    }
+    const selection = syncSelectionState()
+    const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    const univerAPI = univerApiRef.current?.univerAPI
+    if (!selection || !worksheet || !univerAPI) {
+      setActionError('请先选择需要设置的列。')
+      return
+    }
+    const keys = selectedColumnKeys(selection)
+    if (keys.length === 0) {
+      setActionError('当前选区没有有效列。')
+      return
+    }
+    const normalizedOptions = Array.from(new Set(fieldControlOptions.map((item) => item.trim()).filter(Boolean)))
+    if (fieldControlType === 'select' && normalizedOptions.length < 2) {
+      setActionError('下拉列表至少需要两个选项。')
+      return
+    }
+    if (fieldControlType === 'checkbox' && normalizedOptions.length < 2) {
+      setActionError('复选框需要“选中”和“未选中”两个值。')
+      return
+    }
+
+    const nextColumns = (latestSheetRef.current.columns || []).map((column) => {
+      if (!keys.includes(column.key)) return column
+      if (fieldControlType === 'none') {
+        const next = { ...column, type: 'text' as const }
+        delete next.options
+        delete next.optionColors
+        delete next.searchable
+        return next
+      }
+      const options = fieldControlType === 'checkbox' ? normalizedOptions.slice(0, 2) : normalizedOptions
+      const optionColors = Object.fromEntries(options.map((option, index) => [option, fieldControlColors[option] || optionColorFor(column, option, index)]))
+      return { ...column, type: fieldControlType, options, optionColors, searchable: fieldControlType === 'select' && fieldControlSearchable }
+    })
+
+    setFieldControlApplying(true)
+    setActionError('')
+    try {
+      latestSheetRef.current = { ...latestSheetRef.current, columns: nextColumns }
+      applyingRemotePatchRef.current = true
+      applyColumnDataControls(univerAPI, worksheet, nextColumns, new Set(keys))
+      applyingRemotePatchRef.current = false
+      await persistCurrentSheet()
+      setShowFieldControlPanel(false)
+      setApprovalNotice(`已为 ${keys.length} 列应用${fieldControlType === 'checkbox' ? '复选框' : fieldControlType === 'select' ? '下拉列表与状态颜色' : '普通文本'}。`)
+      window.setTimeout(() => setApprovalNotice(''), 3200)
+    } catch (err) {
+      applyingRemotePatchRef.current = false
+      setActionError(err instanceof Error ? err.message : '字段控件保存失败，请稍后再试。')
+    } finally {
+      setFieldControlApplying(false)
+    }
+  }, [editLocked, fieldControlColors, fieldControlOptions, fieldControlSearchable, fieldControlType, persistCurrentSheet, selectedColumnKeys, syncSelectionState])
+
+  const handleSearchableOptionSelect = useCallback((value: string | null) => {
+    const target = optionPickerTarget
+    if (!target) return
+    if (editLocked || !canEditCell(target.columnKey, target.row - 1)) {
+      setActionError('当前账号不能修改这个单元格。')
+      return
+    }
+    try {
+      const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
+      const worksheet = workbook?.getActiveSheet?.()
+      if (!worksheet) throw new Error('工作表尚未加载完成')
+      worksheet.getRange(target.row, target.column, 1, 1).setValue(value ?? '')
+      setOptionPickerTarget(null)
+      setOptionPickerSearch('')
+      schedulePersistRef.current()
+      setApprovalNotice(`已将${target.columnName}设置为${value ? `“${value}”` : '空值'}。`)
+      window.setTimeout(() => setApprovalNotice(''), 2400)
+    } catch (pickerError) {
+      setActionError(pickerError instanceof Error ? pickerError.message : '下拉选项写入失败。')
+    }
+  }, [canEditCell, editLocked, optionPickerTarget])
+
+  const openApprovalFlowPanel = useCallback(() => {
+    const selection = syncSelectionState()
+    if (!selection) {
+      setActionError('请先框选需要审批的单元格、行或列。')
+      return
+    }
+    setApprovalName(`${selection.columnLabel}审批`)
+    setApprovalDescription(`范围：${selection.rangeLabel}。审批通过后才写入正式数据。`)
+    setShowApprovalPanel(true)
+    setApprovalLoading(true)
+    Promise.all([refreshApprovalRules(), refreshApprovalStates()]).finally(() => setApprovalLoading(false))
+  }, [refreshApprovalRules, refreshApprovalStates, syncSelectionState])
+
+  const handleCreateApprovalFlow = useCallback(async () => {
+    if (editLocked) {
+      setActionError('当前账号只有查看权限，不能创建审批流程。')
+      return
+    }
+    const selection = syncSelectionState()
+    if (!selection) {
+      setActionError('请先框选审批范围。')
+      return
+    }
+    const columns = selectedColumnKeys(selection)
+    if (columns.length === 0) {
+      setActionError('审批范围没有有效列。')
+      return
+    }
+    const steps = approvalSteps.map(({ id: _id, ...step }) => ({
+      ...step,
+      required_approvals: Math.max(1, step.required_approvals || 1),
+    }))
+    if (steps.some((step) => step.user_ids.length + step.department_ids.length === 0)) {
+      setActionError('每个审批步骤至少选择一名员工或一个部门。')
+      return
+    }
+    const allRows = selection.isEntireColumnSelection || (selection.includesHeaderRow && selection.endRowIndex < 0)
+    const startRow = allRows ? undefined : Math.max(0, selection.rowIndex)
+    const endRow = allRows ? undefined : Math.max(startRow || 0, selection.endRowIndex)
+    setApprovalAction('create')
+    setActionError('')
+    try {
+      const res = await api.post<AutomationRule>('/automation/rules', {
+        name: approvalName.trim() || '选区数据审批',
+        description: approvalDescription.trim(),
+        sheet_id: sheetId,
+        trigger_type: 'cell_change',
+        watched_columns: columns,
+        cron_expr: '',
+        timezone: 'Asia/Shanghai',
+        condition_logic: 'all',
+        conditions: [],
+        approval_steps: steps,
+        approval_ranges: [{ start_row: startRow, end_row: endRow, columns }],
+        actions: [{
+          type: 'notify',
+          recipient_type: 'trigger_user',
+          title_template: '审批通过：{{rule.name}}',
+          message_template: '{{sheet.name}} 第 {{row.number}} 行的待审内容已正式写入。',
+        }],
+        hold_changes: true,
+        enabled: true,
+      })
+      if (res.code !== 0) throw new Error(res.message || '创建审批流程失败')
+      await refreshApprovalRules()
+      setApprovalNotice('审批流程已生效，后续修改会先进入待审批状态。')
+      window.setTimeout(() => setApprovalNotice(''), 4200)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '创建审批流程失败，请稍后再试。')
+    } finally {
+      setApprovalAction('')
+    }
+  }, [approvalDescription, approvalName, approvalSteps, editLocked, refreshApprovalRules, selectedColumnKeys, sheetId, syncSelectionState])
+
+  const handleDeleteApprovalRule = useCallback(async (rule: AutomationRule) => {
+    if (!window.confirm(`确定删除审批流程“${rule.name}”吗？`)) return
+    setApprovalAction(`delete:${rule.id}`)
+    try {
+      const res = await api.delete(`/automation/rules/${rule.id}`)
+      if (res.code !== 0) throw new Error(res.message || '删除审批流程失败')
+      await refreshApprovalRules()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '删除审批流程失败，请稍后再试。')
+    } finally {
+      setApprovalAction('')
+    }
+  }, [refreshApprovalRules])
+
+  const focusApprovalState = useCallback((item: CellApprovalState) => {
+    const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook?.()?.getActiveSheet?.()
+    const columnIndex = latestSheetRef.current.columns?.findIndex((column) => column.key === item.col) ?? -1
+    if (!worksheet || columnIndex < 0) return
+    worksheet.getRange(item.row + 1, columnIndex, 1, 1).activate()
+    worksheet.scrollToCell?.(item.row + 1, columnIndex)
+    window.setTimeout(() => syncSelectionState(), 0)
+  }, [syncSelectionState])
+
+  const handApprovalSelectionToAI = useCallback(() => {
+    const selection = syncSelectionState()
+    if (!selection) return
+    const columns = selectedColumnKeys(selection)
+    const allRows = selection.isEntireColumnSelection || (selection.includesHeaderRow && selection.endRowIndex < 0)
+    window.dispatchEvent(new CustomEvent('yaerp:ai-compose', {
+      detail: {
+        prompt: `请为当前选区设计并创建一个 ERP 审批流程。先确认审批人和步骤；待审值只有审批通过后才写入，驳回保持原值。`,
+        workbookId: Number(workbookId),
+        sheetId,
+        selection: {
+          sheet_id: sheetId,
+          start_row: allRows ? undefined : Math.max(0, selection.rowIndex),
+          end_row: allRows ? undefined : Math.max(0, selection.endRowIndex),
+          column_keys: columns,
+          range_label: selection.rangeLabel,
+        },
+      },
+    }))
+    setShowApprovalPanel(false)
+  }, [selectedColumnKeys, sheetId, syncSelectionState, workbookId])
+
   const applyIncomingChanges = useCallback((changes: IncomingCellChange[]) => {
     if (changes.length === 0) return
     if (sheetEditorActiveRef.current || imeComposingRef.current) {
@@ -2454,6 +3007,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       void refreshProtectionSnapshot()
     })
 
+    const unsubscribeApproval = wsClient.on('approval_updated', (msg) => {
+      if (msg.sheetId !== sheetId) return
+      void refreshApprovalStates()
+    })
+
     const unsubscribeSheetSync = wsClient.on('sheet_sync', (msg) => {
       if (msg.sheetId !== sheetId) return
       void syncSheetSilently()
@@ -2463,11 +3021,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       unsubscribeBatch()
       unsubscribePresence()
       unsubscribeProtection()
+      unsubscribeApproval()
       unsubscribeSheetSync()
       wsClient.leaveSheet(sheetId)
       setSheetPresence([])
     }
-  }, [applyIncomingChanges, refreshPermissions, refreshProtectionSnapshot, sheetId, syncSheetSilently])
+  }, [applyIncomingChanges, refreshApprovalStates, refreshPermissions, refreshProtectionSnapshot, sheetId, syncSheetSilently])
 
   useEffect(() => subscribeDataChanged((detail) => {
     if (!detail.sheetIds.includes(sheetId)) return
@@ -2680,12 +3239,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           locale: localeKey,
           theme: defaultTheme,
           locales: {
-            [localeKey]: {
-              ...UniverPresetSheetsCoreZhCN,
-              ...UniverPresetSheetsFindReplaceZhCN,
-              ...UniverPresetSheetsFilterZhCN,
-              ...UniverSheetsDrawingZhCN,
-            },
+            [localeKey]: mergeLocaleBundles(
+              UniverPresetSheetsCoreZhCN,
+              UniverPresetSheetsFindReplaceZhCN,
+              UniverPresetSheetsFilterZhCN,
+              UniverSheetsDrawingZhCN,
+              UniverPresetSheetsDataValidationZhCN,
+              UniverPresetSheetsConditionalFormattingZhCN,
+            ),
           },
           presets: [
             UniverSheetsCorePreset({
@@ -2700,6 +3261,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             UniverSheetsDrawingPreset(),
             UniverSheetsFilterPreset(),
             UniverSheetsFindReplacePreset(),
+            UniverSheetsDataValidationPreset({ showEditOnDropdown: true }),
+            UniverSheetsConditionalFormattingPreset(),
           ],
         })
 
@@ -2709,6 +3272,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         const workbookApi = univerAPI.createUniverSheet(workbookData)
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
+        applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
         if (containerRef.current.offsetWidth <= 600) {
           try {
             const activeWorksheet = workbookApi.getActiveSheet()
@@ -2807,7 +3371,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               const snap = latestSheetRef.current
               const saved = workbookApi.save()
               const savedSheetId = saved.sheetOrder[0]
-              const savedSheet = cloneJsonSnapshot(saved.sheets[savedSheetId] as Partial<IWorksheetData>)
+              let savedSheet = cloneJsonSnapshot(saved.sheets[savedSheetId] as Partial<IWorksheetData>)
               if (!savedSheet) continue
 
               const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [], saved.styles as Record<string, unknown> | undefined)
@@ -2845,7 +3409,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 continue
               }
 
-              const res = await api.put(`/sheets/${snap.id}`, {
+              const res = await api.put<CellUpdateResult>(`/sheets/${snap.id}`, {
                 name: nextSheetName,
                 sort_order: snap.sort_order,
                 columns: nextColumns,
@@ -2856,6 +3420,37 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
               if (res.code !== 0) {
                 throw new Error(res.message || '保存工作表失败')
+              }
+
+              const revertedChanges = Array.isArray(res.data?.reverted_changes) ? res.data.reverted_changes : []
+              if (revertedChanges.length > 0) {
+                applyingRemotePatchRef.current = true
+                revertedChanges.forEach((change) => {
+                  const columnIndex = nextColumns.findIndex((column) => column.key === change.col)
+                  if (columnIndex < 0 || change.row < 0) return
+                  workbookApi.getActiveSheet().getRange(change.row + 1, columnIndex, 1, 1).setValue(
+                    typeof change.value === 'string' && change.value.startsWith('=')
+                      ? { f: change.value }
+                      : (change.value ?? '') as string | number | boolean
+                  )
+                })
+                savedSheet = applyRealtimeCellChangesToWorksheetSnapshot(savedSheet, revertedChanges, nextColumns)
+                nextConfig.univerSheetData = savedSheet
+                const pendingStates = Array.isArray(res.data?.pending_states) ? res.data.pending_states : []
+                if (pendingStates.length > 0) {
+                  setApprovalStates((current) => {
+                    const byID = new Map(current.map((item) => [item.id, item]))
+                    pendingStates.forEach((item) => byID.set(item.id, item))
+                    return Array.from(byID.values())
+                  })
+                  setApprovalNotice(`已提交 ${pendingStates.length} 个单元格审批，正式数据保持原值。`)
+                  window.setTimeout(() => setApprovalNotice(''), 4200)
+                }
+                if (remotePatchResetTimerRef.current) clearTimeout(remotePatchResetTimerRef.current)
+                remotePatchResetTimerRef.current = setTimeout(() => {
+                  applyingRemotePatchRef.current = false
+                  remotePatchResetTimerRef.current = null
+                }, 200)
               }
 
               latestSheetRef.current = {
@@ -2937,6 +3532,28 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           if (columnIndex >= 0) sendPresenceForCell('selected', selection.rowIndex + 1, columnIndex)
         })
 
+        const searchableOptionClickDisposable = univerAPI.addEvent(univerAPI.Event.CellClicked, (params) => {
+          if (params.row <= 0) return
+          const column = latestSheetRef.current.columns?.[params.column]
+          if (column?.type !== 'select' || !column.searchable || !column.options?.length) return
+          let currentValue = ''
+          try {
+            currentValue = String(params.worksheet.getRange(params.row, params.column, 1, 1).getValues?.()?.[0]?.[0] ?? '')
+          } catch {
+            currentValue = ''
+          }
+          setOptionPickerSearch('')
+          setOptionPickerTarget({
+            row: params.row,
+            column: params.column,
+            columnKey: column.key,
+            columnName: column.name || column.key,
+            options: column.options.slice(),
+            optionColors: column.optionColors,
+            currentValue,
+          })
+        })
+
         const scrollPositionDisposable = univerAPI.addEvent(univerAPI.Event.Scroll, () => {
           scheduleSheetViewMemoryPersist()
         })
@@ -2988,6 +3605,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           persistSheetViewMemory()
           disposable.dispose()
           selectionPresenceDisposable.dispose()
+          searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
           beforeEditPresenceDisposable.dispose()
           editStartedPresenceDisposable.dispose()
@@ -3017,6 +3635,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           univerApiRef.current = null
           setHasFilter(false)
           setSelectionState(null)
+          setOptionPickerTarget(null)
+          setOptionPickerSearch('')
 
           try {
             ;(univer as { dispose?: () => void }).dispose?.()
@@ -3486,7 +4106,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     )
   }
 
-  const showFabs = !showImagePicker && !univerHasOverlay && !showNumberFormatPanel
+  const showFabs = !showImagePicker && !univerHasOverlay && !showNumberFormatPanel && !showApprovalPanel && !showFieldControlPanel && !optionPickerTarget
   const currentRowProtection = selectionState
     ? protectionSnapshot.rows.find((item) => item.row_index === selectionState.rowIndex) || null
     : null
@@ -3624,6 +4244,31 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       return priority[left.state] - priority[right.state] || left.username.localeCompare(right.username, 'zh-CN')
     })
   const displayedCollaborators = presenceExpanded ? onlineCollaborators : onlineCollaborators.slice(0, 4)
+  const currentApprovalStates = selectionState
+    ? approvalStates.filter((item) => item.row === selectionState.rowIndex && item.col === selectionState.columnKey)
+    : []
+  const pendingApprovalStates = approvalStates.filter((item) => item.status === 'pending')
+  const normalizedOptionPickerSearch = optionPickerSearch.trim().toLocaleLowerCase('zh-CN')
+  const filteredOptionPickerOptions = optionPickerTarget
+    ? optionPickerTarget.options.filter((option) => !normalizedOptionPickerSearch || option.toLocaleLowerCase('zh-CN').includes(normalizedOptionPickerSearch))
+    : []
+  const normalizedApprovalUserSearch = approvalUserSearch.trim().toLocaleLowerCase('zh-CN')
+  const filteredApprovalUsers = normalizedApprovalUserSearch
+    ? protectionUsers.filter((user) => `${user.username} ${user.email}`.toLocaleLowerCase('zh-CN').includes(normalizedApprovalUserSearch))
+    : protectionUsers
+  const approvalRangeLabel = (rule: AutomationRule) => {
+    const target = rule.approval_ranges?.[0]
+    const columnNames = (target?.columns || rule.watched_columns || []).map((key) => columnLabelMap.get(key) || key)
+    const rows = typeof target?.start_row === 'number' && typeof target?.end_row === 'number'
+      ? `第 ${target.start_row + 2}-${target.end_row + 2} 行`
+      : '全部数据行'
+    return `${rows} · ${columnNames.length > 0 ? columnNames.join('、') : '全部列'}`
+  }
+  const approvalRelatedSummary = (item: CellApprovalState) => Object.entries(item.related_data || {})
+    .filter(([key, value]) => key !== item.col && value !== null && value !== undefined && value !== '')
+    .slice(0, 4)
+    .map(([key, value]) => `${item.field_labels?.[key] || columnLabelMap.get(key) || key}：${formatApprovalValue(value)}`)
+    .join(' · ')
 
   return (
     <div
@@ -3722,6 +4367,31 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   aria-label="数字与默认格式"
                 >
                   <Hash className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label="字段控件（下拉/复选框）">
+                <button
+                  type="button"
+                  onClick={openFieldControls}
+                  disabled={editLocked}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="字段控件（下拉/复选框）"
+                  aria-label="字段控件"
+                >
+                  <ListChecks className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label={`审批流程${pendingApprovalStates.length > 0 ? ` · ${pendingApprovalStates.length} 个待审` : ''}`}>
+                <button
+                  type="button"
+                  onClick={openApprovalFlowPanel}
+                  disabled={editLocked}
+                  className="relative flex h-10 w-10 items-center justify-center rounded-full border border-amber-200 bg-amber-50 text-amber-700 shadow-lg transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="配置选区审批流程"
+                  aria-label="审批流程"
+                >
+                  <ClipboardCheck className="h-4 w-4" />
+                  {pendingApprovalStates.length > 0 && <span className="absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white">{Math.min(pendingApprovalStates.length, 99)}</span>}
                 </button>
               </FloatingToolHint>
               <FloatingToolHint label="保护设置">
@@ -3877,6 +4547,172 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             >
               {toolbarExpanded ? <ChevronUp className="h-5 w-5" /> : <Wrench className="h-5 w-5" />}
             </button>
+          </div>
+        </div>
+      )}
+
+      {optionPickerTarget && (
+        <div className="fixed inset-0 z-[1100] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) { setOptionPickerTarget(null); setOptionPickerSearch('') } }}>
+          <div className="flex max-h-[82vh] w-full flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:max-w-md sm:rounded-lg">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div className="min-w-0"><div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><Building2 className="h-4 w-4 text-emerald-600" />选择{optionPickerTarget.columnName}</div><div className="mt-1 truncate text-xs text-slate-400">第 {optionPickerTarget.row + 1} 行 · 支持输入关键词筛选</div></div>
+              <button type="button" onClick={() => { setOptionPickerTarget(null); setOptionPickerSearch('') }} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100" title="关闭"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="border-b border-slate-100 p-4">
+              <label className="relative block"><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input autoFocus type="search" value={optionPickerSearch} onChange={(event) => setOptionPickerSearch(event.target.value)} placeholder={`搜索${optionPickerTarget.columnName}...`} className="h-10 w-full rounded-lg border border-slate-200 bg-slate-50 pl-9 pr-3 text-sm outline-none focus:border-emerald-300 focus:bg-white focus:ring-2 focus:ring-emerald-100" /></label>
+              {optionPickerTarget.currentValue && <div className="mt-2 text-xs text-slate-400">当前值：<span className="font-semibold text-slate-700">{optionPickerTarget.currentValue}</span></div>}
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-2">
+              {filteredOptionPickerOptions.length === 0 ? <div className="px-4 py-10 text-center text-sm text-slate-400">没有匹配的选项</div> : filteredOptionPickerOptions.map((option, index) => {
+                const configured = optionPickerTarget.optionColors?.[option]
+                const fallback = COMMON_OPTION_COLORS[option] || OPTION_COLOR_PALETTE[index % OPTION_COLOR_PALETTE.length]
+                const backgroundColor = configured?.backgroundColor || fallback.backgroundColor
+                const textColor = configured?.textColor || fallback.textColor
+                const selected = option === optionPickerTarget.currentValue
+                return <button key={option} type="button" onClick={() => handleSearchableOptionSelect(option)} className={`flex min-h-11 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-slate-50 ${selected ? 'bg-emerald-50' : ''}`}><span className="h-7 w-2 shrink-0 rounded-full" style={{ backgroundColor }} /><span className="min-w-0 flex-1 truncate text-sm font-medium" style={{ color: textColor }}>{option}</span>{selected && <Check className="h-4 w-4 shrink-0 text-emerald-600" />}</button>
+              })}
+            </div>
+            <div className="flex items-center justify-between gap-2 border-t border-slate-200 px-4 py-3"><span className="text-xs text-slate-400">共 {optionPickerTarget.options.length} 个选项</span><button type="button" onClick={() => handleSearchableOptionSelect(null)} disabled={editLocked} className="h-8 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-40">清空当前值</button></div>
+          </div>
+        </div>
+      )}
+
+      {showFieldControlPanel && (
+        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !fieldControlApplying) setShowFieldControlPanel(false) }}>
+          <div className="flex max-h-[90vh] w-[min(620px,96vw)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><ListChecks className="h-4 w-4 text-emerald-600" />字段控件</div>
+                <div className="mt-1 truncate text-xs text-slate-400">应用到：{selectionState?.rangeLabel || '当前选区中的列'}</div>
+              </div>
+              <button type="button" onClick={() => setShowFieldControlPanel(false)} disabled={fieldControlApplying} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100" title="关闭"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              <div className="grid grid-cols-3 gap-2 rounded-lg bg-slate-100 p-1">
+                {([
+                  { type: 'select' as const, label: '下拉列表', icon: ListChecks },
+                  { type: 'checkbox' as const, label: '是/否复选框', icon: CheckSquare2 },
+                  { type: 'none' as const, label: '普通文本', icon: Square },
+                ]).map((item) => (
+                  <button key={item.type} type="button" onClick={() => { setFieldControlType(item.type); if (item.type !== 'select') setFieldControlSearchable(false); if (item.type === 'checkbox') setFieldControlOptions((current) => current.length >= 2 ? current.slice(0, 2) : ['是', '否']) }} className={`flex min-h-10 items-center justify-center gap-2 rounded-md px-2 text-xs font-semibold transition ${fieldControlType === item.type ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}>
+                    <item.icon className="h-4 w-4" />{item.label}
+                  </button>
+                ))}
+              </div>
+
+              {fieldControlType !== 'none' && (
+                <>
+                  <div className="mt-5 flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-semibold text-slate-600">快速模板</span>
+                    <button type="button" onClick={() => setFieldControlOptions(['待处理', '已完成', '已取消'])} className="h-8 rounded-lg border border-slate-200 px-2.5 text-xs text-slate-600 hover:bg-slate-50">任务状态</button>
+                    <button type="button" onClick={() => setFieldControlOptions(['待审批', '已通过', '已驳回'])} className="h-8 rounded-lg border border-slate-200 px-2.5 text-xs text-slate-600 hover:bg-slate-50">审批状态</button>
+                    <button type="button" onClick={applySupplierFieldTemplate} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"><Building2 className="h-3.5 w-3.5" />供应商</button>
+                    <button type="button" onClick={() => { setFieldControlType('checkbox'); setFieldControlSearchable(false); setFieldControlOptions(['是', '否']) }} className="h-8 rounded-lg border border-slate-200 px-2.5 text-xs text-slate-600 hover:bg-slate-50">是 / 否</button>
+                  </div>
+                  {fieldControlType === 'select' && (
+                    <div className="mt-3 flex flex-col gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div><div className="text-xs font-semibold text-slate-700">搜索选择</div><div className="mt-0.5 text-[11px] leading-5 text-slate-400">开启后，点击该列单元格会弹出可搜索的下拉选择器。</div></div>
+                      <label className="inline-flex shrink-0 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600"><input type="checkbox" checked={fieldControlSearchable} onChange={(event) => setFieldControlSearchable(event.target.checked)} className="h-4 w-4 rounded border-slate-300 text-emerald-600" />启用搜索</label>
+                    </div>
+                  )}
+                  <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
+                    {fieldControlOptions.map((option, index) => {
+                      const color = fieldControlColors[option] || COMMON_OPTION_COLORS[option] || OPTION_COLOR_PALETTE[index % OPTION_COLOR_PALETTE.length]
+                      return (
+                        <div key={`${index}-${option}`} className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-3 py-2.5 last:border-b-0">
+                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[11px] font-semibold" style={{ backgroundColor: color.backgroundColor, color: color.textColor }}>{index + 1}</span>
+                          <input value={option} onChange={(event) => {
+                            const nextValue = event.target.value
+                            setFieldControlOptions((current) => current.map((item, itemIndex) => itemIndex === index ? nextValue : item))
+                            setFieldControlColors((current) => {
+                              const next = { ...current }
+                              const existing = next[option]
+                              delete next[option]
+                              if (nextValue.trim()) next[nextValue] = existing || color
+                              return next
+                            })
+                          }} className="h-9 min-w-[160px] flex-1 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-300" placeholder={`选项 ${index + 1}`} />
+                          <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-2 text-[11px] text-slate-500" title="背景颜色"><span>背景</span><input type="color" value={color.backgroundColor.slice(0, 7)} onChange={(event) => setFieldControlColors((current) => ({ ...current, [option]: { ...color, backgroundColor: event.target.value.toUpperCase() } }))} className="h-6 w-7 cursor-pointer border-0 bg-transparent p-0" /></label>
+                          <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-2 text-[11px] text-slate-500" title="文字颜色"><span>文字</span><input type="color" value={color.textColor.slice(0, 7)} onChange={(event) => setFieldControlColors((current) => ({ ...current, [option]: { ...color, textColor: event.target.value.toUpperCase() } }))} className="h-6 w-7 cursor-pointer border-0 bg-transparent p-0" /></label>
+                          {fieldControlType === 'select' && fieldControlOptions.length > 2 && <button type="button" onClick={() => setFieldControlOptions((current) => current.filter((_, itemIndex) => itemIndex !== index))} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600" title="删除选项"><Trash2 className="h-3.5 w-3.5" /></button>}
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {fieldControlType === 'select' && <div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={() => setFieldControlOptions((current) => [...current, `选项 ${current.length + 1}`])} className="inline-flex h-9 items-center gap-2 rounded-lg border border-dashed border-slate-300 px-3 text-xs font-semibold text-slate-600 hover:border-emerald-300 hover:text-emerald-700"><Plus className="h-3.5 w-3.5" />添加选项</button><button type="button" onClick={() => { const values = collectSelectedColumnOptions(); if (values.length > 0) { setFieldControlOptions(values); setFieldControlColors(Object.fromEntries(values.map((option, index) => [option, OPTION_COLOR_PALETTE[index % OPTION_COLOR_PALETTE.length]]))) } else { setActionError('当前列还没有可提取的供应商或选项内容。') } }} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"><Building2 className="h-3.5 w-3.5" />从当前列提取</button></div>}
+                  <div className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-2.5 text-xs leading-5 text-emerald-800">下拉项会使用不同颜色显示；供应商等长列表可开启搜索，点击单元格即可筛选并选择。</div>
+                </>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
+              <button type="button" onClick={() => setShowFieldControlPanel(false)} disabled={fieldControlApplying} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button>
+              <button type="button" onClick={() => void handleApplyFieldControl()} disabled={fieldControlApplying} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white disabled:opacity-50"><BadgeCheck className="h-4 w-4" />{fieldControlApplying ? '正在应用...' : '应用到选区列'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showApprovalPanel && (
+        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !approvalAction) setShowApprovalPanel(false) }}>
+          <div className="flex max-h-[92vh] w-[min(860px,97vw)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><ClipboardCheck className="h-4 w-4 text-amber-600" />表格内审批流程</div>
+                <div className="mt-1 truncate text-xs text-slate-400">当前选区：{selectionState?.rangeLabel || '未选择'}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={handApprovalSelectionToAI} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-sky-200 bg-sky-50 px-2.5 text-xs font-semibold text-sky-700 hover:bg-sky-100"><Bot className="h-3.5 w-3.5" />交给 AI 设计</button>
+                <button type="button" onClick={() => setShowApprovalPanel(false)} disabled={Boolean(approvalAction)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100" title="关闭"><X className="h-4 w-4" /></button>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(260px,.8fr)]">
+                <div className="space-y-4">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="space-y-1.5"><span className="text-xs font-semibold text-slate-600">流程名称</span><input value={approvalName} onChange={(event) => setApprovalName(event.target.value)} className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-amber-300" /></label>
+                    <label className="space-y-1.5"><span className="text-xs font-semibold text-slate-600">处理逻辑</span><div className="flex h-10 items-center rounded-lg border border-amber-200 bg-amber-50 px-3 text-xs font-semibold text-amber-800">通过才写入，驳回保留原值</div></label>
+                  </div>
+                  <label className="block space-y-1.5"><span className="text-xs font-semibold text-slate-600">说明</span><textarea value={approvalDescription} onChange={(event) => setApprovalDescription(event.target.value)} rows={2} className="w-full resize-none rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-300" /></label>
+
+                  <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between"><div><div className="text-sm font-semibold text-slate-800">审批步骤</div><div className="mt-0.5 text-xs text-slate-400">按顺序执行，可使用员工或部门。</div></div><button type="button" onClick={() => setApprovalSteps((current) => [...current, newApprovalStep(current.length)])} className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"><Plus className="h-3.5 w-3.5" />添加步骤</button></div>
+                  <div className="space-y-3">
+                    {approvalSteps.map((step, stepIndex) => {
+                      const principalCount = new Set([...step.user_ids, ...step.department_ids.map((id) => -id)]).size
+                      return (
+                        <section key={step.id} className="overflow-hidden rounded-lg border border-slate-200">
+                          <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 bg-slate-50 px-3 py-2.5">
+                            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-amber-100 text-xs font-bold text-amber-800">{stepIndex + 1}</span>
+                            <input value={step.name} onChange={(event) => setApprovalSteps((current) => current.map((item) => item.id === step.id ? { ...item, name: event.target.value } : item))} className="h-8 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold outline-none focus:border-amber-300" />
+                            <div className="ml-8 flex basis-[calc(100%-2rem)] items-center justify-end gap-2 sm:ml-0 sm:basis-auto">
+                              <label className="flex shrink-0 items-center gap-1.5 text-[11px] text-slate-500">需通过<input type="number" min={1} max={Math.max(1, principalCount)} value={step.required_approvals} onChange={(event) => setApprovalSteps((current) => current.map((item) => item.id === step.id ? { ...item, required_approvals: Math.max(1, Number(event.target.value) || 1) } : item))} className="h-8 w-14 rounded-lg border border-slate-200 bg-white px-2 text-center text-xs outline-none" />人</label>
+                              {approvalSteps.length > 1 && <button type="button" onClick={() => setApprovalSteps((current) => current.filter((item) => item.id !== step.id))} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600" title="删除步骤"><Trash2 className="h-3.5 w-3.5" /></button>}
+                            </div>
+                          </div>
+                          <div className="grid gap-3 p-3 md:grid-cols-2">
+                            <div><div className="mb-1.5 text-xs font-semibold text-slate-600">部门</div><div className="max-h-36 overflow-y-auto rounded-lg border border-slate-200">{protectionDepartments.length === 0 ? <div className="px-3 py-4 text-center text-xs text-slate-400">暂无部门</div> : protectionDepartments.map((department) => <label key={department.id} className="flex cursor-pointer items-center gap-2 border-b border-slate-100 px-3 py-2 text-xs last:border-b-0 hover:bg-slate-50"><input type="checkbox" checked={step.department_ids.includes(department.id)} onChange={(event) => setApprovalSteps((current) => current.map((item) => item.id === step.id ? { ...item, department_ids: event.target.checked ? [...item.department_ids, department.id] : item.department_ids.filter((id) => id !== department.id) } : item))} className="h-4 w-4 rounded border-slate-300 text-amber-600" /><span className="min-w-0 flex-1 truncate">{department.name}</span><span className="text-[10px] text-slate-400">{department.member_count} 人</span></label>)}</div></div>
+                            <div><div className="mb-1.5 text-xs font-semibold text-slate-600">员工</div><label className="relative mb-2 block"><Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" /><input type="search" value={approvalUserSearch} onChange={(event) => setApprovalUserSearch(event.target.value)} placeholder="搜索员工" className="h-8 w-full rounded-lg border border-slate-200 pl-8 pr-2 text-xs outline-none focus:border-amber-300" /></label><div className="max-h-36 overflow-y-auto rounded-lg border border-slate-200">{protectionUsersLoading ? <div className="px-3 py-4 text-center text-xs text-slate-400">正在加载员工...</div> : filteredApprovalUsers.map((user) => <label key={user.id} className="flex cursor-pointer items-center gap-2 border-b border-slate-100 px-3 py-2 text-xs last:border-b-0 hover:bg-slate-50"><input type="checkbox" checked={step.user_ids.includes(user.id)} onChange={(event) => setApprovalSteps((current) => current.map((item) => item.id === step.id ? { ...item, user_ids: event.target.checked ? [...item.user_ids, user.id] : item.user_ids.filter((id) => id !== user.id) } : item))} className="h-4 w-4 rounded border-slate-300 text-amber-600" /><span className="min-w-0 flex-1 truncate">{user.username}</span></label>)}</div></div>
+                          </div>
+                        </section>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                <aside className="space-y-4">
+                  <section className="overflow-hidden rounded-lg border border-slate-200"><div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-3 py-2.5"><span className="text-sm font-semibold text-slate-800">已配置流程</span><span className="text-xs text-slate-400">{approvalRules.length}</span></div><div className="max-h-56 overflow-y-auto">{approvalLoading ? <div className="px-3 py-6 text-center text-xs text-slate-400">正在加载...</div> : approvalRules.length === 0 ? <div className="px-3 py-6 text-center text-xs text-slate-400">当前工作表暂无审批流程</div> : approvalRules.map((rule) => <div key={rule.id} className="border-b border-slate-100 px-3 py-3 last:border-b-0"><div className="flex items-start gap-2"><div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold text-slate-800">{rule.name}</div><div className="mt-1 text-[11px] leading-5 text-slate-400">{approvalRangeLabel(rule)}</div></div><span className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${rule.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{rule.enabled ? '启用' : '停用'}</span>{(adminMode || rule.owner_id === profile?.id) && <button type="button" onClick={() => void handleDeleteApprovalRule(rule)} disabled={approvalAction === `delete:${rule.id}`} className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-300 hover:bg-rose-50 hover:text-rose-600" title="删除流程"><Trash2 className="h-3.5 w-3.5" /></button>}</div></div>)}</div></section>
+                  <section className="overflow-hidden rounded-lg border border-slate-200">
+                    <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-3 py-2.5"><span className="text-sm font-semibold text-slate-800">单元格审批状态</span><span className="rounded-md bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">待审 {pendingApprovalStates.length}</span></div>
+                    <div className="max-h-80 overflow-y-auto">
+                      {approvalStates.length === 0 ? <div className="px-3 py-6 text-center text-xs text-slate-400">暂无审批记录</div> : approvalStates.slice(0, 80).map((item) => {
+                        const relatedSummary = approvalRelatedSummary(item)
+                        return <button key={item.id} type="button" onClick={() => focusApprovalState(item)} className="block w-full border-b border-slate-100 px-3 py-3 text-left last:border-b-0 hover:bg-slate-50"><div className="flex items-center justify-between gap-2"><span className="truncate text-xs font-semibold text-slate-700">{item.field_labels?.[item.col] || columnLabelMap.get(item.col) || item.col}{item.row + 2} · {item.rule_name}</span><span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${item.status === 'pending' ? 'bg-amber-100 text-amber-800' : item.status === 'approved' ? 'bg-emerald-100 text-emerald-700' : item.status === 'rejected' ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-500'}`}>{item.status === 'pending' ? '待审批' : item.status === 'approved' ? '已通过' : item.status === 'rejected' ? '已驳回' : '已结束'}</span></div><div className="mt-1 text-[11px] text-slate-400">{item.submitted_by_name} · {new Date(item.submitted_at).toLocaleString('zh-CN')}</div><div className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-5 text-amber-800"><span className="text-slate-500">原值：</span>{formatApprovalValue(item.original_value)}<span className="mx-1.5 text-amber-400">→</span><span className="text-slate-500">待审值：</span><strong>{formatApprovalValue(item.proposed_value)}</strong></div>{relatedSummary && <div className="mt-2 line-clamp-2 text-[11px] leading-5 text-slate-500">关联内容：{relatedSummary}</div>}</button>
+                      })}
+                    </div>
+                  </section>
+                </aside>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-4 py-3"><div className="text-xs text-slate-400">审批人仍需拥有对应表格查看权限；正式写入会再次校验提交人的编辑权限。</div><div className="flex items-center gap-2"><button type="button" onClick={() => setShowApprovalPanel(false)} disabled={Boolean(approvalAction)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">关闭</button><button type="button" onClick={() => void handleCreateApprovalFlow()} disabled={Boolean(approvalAction) || approvalSteps.length === 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-amber-600 px-4 text-sm font-semibold text-white disabled:opacity-50"><ClipboardCheck className="h-4 w-4" />{approvalAction === 'create' ? '正在创建...' : '应用审批到选区'}</button></div></div>
           </div>
         </div>
       )}
@@ -4344,9 +5180,26 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         </div>
       )}
 
+      {approvalNotice && (
+        <div className="absolute left-1/2 top-14 z-20 max-w-[min(90%,36rem)] -translate-x-1/2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-center text-xs font-semibold text-amber-800 shadow-lg">
+          {approvalNotice}
+        </div>
+      )}
+
       {actionError && (
         <div className="absolute left-1/2 top-14 z-20 -translate-x-1/2 rounded-full bg-rose-500 px-4 py-1.5 text-xs font-semibold text-white shadow-lg">
           {actionError}
+        </div>
+      )}
+
+      {currentApprovalStates.length > 0 && (
+        <div className={`absolute left-3 z-20 flex max-w-[65%] flex-wrap gap-2 ${(currentProtectionItems.length > 0 || showSelectionRestriction) ? 'top-12' : 'top-3'}`}>
+          {currentApprovalStates.map((item) => (
+            <button key={`approval-${item.id}`} type="button" onClick={() => focusApprovalState(item)} className={`inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm ${item.status === 'pending' ? 'border-amber-300 text-amber-800' : item.status === 'approved' ? 'border-emerald-300 text-emerald-700' : 'border-rose-300 text-rose-700'}`} title={item.status === 'pending' ? `原值：${formatApprovalValue(item.original_value)} → 待审值：${formatApprovalValue(item.proposed_value)}` : item.rule_name}>
+              <ClipboardCheck className="h-3 w-3" />
+              {item.status === 'pending' ? '正在审批' : item.status === 'approved' ? '审批已通过' : '审批未通过'} · {item.submitted_by_name}
+            </button>
+          ))}
         </div>
       )}
 

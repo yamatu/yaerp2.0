@@ -11,6 +11,8 @@ import {
   LayoutDashboard,
   Shield,
   MessageCircle,
+  Workflow,
+  ScrollText,
   Users,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
@@ -22,6 +24,8 @@ const adminModules = [
   { label: '角色管理', href: '/admin/roles', icon: Shield },
   { label: '部门权限', href: '/admin/permissions', icon: Building2 },
   { label: '数据备份', href: '/admin/backup', icon: Database },
+  { label: '操作审计', href: '/admin/audit', icon: ScrollText },
+  { label: '流程自动化', href: '/admin/automation', icon: Workflow },
   { label: 'AI 助手', href: '/admin/ai', icon: Bot },
   { label: 'WhatsApp', href: '/admin/whatsapp', icon: MessageCircle },
 ]

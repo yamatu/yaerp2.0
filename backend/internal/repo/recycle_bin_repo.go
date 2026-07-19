@@ -2,6 +2,7 @@ package repo
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -16,7 +17,37 @@ func NewRecycleBinRepo(db *sql.DB) *RecycleBinRepo {
 	return &RecycleBinRepo{db: db}
 }
 
-func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []model.Workbook, error) {
+const deletedTradeOrderSelect = `
+	SELECT o.id, o.order_no, o.title, o.stage, c.name, c.company_name,
+	       o.owner_id, COALESCE(owner.username, ''), o.workbook_id, COALESCE(w.name, ''),
+	       (SELECT COUNT(*) FROM trade_order_items item WHERE item.order_id = o.id),
+	       (SELECT COUNT(*) FROM trade_supplier_quotes quote WHERE quote.order_id = o.id),
+	       (SELECT COUNT(*) FROM trade_customer_quote_rounds quote WHERE quote.order_id = o.id),
+	       (SELECT COUNT(*) FROM trade_order_stage_events event WHERE event.order_id = o.id),
+	       (SELECT COUNT(*) FROM trade_inspection_photos photo WHERE photo.order_id = o.id),
+	       o.deleted_at, o.deleted_by, deleter.username, o.created_at, o.updated_at
+	FROM trade_orders o
+	JOIN trade_customers c ON c.id = o.customer_id
+	LEFT JOIN users owner ON owner.id = o.owner_id
+	LEFT JOIN users deleter ON deleter.id = o.deleted_by
+	LEFT JOIN workbooks w ON w.id = o.workbook_id`
+
+func scanDeletedTradeOrder(scanner interface{ Scan(...any) error }) (*model.DeletedTradeOrder, error) {
+	var order model.DeletedTradeOrder
+	if err := scanner.Scan(
+		&order.ID, &order.OrderNo, &order.Title, &order.Stage,
+		&order.CustomerName, &order.CustomerCompany, &order.OwnerID, &order.OwnerName,
+		&order.WorkbookID, &order.WorkbookName, &order.ItemCount, &order.SupplierQuoteCount,
+		&order.CustomerQuoteCount, &order.StageEventCount, &order.InspectionPhotoCount,
+		&order.DeletedAt, &order.DeletedByID, &order.DeletedByName,
+		&order.CreatedAt, &order.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &order, nil
+}
+
+func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []model.Workbook, []model.DeletedTradeOrder, error) {
 	folderRows, err := r.db.Query(
 		`SELECT f.id, f.name, f.parent_id, f.owner_id, owner.username,
 		        f.deleted_at, f.deleted_by, deleter.username, f.created_at, f.updated_at
@@ -36,7 +67,7 @@ func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []
 		userID, includeAll,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list deleted folders: %w", err)
+		return nil, nil, nil, fmt.Errorf("list deleted folders: %w", err)
 	}
 	defer folderRows.Close()
 
@@ -47,12 +78,12 @@ func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []
 			&folder.ID, &folder.Name, &folder.ParentID, &folder.OwnerID, &folder.OwnerName,
 			&folder.DeletedAt, &folder.DeletedByID, &folder.DeletedByName, &folder.CreatedAt, &folder.UpdatedAt,
 		); err != nil {
-			return nil, nil, fmt.Errorf("scan deleted folder: %w", err)
+			return nil, nil, nil, fmt.Errorf("scan deleted folder: %w", err)
 		}
 		folders = append(folders, folder)
 	}
 	if err := folderRows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("iterate deleted folders: %w", err)
+		return nil, nil, nil, fmt.Errorf("iterate deleted folders: %w", err)
 	}
 
 	workbookRows, err := r.db.Query(
@@ -71,11 +102,17 @@ func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []
 		         AND folder_batch.deleted_at = w.deleted_at
 		         AND folder_batch.deleted_by IS NOT DISTINCT FROM w.deleted_by
 		   )
+		   AND NOT EXISTS (
+		       SELECT 1
+		       FROM trade_orders trade_order
+		       WHERE trade_order.workbook_id = w.id
+		         AND trade_order.deleted_at IS NOT NULL
+		   )
 		 ORDER BY w.deleted_at DESC, w.id DESC`,
 		userID, includeAll,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list deleted workbooks: %w", err)
+		return nil, nil, nil, fmt.Errorf("list deleted workbooks: %w", err)
 	}
 	defer workbookRows.Close()
 
@@ -88,15 +125,36 @@ func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []
 			&workbook.DeletedAt, &workbook.DeletedByID, &workbook.DeletedByName,
 			&workbook.CreatedAt, &workbook.UpdatedAt,
 		); err != nil {
-			return nil, nil, fmt.Errorf("scan deleted workbook: %w", err)
+			return nil, nil, nil, fmt.Errorf("scan deleted workbook: %w", err)
 		}
 		workbooks = append(workbooks, workbook)
 	}
 	if err := workbookRows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("iterate deleted workbooks: %w", err)
+		return nil, nil, nil, fmt.Errorf("iterate deleted workbooks: %w", err)
 	}
 
-	return folders, workbooks, nil
+	tradeOrders := make([]model.DeletedTradeOrder, 0)
+	if includeAll {
+		orderRows, err := r.db.Query(deletedTradeOrderSelect + `
+			WHERE o.deleted_at IS NOT NULL
+			ORDER BY o.deleted_at DESC, o.id DESC`)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("list deleted trade orders: %w", err)
+		}
+		defer orderRows.Close()
+		for orderRows.Next() {
+			order, err := scanDeletedTradeOrder(orderRows)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("scan deleted trade order: %w", err)
+			}
+			tradeOrders = append(tradeOrders, *order)
+		}
+		if err := orderRows.Err(); err != nil {
+			return nil, nil, nil, fmt.Errorf("iterate deleted trade orders: %w", err)
+		}
+	}
+
+	return folders, workbooks, tradeOrders, nil
 }
 
 func (r *RecycleBinRepo) GetDeletedWorkbook(id int64) (*model.Workbook, error) {
@@ -108,7 +166,12 @@ func (r *RecycleBinRepo) GetDeletedWorkbook(id int64) (*model.Workbook, error) {
 		 FROM workbooks w
 		 LEFT JOIN users owner ON owner.id = w.owner_id
 		 LEFT JOIN users deleter ON deleter.id = w.deleted_by
-		 WHERE w.id = $1 AND w.deleted_at IS NOT NULL`,
+		 WHERE w.id = $1 AND w.deleted_at IS NOT NULL
+		   AND NOT EXISTS (
+		       SELECT 1 FROM trade_orders trade_order
+		       WHERE trade_order.workbook_id = w.id
+		         AND trade_order.deleted_at IS NOT NULL
+		   )`,
 		id,
 	).Scan(
 		&workbook.ID, &workbook.Name, &workbook.Description, &workbook.OwnerID, &workbook.OwnerName,
@@ -146,6 +209,19 @@ func (r *RecycleBinRepo) GetDeletedFolder(id int64) (*model.Folder, error) {
 		return nil, fmt.Errorf("get deleted folder: %w", err)
 	}
 	return &folder, nil
+}
+
+func (r *RecycleBinRepo) GetDeletedTradeOrder(id int64) (*model.DeletedTradeOrder, error) {
+	order, err := scanDeletedTradeOrder(r.db.QueryRow(
+		deletedTradeOrderSelect+` WHERE o.id = $1 AND o.deleted_at IS NOT NULL`, id,
+	))
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("deleted trade order %d not found", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get deleted trade order: %w", err)
+	}
+	return order, nil
 }
 
 func (r *RecycleBinRepo) RestoreWorkbook(id int64) error {
@@ -197,6 +273,11 @@ func (r *RecycleBinRepo) RestoreFolder(folder *model.Folder) error {
 			WHERE folder_id IN (SELECT id FROM folder_tree)
 			  AND deleted_at = $2
 			  AND deleted_by IS NOT DISTINCT FROM $3
+			  AND NOT EXISTS (
+			      SELECT 1 FROM trade_orders trade_order
+			      WHERE trade_order.workbook_id = workbooks.id
+			        AND trade_order.deleted_at IS NOT NULL
+			  )
 			RETURNING id
 		), restored_folders AS (
 			UPDATE folders
@@ -231,6 +312,83 @@ func (r *RecycleBinRepo) RestoreFolder(folder *model.Folder) error {
 	return nil
 }
 
+func (r *RecycleBinRepo) RestoreTradeOrder(id, restoredBy int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin restoring trade order: %w", err)
+	}
+	defer tx.Rollback()
+
+	var workbookID sql.NullInt64
+	var stage string
+	var orderNo string
+	var title string
+	if err := tx.QueryRow(
+		`SELECT workbook_id, stage, order_no, title
+		 FROM trade_orders
+		 WHERE id = $1 AND deleted_at IS NOT NULL
+		 FOR UPDATE`, id,
+	).Scan(&workbookID, &stage, &orderNo, &title); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("deleted trade order %d not found", id)
+		}
+		return fmt.Errorf("lock deleted trade order: %w", err)
+	}
+
+	if workbookID.Valid {
+		if _, err := tx.Exec(
+			`UPDATE workbooks workbook
+			 SET folder_id = CASE
+			       WHEN workbook.folder_id IS NULL OR EXISTS (
+			           SELECT 1 FROM folders folder
+			           WHERE folder.id = workbook.folder_id AND folder.deleted_at IS NULL
+			       ) THEN workbook.folder_id
+			       ELSE NULL
+			     END,
+			     deleted_at = NULL,
+			     deleted_by = NULL,
+			     updated_at = NOW()
+			 WHERE workbook.id = $1 AND workbook.deleted_at IS NOT NULL`,
+			workbookID.Int64,
+		); err != nil {
+			return fmt.Errorf("restore trade order workbook: %w", err)
+		}
+	}
+
+	result, err := tx.Exec(
+		`UPDATE trade_orders
+		 SET deleted_at = NULL, deleted_by = NULL, updated_at = NOW()
+		 WHERE id = $1 AND deleted_at IS NOT NULL`, id,
+	)
+	if err != nil {
+		return fmt.Errorf("restore trade order: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("deleted trade order %d not found", id)
+	}
+
+	snapshot, err := json.Marshal(map[string]any{
+		"order_no": orderNo,
+		"title":    title,
+		"restored": true,
+	})
+	if err != nil {
+		return fmt.Errorf("encode restored trade order event: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO trade_order_stage_events (order_id, from_stage, to_stage, actor_id, note, snapshot)
+		 VALUES ($1, $2, $2, $3, '从回收站还原业务单', $4::jsonb)`,
+		id, stage, restoredBy, string(snapshot),
+	); err != nil {
+		return fmt.Errorf("record restored trade order event: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit restoring trade order: %w", err)
+	}
+	return nil
+}
+
 func (r *RecycleBinRepo) DeleteWorkbookPermanently(id int64) error {
 	result, err := r.db.Exec(`DELETE FROM workbooks WHERE id = $1 AND deleted_at IS NOT NULL`, id)
 	if err != nil {
@@ -239,6 +397,47 @@ func (r *RecycleBinRepo) DeleteWorkbookPermanently(id int64) error {
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return fmt.Errorf("deleted workbook %d not found", id)
+	}
+	return nil
+}
+
+func (r *RecycleBinRepo) DeleteTradeOrderPermanently(id int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin permanent trade order deletion: %w", err)
+	}
+	defer tx.Rollback()
+
+	var workbookID sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT workbook_id FROM trade_orders
+		 WHERE id = $1 AND deleted_at IS NOT NULL
+		 FOR UPDATE`, id,
+	).Scan(&workbookID); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("deleted trade order %d not found", id)
+		}
+		return fmt.Errorf("lock deleted trade order: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM trade_orders WHERE id = $1 AND deleted_at IS NOT NULL`, id); err != nil {
+		return fmt.Errorf("permanently delete trade order: %w", err)
+	}
+	if workbookID.Valid {
+		if _, err := tx.Exec(
+			`DELETE FROM workbooks workbook
+			 WHERE workbook.id = $1
+			   AND workbook.deleted_at IS NOT NULL
+			   AND NOT EXISTS (
+			       SELECT 1 FROM trade_orders other_order
+			       WHERE other_order.workbook_id = workbook.id
+			   )`, workbookID.Int64,
+		); err != nil {
+			return fmt.Errorf("permanently delete trade order workbook: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit permanent trade order deletion: %w", err)
 	}
 	return nil
 }
@@ -267,7 +466,12 @@ func (r *RecycleBinRepo) DeleteFolderPermanently(folder *model.Folder) error {
 		DELETE FROM workbooks
 		WHERE folder_id IN (SELECT id FROM folder_tree)
 		  AND deleted_at = $2
-		  AND deleted_by IS NOT DISTINCT FROM $3`,
+		  AND deleted_by IS NOT DISTINCT FROM $3
+		  AND NOT EXISTS (
+		      SELECT 1 FROM trade_orders trade_order
+		      WHERE trade_order.workbook_id = workbooks.id
+		        AND trade_order.deleted_at IS NOT NULL
+		  )`,
 		folder.ID, *folder.DeletedAt, folder.DeletedByID,
 	); err != nil {
 		return fmt.Errorf("permanently delete folder workbooks: %w", err)
@@ -294,6 +498,10 @@ func (r *RecycleBinRepo) PurgeDeletedBefore(cutoff time.Time) (int64, error) {
 	}
 	defer tx.Rollback()
 
+	tradeOrderResult, err := tx.Exec(`DELETE FROM trade_orders WHERE deleted_at IS NOT NULL AND deleted_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("purge deleted trade orders: %w", err)
+	}
 	workbookResult, err := tx.Exec(`DELETE FROM workbooks WHERE deleted_at IS NOT NULL AND deleted_at < $1`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("purge deleted workbooks: %w", err)
@@ -303,10 +511,11 @@ func (r *RecycleBinRepo) PurgeDeletedBefore(cutoff time.Time) (int64, error) {
 		return 0, fmt.Errorf("purge deleted folders: %w", err)
 	}
 
+	tradeOrderCount, _ := tradeOrderResult.RowsAffected()
 	workbookCount, _ := workbookResult.RowsAffected()
 	folderCount, _ := folderResult.RowsAffected()
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit recycle bin cleanup: %w", err)
 	}
-	return workbookCount + folderCount, nil
+	return tradeOrderCount + workbookCount + folderCount, nil
 }

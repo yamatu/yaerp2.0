@@ -92,6 +92,7 @@ func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 		"update_sheet_name":        s.toolUpdateSheetName,
 		"set_cell_format":          s.toolSetCellFormat,
 		"format_cell_range":        s.toolFormatCellRange,
+		"configure_approval_flow":  s.toolConfigureApprovalFlow,
 		"create_financial_report":  s.toolCreateFinancialReport,
 		"list_summary_pages":       s.toolListSummaryPages,
 		"create_summary_page":      s.toolCreateSummaryPage,
@@ -133,6 +134,24 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 			),
 		}
 		conversation = append(append([]map[string]any{}, conversation[:1]...), append([]map[string]any{contextMessage}, conversation[1:]...)...)
+	}
+	if chatContext != nil && chatContext.Selection != nil && chatContext.Selection.SheetID > 0 {
+		selection := chatContext.Selection
+		if err := s.ensureSheetViewAccess(userID, selection.SheetID); err != nil {
+			return nil, fmt.Errorf("选中的单元格范围不可访问: %w", err)
+		}
+		rowText := "全部数据行"
+		if selection.StartRow != nil && selection.EndRow != nil {
+			rowText = fmt.Sprintf("数据行 %d-%d（0-based）", *selection.StartRow, *selection.EndRow)
+		}
+		selectionMessage := map[string]any{
+			"role": "system",
+			"content": fmt.Sprintf(
+				"用户已在工作表 ID %d 中明确框选范围“%s”：%s，列 key 为 [%s]。当用户要求为当前选区配置审批、下拉、复选框、格式或 ERP 流程时，必须使用这些精确坐标，不得擅自扩大到整张表。",
+				selection.SheetID, strings.TrimSpace(selection.RangeLabel), rowText, strings.Join(selection.ColumnKeys, ", "),
+			),
+		}
+		conversation = append(append([]map[string]any{}, conversation[:1]...), append([]map[string]any{selectionMessage}, conversation[1:]...)...)
 	}
 	if chatContext != nil && len(chatContext.AttachmentIDs) > 0 {
 		conversation, err = s.addAttachmentContext(userID, assistant, conversation, chatContext.AttachmentIDs)
@@ -410,9 +429,10 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
 					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；rows[*].row 一律表示 0-based 数据行索引（第一条数据行为 0，不是界面里显示的第 2 行），display_row 才是界面中的行号；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
 					"\n\n%s"+
-					"\n\n支持的列类型：text（文本）、number（数字）、currency（货币）、date（日期）、select（下拉选择）、image（图片）、formula（公式）。"+
+					"\n\n支持的列类型：text（文本）、number（数字）、currency（货币）、date（日期）、select（下拉选择）、checkbox（是/否复选框）、image（图片）、formula（公式）。"+
 					"\n支持的公式：SUM、AVERAGE、COUNT、MAX、MIN、IF、VLOOKUP、CONCATENATE 等 Excel 兼容公式。公式模板可使用 {{row}} 表示当前 Excel 行号，也应优先使用 {{column_key}} 引用字段，例如 ={{quantity}}*{{unit_price}}，不要猜测 Excel 列字母。"+
-					"\n你可以创建和管理工作簿/工作表：使用 create_workbook 创建工作簿，create_sheet 创建工作表，update_workbook 修改工作簿名称/描述，update_sheet_name 重命名工作表，set_cell_format 修改列类型与选项，format_cell_range 设计单元格颜色、字体、对齐、边框、行高和列宽。create_sheet 的 columns 必须使用 key、name、type、width、options；select 的选项放入 options 数组，绝不能把选项文本当作 format。"+
+					"\n你可以创建和管理工作簿/工作表：使用 create_workbook 创建工作簿，create_sheet 创建工作表，update_workbook 修改工作簿名称/描述，update_sheet_name 重命名工作表，set_cell_format 修改列类型、下拉/复选框与选项颜色，format_cell_range 设计单元格颜色、字体、对齐、边框、行高和列宽，configure_approval_flow 为精确选区建立审批流程。create_sheet 的 columns 必须使用 key、name、type、width、options；select 的选项放入 options 数组，供应商等长列表应设置 searchable=true，checkbox 默认使用“是/否”。"+
+					"\n审批流程必须继承当前登录账号权限：管理员 Agent 可按管理员权限配置，普通员工 Agent 不得越权。配置 hold_changes 审批后，待审值不会进入正式单元格，只有最终通过才写入，驳回保持原值。"+
 					"\n当用户明确要求美化、排版、设置表头颜色或区分数据区域时，可以直接调用 format_cell_range；必须使用用户有写权限且未被他人保护的范围。颜色优先使用 #RRGGBB。"+
 					"\n用户明确要求财务分析工作簿时，使用 create_financial_report；需要跨工作簿网页总结时，使用 create_summary_page；需要编辑既有总结时，先 list_summary_pages 再 update_summary_page。"+
 					"%s\n\n当前用户可访问的数据摘要如下：\n\n%s",
@@ -645,13 +665,15 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"key":          map[string]any{"type": "string"},
-							"name":         map[string]any{"type": "string"},
-							"type":         map[string]any{"type": "string", "enum": []string{"text", "number", "currency", "date", "select", "image", "formula", "percentage"}},
-							"width":        map[string]any{"type": "number"},
-							"required":     map[string]any{"type": "boolean"},
-							"options":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-							"currencyCode": map[string]any{"type": "string"},
+							"key":           map[string]any{"type": "string"},
+							"name":          map[string]any{"type": "string"},
+							"type":          map[string]any{"type": "string", "enum": []string{"text", "number", "currency", "date", "select", "checkbox", "image", "formula", "percentage"}},
+							"width":         map[string]any{"type": "number"},
+							"required":      map[string]any{"type": "boolean"},
+							"options":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+							"option_colors": map[string]any{"type": "object"},
+							"searchable":    map[string]any{"type": "boolean"},
+							"currencyCode":  map[string]any{"type": "string"},
 						},
 						"required": []string{"key", "name", "type"},
 					},
@@ -676,16 +698,41 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "name"},
 		}),
-		buildToolDefinition("set_cell_format", "Set one column type and optional dropdown/currency metadata. For dropdowns use format=select and put choices in options.", map[string]any{
+		buildToolDefinition("set_cell_format", "Set one column type and optional dropdown, checkbox, currency, and option color metadata. For dropdowns use format=select and put choices in options.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"sheet_id":     map[string]any{"type": "integer"},
-				"column_key":   map[string]any{"type": "string"},
-				"format":       map[string]any{"type": "string", "enum": []string{"text", "number", "currency", "date", "percentage", "formula", "select", "image"}},
-				"options":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"currencyCode": map[string]any{"type": "string"},
+				"sheet_id":      map[string]any{"type": "integer"},
+				"column_key":    map[string]any{"type": "string"},
+				"format":        map[string]any{"type": "string", "enum": []string{"text", "number", "currency", "date", "percentage", "formula", "select", "checkbox", "image"}},
+				"options":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"option_colors": map[string]any{"type": "object", "description": "Map option text to {background_color,text_color}."},
+				"searchable":    map[string]any{"type": "boolean", "description": "Open a searchable picker when a select cell is clicked."},
+				"currencyCode":  map[string]any{"type": "string"},
 			},
 			"required": []string{"sheet_id", "column_key", "format"},
+		}),
+		buildToolDefinition("configure_approval_flow", "Create a hold-until-approved workflow for exact sheet rows and columns. Omit start_row/end_row for all data rows. Pending values are committed only after final approval.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id":    map[string]any{"type": "integer"},
+				"name":        map[string]any{"type": "string"},
+				"description": map[string]any{"type": "string"},
+				"start_row":   map[string]any{"type": "integer", "description": "0-based first data row; omit with end_row for all rows"},
+				"end_row":     map[string]any{"type": "integer", "description": "0-based last data row; omit with start_row for all rows"},
+				"column_keys": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"approval_steps": map[string]any{"type": "array", "items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"name":               map[string]any{"type": "string"},
+						"user_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+						"department_ids":     map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+						"required_approvals": map[string]any{"type": "integer"},
+					},
+					"required": []string{"name", "required_approvals"},
+				}},
+				"notify_submitter": map[string]any{"type": "boolean"},
+			},
+			"required": []string{"sheet_id", "name", "column_keys", "approval_steps"},
 		}),
 		buildToolDefinition("format_cell_range", "Design spreadsheet cell presentation. Rows are 0-based data rows; the header is controlled by scope=header/all. Use this for colors, typography, alignment, wrapping, borders, row height and column width.", map[string]any{
 			"type": "object",
@@ -1603,19 +1650,30 @@ func (s *AIService) toolUpdateCell(userID int64, args map[string]any) (*toolExec
 		return nil, fmt.Errorf("marshal cell value: %w", err)
 	}
 
-	if err := s.sheetService.UpdateCells(userID, []model.CellUpdate{{SheetID: sheetID, Row: row, Col: columnKey, Value: raw}}); err != nil {
+	writeResult, err := s.sheetService.UpdateCellsWithSourceDetailed(userID, []model.CellUpdate{{SheetID: sheetID, Row: row, Col: columnKey, Value: raw}}, "ai")
+	if err != nil {
 		return nil, err
 	}
 
-	if err := s.invalidateSheetByID(sheetID); err != nil {
-		return nil, err
+	if len(writeResult.AppliedChanges) > 0 {
+		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
+			return nil, err
+		}
+	}
+	pending := len(writeResult.PendingStates) > 0
+	summary := fmt.Sprintf("已更新第 %d 行的 %s", row+1, columnKey)
+	changedSheetIDs := []int64{sheetID}
+	if pending {
+		summary = fmt.Sprintf("第 %d 行的 %s 已提交审批，审批通过后才会写入", row+1, columnKey)
+		changedSheetIDs = nil
 	}
 
 	return &toolExecutionResult{
-		Data:            map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "column_key": columnKey, "value": value},
-		TouchedSheetIDs: []int64{sheetID},
-		ChangedSheetIDs: []int64{sheetID},
-		Summary:         fmt.Sprintf("已更新第 %d 行的 %s", row+1, columnKey),
+		Data:             map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "column_key": columnKey, "value": value, "pending_approval": pending, "approval_states": writeResult.PendingStates},
+		TouchedSheetIDs:  []int64{sheetID},
+		ChangedSheetIDs:  changedSheetIDs,
+		ResourcesChanged: pending,
+		Summary:          summary,
 	}, nil
 }
 
@@ -1663,7 +1721,7 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 
 	if !isEmptySheet {
 		afterRow := row - 1
-		if err := s.sheetService.InsertRow(userID, sheetID, afterRow); err != nil {
+		if err := s.sheetService.InsertRowWithSource(userID, sheetID, afterRow, "ai"); err != nil {
 			return nil, err
 		}
 	}
@@ -1677,12 +1735,12 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 			}
 			changes = append(changes, model.CellUpdate{SheetID: sheetID, Row: row, Col: key, Value: raw})
 		}
-		if err := s.sheetService.UpdateCells(userID, changes); err != nil {
+		if err := s.sheetService.UpdateCellsWithSource(userID, changes, "ai"); err != nil {
 			return nil, err
 		}
 	}
 
-	if err := s.invalidateSheetByID(sheetID); err != nil {
+	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
 		return nil, err
 	}
 
@@ -1718,10 +1776,10 @@ func (s *AIService) toolDeleteRow(userID int64, args map[string]any) (*toolExecu
 	if err := s.validateRowWriteAccess(userID, sheetID, row); err != nil {
 		return nil, err
 	}
-	if err := s.sheetService.DeleteRow(userID, sheetID, row); err != nil {
+	if err := s.sheetService.DeleteRowWithSource(userID, sheetID, row, "ai"); err != nil {
 		return nil, err
 	}
-	if err := s.invalidateSheetByID(sheetID); err != nil {
+	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
 		return nil, err
 	}
 
@@ -1939,7 +1997,7 @@ func (s *AIService) toolCreateWorkbook(userID int64, args map[string]any) (*tool
 		workbook.Description = &description
 	}
 
-	if err := s.sheetService.CreateWorkbookForUser(userID, workbook); err != nil {
+	if err := s.sheetService.CreateWorkbookForUserWithSource(userID, workbook, "ai", "AI 创建工作簿"); err != nil {
 		return nil, fmt.Errorf("创建工作簿失败: %w", err)
 	}
 
@@ -1978,7 +2036,7 @@ func (s *AIService) toolCreateSheet(userID int64, args map[string]any) (*toolExe
 		sheet.Columns = finalJSON
 	}
 
-	if err := s.sheetService.CreateSheetForUser(userID, sheet); err != nil {
+	if err := s.sheetService.CreateSheetForUserWithSource(userID, sheet, "ai", "AI 创建工作表"); err != nil {
 		return nil, fmt.Errorf("创建工作表失败: %w", err)
 	}
 
@@ -2055,7 +2113,7 @@ func (s *AIService) toolUpdateSheetName(userID int64, args map[string]any) (*too
 	}
 
 	sheet.Name = name
-	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.rename", "AI 重命名工作表", false); err != nil {
 		return nil, fmt.Errorf("重命名工作表失败: %w", err)
 	}
 
@@ -2102,14 +2160,22 @@ func (s *AIService) toolSetCellFormat(userID int64, args map[string]any) (*toolE
 	validFormats := map[string]bool{
 		"text": true, "number": true, "currency": true,
 		"date": true, "percentage": true, "formula": true,
-		"select": true, "image": true,
+		"select": true, "checkbox": true, "image": true,
 	}
 	if !validFormats[format] {
-		return nil, fmt.Errorf("不支持的格式类型: %s（支持 text/number/currency/date/percentage/formula/select/image）", format)
+		return nil, fmt.Errorf("不支持的格式类型: %s（支持 text/number/currency/date/percentage/formula/select/checkbox/image）", format)
 	}
 	if format == "select" && len(options) == 0 {
 		return nil, fmt.Errorf("select 类型必须提供非空 options 数组")
 	}
+	if format == "checkbox" && len(options) == 0 {
+		options = []string{"是", "否"}
+	}
+	optionColors, err := parseAgentOptionColors(args["option_colors"])
+	if err != nil {
+		return nil, err
+	}
+	searchable, hasSearchable := optionalBoolArg(args, "searchable")
 
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
@@ -2134,18 +2200,30 @@ func (s *AIService) toolSetCellFormat(userID int64, args map[string]any) (*toolE
 	}
 
 	found := false
+	finalSearchable := false
 	for i, col := range columns {
 		if strings.EqualFold(strings.TrimSpace(col.Key), strings.TrimSpace(columnKey)) || strings.EqualFold(strings.TrimSpace(col.Name), strings.TrimSpace(columnKey)) {
 			columns[i].Type = format
-			if format == "select" {
+			if format == "select" || format == "checkbox" {
 				columns[i].Options = options
+				columns[i].OptionColors = optionColors
+				if format == "select" {
+					if hasSearchable {
+						columns[i].Searchable = searchable
+					}
+				} else {
+					columns[i].Searchable = false
+				}
 			} else {
 				columns[i].Options = nil
+				columns[i].OptionColors = nil
+				columns[i].Searchable = false
 			}
 			if format == "currency" && strings.TrimSpace(currencyCode) != "" {
 				columns[i].CurrencyCode = strings.ToUpper(strings.TrimSpace(currencyCode))
 			}
 			columnKey = columns[i].Key
+			finalSearchable = columns[i].Searchable
 			found = true
 			break
 		}
@@ -2159,19 +2237,118 @@ func (s *AIService) toolSetCellFormat(userID int64, args map[string]any) (*toolE
 		return nil, fmt.Errorf("序列化列定义失败: %w", err)
 	}
 	sheet.Columns = nextColumns
-	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.column.format", "AI 设置列格式", true); err != nil {
 		return nil, fmt.Errorf("更新列格式失败: %w", err)
 	}
 
-	if err := s.invalidateSheetByID(sheetID); err != nil {
+	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
 		return nil, err
 	}
 
 	return &toolExecutionResult{
-		Data:            map[string]any{"ok": true, "sheet_id": sheetID, "column_key": columnKey, "format": format, "options": options},
+		Data:            map[string]any{"ok": true, "sheet_id": sheetID, "column_key": columnKey, "format": format, "options": options, "option_colors": optionColors, "searchable": finalSearchable},
 		TouchedSheetIDs: []int64{sheetID},
 		ChangedSheetIDs: []int64{sheetID},
 		Summary:         fmt.Sprintf("已将列 %s 的格式设为 %s", columnKey, format),
+	}, nil
+}
+
+func (s *AIService) toolConfigureApprovalFlow(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	if s.automationService == nil {
+		return nil, fmt.Errorf("审批服务尚未启用")
+	}
+	sheetID, err := int64Arg(args, "sheet_id")
+	if err != nil {
+		return nil, err
+	}
+	name, err := stringArg(args, "name")
+	if err != nil {
+		return nil, err
+	}
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, fmt.Errorf("工作表不存在: %w", err)
+	}
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return nil, err
+	}
+	columnReferences := stringSliceArg(args, "column_keys")
+	if len(columnReferences) == 0 {
+		return nil, fmt.Errorf("column_keys 至少需要一列")
+	}
+	columnKeys := make([]string, 0, len(columnReferences))
+	seenColumns := make(map[string]struct{}, len(columnReferences))
+	for _, reference := range columnReferences {
+		key, _ := resolveColumnReference(reference, columns)
+		if key == "" {
+			return nil, fmt.Errorf("列 %s 不存在", reference)
+		}
+		if _, exists := seenColumns[key]; exists {
+			continue
+		}
+		seenColumns[key] = struct{}{}
+		columnKeys = append(columnKeys, key)
+	}
+
+	startRow, hasStart := intPtrArg(args, "start_row")
+	endRow, hasEnd := intPtrArg(args, "end_row")
+	if hasStart != hasEnd {
+		return nil, fmt.Errorf("start_row 和 end_row 必须同时设置或同时省略")
+	}
+	if hasStart && (*startRow < 0 || *endRow < *startRow) {
+		return nil, fmt.Errorf("审批行范围无效")
+	}
+
+	rawSteps, ok := args["approval_steps"]
+	if !ok {
+		return nil, fmt.Errorf("approval_steps 不能为空")
+	}
+	encodedSteps, err := json.Marshal(rawSteps)
+	if err != nil {
+		return nil, fmt.Errorf("审批步骤格式无效: %w", err)
+	}
+	var steps []model.AutomationApprovalStep
+	if err := json.Unmarshal(encodedSteps, &steps); err != nil || len(steps) == 0 {
+		return nil, fmt.Errorf("approval_steps 至少需要一个有效步骤")
+	}
+
+	actions := []model.AutomationAction{}
+	notifySubmitter := true
+	if value, exists := optionalBoolArg(args, "notify_submitter"); exists {
+		notifySubmitter = value
+	}
+	if notifySubmitter {
+		actions = append(actions, model.AutomationAction{
+			Type: "notify", RecipientType: "trigger_user",
+			TitleTemplate:   "审批通过：{{rule.name}}",
+			MessageTemplate: "{{sheet.name}} 第 {{row.number}} 行的待审内容已正式写入。",
+		})
+	}
+	enabled := true
+	input := &model.AutomationRuleInput{
+		Name: name, Description: strings.TrimSpace(firstStringValue(args, "description")),
+		SheetID: &sheetID, TriggerType: "cell_change", WatchedColumns: columnKeys,
+		Timezone: "Asia/Shanghai", ConditionLogic: "all",
+		ApprovalSteps:  steps,
+		ApprovalRanges: []model.AutomationApprovalRange{{StartRow: startRow, EndRow: endRow, Columns: columnKeys}},
+		Actions:        actions, HoldChanges: true, Enabled: &enabled,
+	}
+	rule, err := s.automationService.CreateRule(userID, input)
+	if err != nil {
+		return nil, err
+	}
+	rangeText := "全部数据行"
+	if startRow != nil && endRow != nil {
+		rangeText = fmt.Sprintf("数据行 %d-%d", *startRow, *endRow)
+	}
+	return &toolExecutionResult{
+		Data: map[string]any{
+			"ok": true, "rule_id": rule.ID, "rule_name": rule.Name, "sheet_id": sheetID,
+			"column_keys": columnKeys, "range": rangeText, "approval_steps": len(steps),
+		},
+		TouchedSheetIDs: []int64{sheetID}, ResourcesChanged: true,
+		Summary: fmt.Sprintf("已为工作表「%s」的 %s 配置审批流程「%s」", sheet.Name, rangeText, rule.Name),
 	}, nil
 }
 
@@ -2376,10 +2553,10 @@ func (s *AIService) toolFormatCellRange(userID int64, args map[string]any) (*too
 	}
 	sheet.Config = nextConfig
 	sheet.Columns = nextColumns
-	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.range.format", "AI 设置单元格样式", true); err != nil {
 		return nil, fmt.Errorf("更新单元格格式失败: %w", err)
 	}
-	if err := s.invalidateSheetByID(sheetID); err != nil {
+	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
 		return nil, err
 	}
 
@@ -2580,6 +2757,42 @@ func optionalAgentColor(args map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("%s 必须使用 #RRGGBB 或 #RRGGBBAA 颜色", key)
 	}
 	return value, nil
+}
+
+func parseAgentOptionColors(value any) (map[string]sheetOptionColor, error) {
+	if value == nil {
+		return nil, nil
+	}
+	raw, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("option_colors 必须是对象")
+	}
+	result := make(map[string]sheetOptionColor, len(raw))
+	for option, colorValue := range raw {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			continue
+		}
+		colorMap, ok := colorValue.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("选项 %s 的颜色配置必须是对象", option)
+		}
+		background := strings.ToUpper(strings.TrimSpace(firstStringValue(colorMap, "background_color", "backgroundColor", "background")))
+		textColor := strings.ToUpper(strings.TrimSpace(firstStringValue(colorMap, "text_color", "textColor", "color")))
+		for key, color := range map[string]string{"background_color": background, "text_color": textColor} {
+			if color == "" {
+				continue
+			}
+			if matched, _ := regexp.MatchString(`^#[0-9A-F]{6}([0-9A-F]{2})?$`, color); !matched {
+				return nil, fmt.Errorf("选项 %s 的 %s 必须使用 #RRGGBB 或 #RRGGBBAA", option, key)
+			}
+		}
+		result[option] = sheetOptionColor{BackgroundColor: background, TextColor: textColor}
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
 }
 
 func optionalBoolArg(args map[string]any, key string) (bool, bool) {
@@ -2881,7 +3094,7 @@ func (s *AIService) executeSpreadsheetOperations(userID int64, operations []Spre
 	}
 
 	for sheetID := range touchedSheets {
-		if err := s.invalidateSheetByID(sheetID); err != nil {
+		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
 			return nil, err
 		}
 	}
@@ -3126,12 +3339,12 @@ func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayloa
 	return rows
 }
 
-func (s *AIService) invalidateSheetByID(sheetID int64) error {
+func (s *AIService) invalidateSheetByID(userID, sheetID int64) error {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return fmt.Errorf("reload touched sheet: %w", err)
 	}
-	return s.invalidateSheetSnapshot(sheet)
+	return s.invalidateSheetSnapshot(userID, sheet)
 }
 
 func int64Arg(args map[string]any, key string) (int64, error) {
@@ -3720,8 +3933,21 @@ func normalizeAgentSheetColumns(value any) ([]sheetColumnPayload, error) {
 		if !isSupportedColumnType(columnType) {
 			return nil, fmt.Errorf("columns[%d] 的类型 %q 不受支持", index, rawType)
 		}
-		if len(options) > 0 {
+		if columnType == "checkbox" && len(options) == 0 {
+			options = []string{"是", "否"}
+		}
+		if len(options) > 0 && columnType != "checkbox" {
 			columnType = "select"
+		}
+		optionColors, err := parseAgentOptionColors(raw["option_colors"])
+		if err != nil {
+			return nil, fmt.Errorf("columns[%d]: %w", index, err)
+		}
+		if len(optionColors) == 0 {
+			optionColors, err = parseAgentOptionColors(raw["optionColors"])
+			if err != nil {
+				return nil, fmt.Errorf("columns[%d]: %w", index, err)
+			}
 		}
 
 		width := float64(140)
@@ -3734,6 +3960,7 @@ func normalizeAgentSheetColumns(value any) ([]sheetColumnPayload, error) {
 			}
 		}
 		required, _ := raw["required"].(bool)
+		searchable, _ := raw["searchable"].(bool)
 		validation, _ := raw["validation"].(map[string]any)
 		currencyCode := firstStringValue(raw, "currencyCode", "currency_code")
 		currencySource := firstStringValue(raw, "currencySource", "currency_source")
@@ -3746,6 +3973,8 @@ func normalizeAgentSheetColumns(value any) ([]sheetColumnPayload, error) {
 			Validation:     validation,
 			Formula:        firstStringValue(raw, "formula", "formula_template", "formulaTemplate"),
 			Options:        options,
+			OptionColors:   optionColors,
+			Searchable:     columnType == "select" && searchable,
 			CurrencyCode:   strings.ToUpper(currencyCode),
 			CurrencySource: currencySource,
 		})
@@ -3772,6 +4001,8 @@ func normalizeColumnType(value string) string {
 		return "formula"
 	case "select", "dropdown", "enum", "下拉", "下拉选择", "选择", "枚举":
 		return "select"
+	case "checkbox", "check", "boolean", "bool", "复选框", "勾选", "是/否", "是否":
+		return "checkbox"
 	case "image", "图片", "图像":
 		return "image"
 	default:
@@ -3781,7 +4012,7 @@ func normalizeColumnType(value string) string {
 
 func isSupportedColumnType(value string) bool {
 	switch value {
-	case "text", "number", "currency", "date", "percentage", "formula", "select", "image":
+	case "text", "number", "currency", "date", "percentage", "formula", "select", "checkbox", "image":
 		return true
 	default:
 		return false

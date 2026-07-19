@@ -157,6 +157,12 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		response.Error(c, http.StatusForbidden, "default admin user cannot be disabled")
 		return
 	}
+	if req.Status != nil && *req.Status == 0 {
+		if err := h.authService.RevokeUserSessions(id); err != nil {
+			response.ServerError(c, err.Error())
+			return
+		}
+	}
 
 	if err := h.userRepo.Update(id, &req); err != nil {
 		response.ServerError(c, err.Error())
@@ -172,6 +178,11 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		response.BadRequest(c, "invalid user id")
 		return
 	}
+	currentUserID := c.GetInt64("user_id")
+	if id == currentUserID {
+		response.Error(c, http.StatusForbidden, "cannot delete the currently signed-in account")
+		return
+	}
 
 	isDefaultAdmin, err := h.userRepo.IsDefaultAdminUser(id)
 	if err != nil {
@@ -183,12 +194,16 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	if err := h.userRepo.Delete(id); err != nil {
+	if err := h.authService.RevokeUserSessions(id); err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	if err := h.userRepo.DeleteAndTransfer(id, currentUserID); err != nil {
 		response.ServerError(c, err.Error())
 		return
 	}
 
-	response.OKMsg(c, "user deleted")
+	response.OKMsg(c, "员工账号已删除，名下业务数据已转交当前管理员")
 }
 
 func (h *UserHandler) AssignRoles(c *gin.Context) {
@@ -258,6 +273,10 @@ func (h *UserHandler) ResetPassword(c *gin.Context) {
 		return
 	}
 
+	if err := h.authService.RevokeUserSessions(id); err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
 	if err := h.authService.ResetPassword(id, req.NewPassword); err != nil {
 		response.ServerError(c, err.Error())
 		return

@@ -48,22 +48,113 @@ type protectionMaps struct {
 }
 
 type SheetService struct {
-	sheetRepo   *repo.SheetRepo
-	permService *PermissionService
+	sheetRepo               *repo.SheetRepo
+	permService             *PermissionService
+	history                 *SheetHistoryService
+	cellChangeHook          func(userID int64, changes []model.CellUpdate, source string)
+	cellApprovalInterceptor func(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error)
 }
 
-func NewSheetService(sheetRepo *repo.SheetRepo, permService *PermissionService) *SheetService {
-	return &SheetService{sheetRepo: sheetRepo, permService: permService}
+func NewSheetService(sheetRepo *repo.SheetRepo, permService *PermissionService, history ...*SheetHistoryService) *SheetService {
+	var historyService *SheetHistoryService
+	if len(history) > 0 {
+		historyService = history[0]
+	}
+	return &SheetService{sheetRepo: sheetRepo, permService: permService, history: historyService}
+}
+
+func (s *SheetService) SetCellChangeHook(hook func(userID int64, changes []model.CellUpdate, source string)) {
+	s.cellChangeHook = hook
+}
+
+func (s *SheetService) SetCellApprovalInterceptor(hook func(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error)) {
+	s.cellApprovalInterceptor = hook
+}
+
+func (s *SheetService) NotifyCellChanges(userID int64, changes []model.CellUpdate, source string) {
+	if s.cellChangeHook == nil || len(changes) == 0 {
+		return
+	}
+	copyOfChanges := append([]model.CellUpdate(nil), changes...)
+	for index := range copyOfChanges {
+		copyOfChanges[index].Value = append(json.RawMessage(nil), copyOfChanges[index].Value...)
+	}
+	if source == "automation" {
+		s.cellChangeHook(userID, copyOfChanges, source)
+		return
+	}
+	go s.cellChangeHook(userID, copyOfChanges, source)
+}
+
+func (s *SheetService) beginHistory(userID, sheetID int64, source, action, summary string, coalesce bool) (*sheetMutationHistory, error) {
+	if s.history == nil {
+		return nil, nil
+	}
+	return s.history.prepareMutation(userID, sheetID, source, action, summary, coalesce)
+}
+
+func (s *SheetService) finishHistory(history *sheetMutationHistory) error {
+	if s.history == nil || history == nil {
+		return nil
+	}
+	return s.history.completeMutation(history)
+}
+
+func (s *SheetService) CaptureCurrentVersion(userID, sheetID int64, source, summary string, coalesce bool) (*model.SheetVersion, error) {
+	if s.history == nil {
+		return nil, nil
+	}
+	snapshot, err := s.history.historyRepo.LoadSheetSnapshot(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	version, _, err := s.history.captureSnapshot(model.SheetVersionCapture{
+		UserID: userID, SheetID: sheetID, Source: source, Summary: summary, Coalesce: coalesce,
+	}, snapshot)
+	return version, err
+}
+
+func (s *SheetService) RecordOperation(event model.OperationEvent) error {
+	if s.history == nil {
+		return nil
+	}
+	return s.history.recordOperation(event)
+}
+
+func (s *SheetService) UpdateSheetWithSource(userID int64, sheet *model.Sheet, source, action, summary string, coalesce bool) error {
+	if sheet == nil || sheet.ID <= 0 {
+		return fmt.Errorf("invalid sheet")
+	}
+	history, err := s.beginHistory(userID, sheet.ID, source, action, summary, coalesce)
+	if err != nil {
+		return err
+	}
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 // Workbook operations
 
 func (s *SheetService) CreateWorkbookForUser(userID int64, workbook *model.Workbook) error {
+	return s.CreateWorkbookForUserWithSource(userID, workbook, "web", "创建工作簿")
+}
+
+func (s *SheetService) CreateWorkbookForUserWithSource(userID int64, workbook *model.Workbook, source, summary string) error {
 	if err := s.ensureWorkbookFolderWritable(userID, workbook.FolderID); err != nil {
 		return err
 	}
-
-	return s.sheetRepo.CreateWorkbook(workbook)
+	if err := s.sheetRepo.CreateWorkbook(workbook); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: workbook.ID,
+		Action: "workbook.create", Source: source, Summary: summary,
+		Metadata: map[string]any{
+			"workbook_id": workbook.ID, "workbook_name": workbook.Name, "folder_id": workbook.FolderID,
+		},
+	})
 }
 
 func (s *SheetService) ensureWorkbookFolderWritable(userID int64, folderID *int64) error {
@@ -179,6 +270,25 @@ func (s *SheetService) DuplicateWorkbookForUser(userID, workbookID int64) (*mode
 	if err := s.sheetRepo.DuplicateWorkbook(source.ID, clone, userID); err != nil {
 		return nil, err
 	}
+	clonedSheets, err := s.sheetRepo.GetSheetsByWorkbook(clone.ID)
+	if err != nil {
+		return nil, err
+	}
+	for index := range clonedSheets {
+		if _, err := s.CaptureCurrentVersion(userID, clonedSheets[index].ID, "web", "复制工作簿时创建初始版本", false); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: clone.ID,
+		Action: "workbook.duplicate", Source: "web", Summary: "复制工作簿",
+		Metadata: map[string]any{
+			"workbook_id": clone.ID, "workbook_name": clone.Name,
+			"source_workbook_id": source.ID, "source_workbook_name": source.Name,
+		},
+	}); err != nil {
+		return nil, err
+	}
 	return clone, nil
 }
 
@@ -205,11 +315,15 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 	if err != nil {
 		return nil, err
 	}
+	wb.CanManage = canManageWorkbook
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
 		return nil, err
 	}
 	if isAdmin {
+		for index := range sheets {
+			sheets[index].AccessLevel = "write"
+		}
 		wb.Sheets = sheets
 		return wb, nil
 	}
@@ -231,19 +345,16 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 		if sheet.IsHidden {
 			continue
 		}
-		if canManageWorkbook {
-			masked, err := s.maskSheetForUser(&sheet, userID)
-			if err != nil {
-				return nil, err
-			}
-			visibleSheets = append(visibleSheets, *masked)
-			continue
-		}
 		matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
 		if err != nil {
 			return nil, fmt.Errorf("check sheet %d permission: %w", sheet.ID, err)
 		}
 		if matrix.Sheet.CanView {
+			if matrix.Sheet.CanEdit {
+				sheet.AccessLevel = "write"
+			} else {
+				sheet.AccessLevel = "read"
+			}
 			masked, err := s.maskSheetForUser(&sheet, userID)
 			if err != nil {
 				return nil, err
@@ -343,7 +454,16 @@ func (s *SheetService) UpdateWorkbookForUser(userID int64, workbook *model.Workb
 	workbook.IsTemplate = existing.IsTemplate
 	workbook.Status = existing.Status
 
-	return s.sheetRepo.UpdateWorkbook(workbook)
+	if err := s.sheetRepo.UpdateWorkbook(workbook); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: workbook.ID,
+		Action: "workbook.update", Source: "web", Summary: "更新工作簿信息",
+		OldValue: map[string]any{"name": existing.Name, "description": existing.Description},
+		NewValue: map[string]any{"name": workbook.Name, "description": workbook.Description},
+		Metadata: map[string]any{"workbook_id": workbook.ID, "workbook_name": workbook.Name},
+	})
 }
 
 func (s *SheetService) DeleteWorkbookForUser(userID, id int64) error {
@@ -392,7 +512,14 @@ func (s *SheetService) DeleteWorkbookForUser(userID, id int64) error {
 		}
 	}
 
-	return s.sheetRepo.SoftDeleteWorkbook(id, userID)
+	if err := s.sheetRepo.SoftDeleteWorkbook(id, userID); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: id,
+		Action: "workbook.delete", Source: "web", Summary: "删除工作簿到回收站",
+		Metadata: map[string]any{"workbook_id": id, "workbook_name": workbook.Name},
+	})
 }
 
 func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action string) (*model.Workbook, error) {
@@ -419,6 +546,9 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 	payload, state, err := parseWorkbookLifecycleState(workbook.Metadata)
 	if err != nil {
 		return nil, err
+	}
+	oldState := map[string]any{
+		"locked": state.Locked != nil, "hidden": state.Hidden != nil, "public": state.Public != nil,
 	}
 
 	actor := &sheetStateUser{ID: userID, Name: username, At: time.Now().Format(time.RFC3339)}
@@ -462,6 +592,19 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 	if err := applyWorkbookLifecycleState(updated); err != nil {
 		return nil, err
 	}
+	if err := s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: id,
+		Action: "workbook.state.update", Source: "web", Summary: "更新工作簿状态",
+		OldValue: oldState,
+		NewValue: map[string]any{
+			"locked": updated.IsLocked, "hidden": updated.IsHidden, "public": updated.IsPublic,
+		},
+		Metadata: map[string]any{
+			"workbook_id": id, "workbook_name": updated.Name, "state_action": action,
+		},
+	}); err != nil {
+		return nil, err
+	}
 	return updated, nil
 }
 
@@ -491,11 +634,19 @@ func (s *SheetService) UpdateWorkbookStates(userID int64, workbookIDs []int64, u
 // Sheet operations
 
 func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) error {
+	return s.CreateSheetForUserWithSource(userID, sheet, "web", "创建工作表")
+}
+
+func (s *SheetService) CreateSheetForUserWithSource(userID int64, sheet *model.Sheet, source, summary string) error {
 	wb, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
 	if err != nil {
 		return err
 	}
-	if err := s.ensureCanAddSheet(userID, wb); err != nil {
+	if source != "trade_erp" {
+		if err := s.ensureCanAddSheet(userID, wb); err != nil {
+			return err
+		}
+	} else if err := applyWorkbookLifecycleState(wb); err != nil {
 		return err
 	}
 
@@ -505,7 +656,17 @@ func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) erro
 	}
 	sheet.SortOrder = nextSortOrder
 
-	return s.sheetRepo.CreateSheet(sheet)
+	if err := s.sheetRepo.CreateSheet(sheet); err != nil {
+		return err
+	}
+	if _, err := s.CaptureCurrentVersion(userID, sheet.ID, source, summary, false); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, SheetID: sheet.ID, ResourceType: "sheet", ResourceID: sheet.ID,
+		Action: "sheet.create", Source: source, Summary: summary,
+		Metadata: map[string]any{"sheet_name": sheet.Name, "workbook_id": sheet.WorkbookID},
+	})
 }
 
 func (s *SheetService) ensureCanAddSheet(userID int64, workbook *model.Workbook) error {
@@ -588,6 +749,16 @@ func (s *SheetService) DuplicateSheetForUser(userID, sheetID int64) (*model.Shee
 	if err := applySheetLifecycleState(clone); err != nil {
 		return nil, err
 	}
+	if _, err := s.CaptureCurrentVersion(userID, clone.ID, "web", "复制工作表", false); err != nil {
+		return nil, err
+	}
+	if err := s.RecordOperation(model.OperationEvent{
+		UserID: userID, SheetID: clone.ID, ResourceType: "sheet", ResourceID: clone.ID,
+		Action: "sheet.duplicate", Source: "web", Summary: "复制工作表",
+		Metadata: map[string]any{"source_sheet_id": source.ID, "sheet_name": clone.Name, "workbook_id": clone.WorkbookID},
+	}); err != nil {
+		return nil, err
+	}
 	return clone, nil
 }
 
@@ -628,8 +799,15 @@ func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.S
 		}
 	}
 	sheet.Config = mergedConfig
+	history, err := s.beginHistory(userID, sheet.ID, "web", "sheet.update", "更新工作表内容或格式", true)
+	if err != nil {
+		return err
+	}
 
-	return s.sheetRepo.UpdateSheet(sheet)
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 func (s *SheetService) GetSheet(id int64) (*model.Sheet, error) {
@@ -643,7 +821,7 @@ func (s *SheetService) GetSheet(id int64) (*model.Sheet, error) {
 	return sheet, nil
 }
 
-func (s *SheetService) SyncAssignedSheetGroup(sheetID int64) ([]int64, error) {
+func (s *SheetService) SyncAssignedSheetGroup(userID, sheetID int64) ([]int64, error) {
 	sourceSheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return nil, err
@@ -688,7 +866,14 @@ func (s *SheetService) SyncAssignedSheetGroup(sheetID int64) ([]int64, error) {
 			return nil, err
 		}
 		targetSheet.Config = config
+		history, err := s.beginHistory(userID, targetSheet.ID, "sync", "sheet.sync", "同步发放工作表结构", true)
+		if err != nil {
+			return nil, err
+		}
 		if err := s.sheetRepo.UpdateSheet(targetSheet); err != nil {
+			return nil, err
+		}
+		if err := s.finishHistory(history); err != nil {
 			return nil, err
 		}
 
@@ -787,7 +972,18 @@ func (s *SheetService) DeleteSheetForUser(userID, id int64) error {
 			return err
 		}
 	}
-	return s.sheetRepo.DeleteSheet(id)
+	workbook, _ := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err := s.sheetRepo.DeleteSheet(id); err != nil {
+		return err
+	}
+	metadata := map[string]any{"sheet_name": sheet.Name, "workbook_id": sheet.WorkbookID}
+	if workbook != nil {
+		metadata["workbook_name"] = workbook.Name
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "sheet", ResourceID: id,
+		Action: "sheet.delete", Source: "web", Summary: "删除工作表", Metadata: metadata,
+	})
 }
 
 func (s *SheetService) AssignWorkbookToUsers(workbookID, adminUserID int64, userIDs []int64) error {
@@ -845,6 +1041,19 @@ func (s *SheetService) AssignWorkbookToUsers(workbookID, adminUserID int64, user
 					return fmt.Errorf("copy row %d for user %d: %w", row.RowIndex, userID, err)
 				}
 			}
+			if _, err := s.CaptureCurrentVersion(adminUserID, clonedSheet.ID, "sync", "发放任务工作表初始版本", false); err != nil {
+				return err
+			}
+		}
+		if err := s.RecordOperation(model.OperationEvent{
+			UserID: adminUserID, ResourceType: "workbook", ResourceID: clone.ID,
+			Action: "workbook.assign", Source: "sync", Summary: "向员工发放工作簿",
+			Metadata: map[string]any{
+				"workbook_id": clone.ID, "workbook_name": clone.Name, "recipient_user_id": userID,
+				"source_workbook_id": workbookID, "source_workbook_name": template.Name,
+			},
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -891,86 +1100,318 @@ func (s *SheetService) ValidateCellChangesForUser(userID, sheetID int64, changes
 }
 
 func (s *SheetService) UpdateCells(userID int64, changes []model.CellUpdate) error {
+	_, err := s.UpdateCellsWithSourceDetailed(userID, changes, "web")
+	return err
+}
+
+func (s *SheetService) UpdateCellsWithSource(userID int64, changes []model.CellUpdate, source string) error {
+	_, err := s.UpdateCellsWithSourceDetailed(userID, changes, source)
+	return err
+}
+
+func (s *SheetService) UpdateCellsWithSourceDetailed(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
 	if len(changes) == 0 {
-		return nil
+		return &model.CellUpdateResult{}, nil
 	}
 
-	sheets := make(map[int64]*model.Sheet)
+	changes, err := collapseCellChanges(changes)
+	if err != nil {
+		return nil, err
+	}
+
+	trustedTradeMutation := source == "trade_erp"
 	accessCaches := make(map[int64]*sheetCellAccessCache)
-	for _, change := range changes {
-		if change.Row < 0 || strings.TrimSpace(change.Col) == "" {
-			return fmt.Errorf("invalid cell target")
-		}
-		sheet, ok := sheets[change.SheetID]
-		if !ok {
-			loadedSheet, err := s.sheetRepo.GetSheet(change.SheetID)
-			if err != nil {
-				return fmt.Errorf("failed to get sheet: %w", err)
-			}
-			if err := applySheetLifecycleState(loadedSheet); err != nil {
-				return err
-			}
-			if err := s.ensureSheetModificationAllowed(loadedSheet, userID); err != nil {
-				return err
-			}
-			sheets[change.SheetID] = loadedSheet
-			sheet = loadedSheet
-			accessCache, err := newSheetCellAccessCache(s.permService, userID, change.SheetID, loadedSheet.Config, true)
-			if err != nil {
-				return err
-			}
-			accessCaches[change.SheetID] = accessCache
-		}
-		_ = sheet
-		accessCache := accessCaches[change.SheetID]
-		worksheetRow := change.Row + 1
-		if !accessCache.allowsCell(change.Col, worksheetRow, "write") {
-			return fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, change.Col, change.Row+2)
-		}
-		if protected, reason := accessCache.checkProtection(change.Col, worksheetRow, userID); protected {
-			return fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
-		}
-
-		// Get existing row data or start fresh
-		existingRows, err := s.sheetRepo.GetRows(change.SheetID)
-		if err != nil {
-			return fmt.Errorf("failed to get rows: %w", err)
-		}
-
-		var rowData map[string]interface{}
-		for _, r := range existingRows {
-			if r.RowIndex == change.Row {
-				if err := json.Unmarshal(r.Data, &rowData); err != nil {
-					rowData = make(map[string]interface{})
+	histories := make(map[int64]*sheetMutationHistory)
+	if !trustedTradeMutation {
+		for _, change := range changes {
+			accessCache, ok := accessCaches[change.SheetID]
+			if !ok {
+				loadedSheet, err := s.sheetRepo.GetSheet(change.SheetID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get sheet: %w", err)
 				}
-				break
+				if err := applySheetLifecycleState(loadedSheet); err != nil {
+					return nil, err
+				}
+				if err := s.ensureSheetModificationAllowed(loadedSheet, userID); err != nil {
+					return nil, err
+				}
+				accessCache, err = newSheetCellAccessCache(s.permService, userID, change.SheetID, loadedSheet.Config, true)
+				if err != nil {
+					return nil, err
+				}
+				accessCaches[change.SheetID] = accessCache
 			}
-		}
-		if rowData == nil {
-			rowData = make(map[string]interface{})
-		}
-
-		// Update the cell value
-		var val interface{}
-		if err := json.Unmarshal(change.Value, &val); err != nil {
-			val = string(change.Value)
-		}
-		rowData[change.Col] = val
-
-		data, err := json.Marshal(rowData)
-		if err != nil {
-			return fmt.Errorf("failed to marshal row data: %w", err)
-		}
-
-		if err := s.sheetRepo.UpsertRow(change.SheetID, change.Row, data, userID); err != nil {
-			return fmt.Errorf("failed to upsert row: %w", err)
+			worksheetRow := change.Row + 1
+			if !accessCache.allowsCell(change.Col, worksheetRow, "write") {
+				return nil, fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, change.Col, change.Row+2)
+			}
+			if protected, reason := accessCache.checkProtection(change.Col, worksheetRow, userID); protected {
+				return nil, fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
+			}
 		}
 	}
 
+	result := &model.CellUpdateResult{AppliedChanges: changes}
+	if s.cellApprovalInterceptor != nil {
+		result, err = s.cellApprovalInterceptor(userID, changes, source)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			result = &model.CellUpdateResult{AppliedChanges: changes}
+		}
+	}
+	changes = result.AppliedChanges
+	for _, change := range changes {
+		if _, exists := histories[change.SheetID]; exists {
+			continue
+		}
+		history, err := s.beginHistory(userID, change.SheetID, source, "cell.update", fmt.Sprintf("更新 %d 个单元格", len(changes)), true)
+		if err != nil {
+			return nil, err
+		}
+		histories[change.SheetID] = history
+	}
+
+	if len(changes) > 0 {
+		if err := s.sheetRepo.BatchUpdateCells(changes, userID); err != nil {
+			return nil, err
+		}
+		if err := s.syncCellChangesToSnapshots(changes); err != nil {
+			return nil, err
+		}
+	}
+	for _, history := range histories {
+		if err := s.finishHistory(history); err != nil {
+			return nil, err
+		}
+	}
+	s.NotifyCellChanges(userID, changes, source)
+	return result, nil
+}
+
+func (s *SheetService) syncCellChangesToSnapshots(changes []model.CellUpdate) error {
+	bySheet := make(map[int64][]model.CellUpdate)
+	for _, change := range changes {
+		bySheet[change.SheetID] = append(bySheet[change.SheetID], change)
+	}
+	for sheetID, sheetChanges := range bySheet {
+		sheet, err := s.sheetRepo.GetSheet(sheetID)
+		if err != nil {
+			return err
+		}
+		if len(sheet.Config) == 0 {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(sheet.Config, &payload); err != nil {
+			continue
+		}
+		sheetData, ok := payload["univerSheetData"].(map[string]interface{})
+		if !ok || sheetData == nil {
+			continue
+		}
+		cellData, _ := sheetData["cellData"].(map[string]interface{})
+		if cellData == nil {
+			cellData = make(map[string]interface{})
+			sheetData["cellData"] = cellData
+		}
+		columnKeys, err := parseColumnKeys(sheet.Columns)
+		if err != nil {
+			return err
+		}
+		columnIndexes := make(map[string]int, len(columnKeys))
+		for index, key := range columnKeys {
+			columnIndexes[key] = index
+		}
+		for _, change := range sheetChanges {
+			columnIndex, exists := columnIndexes[change.Col]
+			if !exists || change.Row < 0 {
+				continue
+			}
+			rowKey := strconv.Itoa(change.Row + 1)
+			columnKey := strconv.Itoa(columnIndex)
+			rowMap, _ := cellData[rowKey].(map[string]interface{})
+			if rowMap == nil {
+				rowMap = make(map[string]interface{})
+				cellData[rowKey] = rowMap
+			}
+			cell, _ := rowMap[columnKey].(map[string]interface{})
+			if cell == nil {
+				cell = make(map[string]interface{})
+			}
+			var value any
+			if len(change.Value) > 0 {
+				if err := json.Unmarshal(change.Value, &value); err != nil {
+					return err
+				}
+			}
+			if formula, ok := value.(string); ok && strings.HasPrefix(strings.TrimSpace(formula), "=") {
+				cell["f"] = formula
+				delete(cell, "v")
+			} else {
+				cell["v"] = value
+				delete(cell, "f")
+			}
+			rowMap[columnKey] = cell
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		sheet.Config = encoded
+		if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
+func (s *SheetService) PrepareSheetCellChanges(userID int64, existing, next *model.Sheet, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
+	if existing == nil || next == nil || len(changes) == 0 {
+		return &model.CellUpdateResult{AppliedChanges: changes}, nil
+	}
+	collapsed, err := collapseCellChanges(changes)
+	if err != nil {
+		return nil, err
+	}
+	result := &model.CellUpdateResult{AppliedChanges: collapsed}
+	if s.cellApprovalInterceptor != nil {
+		result, err = s.cellApprovalInterceptor(userID, collapsed, source)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			result = &model.CellUpdateResult{AppliedChanges: collapsed}
+		}
+	}
+	if len(result.RevertedChanges) > 0 {
+		next.Config, err = restoreWorksheetCellValues(existing.Config, next.Config, next.Columns, result.RevertedChanges)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func restoreWorksheetCellValues(existingConfig, nextConfig, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, error) {
+	if len(changes) == 0 {
+		return nextConfig, nil
+	}
+	var existingPayload, nextPayload map[string]interface{}
+	if len(existingConfig) > 0 {
+		if err := json.Unmarshal(existingConfig, &existingPayload); err != nil {
+			return nil, fmt.Errorf("parse existing sheet config: %w", err)
+		}
+	}
+	if len(nextConfig) > 0 {
+		if err := json.Unmarshal(nextConfig, &nextPayload); err != nil {
+			return nil, fmt.Errorf("parse next sheet config: %w", err)
+		}
+	}
+	if existingPayload == nil {
+		existingPayload = make(map[string]interface{})
+	}
+	if nextPayload == nil {
+		nextPayload = make(map[string]interface{})
+	}
+	columnKeys, err := parseColumnKeys(columns)
+	if err != nil {
+		return nil, err
+	}
+	columnIndexes := make(map[string]int, len(columnKeys))
+	for index, key := range columnKeys {
+		columnIndexes[key] = index
+	}
+	ensureCellData := func(payload map[string]interface{}) map[string]interface{} {
+		sheetData, _ := payload["univerSheetData"].(map[string]interface{})
+		if sheetData == nil {
+			sheetData = make(map[string]interface{})
+			payload["univerSheetData"] = sheetData
+		}
+		cellData, _ := sheetData["cellData"].(map[string]interface{})
+		if cellData == nil {
+			cellData = make(map[string]interface{})
+			sheetData["cellData"] = cellData
+		}
+		return cellData
+	}
+	existingCells := ensureCellData(existingPayload)
+	nextCells := ensureCellData(nextPayload)
+	for _, change := range changes {
+		columnIndex, exists := columnIndexes[change.Col]
+		if !exists || change.Row < 0 {
+			continue
+		}
+		rowKey := strconv.Itoa(change.Row + 1)
+		columnKey := strconv.Itoa(columnIndex)
+		existingRow, _ := existingCells[rowKey].(map[string]interface{})
+		nextRow, _ := nextCells[rowKey].(map[string]interface{})
+		if nextRow == nil {
+			nextRow = make(map[string]interface{})
+			nextCells[rowKey] = nextRow
+		}
+		if existingCell, ok := existingRow[columnKey]; ok {
+			nextRow[columnKey] = existingCell
+		} else {
+			delete(nextRow, columnKey)
+		}
+	}
+	encoded, err := json.Marshal(nextPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal restored sheet config: %w", err)
+	}
+	return encoded, nil
+}
+
+type cellUpdateKey struct {
+	SheetID int64
+	Row     int
+	Col     string
+}
+
+func collapseCellChanges(changes []model.CellUpdate) ([]model.CellUpdate, error) {
+	collapsed := make([]model.CellUpdate, 0, len(changes))
+	indexes := make(map[cellUpdateKey]int, len(changes))
+	for _, change := range changes {
+		change.Col = strings.TrimSpace(change.Col)
+		if change.SheetID <= 0 || change.Row < 0 || change.Col == "" {
+			return nil, fmt.Errorf("invalid cell target")
+		}
+		if len(change.Value) == 0 {
+			change.Value = json.RawMessage("null")
+		}
+		if !json.Valid(change.Value) {
+			return nil, fmt.Errorf("invalid JSON value for %s%d", change.Col, change.Row+1)
+		}
+
+		key := cellUpdateKey{SheetID: change.SheetID, Row: change.Row, Col: change.Col}
+		if index, exists := indexes[key]; exists {
+			collapsed[index] = change
+			continue
+		}
+		indexes[key] = len(collapsed)
+		collapsed = append(collapsed, change)
+	}
+
+	sort.Slice(collapsed, func(i, j int) bool {
+		if collapsed[i].SheetID != collapsed[j].SheetID {
+			return collapsed[i].SheetID < collapsed[j].SheetID
+		}
+		if collapsed[i].Row != collapsed[j].Row {
+			return collapsed[i].Row < collapsed[j].Row
+		}
+		return collapsed[i].Col < collapsed[j].Col
+	})
+	return collapsed, nil
+}
+
 func (s *SheetService) InsertRow(userID, sheetID int64, rowIndex int) error {
+	return s.InsertRowWithSource(userID, sheetID, rowIndex, "web")
+}
+
+func (s *SheetService) InsertRowWithSource(userID, sheetID int64, rowIndex int, source string) error {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return err
@@ -987,10 +1428,21 @@ func (s *SheetService) InsertRow(userID, sheetID int64, rowIndex int) error {
 		return err
 	}
 
-	return s.sheetRepo.InsertRowWithConfig(sheetID, rowIndex, nextConfig)
+	history, err := s.beginHistory(userID, sheetID, source, "row.insert", fmt.Sprintf("插入第 %d 行", rowIndex+2), false)
+	if err != nil {
+		return err
+	}
+	if err := s.sheetRepo.InsertRowWithConfig(sheetID, rowIndex, nextConfig); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 func (s *SheetService) DeleteRow(userID, sheetID int64, rowIndex int) error {
+	return s.DeleteRowWithSource(userID, sheetID, rowIndex, "web")
+}
+
+func (s *SheetService) DeleteRowWithSource(userID, sheetID int64, rowIndex int, source string) error {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return err
@@ -1010,7 +1462,14 @@ func (s *SheetService) DeleteRow(userID, sheetID int64, rowIndex int) error {
 		return err
 	}
 
-	return s.sheetRepo.DeleteRowWithConfig(sheetID, rowIndex, nextConfig)
+	history, err := s.beginHistory(userID, sheetID, source, "row.delete", fmt.Sprintf("删除第 %d 行", rowIndex+2), false)
+	if err != nil {
+		return err
+	}
+	if err := s.sheetRepo.DeleteRowWithConfig(sheetID, rowIndex, nextConfig); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 func (s *SheetService) GetProtectionSnapshot(sheetID, userID int64) (*model.ProtectionSnapshot, error) {
@@ -1064,6 +1523,10 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 		return nil, nil, err
 	}
 	finalizeProtectionPayload(payload, protections, legacyLocks)
+	history, err := s.beginHistory(userID, sheetID, "web", "protection.update", protectionActionSummary(req.Action), false)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	nextConfig, err := json.Marshal(payload)
 	if err != nil {
@@ -1072,6 +1535,9 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 
 	sheet.Config = nextConfig
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return nil, nil, err
+	}
+	if err := s.finishHistory(history); err != nil {
 		return nil, nil, err
 	}
 
@@ -1153,6 +1619,10 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 		}
 	}
 	finalizeProtectionPayload(payload, protections, legacyLocks)
+	history, err := s.beginHistory(userID, sheetID, "web", "protection.batch_update", fmt.Sprintf("批量更新 %d 个保护区域", len(items)), false)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	nextConfig, err := json.Marshal(payload)
 	if err != nil {
@@ -1161,6 +1631,9 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 
 	sheet.Config = nextConfig
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return nil, nil, err
+	}
+	if err := s.finishHistory(history); err != nil {
 		return nil, nil, err
 	}
 
@@ -1185,17 +1658,20 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 }
 
 func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action string) (*model.Sheet, error) {
-	isAdmin, err := s.permService.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	if !isAdmin {
-		return nil, fmt.Errorf("%w: only admins can change locked/archive state", ErrSheetStateDenied)
-	}
-
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return nil, err
+	}
+	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	canManage, err := s.CanManageWorkbook(userID, workbook)
+	if err != nil {
+		return nil, err
+	}
+	if !canManage {
+		return nil, fmt.Errorf("%w: only workbook managers can change locked/archive state", ErrSheetStateDenied)
 	}
 	payload, state, err := parseSheetLifecycleState(sheet.Config)
 	if err != nil {
@@ -1219,6 +1695,10 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 	default:
 		return nil, fmt.Errorf("unsupported sheet state action")
 	}
+	history, err := s.beginHistory(userID, sheetID, "web", "sheet.state.update", sheetStateActionSummary(action), false)
+	if err != nil {
+		return nil, err
+	}
 
 	if state.Locked == nil && state.Archived == nil && state.Hidden == nil {
 		delete(payload, "sheetState")
@@ -1235,6 +1715,9 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
 		return nil, err
 	}
+	if err := s.finishHistory(history); err != nil {
+		return nil, err
+	}
 
 	updatedSheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
@@ -1245,6 +1728,25 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 	}
 
 	return updatedSheet, nil
+}
+
+func protectionActionSummary(action string) string {
+	if action == "unlock" {
+		return "解除工作表区域保护"
+	}
+	return "设置工作表区域保护"
+}
+
+func sheetStateActionSummary(action string) string {
+	labels := map[string]string{
+		"lock": "锁定工作表", "unlock": "解除工作表锁定",
+		"archive": "归档工作表", "unarchive": "取消工作表归档",
+		"hide": "隐藏工作表", "unhide": "恢复工作表可见",
+	}
+	if label := labels[action]; label != "" {
+		return label
+	}
+	return "更新工作表状态"
 }
 
 func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey string, userID int64) (bool, string, error) {

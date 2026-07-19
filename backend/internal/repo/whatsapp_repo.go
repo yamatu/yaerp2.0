@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/lib/pq"
 
@@ -143,6 +144,63 @@ func (r *WhatsAppRepo) FindChannelLink(accountID int64, chatID string) (*model.W
 	return scanWhatsAppChannelLink(r.db.QueryRow(
 		whatsAppChannelLinkSelectSQL()+` WHERE link.whatsapp_account_id = $1 AND link.whatsapp_chat_id = $2`, accountID, chatID,
 	))
+}
+
+func (r *WhatsAppRepo) ListChatSearchAliases(accountID, userID int64) (map[string][]string, error) {
+	rows, err := r.db.Query(
+		`SELECT source.chat_id, source.alias
+		   FROM (
+		       SELECT customer.whatsapp_chat_id AS chat_id, alias.value AS alias, alias.priority
+		         FROM trade_customers customer
+		         CROSS JOIN LATERAL (VALUES
+		             (customer.name, 1), (customer.company_name, 2), (customer.contact_name, 3),
+		             (customer.phone, 4), (customer.email, 5), (customer.customer_code, 6),
+		             (customer.whatsapp_chat_name, 7)
+		         ) AS alias(value, priority)
+		        WHERE customer.owner_id = $2
+		          AND customer.whatsapp_chat_id IS NOT NULL
+		          AND customer.whatsapp_chat_id <> ''
+		       UNION ALL
+		       SELECT link.whatsapp_chat_id, alias.value, alias.priority
+		         FROM whatsapp_channel_links link
+		         JOIN channels channel ON channel.id = link.channel_id
+		         CROSS JOIN LATERAL (VALUES
+		             (channel.name, 10), (COALESCE(channel.description, ''), 11),
+		             (link.whatsapp_chat_name, 12), (link.whatsapp_chat_about, 13)
+		         ) AS alias(value, priority)
+		        WHERE link.whatsapp_account_id = $1
+		   ) source
+		  WHERE BTRIM(source.alias) <> ''
+		  ORDER BY source.chat_id, source.priority`,
+		accountID, userID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list WhatsApp chat search aliases: %w", err)
+	}
+	defer rows.Close()
+	result := make(map[string][]string)
+	seen := make(map[string]map[string]struct{})
+	for rows.Next() {
+		var chatID, alias string
+		if err := rows.Scan(&chatID, &alias); err != nil {
+			return nil, err
+		}
+		chatID = strings.TrimSpace(chatID)
+		alias = strings.TrimSpace(alias)
+		if chatID == "" || alias == "" {
+			continue
+		}
+		if seen[chatID] == nil {
+			seen[chatID] = make(map[string]struct{})
+		}
+		key := strings.ToLower(alias)
+		if _, exists := seen[chatID][key]; exists {
+			continue
+		}
+		seen[chatID][key] = struct{}{}
+		result[chatID] = append(result[chatID], alias)
+	}
+	return result, rows.Err()
 }
 
 func (r *WhatsAppRepo) UpsertChannelLink(link *model.WhatsAppChannelLink) error {

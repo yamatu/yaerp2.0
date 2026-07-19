@@ -20,14 +20,19 @@ import (
 )
 
 type AIService struct {
-	cfg             *config.Config
-	db              *sql.DB
-	sheetRepo       *repo.SheetRepo
-	sheetService    *SheetService
-	permService     *PermissionService
-	uploadService   *UploadService
-	scheduleService *AIScheduleService
-	tools           map[string]ToolFunc
+	cfg               *config.Config
+	db                *sql.DB
+	sheetRepo         *repo.SheetRepo
+	sheetService      *SheetService
+	permService       *PermissionService
+	uploadService     *UploadService
+	scheduleService   *AIScheduleService
+	automationService *AutomationService
+	tools             map[string]ToolFunc
+}
+
+func (s *AIService) SetAutomationService(automationService *AutomationService) {
+	s.automationService = automationService
 }
 
 const aiRequestTimeout = 180 * time.Second
@@ -60,9 +65,18 @@ type ChatRequest struct {
 }
 
 type ChatContext struct {
-	WorkbookID    *int64  `json:"workbook_id"`
-	SheetIDs      []int64 `json:"sheet_ids"`
-	AttachmentIDs []int64 `json:"attachment_ids"`
+	WorkbookID    *int64                `json:"workbook_id"`
+	SheetIDs      []int64               `json:"sheet_ids"`
+	AttachmentIDs []int64               `json:"attachment_ids"`
+	Selection     *ChatSelectionContext `json:"selection,omitempty"`
+}
+
+type ChatSelectionContext struct {
+	SheetID    int64    `json:"sheet_id"`
+	StartRow   *int     `json:"start_row,omitempty"`
+	EndRow     *int     `json:"end_row,omitempty"`
+	ColumnKeys []string `json:"column_keys"`
+	RangeLabel string   `json:"range_label"`
 }
 
 type ChatResponse struct {
@@ -748,16 +762,23 @@ type aiPreviewRow struct {
 }
 
 type sheetColumnPayload struct {
-	Key            string                 `json:"key"`
-	Name           string                 `json:"name"`
-	Type           string                 `json:"type"`
-	Width          float64                `json:"width,omitempty"`
-	Required       bool                   `json:"required,omitempty"`
-	Validation     map[string]interface{} `json:"validation,omitempty"`
-	Formula        string                 `json:"formula,omitempty"`
-	Options        []string               `json:"options,omitempty"`
-	CurrencyCode   string                 `json:"currencyCode,omitempty"`
-	CurrencySource string                 `json:"currencySource,omitempty"`
+	Key            string                      `json:"key"`
+	Name           string                      `json:"name"`
+	Type           string                      `json:"type"`
+	Width          float64                     `json:"width,omitempty"`
+	Required       bool                        `json:"required,omitempty"`
+	Validation     map[string]interface{}      `json:"validation,omitempty"`
+	Formula        string                      `json:"formula,omitempty"`
+	Options        []string                    `json:"options,omitempty"`
+	OptionColors   map[string]sheetOptionColor `json:"optionColors,omitempty"`
+	Searchable     bool                        `json:"searchable,omitempty"`
+	CurrencyCode   string                      `json:"currencyCode,omitempty"`
+	CurrencySource string                      `json:"currencySource,omitempty"`
+}
+
+type sheetOptionColor struct {
+	BackgroundColor string `json:"backgroundColor,omitempty"`
+	TextColor       string `json:"textColor,omitempty"`
 }
 
 func enrichSpreadsheetOperations(operations []SpreadsheetOperation, meta map[int64]sheetPreviewMeta) []SpreadsheetOperation {
@@ -876,7 +897,7 @@ func (s *AIService) applyCellUpdateOperation(userID int64, operation Spreadsheet
 		return fmt.Errorf("marshal row data: %w", err)
 	}
 
-	if err := s.sheetService.UpdateCells(userID, []model.CellUpdate{{SheetID: operation.SheetID, Row: operation.Row, Col: operation.ColumnKey, Value: rawValue}}); err != nil {
+	if err := s.sheetService.UpdateCellsWithSource(userID, []model.CellUpdate{{SheetID: operation.SheetID, Row: operation.Row, Col: operation.ColumnKey, Value: rawValue}}, "ai"); err != nil {
 		return fmt.Errorf("apply spreadsheet operation: %w", err)
 	}
 
@@ -888,7 +909,7 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 		return fmt.Errorf("invalid insert_row row index")
 	}
 
-	if err := s.sheetService.InsertRow(userID, operation.SheetID, operation.Row-1); err != nil {
+	if err := s.sheetService.InsertRowWithSource(userID, operation.SheetID, operation.Row-1, "ai"); err != nil {
 		return fmt.Errorf("insert row: %w", err)
 	}
 
@@ -914,7 +935,7 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 		})
 	}
 
-	if err := s.sheetService.UpdateCells(userID, changes); err != nil {
+	if err := s.sheetService.UpdateCellsWithSource(userID, changes, "ai"); err != nil {
 		return fmt.Errorf("persist inserted row: %w", err)
 	}
 
@@ -926,7 +947,7 @@ func (s *AIService) applyDeleteRowOperation(userID int64, operation SpreadsheetO
 		return fmt.Errorf("invalid delete_row row index")
 	}
 
-	if err := s.sheetService.DeleteRow(userID, operation.SheetID, operation.Row); err != nil {
+	if err := s.sheetService.DeleteRowWithSource(userID, operation.SheetID, operation.Row, "ai"); err != nil {
 		return fmt.Errorf("delete row: %w", err)
 	}
 
@@ -972,7 +993,7 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 		return fmt.Errorf("marshal inserted column metadata: %w", err)
 	}
 	sheet.Columns = nextColumns
-	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.column.insert", "AI 新增工作表列", true); err != nil {
 		return fmt.Errorf("persist inserted column: %w", err)
 	}
 
@@ -999,6 +1020,9 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 		if err := s.sheetRepo.UpsertRow(operation.SheetID, row.RowIndex, encoded, userID); err != nil {
 			return fmt.Errorf("apply inserted column values: %w", err)
 		}
+	}
+	if _, err := s.sheetService.CaptureCurrentVersion(userID, operation.SheetID, "ai", "AI 新增工作表列并填充数据", true); err != nil {
+		return err
 	}
 
 	return nil
@@ -1063,11 +1087,14 @@ func (s *AIService) applyFillFormulaOperation(userID int64, operation Spreadshee
 			return fmt.Errorf("apply formula fill: %w", err)
 		}
 	}
+	if _, err := s.sheetService.CaptureCurrentVersion(userID, operation.SheetID, "ai", "AI 批量填充公式", true); err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (s *AIService) invalidateSheetSnapshot(sheet *model.Sheet) error {
+func (s *AIService) invalidateSheetSnapshot(userID int64, sheet *model.Sheet) error {
 	if len(sheet.Config) == 0 {
 		return nil
 	}
@@ -1086,7 +1113,7 @@ func (s *AIService) invalidateSheetSnapshot(sheet *model.Sheet) error {
 	}
 
 	sheet.Config = nextConfig
-	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.snapshot.invalidate", "AI 刷新工作表缓存", true); err != nil {
 		return fmt.Errorf("persist invalidated sheet config: %w", err)
 	}
 

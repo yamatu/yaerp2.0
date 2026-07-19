@@ -9,7 +9,9 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@univerjs/preset-sheets-conditional-formatting": "^0.6.10",
     "@univerjs/preset-sheets-core": "^0.6.2",
+    "@univerjs/preset-sheets-data-validation": "^0.6.10",
     "@univerjs/preset-sheets-drawing": "^0.6.10",
     "@univerjs/preset-sheets-find-replace": "^0.6.10",
     "@univerjs/presets": "^0.6.2",

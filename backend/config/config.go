@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -10,6 +11,7 @@ type Config struct {
 	Redis    RedisConfig
 	MinIO    MinIOConfig
 	JWT      JWTConfig
+	Auth     AuthConfig
 	Server   ServerConfig
 	AI       AIConfig
 	Backup   BackupConfig
@@ -45,9 +47,14 @@ type JWTConfig struct {
 	RefreshHours int
 }
 
+type AuthConfig struct {
+	AllowPublicRegistration bool
+}
+
 type ServerConfig struct {
-	Port string
-	Mode string
+	Port           string
+	Mode           string
+	AllowedOrigins []string
 }
 
 type AIConfig struct {
@@ -99,9 +106,13 @@ func Load() *Config {
 			ExpireHours:  getEnvInt("JWT_EXPIRE_HOURS", 24),
 			RefreshHours: getEnvInt("JWT_REFRESH_HOURS", 168),
 		},
+		Auth: AuthConfig{
+			AllowPublicRegistration: getEnv("ALLOW_PUBLIC_REGISTRATION", "false") == "true",
+		},
 		Server: ServerConfig{
-			Port: getEnv("BACKEND_PORT", "8080"),
-			Mode: getEnv("GIN_MODE", "debug"),
+			Port:           getEnv("BACKEND_PORT", "8080"),
+			Mode:           getEnv("GIN_MODE", "debug"),
+			AllowedOrigins: getEnvList("CORS_ALLOWED_ORIGINS", []string{"*"}),
 		},
 		AI: AIConfig{
 			Endpoint: getEnv("AI_API_ENDPOINT", ""),
@@ -147,4 +158,22 @@ func getPositiveEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func getEnvList(key string, fallback []string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	values := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		value := strings.TrimSpace(item)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	if len(values) == 0 {
+		return fallback
+	}
+	return values
 }

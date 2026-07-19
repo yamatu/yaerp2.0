@@ -33,6 +33,21 @@ interface PanelSize {
   height: number
 }
 
+interface AIComposeSelection {
+  sheet_id: number
+  start_row?: number
+  end_row?: number
+  column_keys: string[]
+  range_label: string
+}
+
+interface AIComposeEventDetail {
+  prompt?: string
+  workbookId?: number
+  sheetId?: number
+  selection?: AIComposeSelection
+}
+
 const DEFAULT_PANEL_SIZE: PanelSize = { width: 576, height: 720 }
 const MIN_PANEL_WIDTH = 360
 const MIN_PANEL_HEIGHT = 420
@@ -175,6 +190,8 @@ function toolTitle(name: string) {
       return '设置单元格格式'
     case 'format_cell_range':
       return '设计单元格样式'
+    case 'configure_approval_flow':
+      return '配置审批流程'
     case 'create_financial_report':
       return '创建财务分析工作簿'
     case 'list_summary_pages':
@@ -498,6 +515,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   )
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
+  const [contextSelection, setContextSelection] = useState<AIComposeSelection | null>(null)
   const [loadingContextWorkbookId, setLoadingContextWorkbookId] = useState<number | null>(null)
   const [suggestionSeed, setSuggestionSeed] = useState(0)
   const { workbooks } = useWorkbooks()
@@ -593,7 +611,26 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     if (!contextOnlyMine || !contextWorkbook || contextWorkbook.owner_id === userId) return
     setContextWorkbook(null)
     setContextSheetIds([])
+    setContextSelection(null)
   }, [contextOnlyMine, contextWorkbook, userId])
+
+  useEffect(() => {
+    const handleCompose = (event: Event) => {
+      const detail = (event as CustomEvent<AIComposeEventDetail>).detail || {}
+      if (detail.prompt) setInputValue(detail.prompt)
+      if (detail.selection) setContextSelection(detail.selection)
+      if (!detail.workbookId) return
+      void (async () => {
+        const res = await api.get<Workbook>(`/workbooks/${detail.workbookId}`)
+        if (res.code !== 0 || !res.data) return
+        setContextWorkbook(res.data)
+        setContextSheetIds(detail.sheetId ? [detail.sheetId] : [])
+        setContextPickerOpen(false)
+      })()
+    }
+    window.addEventListener('yaerp:ai-compose', handleCompose)
+    return () => window.removeEventListener('yaerp:ai-compose', handleCompose)
+  }, [])
 
   useEffect(() => {
     if (!open || assistants.length > 0) return
@@ -706,6 +743,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         context: contextWorkbook ? {
           workbook_id: contextWorkbook.id,
           sheet_ids: contextSheetIds,
+          selection: contextSelection || undefined,
         } : undefined,
       })
 	  if (res.code !== 0 || !res.data) {
@@ -869,12 +907,14 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       if (res.code !== 0 || !res.data) return
       setContextWorkbook(res.data)
       setContextSheetIds([])
+      setContextSelection(null)
     } finally {
       setLoadingContextWorkbookId(null)
     }
   }, [])
 
   const toggleContextSheet = useCallback((sheetId: number) => {
+    setContextSelection(null)
     setContextSheetIds((current) => current.includes(sheetId)
       ? current.filter((id) => id !== sheetId)
       : [...current, sheetId])
@@ -1089,8 +1129,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             </button>
             {contextWorkbook && (
               <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5 text-xs text-slate-600">
-                <span className="min-w-0 flex-1 truncate font-medium">{contextWorkbook.name}{contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}</span>
-                <button type="button" onClick={() => { setContextWorkbook(null); setContextSheetIds([]); setContextPickerOpen(false) }} className="shrink-0 text-slate-400 hover:text-slate-700" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
+                <span className="min-w-0 flex-1 truncate font-medium">{contextWorkbook.name}{contextSelection ? ` · ${contextSelection.range_label}` : contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}</span>
+                <button type="button" onClick={() => { setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null); setContextPickerOpen(false) }} className="shrink-0 text-slate-400 hover:text-slate-700" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
               </div>
             )}
           </div>

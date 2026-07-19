@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
 
 	"yaerp/config"
 	"yaerp/internal/handler"
@@ -26,6 +27,7 @@ import (
 
 func main() {
 	cfg := config.Load()
+	warnSecurityConfiguration(cfg)
 
 	// Database
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
@@ -67,8 +69,11 @@ func main() {
 
 	// Repos
 	userRepo := repo.NewUserRepo(db)
+	warnDefaultAdminPassword(cfg, userRepo)
 	sheetRepo := repo.NewSheetRepo(db)
 	permRepo := repo.NewPermissionRepo(db)
+	historyRepo := repo.NewSheetHistoryRepo(db)
+	automationRepo := repo.NewAutomationRepo(db)
 	departmentRepo := repo.NewDepartmentRepo(db)
 	attachRepo := repo.NewAttachmentRepo(db)
 	folderRepo := repo.NewFolderRepo(db)
@@ -76,12 +81,14 @@ func main() {
 	channelRepo := repo.NewChannelRepo(db)
 	whatsAppRepo := repo.NewWhatsAppRepo(db)
 	scheduleRepo := repo.NewAIScheduleRepo(db)
+	tradeRepo := repo.NewTradeRepo(db)
 
 	// Services
 	authService := service.NewAuthService(userRepo, jwtUtil, rdb)
 	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo, departmentRepo)
 	departmentService := service.NewDepartmentService(departmentRepo, userRepo)
-	sheetService := service.NewSheetService(sheetRepo, permService)
+	historyService := service.NewSheetHistoryService(historyRepo, sheetRepo, permService)
+	sheetService := service.NewSheetService(sheetRepo, permService, historyService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, channelRepo, cfg.JWT.Secret)
 	go func() {
 		updated, removed, err := uploadService.BackfillGalleryContentHashes()
@@ -93,10 +100,22 @@ func main() {
 		}
 	}()
 	channelService := service.NewChannelService(channelRepo, uploadService, sheetService, permService, userRepo)
+	automationService := service.NewAutomationService(automationRepo, sheetRepo, sheetService, permService, channelService)
+	sheetService.SetCellApprovalInterceptor(automationService.InterceptCellChanges)
 	whatsAppService := service.NewWhatsAppService(
 		whatsAppRepo, channelRepo, uploadService, sheetService, permService,
 		cfg.WhatsApp.ServiceURL, cfg.WhatsApp.InternalSecret, cfg.JWT.Secret,
 	)
+	tradeService := service.NewTradeService(
+		tradeRepo, sheetRepo, sheetService, channelService, whatsAppService, uploadService,
+		permService, userRepo, automationRepo,
+	)
+	permService.SetSheetPermissionMatrixOverride(tradeService.TradeSheetPermissionMatrix)
+	permService.SetWorkbookPermissionOverride(tradeService.TradeWorkbookPermission)
+	sheetService.SetCellChangeHook(func(userID int64, changes []model.CellUpdate, source string) {
+		automationService.HandleCellChanges(userID, changes, source)
+		tradeService.HandleCellChanges(userID, changes, source)
+	})
 	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
 	channelService.SetImportService(importService)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
@@ -106,6 +125,7 @@ func main() {
 	go backupService.StartAutomaticBackups(context.Background())
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
 	aiService := service.NewAIService(cfg, db, sheetRepo, sheetService, permService, uploadService, scheduleService)
+	aiService.SetAutomationService(automationService)
 	channelService.SetAIService(aiService)
 	scheduleService.SetReportGenerator(aiService.GenerateSheetReport)
 	if err := scheduleService.Start(); err != nil {
@@ -140,11 +160,50 @@ func main() {
 			log.Printf("mark WhatsApp channel %d seen: %v", channelID, err)
 		}
 	})
-	wsHandler := ws.NewWSHandler(hub, jwtUtil, permService, sheetService)
+	automationService.SetNotificationHook(func(userIDs []int64) {
+		payload, err := json.Marshal(ws.Message{Type: "task_notification"})
+		if err == nil {
+			hub.BroadcastToUsers(userIDs, payload)
+		}
+	})
+	tradeService.SetNotificationHook(func(userIDs []int64) {
+		payload, err := json.Marshal(ws.Message{Type: "task_notification"})
+		if err == nil {
+			hub.BroadcastToUsers(userIDs, payload)
+		}
+	})
+	broadcastTradeOrderUpdate := func(orderID int64) {
+		payload, err := json.Marshal(ws.Message{Type: "trade_order_updated", OrderID: orderID})
+		if err == nil {
+			hub.BroadcastAll(payload)
+		}
+	}
+	tradeService.SetOrderUpdatedHook(broadcastTradeOrderUpdate)
+	recycleBinService.SetTradeOrderChangedHook(broadcastTradeOrderUpdate)
+	tradeService.SetCellBroadcastHook(func(actorID int64, changes []model.CellUpdate) {
+		broadcastAutomationCellChanges(hub, sheetService, actorID, changes)
+	})
+	automationService.SetCellBroadcastHook(func(actorID int64, changes []model.CellUpdate) {
+		broadcastAutomationCellChanges(hub, sheetService, actorID, changes)
+	})
+	automationService.SetApprovalStateHook(func(sheetIDs []int64) {
+		for _, sheetID := range sheetIDs {
+			payload, err := json.Marshal(ws.Message{Type: "approval_updated", SheetID: sheetID})
+			if err == nil {
+				hub.BroadcastToSheetExceptClientID(sheetID, payload, "")
+			}
+		}
+	})
+	if err := automationService.Start(); err != nil {
+		log.Fatalf("failed to start automation service: %v", err)
+	}
+	defer automationService.Stop()
+	wsHandler := ws.NewWSHandler(hub, authService, permService, sheetService, cfg.Server.AllowedOrigins)
 
 	// Handlers
 	authHandler := handler.NewAuthHandler(authService)
 	sheetHandler := handler.NewSheetHandler(sheetService, hub)
+	sheetHistoryHandler := handler.NewSheetHistoryHandler(historyService, hub)
 	cellHandler := handler.NewCellHandler(sheetService, permService)
 	uploadHandler := handler.NewUploadHandler(uploadService)
 	channelHandler := handler.NewChannelHandler(channelService, uploadService, hub)
@@ -158,20 +217,24 @@ func main() {
 	recycleBinHandler := handler.NewRecycleBinHandler(recycleBinService)
 	backupHandler := handler.NewBackupHandler(backupService)
 	aiHandler := handler.NewAIHandler(aiService, hub)
+	automationHandler := handler.NewAutomationHandler(automationService)
+	tradeHandler := handler.NewTradeHandler(tradeService)
 
 	// Router
 	gin.SetMode(cfg.Server.Mode)
 	r := gin.Default()
 
 	// Middleware
-	r.Use(middleware.CORSMiddleware([]string{"*"}))
+	r.Use(middleware.CORSMiddleware(cfg.Server.AllowedOrigins))
 	r.Use(middleware.RateLimitMiddleware(100))
 
 	// Public routes
 	auth := r.Group("/api/auth")
 	{
 		auth.POST("/login", authHandler.Login)
-		auth.POST("/register", authHandler.Register)
+		if cfg.Auth.AllowPublicRegistration {
+			auth.POST("/register", authHandler.Register)
+		}
 		auth.POST("/refresh", authHandler.RefreshToken)
 	}
 	r.GET("/api/files/:id/content", uploadHandler.ServeFile)
@@ -185,10 +248,58 @@ func main() {
 	{
 		api.GET("/auth/me", authHandler.Me)
 		api.POST("/auth/logout", authHandler.Logout)
+		api.POST("/auth/ws-ticket", authHandler.CreateWebSocketTicket)
 		api.POST("/auth/change-password", authHandler.ChangePassword)
 		api.PUT("/auth/avatar", userHandler.UpdateOwnAvatar)
 		api.GET("/users/shareable", userHandler.ListShareableUsers)
 		api.GET("/departments", departmentHandler.List)
+		api.GET("/trade/access", tradeHandler.AccessProfile)
+		api.GET("/trade/dashboard", tradeHandler.Dashboard)
+		api.GET("/trade/boss-dashboard", tradeHandler.BossDashboard)
+		api.GET("/trade/customers", tradeHandler.ListCustomers)
+		api.POST("/trade/customers", tradeHandler.CreateCustomer)
+		api.GET("/trade/suppliers", tradeHandler.ListSuppliers)
+		api.POST("/trade/suppliers", tradeHandler.CreateSupplier)
+		api.GET("/trade/positions", tradeHandler.ListPositions)
+		api.PUT("/trade/positions/assignments", tradeHandler.UpdatePositionAssignments)
+		api.GET("/trade/settings", tradeHandler.GetSettings)
+		api.PUT("/trade/settings", tradeHandler.UpdateSettings)
+		api.GET("/trade/orders", tradeHandler.ListOrders)
+		api.POST("/trade/orders", tradeHandler.CreateOrder)
+		api.GET("/trade/orders/:id", tradeHandler.GetOrder)
+		api.PUT("/trade/orders/:id/profit-settings", tradeHandler.UpdateProfitSettings)
+		api.DELETE("/trade/orders/:id", tradeHandler.DeleteOrder)
+		api.POST("/trade/orders/:id/items", tradeHandler.AddOrderItems)
+		api.PUT("/trade/orders/:id/stage-data", tradeHandler.UpdateStageData)
+		api.POST("/trade/orders/:id/advance", tradeHandler.AdvanceOrder)
+		api.POST("/trade/orders/:id/supplier-quotes", tradeHandler.CreateSupplierQuote)
+		api.POST("/trade/orders/:id/supplier-quotes/:quoteId/select", tradeHandler.SelectSupplierQuote)
+		api.POST("/trade/orders/:id/customer-quotes", tradeHandler.CreateCustomerQuoteRound)
+		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/status", tradeHandler.UpdateCustomerQuoteRoundStatus)
+		api.POST("/trade/orders/:id/pi/pdf", tradeHandler.GeneratePI)
+		api.POST("/trade/orders/:id/pi/send", tradeHandler.SendPI)
+		api.POST("/trade/orders/:id/sync-workbook", tradeHandler.SyncOrderWorkspace)
+		api.POST("/trade/orders/:id/inspection-photos", tradeHandler.UploadInspectionPhoto)
+		api.PUT("/trade/orders/:id/label-settings", tradeHandler.UpdateLabelSettings)
+		api.GET("/automation/rules", automationHandler.ListRules)
+		api.POST("/automation/rules", automationHandler.CreateRule)
+		api.GET("/automation/rules/:id", automationHandler.GetRule)
+		api.PUT("/automation/rules/:id", automationHandler.UpdateRule)
+		api.DELETE("/automation/rules/:id", automationHandler.DeleteRule)
+		api.POST("/automation/rules/:id/trigger", automationHandler.TriggerRule)
+		api.GET("/automation/runs", automationHandler.ListRuns)
+		api.GET("/automation/runs/:id", automationHandler.GetRun)
+		api.GET("/tasks/summary", automationHandler.TaskCenterSummary)
+		api.GET("/tasks/approvals", automationHandler.ListPendingApprovals)
+		api.POST("/tasks/approvals/:id/decision", automationHandler.DecideApproval)
+		api.GET("/tasks/notifications", automationHandler.ListNotifications)
+		api.PUT("/tasks/notifications/read-all", automationHandler.MarkAllNotificationsRead)
+		api.PUT("/tasks/notifications/:id/read", automationHandler.MarkNotificationRead)
+		api.GET("/sheets/:id/versions", sheetHistoryHandler.ListVersions)
+		api.POST("/sheets/:id/versions", sheetHistoryHandler.CreateCheckpoint)
+		api.GET("/sheets/:id/versions/:versionId/diff", sheetHistoryHandler.VersionDiff)
+		api.POST("/sheets/:id/versions/:versionId/restore", sheetHistoryHandler.RestoreVersion)
+		api.GET("/sheets/:id/audit-logs", sheetHistoryHandler.ListSheetAuditLogs)
 
 		// Workbooks
 		api.GET("/workbooks", sheetHandler.ListWorkbooks)
@@ -216,6 +327,7 @@ func main() {
 			sheetView.GET("/data", sheetHandler.GetSheetData)
 			sheetView.GET("/permissions", permHandler.GetPermissionMatrix)
 			sheetView.GET("/protections", sheetHandler.GetProtections)
+			sheetView.GET("/approval-states", automationHandler.ListCellApprovalStates)
 			sheetView.GET("/export", sheetHandler.ExportSheet)
 			sheetView.GET("/export/pdf", sheetHandler.ExportSheetPDF)
 		}
@@ -226,11 +338,11 @@ func main() {
 			sheetEdit.PUT("", sheetHandler.UpdateSheet)
 			sheetEdit.POST("/protections", sheetHandler.UpdateProtection)
 			sheetEdit.POST("/protections/batch", sheetHandler.UpdateProtectionBatch)
-			sheetEdit.PUT("/state", sheetHandler.UpdateSheetState)
 			sheetEdit.POST("/cells", cellHandler.BatchUpdate)
 			sheetEdit.POST("/rows", cellHandler.InsertRow)
 			sheetEdit.DELETE("/rows/:index", cellHandler.DeleteRow)
 		}
+		api.PUT("/sheets/:id/state", sheetHandler.UpdateSheetState)
 
 		sheetDelete := api.Group("/sheets/:id")
 		sheetDelete.Use(middleware.PermissionMiddleware(permService, "delete"))
@@ -318,6 +430,8 @@ func main() {
 		api.DELETE("/recycle-bin/workbooks/:id", recycleBinHandler.DeleteWorkbook)
 		api.POST("/recycle-bin/folders/:id/restore", recycleBinHandler.RestoreFolder)
 		api.DELETE("/recycle-bin/folders/:id", recycleBinHandler.DeleteFolder)
+		api.POST("/recycle-bin/trade-orders/:id/restore", recycleBinHandler.RestoreTradeOrder)
+		api.DELETE("/recycle-bin/trade-orders/:id", recycleBinHandler.DeleteTradeOrder)
 
 		// AI Chat
 		api.GET("/ai/assistants", aiHandler.ListAvailableAssistants)
@@ -334,6 +448,7 @@ func main() {
 		{
 			// Users
 			admin.GET("/users", userHandler.ListUsers)
+			admin.GET("/admin/audit-logs", sheetHistoryHandler.ListAllAuditLogs)
 			admin.POST("/users", userHandler.CreateUser)
 			admin.PUT("/users/:id", userHandler.UpdateUser)
 			admin.DELETE("/users/:id", userHandler.DeleteUser)
@@ -412,5 +527,70 @@ func main() {
 	log.Printf("Server starting on port %s", cfg.Server.Port)
 	if err := r.Run(":" + cfg.Server.Port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func broadcastAutomationCellChanges(hub *ws.Hub, sheetService *service.SheetService, actorID int64, changes []model.CellUpdate) {
+	grouped := make(map[int64][]model.CellUpdate)
+	for _, change := range changes {
+		if change.SheetID <= 0 || change.Row < 0 || change.Col == "" {
+			continue
+		}
+		grouped[change.SheetID] = append(grouped[change.SheetID], change)
+	}
+	for sheetID, sheetChanges := range grouped {
+		hub.BroadcastToSheetByUser(sheetID, "", func(recipientUserID int64) []byte {
+			filtered, err := sheetService.RealtimeCellChangesForUser(sheetID, recipientUserID, sheetChanges)
+			if err != nil {
+				log.Printf("failed to build automation changes for sheet %d user %d: %v", sheetID, recipientUserID, err)
+				return nil
+			}
+			if len(filtered) == 0 {
+				return nil
+			}
+			rawChanges, err := json.Marshal(filtered)
+			if err != nil {
+				return nil
+			}
+			payload, err := json.Marshal(ws.Message{
+				Type: "batch_update", SheetID: sheetID, Changes: rawChanges,
+				UserID: actorID, Username: "自动化",
+			})
+			if err != nil {
+				return nil
+			}
+			return payload
+		})
+	}
+}
+
+func warnSecurityConfiguration(cfg *config.Config) {
+	if cfg.Server.Mode != gin.ReleaseMode {
+		return
+	}
+	if cfg.JWT.Secret == "yaerp-jwt-secret-change-me" {
+		log.Print("SECURITY WARNING: JWT_SECRET is using the built-in default")
+	}
+	for _, origin := range cfg.Server.AllowedOrigins {
+		if origin == "*" {
+			log.Print("SECURITY WARNING: CORS_ALLOWED_ORIGINS permits every browser origin")
+			break
+		}
+	}
+	if cfg.Auth.AllowPublicRegistration {
+		log.Print("SECURITY WARNING: public user registration is enabled")
+	}
+}
+
+func warnDefaultAdminPassword(cfg *config.Config, userRepo *repo.UserRepo) {
+	if cfg.Server.Mode != gin.ReleaseMode {
+		return
+	}
+	admin, err := userRepo.GetByUsername("admin")
+	if err != nil || admin == nil {
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(admin.Password), []byte("admin123")) == nil {
+		log.Print("SECURITY WARNING: the default admin account still uses the initial password; change it immediately")
 	}
 }

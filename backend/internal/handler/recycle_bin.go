@@ -43,6 +43,14 @@ func (h *RecycleBinHandler) DeleteFolder(c *gin.Context) {
 	h.handleResourceAction(c, h.service.DeleteFolderPermanently, "folder permanently deleted")
 }
 
+func (h *RecycleBinHandler) RestoreTradeOrder(c *gin.Context) {
+	h.handleResourceAction(c, h.service.RestoreTradeOrder, "trade order restored")
+}
+
+func (h *RecycleBinHandler) DeleteTradeOrder(c *gin.Context) {
+	h.handleResourceAction(c, h.service.DeleteTradeOrderPermanently, "trade order permanently deleted")
+}
+
 func (h *RecycleBinHandler) handleResourceAction(
 	c *gin.Context,
 	action func(userID, resourceID int64) error,

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,7 +13,6 @@ import (
 
 	"yaerp/internal/model"
 	"yaerp/internal/service"
-	jwtpkg "yaerp/pkg/jwt"
 )
 
 var upgrader = websocket.Upgrader{
@@ -31,26 +31,38 @@ const (
 )
 
 type WSHandler struct {
-	Hub          *Hub
-	JWTUtil      *jwtpkg.JWTUtil
-	PermService  *service.PermissionService
-	SheetService *service.SheetService
+	Hub            *Hub
+	AuthService    *service.AuthService
+	PermService    *service.PermissionService
+	SheetService   *service.SheetService
+	AllowedOrigins []string
 }
 
-func NewWSHandler(hub *Hub, jwtUtil *jwtpkg.JWTUtil, permService *service.PermissionService, sheetService *service.SheetService) *WSHandler {
-	return &WSHandler{Hub: hub, JWTUtil: jwtUtil, PermService: permService, SheetService: sheetService}
+func NewWSHandler(
+	hub *Hub,
+	authService *service.AuthService,
+	permService *service.PermissionService,
+	sheetService *service.SheetService,
+	allowedOrigins []string,
+) *WSHandler {
+	return &WSHandler{
+		Hub:            hub,
+		AuthService:    authService,
+		PermService:    permService,
+		SheetService:   sheetService,
+		AllowedOrigins: allowedOrigins,
+	}
 }
 
 func (h *WSHandler) HandleWS(c *gin.Context) {
-	token := c.Query("token")
-	if token == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "token required"})
+	if !originAllowed(c.GetHeader("Origin"), h.AllowedOrigins) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "websocket origin is not allowed"})
 		return
 	}
 
-	claims, err := h.JWTUtil.ParseToken(token)
+	claims, err := h.AuthService.ConsumeWebSocketTicket(c.Request.Context(), c.Query("ticket"))
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -72,6 +84,20 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 
 	go h.writePump(conn, client)
 	go h.readPump(conn, client)
+}
+
+func originAllowed(origin string, allowedOrigins []string) bool {
+	origin = strings.TrimSuffix(strings.TrimSpace(origin), "/")
+	if origin == "" {
+		return true
+	}
+	for _, allowedOrigin := range allowedOrigins {
+		allowedOrigin = strings.TrimSuffix(strings.TrimSpace(allowedOrigin), "/")
+		if allowedOrigin == "*" || strings.EqualFold(origin, allowedOrigin) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {

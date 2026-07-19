@@ -63,7 +63,31 @@ type FolderContents struct {
 }
 
 type RecycleBinContents struct {
-	Folders       []Folder   `json:"folders"`
-	Workbooks     []Workbook `json:"workbooks"`
-	RetentionDays int        `json:"retention_days"`
+	Folders       []Folder            `json:"folders"`
+	Workbooks     []Workbook          `json:"workbooks"`
+	TradeOrders   []DeletedTradeOrder `json:"trade_orders"`
+	RetentionDays int                 `json:"retention_days"`
+}
+
+type DeletedTradeOrder struct {
+	ID                   int64      `json:"id"`
+	OrderNo              string     `json:"order_no"`
+	Title                string     `json:"title"`
+	Stage                string     `json:"stage"`
+	CustomerName         string     `json:"customer_name"`
+	CustomerCompany      string     `json:"customer_company"`
+	OwnerID              int64      `json:"owner_id"`
+	OwnerName            string     `json:"owner_name"`
+	WorkbookID           *int64     `json:"workbook_id,omitempty"`
+	WorkbookName         string     `json:"workbook_name"`
+	ItemCount            int64      `json:"item_count"`
+	SupplierQuoteCount   int64      `json:"supplier_quote_count"`
+	CustomerQuoteCount   int64      `json:"customer_quote_count"`
+	StageEventCount      int64      `json:"stage_event_count"`
+	InspectionPhotoCount int64      `json:"inspection_photo_count"`
+	DeletedAt            *time.Time `json:"deleted_at,omitempty"`
+	DeletedByID          *int64     `json:"deleted_by_id,omitempty"`
+	DeletedByName        *string    `json:"deleted_by_name,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }

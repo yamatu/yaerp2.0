@@ -81,6 +81,24 @@ func (r *ChannelRepo) ListChannels(userID int64) ([]model.Channel, error) {
 			               AND (unread.sender_type = 'ai' OR unread.sender_id IS DISTINCT FROM $1)
 		        ) ELSE 0 END,
 		        latest.id, latest.sender_id, latest.created_at,
+		        TRIM(CONCAT_WS(' ',
+		            COALESCE((
+		                SELECT CONCAT_WS(' ', link.whatsapp_chat_name, link.whatsapp_chat_id, account.display_name, account.phone_number)
+		                  FROM whatsapp_channel_links link
+		                  LEFT JOIN whatsapp_accounts account ON account.id = link.whatsapp_account_id
+		                 WHERE link.channel_id = c.id
+		                 LIMIT 1
+		            ), ''),
+		            COALESCE((
+		                SELECT CONCAT_WS(' ', customer.customer_code, customer.name, customer.company_name,
+		                                      customer.contact_name, customer.phone, customer.email,
+		                                      customer.whatsapp_chat_name, customer.whatsapp_chat_id)
+		                  FROM trade_customers customer
+		                 WHERE customer.channel_id = c.id
+		                 ORDER BY customer.updated_at DESC
+		                 LIMIT 1
+		            ), '')
+		        )),
 		        c.created_at, c.updated_at
 		   FROM channels c
 		   LEFT JOIN users u ON u.id = c.owner_id
@@ -138,6 +156,24 @@ func (r *ChannelRepo) GetChannel(id, userID int64) (*model.Channel, error) {
 			               AND (unread.sender_type = 'ai' OR unread.sender_id IS DISTINCT FROM $2)
 		        ) ELSE 0 END,
 		        latest.id, latest.sender_id, latest.created_at,
+		        TRIM(CONCAT_WS(' ',
+		            COALESCE((
+		                SELECT CONCAT_WS(' ', link.whatsapp_chat_name, link.whatsapp_chat_id, account.display_name, account.phone_number)
+		                  FROM whatsapp_channel_links link
+		                  LEFT JOIN whatsapp_accounts account ON account.id = link.whatsapp_account_id
+		                 WHERE link.channel_id = c.id
+		                 LIMIT 1
+		            ), ''),
+		            COALESCE((
+		                SELECT CONCAT_WS(' ', customer.customer_code, customer.name, customer.company_name,
+		                                      customer.contact_name, customer.phone, customer.email,
+		                                      customer.whatsapp_chat_name, customer.whatsapp_chat_id)
+		                  FROM trade_customers customer
+		                 WHERE customer.channel_id = c.id
+		                 ORDER BY customer.updated_at DESC
+		                 LIMIT 1
+		            ), '')
+		        )),
 		        c.created_at, c.updated_at
 		   FROM channels c
 		   LEFT JOIN users u ON u.id = c.owner_id
@@ -1206,6 +1242,7 @@ func scanChannel(scanner interface {
 		&channel.ChannelType, &aiAssistantID, &channel.AIAssistantName, &channel.AIAssistantCount,
 		&channel.MemberCount, &channel.IsPinned, &channel.PinSortOrder, &channel.UnreadCount,
 		&lastMessageID, &lastMessageSenderID, &lastMessageAt,
+		&channel.SearchText,
 		&channel.CreatedAt, &channel.UpdatedAt,
 	); err != nil {
 		return nil, err

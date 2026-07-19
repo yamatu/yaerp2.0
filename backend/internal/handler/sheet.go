@@ -525,8 +525,23 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
+	cellResult, err := h.sheetService.PrepareSheetCellChanges(userID, existing, sheet, req.CellChanges, "web")
+	if err != nil {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		if errors.Is(err, service.ErrAutomationInvalid) {
+			response.BadRequest(c, err.Error())
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+	req.CellChanges = cellResult.AppliedChanges
 	if !sheetChanged(existing, sheet) {
-		response.OKMsg(c, "sheet updated")
+		response.OK(c, cellResult)
 		return
 	}
 	if err := h.sheetService.UpdateSheetForUser(userID, existing, sheet); err != nil {
@@ -546,18 +561,19 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		return
 	}
 	affectedSheetIDs := []int64{id}
-	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(id)
+	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(userID, id)
 	if syncErr != nil {
 		log.Printf("failed to sync assigned sheet group for sheet %d: %v", id, syncErr)
 	} else {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
 	if len(req.CellChanges) > 0 && !sheetStructureChanged(existing, sheet) {
+		h.sheetService.NotifyCellChanges(userID, req.CellChanges, "web")
 		h.broadcastSheetCellChanges(c, affectedSheetIDs, req.CellChanges)
 	} else if sheetStructureChanged(existing, sheet) {
 		h.broadcastSheetReload(c, affectedSheetIDs...)
 	}
-	response.OKMsg(c, "sheet updated")
+	response.OK(c, cellResult)
 }
 
 func (h *SheetHandler) DeleteSheet(c *gin.Context) {
@@ -642,7 +658,7 @@ func (h *SheetHandler) UpdateProtection(c *gin.Context) {
 		return
 	}
 	affectedSheetIDs := []int64{id}
-	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(id)
+	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(userID, id)
 	if syncErr != nil {
 		log.Printf("failed to sync assigned protections for sheet %d: %v", id, syncErr)
 	} else {
@@ -682,7 +698,7 @@ func (h *SheetHandler) UpdateProtectionBatch(c *gin.Context) {
 		return
 	}
 	affectedSheetIDs := []int64{id}
-	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(id)
+	syncedSheetIDs, syncErr := h.sheetService.SyncAssignedSheetGroup(userID, id)
 	if syncErr != nil {
 		log.Printf("failed to sync assigned protection batch for sheet %d: %v", id, syncErr)
 	} else {

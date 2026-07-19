@@ -9,9 +9,11 @@ import {
   LayoutDashboard,
   MessageSquare,
   MessageCircle,
+  ScrollText,
   Settings2,
   Shield,
   Users,
+  Workflow,
 } from 'lucide-react'
 import { AdminShell } from '@/components/admin/AdminShell'
 
@@ -39,6 +41,18 @@ const managementEntries = [
     description: '生成、下载和管理系统数据备份。',
     href: '/admin/backup',
     icon: Database,
+  },
+  {
+    title: '操作审计',
+    description: '查询工作表变更、版本恢复和操作者记录。',
+    href: '/admin/audit',
+    icon: ScrollText,
+  },
+  {
+    title: '流程自动化',
+    description: '配置触发条件、多级审批、通知与自动回写。',
+    href: '/admin/automation',
+    icon: Workflow,
   },
   {
     title: 'AI 助手',

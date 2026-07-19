@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -31,15 +31,14 @@ func AuthMiddleware(jwtUtil *jwtpkg.JWTUtil, rdb *redis.Client) gin.HandlerFunc 
 		tokenString := parts[1]
 
 		// Parse and validate the token.
-		claims, err := jwtUtil.ParseToken(tokenString)
+		claims, err := jwtUtil.ParseAccessToken(tokenString)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 			return
 		}
 
 		// Check whether the token has been blacklisted (e.g. after logout).
-		blacklistKey := "token:blacklist:" + tokenString
-		exists, err := rdb.Exists(context.Background(), blacklistKey).Result()
+		exists, err := rdb.Exists(c.Request.Context(), jwtpkg.BlacklistKey(tokenString), "token:blacklist:"+tokenString).Result()
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check token status"})
 			return
@@ -49,9 +48,20 @@ func AuthMiddleware(jwtUtil *jwtpkg.JWTUtil, rdb *redis.Client) gin.HandlerFunc 
 			return
 		}
 
+		revokedBefore, err := rdb.Get(c.Request.Context(), jwtpkg.UserRevokedBeforeKey(claims.UserID)).Int64()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check account session status"})
+			return
+		}
+		if err == nil && claims.IssuedAt != nil && claims.IssuedAt.Time.Unix() <= revokedBefore {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "account session has been revoked"})
+			return
+		}
+
 		// Inject user information into the context.
 		c.Set("user_id", claims.UserID)
 		c.Set("username", claims.Username)
+		c.Set("access_token", tokenString)
 
 		c.Next()
 	}

@@ -121,14 +121,71 @@ func (r *UserRepo) UpdatePassword(id int64, hashedPassword string) error {
 	return nil
 }
 
-func (r *UserRepo) Delete(id int64) error {
-	result, err := r.db.Exec(`DELETE FROM users WHERE id = $1`, id)
-	if err != nil {
-		return fmt.Errorf("delete user: %w", err)
+func (r *UserRepo) DeleteAndTransfer(id, replacementID int64) error {
+	if id <= 0 || replacementID <= 0 || id == replacementID {
+		return fmt.Errorf("invalid user deletion request")
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin user deletion: %w", err)
+	}
+	defer tx.Rollback()
+
+	var username string
+	if err := tx.QueryRow(`SELECT username FROM users WHERE id=$1 FOR UPDATE`, id).Scan(&username); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("user %d not found", id)
+		}
+		return fmt.Errorf("lock deleted user: %w", err)
+	}
+	var replacementUsername string
+	if err := tx.QueryRow(`SELECT username FROM users WHERE id=$1 FOR SHARE`, replacementID).Scan(&replacementUsername); err != nil {
+		return fmt.Errorf("load replacement user: %w", err)
+	}
+
+	transferStatements := []struct {
+		name  string
+		query string
+	}{
+		{"workbooks", `UPDATE workbooks SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"folders", `UPDATE folders SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"channels", `UPDATE channels SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"gallery directories", `UPDATE gallery_directories SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"AI summary pages", `UPDATE ai_summary_pages SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"automation rules", `UPDATE automation_rules SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"cell approvals", `UPDATE cell_approval_states SET submitted_by=$2,updated_at=NOW() WHERE submitted_by=$1`},
+		{"trade customers", `UPDATE trade_customers SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"trade suppliers", `UPDATE trade_suppliers SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"trade orders", `UPDATE trade_orders SET owner_id=$2,updated_at=NOW() WHERE owner_id=$1`},
+		{"supplier quotes", `UPDATE trade_supplier_quotes SET created_by=$2,updated_at=NOW() WHERE created_by=$1`},
+		{"customer quotes", `UPDATE trade_customer_quote_rounds SET created_by=$2,updated_at=NOW() WHERE created_by=$1`},
+		{"inspection photos", `UPDATE trade_inspection_photos SET uploaded_by=$2 WHERE uploaded_by=$1`},
+	}
+	for _, statement := range transferStatements {
+		if _, err := tx.Exec(statement.query, id, replacementID); err != nil {
+			return fmt.Errorf("transfer %s from %s to %s: %w", statement.name, username, replacementUsername, err)
+		}
+	}
+
+	if _, err := tx.Exec(`UPDATE attachments SET uploader_id=NULL WHERE uploader_id=$1`, id); err != nil {
+		return fmt.Errorf("detach user uploads: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE rows SET created_by=NULL WHERE created_by=$1`, id); err != nil {
+		return fmt.Errorf("detach created rows: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE rows SET updated_by=NULL WHERE updated_by=$1`, id); err != nil {
+		return fmt.Errorf("detach updated rows: %w", err)
+	}
+
+	result, err := tx.Exec(`DELETE FROM users WHERE id=$1`, id)
+	if err != nil {
+		return fmt.Errorf("delete user %s: %w", username, err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
 		return fmt.Errorf("user %d not found", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit user deletion: %w", err)
 	}
 	return nil
 }

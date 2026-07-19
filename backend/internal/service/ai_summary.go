@@ -582,7 +582,7 @@ func (s *AIService) CreateFinancialReportWorkbook(userID int64, name string, sou
 	sourceIDsJSON, _ := json.Marshal(sourceSheetIDs)
 	metadata := json.RawMessage(fmt.Sprintf(`{"generatedBy":"ai_financial_report","sourceSheetIds":%s,"generatedAt":%q}`, sourceIDsJSON, time.Now().Format(time.RFC3339)))
 	workbook := &model.Workbook{Name: name, Description: &description, OwnerID: userID, Metadata: metadata}
-	if err := s.sheetService.CreateWorkbookForUser(userID, workbook); err != nil {
+	if err := s.sheetService.CreateWorkbookForUserWithSource(userID, workbook, "ai", "AI 创建总结工作簿"); err != nil {
 		return 0, 0, 0, err
 	}
 
@@ -598,7 +598,7 @@ func (s *AIService) CreateFinancialReportWorkbook(userID int64, name string, sou
 	}
 	columnJSON, _ := json.Marshal(columns)
 	reportSheet := &model.Sheet{WorkbookID: workbook.ID, Name: "财务汇总", Columns: columnJSON}
-	if err := s.sheetService.CreateSheetForUser(userID, reportSheet); err != nil {
+	if err := s.sheetService.CreateSheetForUserWithSource(userID, reportSheet, "ai", "AI 创建总结工作表"); err != nil {
 		return workbook.ID, 0, 0, err
 	}
 
@@ -621,6 +621,9 @@ func (s *AIService) CreateFinancialReportWorkbook(userID int64, name string, sou
 		if err := s.sheetRepo.UpsertRow(reportSheet.ID, index, encoded, userID); err != nil {
 			return workbook.ID, reportSheet.ID, index, err
 		}
+	}
+	if _, err := s.sheetService.CaptureCurrentVersion(userID, reportSheet.ID, "ai", fmt.Sprintf("AI 生成总结报表，共 %d 行", len(metrics)), false); err != nil {
+		return workbook.ID, reportSheet.ID, len(metrics), err
 	}
 
 	return workbook.ID, reportSheet.ID, len(metrics), nil

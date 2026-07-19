@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"yaerp/internal/model"
 	"yaerp/internal/repo"
@@ -297,12 +298,113 @@ func (s *WhatsAppService) ListChats(requesterID, targetUserID int64) ([]model.Wh
 	if err != nil {
 		return nil, err
 	}
+	chats = deduplicateWhatsAppChats(chats)
+	aliases, _ := s.repo.ListChatSearchAliases(account.ID, account.UserID)
 	for index := range chats {
+		chats[index].SearchAliases = aliases[chats[index].ID]
+		if whatsAppChatNameLooksGenerated(chats[index].Name, chats[index].ID) {
+			if alias := preferredWhatsAppChatAlias(chats[index].SearchAliases, chats[index].ID); alias != "" {
+				chats[index].Name = alias
+			}
+		}
 		if strings.TrimSpace(chats[index].ProfilePicURL) != "" {
 			chats[index].ProfilePicURL = s.avatarProxyURL(account.UserID, chats[index].ID)
 		}
 	}
 	return chats, nil
+}
+
+func whatsAppChatNameLooksGenerated(name, chatID string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return true
+	}
+	compact := compactWhatsAppIdentifier(name)
+	if compact == compactWhatsAppIdentifier(chatID) {
+		return true
+	}
+	for _, value := range name {
+		if unicode.IsLetter(value) {
+			return false
+		}
+	}
+	return len(compact) >= 6
+}
+
+func preferredWhatsAppChatAlias(aliases []string, chatID string) string {
+	chatIdentifier := compactWhatsAppIdentifier(chatID)
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" || compactWhatsAppIdentifier(alias) == chatIdentifier {
+			continue
+		}
+		for _, value := range alias {
+			if unicode.IsLetter(value) {
+				return alias
+			}
+		}
+	}
+	return ""
+}
+
+func compactWhatsAppIdentifier(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	value = strings.TrimSuffix(value, "@c.us")
+	value = strings.TrimSuffix(value, "@g.us")
+	var builder strings.Builder
+	for _, character := range value {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			builder.WriteRune(character)
+		}
+	}
+	return builder.String()
+}
+
+func deduplicateWhatsAppChats(chats []model.WhatsAppChat) []model.WhatsAppChat {
+	result := make([]model.WhatsAppChat, 0, len(chats))
+	indexes := make(map[string]int, len(chats))
+	for _, chat := range chats {
+		chat.ID = strings.TrimSpace(chat.ID)
+		if chat.ID == "" {
+			result = append(result, chat)
+			continue
+		}
+		index, exists := indexes[chat.ID]
+		if !exists {
+			indexes[chat.ID] = len(result)
+			result = append(result, chat)
+			continue
+		}
+		existing := &result[index]
+		if strings.TrimSpace(existing.Name) == "" || (whatsAppChatNameLooksGenerated(existing.Name, existing.ID) && !whatsAppChatNameLooksGenerated(chat.Name, chat.ID)) {
+			existing.Name = chat.Name
+		}
+		if strings.TrimSpace(existing.ProfilePicURL) == "" {
+			existing.ProfilePicURL = chat.ProfilePicURL
+		}
+		if strings.TrimSpace(existing.About) == "" {
+			existing.About = chat.About
+		}
+		if strings.TrimSpace(existing.Description) == "" {
+			existing.Description = chat.Description
+		}
+		if chat.Timestamp >= existing.Timestamp {
+			existing.Timestamp = chat.Timestamp
+			if strings.TrimSpace(chat.LastMessage) != "" {
+				existing.LastMessage = chat.LastMessage
+			}
+		}
+		if chat.UnreadCount > existing.UnreadCount {
+			existing.UnreadCount = chat.UnreadCount
+		}
+		if chat.ParticipantCount > existing.ParticipantCount {
+			existing.ParticipantCount = chat.ParticipantCount
+		}
+		existing.Pinned = existing.Pinned || chat.Pinned
+		existing.Archived = existing.Archived && chat.Archived
+		existing.IsMuted = existing.IsMuted || chat.IsMuted
+	}
+	return result
 }
 
 func (s *WhatsAppService) SyncChannelHistory(userID, channelID int64, request *model.WhatsAppHistorySyncRequest) (*model.WhatsAppHistorySyncResult, error) {

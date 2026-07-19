@@ -15,8 +15,9 @@ const RecycleBinRetentionDays = 30
 var ErrRecycleBinAccessDenied = errors.New("recycle bin access denied")
 
 type RecycleBinService struct {
-	repo        *repo.RecycleBinRepo
-	permService *PermissionService
+	repo                  *repo.RecycleBinRepo
+	permService           *PermissionService
+	tradeOrderChangedHook func(orderID int64)
 }
 
 func NewRecycleBinService(recycleRepo *repo.RecycleBinRepo, permService *PermissionService) *RecycleBinService {
@@ -28,15 +29,52 @@ func (s *RecycleBinService) List(userID int64) (*model.RecycleBinContents, error
 	if err != nil {
 		return nil, err
 	}
-	folders, workbooks, err := s.repo.List(userID, isAdmin)
+	folders, workbooks, tradeOrders, err := s.repo.List(userID, isAdmin)
 	if err != nil {
 		return nil, err
 	}
 	return &model.RecycleBinContents{
 		Folders:       folders,
 		Workbooks:     workbooks,
+		TradeOrders:   tradeOrders,
 		RetentionDays: RecycleBinRetentionDays,
 	}, nil
+}
+
+func (s *RecycleBinService) SetTradeOrderChangedHook(hook func(orderID int64)) {
+	s.tradeOrderChangedHook = hook
+}
+
+func (s *RecycleBinService) RestoreTradeOrder(userID, orderID int64) error {
+	if err := s.requireAdmin(userID); err != nil {
+		return err
+	}
+	if _, err := s.repo.GetDeletedTradeOrder(orderID); err != nil {
+		return err
+	}
+	if err := s.repo.RestoreTradeOrder(orderID, userID); err != nil {
+		return err
+	}
+	if s.tradeOrderChangedHook != nil {
+		s.tradeOrderChangedHook(orderID)
+	}
+	return nil
+}
+
+func (s *RecycleBinService) DeleteTradeOrderPermanently(userID, orderID int64) error {
+	if err := s.requireAdmin(userID); err != nil {
+		return err
+	}
+	if _, err := s.repo.GetDeletedTradeOrder(orderID); err != nil {
+		return err
+	}
+	if err := s.repo.DeleteTradeOrderPermanently(orderID); err != nil {
+		return err
+	}
+	if s.tradeOrderChangedHook != nil {
+		s.tradeOrderChangedHook(orderID)
+	}
+	return nil
 }
 
 func (s *RecycleBinService) RestoreWorkbook(userID, workbookID int64) error {
@@ -87,6 +125,17 @@ func (s *RecycleBinService) authorize(userID, ownerID int64, deletedByID *int64)
 	if userID == ownerID || (deletedByID != nil && userID == *deletedByID) {
 		return nil
 	}
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if !isAdmin {
+		return ErrRecycleBinAccessDenied
+	}
+	return nil
+}
+
+func (s *RecycleBinService) requireAdmin(userID int64) error {
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
 		return err
