@@ -48,6 +48,24 @@ func TestNormalizeTradeCustomerUpdateRejectsInvalidFields(t *testing.T) {
 	}
 }
 
+func TestValidateTradeOrderItemDeletion(t *testing.T) {
+	for _, stage := range []string{
+		model.TradeStageInquiry,
+		model.TradeStageSupplierQuote,
+		model.TradeStageQuotation,
+	} {
+		if err := validateTradeOrderItemDeletion(stage, nil); err != nil {
+			t.Fatalf("stage %s should allow item deletion: %v", stage, err)
+		}
+	}
+	if err := validateTradeOrderItemDeletion(model.TradeStagePurchase, nil); err == nil {
+		t.Fatal("purchase stage must block item deletion")
+	}
+	if err := validateTradeOrderItemDeletion(model.TradeStageQuotation, []model.TradeCustomerQuoteRound{{Status: "accepted"}}); err == nil {
+		t.Fatal("accepted customer quote must block item deletion")
+	}
+}
+
 func TestBuildTradeProfitSummarySameCurrency(t *testing.T) {
 	order := &model.TradeOrder{
 		Stage: model.TradeStageCompleted, Currency: "USD", TotalAmount: 1000,

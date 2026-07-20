@@ -875,6 +875,9 @@ export default function TradeWorkspacePage() {
   const [stageShipmentDraft, setStageShipmentDraft] =
     useState<StageShipmentDraft>(() => emptyStageShipmentDraft());
   const [savingStageData, setSavingStageData] = useState(false);
+  const [orderItemDeleteTarget, setOrderItemDeleteTarget] =
+    useState<TradeOrderItem | null>(null);
+  const [deletingOrderItem, setDeletingOrderItem] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("positions");
@@ -1758,6 +1761,36 @@ export default function TradeWorkspacePage() {
       );
     } finally {
       setSavingStageData(false);
+    }
+  };
+
+  const deleteOrderItem = async () => {
+    if (!detailOrder || !orderItemDeleteTarget) return;
+    setDeletingOrderItem(true);
+    setError("");
+    try {
+      const response = await api.delete<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/items/${orderItemDeleteTarget.id}`,
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "删除订单产品失败");
+      setDetailOrder(response.data);
+      setStageItemDrafts((current) => {
+        const next = { ...current };
+        delete next[orderItemDeleteTarget.id];
+        return next;
+      });
+      setOrderItemDeleteTarget(null);
+      setNotice("产品已从订单中删除，行号、订单金额和流程工作簿已同步更新。");
+      await loadData(true);
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "删除订单产品失败",
+      );
+    } finally {
+      setDeletingOrderItem(false);
     }
   };
 
@@ -8020,9 +8053,34 @@ export default function TradeWorkspacePage() {
                               {item.product_name}
                             </div>
                           </div>
-                          <span className="shrink-0 rounded-md bg-white px-2 py-1 text-[11px] font-medium text-slate-500">
-                            {item.quantity} {item.unit}
-                          </span>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <span className="rounded-md bg-white px-2 py-1 text-[11px] font-medium text-slate-500">
+                              {item.quantity} {item.unit}
+                            </span>
+                            {detailOrder.access?.can_add_items &&
+                              ["inquiry", "supplier_quote", "quotation"].includes(
+                                detailOrder.stage,
+                              ) && (
+                                <button
+                                  type="button"
+                                  onClick={() => setOrderItemDeleteTarget(item)}
+                                  disabled={
+                                    (detailOrder.items || []).length <= 1 ||
+                                    savingStageData ||
+                                    deletingOrderItem
+                                  }
+                                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-600 hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent"
+                                  title={
+                                    (detailOrder.items || []).length <= 1
+                                      ? "订单至少需要保留一个产品"
+                                      : "从订单中删除这个产品"
+                                  }
+                                  aria-label={`删除产品 ${item.sku || item.product_name}`}
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              )}
+                          </div>
                         </div>
                         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                           {(STAGE_DATA_FIELDS[detailOrder.stage] || []).map(
@@ -8110,6 +8168,74 @@ export default function TradeWorkspacePage() {
                     <Save className="h-4 w-4" />
                   )}
                   保存并同步
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {orderItemDeleteTarget && detailOrder && (
+          <div
+            className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !deletingOrderItem)
+                setOrderItemDeleteTarget(null);
+            }}
+          >
+            <div className="w-full max-w-md overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                <div>
+                  <h2 className="font-semibold">删除订单产品</h2>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    {detailOrder.order_no} · 第 {orderItemDeleteTarget.line_no} 行
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOrderItemDeleteTarget(null)}
+                  disabled={deletingOrderItem}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-40"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="space-y-3 p-4">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+                  <div className="font-semibold text-slate-900">
+                    {orderItemDeleteTarget.sku ||
+                      orderItemDeleteTarget.product_name}
+                  </div>
+                  <div className="mt-1 text-sm text-slate-500">
+                    {orderItemDeleteTarget.product_name} ·{" "}
+                    {orderItemDeleteTarget.quantity} {orderItemDeleteTarget.unit}
+                  </div>
+                </div>
+                <p className="text-sm leading-6 text-slate-600">
+                  删除后会同步移除该产品关联的供应商报价，重新排列剩余产品行号，并更新订单金额和流程工作簿。此操作不能撤销。
+                </p>
+              </div>
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setOrderItemDeleteTarget(null)}
+                  disabled={deletingOrderItem}
+                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-600 disabled:opacity-40"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void deleteOrderItem()}
+                  disabled={deletingOrderItem}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-rose-600 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  {deletingOrderItem ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  确认删除
                 </button>
               </div>
             </div>

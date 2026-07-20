@@ -323,6 +323,29 @@ func (h *TradeHandler) AddOrderItems(c *gin.Context) {
 	response.OK(c, order)
 }
 
+func (h *TradeHandler) DeleteOrderItem(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	itemID, err := parseIDParam(c, "itemId")
+	if err != nil {
+		response.BadRequest(c, "无效的产品编号")
+		return
+	}
+	order, err := h.service.DeleteOrderItem(c.GetInt64("user_id"), orderID, itemID)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "产品不存在、业务单不存在或无权操作")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) UpdateStageData(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {

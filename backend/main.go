@@ -275,6 +275,7 @@ func main() {
 		api.PUT("/trade/orders/:id/profit-settings", tradeHandler.UpdateProfitSettings)
 		api.DELETE("/trade/orders/:id", tradeHandler.DeleteOrder)
 		api.POST("/trade/orders/:id/items", tradeHandler.AddOrderItems)
+		api.DELETE("/trade/orders/:id/items/:itemId", tradeHandler.DeleteOrderItem)
 		api.PUT("/trade/orders/:id/stage-data", tradeHandler.UpdateStageData)
 		api.POST("/trade/orders/:id/advance", tradeHandler.AdvanceOrder)
 		api.POST("/trade/orders/:id/supplier-quotes", tradeHandler.CreateSupplierQuote)

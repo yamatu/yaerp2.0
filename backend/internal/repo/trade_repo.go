@@ -17,6 +17,8 @@ type TradeRepo struct {
 	db *sql.DB
 }
 
+var ErrLastTradeOrderItem = errors.New("trade order must keep at least one item")
+
 func NewTradeRepo(db *sql.DB) *TradeRepo {
 	return &TradeRepo{db: db}
 }
@@ -509,6 +511,68 @@ func (r *TradeRepo) AddOrderItems(orderID int64, items []model.TradeOrderItem) e
 		return err
 	}
 	return tx.Commit()
+}
+
+func (r *TradeRepo) DeleteOrderItem(orderID, itemID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin deleting trade order item: %w", err)
+	}
+	defer tx.Rollback()
+
+	var lockedOrderID int64
+	if err := tx.QueryRow(
+		`SELECT id FROM trade_orders WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, orderID,
+	).Scan(&lockedOrderID); err != nil {
+		return err
+	}
+
+	var lineNo int
+	if err := tx.QueryRow(
+		`SELECT line_no FROM trade_order_items WHERE id=$1 AND order_id=$2 FOR UPDATE`, itemID, orderID,
+	).Scan(&lineNo); err != nil {
+		return err
+	}
+	var itemCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM trade_order_items WHERE order_id=$1`, orderID).Scan(&itemCount); err != nil {
+		return err
+	}
+	if itemCount <= 1 {
+		return ErrLastTradeOrderItem
+	}
+
+	result, err := tx.Exec(`DELETE FROM trade_order_items WHERE id=$1 AND order_id=$2`, itemID, orderID)
+	if err != nil {
+		return fmt.Errorf("delete trade order item: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+
+	// Move remaining lines through temporary negative values to avoid unique-key collisions.
+	if _, err := tx.Exec(
+		`UPDATE trade_order_items SET line_no=-line_no WHERE order_id=$1 AND line_no>$2`, orderID, lineNo,
+	); err != nil {
+		return fmt.Errorf("prepare trade order item renumbering: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_order_items SET line_no=(-line_no)-1,updated_at=NOW() WHERE order_id=$1 AND line_no<0`, orderID,
+	); err != nil {
+		return fmt.Errorf("renumber trade order items: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_orders SET
+		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1),0),
+		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1),0)+quoted_freight_amount,
+		 updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`, orderID,
+	); err != nil {
+		return fmt.Errorf("recalculate trade order after item deletion: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit deleting trade order item: %w", err)
+	}
+	return nil
 }
 
 func (r *TradeRepo) DeleteOrderAfterCreateFailure(orderID, ownerID int64) error {

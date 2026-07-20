@@ -928,6 +928,73 @@ func (s *TradeService) AddOrderItems(userID, orderID int64, request *model.AddTr
 	return s.GetOrder(userID, orderID)
 }
 
+func (s *TradeService) DeleteOrderItem(userID, orderID, itemID int64) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, sql.ErrNoRows
+	}
+	userAccess, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !s.canViewTradeOrder(userID, order, userAccess) {
+		return nil, sql.ErrNoRows
+	}
+	orderAccess, err := s.orderAccessForUser(userID, order, userAccess)
+	if err != nil {
+		return nil, err
+	}
+	if !orderAccess.CanAddItems {
+		return nil, fmt.Errorf("当前阶段不能删除产品，请先将流程退回询价或报价环节")
+	}
+	var customerQuotes []model.TradeCustomerQuoteRound
+	if order.Stage == model.TradeStageQuotation {
+		quotes, quoteErr := s.repo.ListCustomerQuoteRounds(orderID)
+		if quoteErr != nil {
+			return nil, quoteErr
+		}
+		customerQuotes = quotes
+	}
+	if err := validateTradeOrderItemDeletion(order.Stage, customerQuotes); err != nil {
+		return nil, err
+	}
+	item, err := s.repo.GetOrderItem(orderID, itemID)
+	if err != nil {
+		return nil, sql.ErrNoRows
+	}
+	if err := s.repo.DeleteOrderItem(orderID, itemID); err != nil {
+		if errors.Is(err, repo.ErrLastTradeOrderItem) {
+			return nil, fmt.Errorf("订单至少需要保留一个产品，不能删除最后一项")
+		}
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		if syncErr := s.syncOrderWorkspaceInternal(userID, orderID); syncErr != nil {
+			log.Printf("sync deleted item for trade order %d: %v", orderID, syncErr)
+		}
+	}
+	if order.ChannelID != nil {
+		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
+			Content:      fmt.Sprintf("业务单 %s 删除产品：%s，流程工作表已更新。", order.OrderNo, firstNonEmptyTrade(item.SKU, item.ProductName)),
+			InternalOnly: true,
+		})
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func validateTradeOrderItemDeletion(stage string, quotes []model.TradeCustomerQuoteRound) error {
+	if stage != model.TradeStageInquiry && stage != model.TradeStageSupplierQuote && stage != model.TradeStageQuotation {
+		return fmt.Errorf("只有询价、供应商询价和对客报价阶段可以删除产品")
+	}
+	for _, quote := range quotes {
+		if quote.Status == "accepted" {
+			return fmt.Errorf("客户已经接受报价，不能删除产品；请先退回并作废已接受的报价")
+		}
+	}
+	return nil
+}
+
 func (s *TradeService) UpdateStageData(userID, orderID int64, request *model.UpdateTradeStageDataRequest) (*model.TradeOrder, error) {
 	if request == nil {
 		return nil, fmt.Errorf("环节数据不能为空")
