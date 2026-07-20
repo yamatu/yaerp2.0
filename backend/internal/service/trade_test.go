@@ -9,6 +9,45 @@ import (
 	"yaerp/internal/model"
 )
 
+func TestNormalizeTradeCustomerUpdateAllowsEditingAndClearingNotes(t *testing.T) {
+	accountID := int64(8)
+	customer, err := normalizeTradeCustomerUpdate(&model.UpdateTradeCustomerRequest{
+		Name: "  New customer name  ", CompanyName: "", Source: "whatsapp", Status: "active",
+		CustomerLevel: "a", WhatsAppAccountID: &accountID, WhatsAppChatID: " 123@c.us ",
+		Tags: []string{" VIP ", "vip", " Europe "}, Notes: "   ",
+	})
+	if err != nil {
+		t.Fatalf("normalize customer update: %v", err)
+	}
+	if customer.Name != "New customer name" || customer.CompanyName != "New customer name" {
+		t.Fatalf("customer name fields were not normalized: %#v", customer)
+	}
+	if customer.Notes != "" {
+		t.Fatalf("notes should be clearable, got %q", customer.Notes)
+	}
+	if customer.Status != "active" || customer.CustomerLevel != "A" || customer.WhatsAppChatID != "123@c.us" {
+		t.Fatalf("customer update fields were not normalized: %#v", customer)
+	}
+	if len(customer.Tags) != 2 || customer.Tags[0] != "VIP" || customer.Tags[1] != "Europe" {
+		t.Fatalf("customer tags were not normalized: %#v", customer.Tags)
+	}
+}
+
+func TestNormalizeTradeCustomerUpdateRejectsInvalidFields(t *testing.T) {
+	for name, request := range map[string]*model.UpdateTradeCustomerRequest{
+		"empty name":     {Name: "", Source: "manual", Status: "lead", CustomerLevel: "B"},
+		"invalid source": {Name: "Customer", Source: "unknown", Status: "lead", CustomerLevel: "B"},
+		"invalid status": {Name: "Customer", Source: "manual", Status: "deleted", CustomerLevel: "B"},
+		"invalid level":  {Name: "Customer", Source: "manual", Status: "lead", CustomerLevel: "D"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := normalizeTradeCustomerUpdate(request); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
 func TestBuildTradeProfitSummarySameCurrency(t *testing.T) {
 	order := &model.TradeOrder{
 		Stage: model.TradeStageCompleted, Currency: "USD", TotalAmount: 1000,

@@ -3,6 +3,7 @@ package repo
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -125,6 +126,35 @@ func (r *TradeRepo) CreateCustomer(customer *model.TradeCustomer) error {
 	return nil
 }
 
+func (r *TradeRepo) UpdateCustomer(customer *model.TradeCustomer) error {
+	if customer == nil || customer.ID <= 0 {
+		return fmt.Errorf("invalid trade customer")
+	}
+	tags, err := json.Marshal(customer.Tags)
+	if err != nil {
+		return fmt.Errorf("marshal customer tags: %w", err)
+	}
+	result, err := r.db.Exec(
+		`UPDATE trade_customers SET
+		 name=$2,company_name=$3,country=$4,region=$5,contact_name=$6,email=$7,phone=$8,
+		 source=$9,status=$10,customer_level=$11,whatsapp_account_id=$12,
+		 whatsapp_chat_id=NULLIF($13,''),whatsapp_chat_name=$14,avatar_url=$15,tags=$16,notes=$17,
+		 updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`,
+		customer.ID, customer.Name, customer.CompanyName, customer.Country, customer.Region,
+		customer.ContactName, customer.Email, customer.Phone, customer.Source, customer.Status,
+		customer.CustomerLevel, customer.WhatsAppAccountID, customer.WhatsAppChatID,
+		customer.WhatsAppChatName, customer.AvatarURL, tags, customer.Notes,
+	)
+	if err != nil {
+		return fmt.Errorf("update trade customer: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *TradeRepo) SetCustomerChannel(customerID, ownerID, channelID int64) error {
 	result, err := r.db.Exec(
 		`UPDATE trade_customers SET channel_id = $3, updated_at = NOW() WHERE id = $1 AND owner_id = $2`,
@@ -141,7 +171,7 @@ func (r *TradeRepo) SetCustomerChannel(customerID, ownerID, channelID int64) err
 }
 
 func (r *TradeRepo) GetCustomerByWhatsApp(ownerID int64, chatID string) (*model.TradeCustomer, error) {
-	query := tradeCustomerSelect + ` WHERE c.owner_id = $1 AND c.whatsapp_chat_id = $2 ` + tradeCustomerGroupBy
+	query := tradeCustomerSelect + ` WHERE c.owner_id = $1 AND c.whatsapp_chat_id = $2 AND c.deleted_at IS NULL ` + tradeCustomerGroupBy
 	customer, err := scanTradeCustomer(r.db.QueryRow(query, ownerID, strings.TrimSpace(chatID)))
 	if err != nil {
 		return nil, err
@@ -150,6 +180,15 @@ func (r *TradeRepo) GetCustomerByWhatsApp(ownerID int64, chatID string) (*model.
 }
 
 func (r *TradeRepo) GetCustomer(customerID, userID int64, isAdmin bool) (*model.TradeCustomer, error) {
+	query := tradeCustomerSelect + ` WHERE c.id = $1 AND c.deleted_at IS NULL AND ($2 OR c.owner_id = $3) ` + tradeCustomerGroupBy
+	customer, err := scanTradeCustomer(r.db.QueryRow(query, customerID, isAdmin, userID))
+	if err != nil {
+		return nil, err
+	}
+	return customer, nil
+}
+
+func (r *TradeRepo) GetCustomerIncludingDeleted(customerID, userID int64, isAdmin bool) (*model.TradeCustomer, error) {
 	query := tradeCustomerSelect + ` WHERE c.id = $1 AND ($2 OR c.owner_id = $3) ` + tradeCustomerGroupBy
 	customer, err := scanTradeCustomer(r.db.QueryRow(query, customerID, isAdmin, userID))
 	if err != nil {
@@ -160,7 +199,8 @@ func (r *TradeRepo) GetCustomer(customerID, userID int64, isAdmin bool) (*model.
 
 func (r *TradeRepo) ListCustomers(userID int64, isAdmin bool, search string) ([]model.TradeCustomer, error) {
 	query := tradeCustomerSelect + `
-		WHERE ($1 OR c.owner_id = $2)
+		WHERE c.deleted_at IS NULL
+		  AND ($1 OR c.owner_id = $2)
 		  AND ($3 = '' OR CONCAT_WS(' ', c.customer_code, c.name, c.company_name, c.contact_name, c.email, c.phone, c.whatsapp_chat_name) ILIKE '%' || $3 || '%')
 	` + tradeCustomerGroupBy + ` ORDER BY c.updated_at DESC, c.id DESC LIMIT 500`
 	rows, err := r.db.Query(query, isAdmin, userID, strings.TrimSpace(search))
@@ -177,6 +217,185 @@ func (r *TradeRepo) ListCustomers(userID int64, isAdmin bool, search string) ([]
 		customers = append(customers, *customer)
 	}
 	return customers, rows.Err()
+}
+
+const tradeCustomerDeleteRequestSelect = `
+	SELECT dr.id,dr.customer_id,c.customer_code,c.name,c.company_name,
+	       dr.requested_by,COALESCE(requester.username,''),dr.reason,dr.status,
+	       dr.decided_by,COALESCE(decider.username,''),dr.decision_comment,
+	       dr.requested_at,dr.decided_at,dr.updated_at
+	FROM trade_customer_delete_requests dr
+	JOIN trade_customers c ON c.id=dr.customer_id
+	LEFT JOIN users requester ON requester.id=dr.requested_by
+	LEFT JOIN users decider ON decider.id=dr.decided_by`
+
+func scanTradeCustomerDeleteRequest(scanner tradeRowScanner) (*model.TradeCustomerDeleteRequest, error) {
+	var request model.TradeCustomerDeleteRequest
+	var requestedBy, decidedBy sql.NullInt64
+	var decidedAt sql.NullTime
+	if err := scanner.Scan(
+		&request.ID, &request.CustomerID, &request.CustomerCode, &request.CustomerName,
+		&request.CustomerCompany, &requestedBy, &request.RequesterName, &request.Reason,
+		&request.Status, &decidedBy, &request.DeciderName, &request.DecisionComment,
+		&request.RequestedAt, &decidedAt, &request.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if requestedBy.Valid {
+		request.RequestedBy = &requestedBy.Int64
+	}
+	if decidedBy.Valid {
+		request.DecidedBy = &decidedBy.Int64
+	}
+	if decidedAt.Valid {
+		request.DecidedAt = &decidedAt.Time
+	}
+	return &request, nil
+}
+
+func (r *TradeRepo) GetCustomerDeleteRequest(requestID int64) (*model.TradeCustomerDeleteRequest, error) {
+	return scanTradeCustomerDeleteRequest(r.db.QueryRow(tradeCustomerDeleteRequestSelect+` WHERE dr.id=$1`, requestID))
+}
+
+func (r *TradeRepo) GetPendingCustomerDeleteRequest(customerID int64) (*model.TradeCustomerDeleteRequest, error) {
+	return scanTradeCustomerDeleteRequest(r.db.QueryRow(
+		tradeCustomerDeleteRequestSelect+` WHERE dr.customer_id=$1 AND dr.status='pending'`, customerID,
+	))
+}
+
+func (r *TradeRepo) ListCustomerDeleteRequests(userID int64, isAdmin bool, status string) ([]model.TradeCustomerDeleteRequest, error) {
+	rows, err := r.db.Query(
+		tradeCustomerDeleteRequestSelect+`
+		 WHERE ($1 OR dr.requested_by=$2)
+		   AND ($3='' OR dr.status=$3)
+		 ORDER BY CASE WHEN dr.status='pending' THEN 0 ELSE 1 END,dr.requested_at DESC,dr.id DESC
+		 LIMIT 500`,
+		isAdmin, userID, strings.TrimSpace(status),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list customer delete requests: %w", err)
+	}
+	defer rows.Close()
+	requests := make([]model.TradeCustomerDeleteRequest, 0)
+	for rows.Next() {
+		request, scanErr := scanTradeCustomerDeleteRequest(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		requests = append(requests, *request)
+	}
+	return requests, rows.Err()
+}
+
+func (r *TradeRepo) CreateCustomerDeleteRequest(customerID, requestedBy int64, reason string) (*model.TradeCustomerDeleteRequest, error) {
+	var requestID int64
+	err := r.db.QueryRow(
+		`INSERT INTO trade_customer_delete_requests (customer_id,requested_by,reason,status,requested_at,updated_at)
+		 SELECT c.id,$2,$3,'pending',NOW(),NOW()
+		 FROM trade_customers c
+		 WHERE c.id=$1 AND c.deleted_at IS NULL
+		 ON CONFLICT (customer_id) WHERE status='pending' DO NOTHING
+		 RETURNING id`,
+		customerID, requestedBy, strings.TrimSpace(reason),
+	).Scan(&requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r.GetPendingCustomerDeleteRequest(customerID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create customer delete request: %w", err)
+	}
+	return r.GetCustomerDeleteRequest(requestID)
+}
+
+func (r *TradeRepo) DecideCustomerDeleteRequest(requestID, adminID int64, decision, comment string) (*model.TradeCustomerDeleteRequest, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin customer delete decision: %w", err)
+	}
+	defer tx.Rollback()
+
+	var customerID int64
+	var status string
+	if err := tx.QueryRow(
+		`SELECT customer_id,status FROM trade_customer_delete_requests WHERE id=$1 FOR UPDATE`, requestID,
+	).Scan(&customerID, &status); err != nil {
+		return nil, err
+	}
+	if status != "pending" {
+		return nil, fmt.Errorf("该客户删除申请已经处理")
+	}
+
+	nextStatus := "rejected"
+	if decision == "approve" {
+		nextStatus = "approved"
+		result, updateErr := tx.Exec(
+			`UPDATE trade_customers SET deleted_at=NOW(),deleted_by=$2,updated_at=NOW()
+			 WHERE id=$1 AND deleted_at IS NULL`, customerID, adminID,
+		)
+		if updateErr != nil {
+			return nil, fmt.Errorf("delete trade customer: %w", updateErr)
+		}
+		if affected, _ := result.RowsAffected(); affected == 0 {
+			return nil, sql.ErrNoRows
+		}
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_customer_delete_requests
+		 SET status=$2,decided_by=$3,decision_comment=$4,decided_at=NOW(),updated_at=NOW()
+		 WHERE id=$1`,
+		requestID, nextStatus, adminID, strings.TrimSpace(comment),
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit customer delete decision: %w", err)
+	}
+	return r.GetCustomerDeleteRequest(requestID)
+}
+
+func (r *TradeRepo) AdminDeleteCustomer(customerID, adminID int64) (*model.TradeCustomerDeleteRequest, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin deleting trade customer: %w", err)
+	}
+	defer tx.Rollback()
+
+	var customerName string
+	if err := tx.QueryRow(
+		`SELECT name FROM trade_customers WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, customerID,
+	).Scan(&customerName); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_customers SET deleted_at=NOW(),deleted_by=$2,updated_at=NOW() WHERE id=$1`,
+		customerID, adminID,
+	); err != nil {
+		return nil, fmt.Errorf("delete trade customer: %w", err)
+	}
+
+	var requestID int64
+	err = tx.QueryRow(
+		`UPDATE trade_customer_delete_requests
+		 SET status='approved',decided_by=$2,decision_comment='管理员直接删除',decided_at=NOW(),updated_at=NOW()
+		 WHERE customer_id=$1 AND status='pending'
+		 RETURNING id`,
+		customerID, adminID,
+	).Scan(&requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRow(
+			`INSERT INTO trade_customer_delete_requests
+			 (customer_id,requested_by,reason,status,decided_by,decision_comment,requested_at,decided_at,updated_at)
+			 VALUES($1,$2,'管理员直接删除','approved',$2,'管理员直接删除',NOW(),NOW(),NOW()) RETURNING id`,
+			customerID, adminID,
+		).Scan(&requestID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("record customer deletion approval for %s: %w", customerName, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit deleting trade customer: %w", err)
+	}
+	return r.GetCustomerDeleteRequest(requestID)
 }
 
 func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrderItem) error {
@@ -1396,7 +1615,7 @@ func (r *TradeRepo) Dashboard(userID int64, isAdmin bool) (*model.TradeDashboard
 func (r *TradeRepo) DashboardScoped(userID int64, canViewAll bool, stages []string, includeCustomers bool) (*model.TradeDashboard, error) {
 	dashboard := &model.TradeDashboard{StageCounts: map[string]int64{}}
 	if err := r.db.QueryRow(
-		`SELECT COUNT(*) FROM trade_customers WHERE $1 AND ($2 OR owner_id = $3)`, includeCustomers, canViewAll, userID,
+		`SELECT COUNT(*) FROM trade_customers WHERE deleted_at IS NULL AND $1 AND ($2 OR owner_id = $3)`, includeCustomers, canViewAll, userID,
 	).Scan(&dashboard.CustomerCount); err != nil {
 		return nil, fmt.Errorf("count trade customers: %w", err)
 	}

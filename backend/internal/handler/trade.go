@@ -115,6 +115,102 @@ func (h *TradeHandler) CreateCustomer(c *gin.Context) {
 	response.OK(c, customer)
 }
 
+func (h *TradeHandler) UpdateCustomer(c *gin.Context) {
+	customerID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的客户编号")
+		return
+	}
+	var request model.UpdateTradeCustomerRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	customer, err := h.service.UpdateCustomer(c.GetInt64("user_id"), customerID, &request)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "客户不存在或无权编辑")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, customer)
+}
+
+func (h *TradeHandler) ListCustomerDeleteRequests(c *gin.Context) {
+	requests, err := h.service.ListCustomerDeleteRequests(c.GetInt64("user_id"), c.Query("status"))
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, requests)
+}
+
+func (h *TradeHandler) RequestCustomerDelete(c *gin.Context) {
+	customerID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的客户编号")
+		return
+	}
+	var request model.TradeCustomerDeleteRequestInput
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	deleteRequest, err := h.service.RequestCustomerDelete(c.GetInt64("user_id"), customerID, &request)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "客户不存在或无权访问")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, deleteRequest)
+}
+
+func (h *TradeHandler) DecideCustomerDeleteRequest(c *gin.Context) {
+	requestID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的删除申请编号")
+		return
+	}
+	var request model.TradeCustomerDeleteDecisionInput
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.service.DecideCustomerDeleteRequest(c.GetInt64("user_id"), requestID, &request)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "客户或删除申请不存在")
+		return
+	}
+	if err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
+func (h *TradeHandler) DeleteCustomer(c *gin.Context) {
+	customerID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的客户编号")
+		return
+	}
+	result, err := h.service.DeleteCustomer(c.GetInt64("user_id"), customerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "客户不存在")
+		return
+	}
+	if err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *TradeHandler) ListOrders(c *gin.Context) {
 	filter := model.TradeOrderFilter{Search: c.Query("search"), Stage: strings.TrimSpace(c.Query("stage"))}
 	if value := strings.TrimSpace(c.Query("customer_id")); value != "" {

@@ -30,6 +30,7 @@ import {
   MessageCircle,
   MessageSquare,
   PackageCheck,
+  Pencil,
   Plus,
   Printer,
   RefreshCw,
@@ -38,6 +39,7 @@ import {
   Search,
   Send,
   Settings,
+  ShieldCheck,
   Ship,
   ShoppingCart,
   SlidersHorizontal,
@@ -61,6 +63,7 @@ import { matchesWhatsAppChat } from "@/lib/whatsappSearch";
 import { wsClient } from "@/lib/ws";
 import type {
   TradeCustomer,
+  TradeCustomerDeleteRequest,
   TradeCustomerQuoteRound,
   TradeCustomerQuoteStatus,
   TradeAccessProfile,
@@ -97,6 +100,7 @@ interface CustomerDraft {
   email: string;
   phone: string;
   source: TradeCustomer["source"];
+  status: TradeCustomer["status"];
   customer_level: TradeCustomer["customer_level"];
   tags: string;
   notes: string;
@@ -377,6 +381,13 @@ const SOURCE_LABELS: Record<TradeCustomer["source"], string> = {
   other: "其他",
 };
 
+const CUSTOMER_STATUS_LABELS: Record<TradeCustomer["status"], string> = {
+  lead: "潜在客户",
+  active: "合作中",
+  inactive: "暂停合作",
+  blocked: "停止合作",
+};
+
 function newCustomerDraft(): CustomerDraft {
   return {
     name: "",
@@ -387,6 +398,7 @@ function newCustomerDraft(): CustomerDraft {
     email: "",
     phone: "",
     source: "manual",
+    status: "lead",
     customer_level: "B",
     tags: "",
     notes: "",
@@ -777,6 +789,9 @@ export default function TradeWorkspacePage() {
     null,
   );
   const [customers, setCustomers] = useState<TradeCustomer[]>([]);
+  const [customerDeleteRequests, setCustomerDeleteRequests] = useState<
+    TradeCustomerDeleteRequest[]
+  >([]);
   const [orders, setOrders] = useState<TradeOrder[]>([]);
   const [suppliers, setSuppliers] = useState<TradeSupplier[]>([]);
   const [positions, setPositions] = useState<TradePosition[]>([]);
@@ -797,12 +812,23 @@ export default function TradeWorkspacePage() {
   const [error, setError] = useState("");
 
   const [customerModalOpen, setCustomerModalOpen] = useState(false);
+  const [editingCustomer, setEditingCustomer] =
+    useState<TradeCustomer | null>(null);
   const [customerMode, setCustomerMode] = useState<"manual" | "whatsapp">(
     "manual",
   );
   const [customerDraft, setCustomerDraft] =
     useState<CustomerDraft>(newCustomerDraft);
   const [savingCustomer, setSavingCustomer] = useState(false);
+  const [customerDeleteTarget, setCustomerDeleteTarget] =
+    useState<TradeCustomer | null>(null);
+  const [customerDeleteReason, setCustomerDeleteReason] = useState("");
+  const [deletingCustomer, setDeletingCustomer] = useState(false);
+  const [customerDeleteApprovalsOpen, setCustomerDeleteApprovalsOpen] =
+    useState(false);
+  const [decidingCustomerDeleteID, setDecidingCustomerDeleteID] = useState<
+    number | null
+  >(null);
   const [whatsAppAccount, setWhatsAppAccount] =
     useState<WhatsAppAccount | null>(null);
   const [whatsAppChats, setWhatsAppChats] = useState<WhatsAppChat[]>([]);
@@ -901,6 +927,9 @@ export default function TradeWorkspacePage() {
           api.get<TradeSupplier[]>("/trade/suppliers"),
           api.get<TradePosition[]>("/trade/positions"),
           api.get<TradeSettings>("/trade/settings"),
+          api.get<TradeCustomerDeleteRequest[]>(
+            "/trade/customer-delete-requests?status=pending",
+          ),
         ] as const;
         const [
           accessResponse,
@@ -910,6 +939,7 @@ export default function TradeWorkspacePage() {
           supplierResponse,
           positionResponse,
           settingsResponse,
+          customerDeleteResponse,
         ] = await Promise.all(requests);
         const responses = [
           accessResponse,
@@ -919,6 +949,7 @@ export default function TradeWorkspacePage() {
           supplierResponse,
           positionResponse,
           settingsResponse,
+          customerDeleteResponse,
         ];
         const failed = responses.find((response) => response.code !== 0);
         if (failed) throw new Error(failed.message || "加载外贸业务数据失败");
@@ -928,6 +959,7 @@ export default function TradeWorkspacePage() {
         setOrders(orderResponse.data || []);
         setSuppliers(supplierResponse.data || []);
         setPositions(positionResponse.data || []);
+        setCustomerDeleteRequests(customerDeleteResponse.data || []);
         if (accessResponse.data?.can_view_all_orders) {
           const bossResponse = await api.get<TradeBossDashboard>(
             "/trade/boss-dashboard",
@@ -1204,6 +1236,16 @@ export default function TradeWorkspacePage() {
     );
   }, [orders]);
 
+  const pendingCustomerDeleteByCustomer = useMemo(
+    () =>
+      new Map(
+        customerDeleteRequests
+          .filter((request) => request.status === "pending")
+          .map((request) => [request.customer_id, request]),
+      ),
+    [customerDeleteRequests],
+  );
+
   const filteredCustomers = useMemo(() => {
     const keyword = search.trim().toLowerCase();
     return customers.filter((customer) => {
@@ -1305,9 +1347,37 @@ export default function TradeWorkspacePage() {
   );
 
   const openCustomerModal = (mode: "manual" | "whatsapp" = "manual") => {
+    setEditingCustomer(null);
     setCustomerDraft(newCustomerDraft());
     setCustomerMode(mode);
     setWhatsAppSearch("");
+    setCustomerModalOpen(true);
+    setError("");
+  };
+
+  const openEditCustomer = (customer: TradeCustomer) => {
+    setEditingCustomer(customer);
+    setCustomerMode("manual");
+    setWhatsAppSearch("");
+    setCustomerDraft({
+      name: customer.name,
+      company_name: customer.company_name,
+      country: customer.country,
+      region: customer.region,
+      contact_name: customer.contact_name,
+      email: customer.email,
+      phone: customer.phone,
+      source: customer.source,
+      status: customer.status,
+      customer_level: customer.customer_level,
+      tags: (customer.tags || []).join(", "),
+      notes: customer.notes,
+      create_channel: false,
+      whatsapp_account_id: customer.whatsapp_account_id,
+      whatsapp_chat_id: customer.whatsapp_chat_id,
+      whatsapp_chat_name: customer.whatsapp_chat_name,
+      avatar_url: customer.avatar_url,
+    });
     setCustomerModalOpen(true);
     setError("");
   };
@@ -1334,7 +1404,7 @@ export default function TradeWorkspacePage() {
     setSavingCustomer(true);
     setError("");
     try {
-      const response = await api.post<TradeCustomer>("/trade/customers", {
+      const payload = {
         ...customerDraft,
         name: customerDraft.name.trim(),
         company_name: customerDraft.company_name.trim(),
@@ -1342,24 +1412,129 @@ export default function TradeWorkspacePage() {
           .split(/[,，]/)
           .map((tag) => tag.trim())
           .filter(Boolean),
-      });
+      };
+      const response = editingCustomer
+        ? await api.put<TradeCustomer>(
+            `/trade/customers/${editingCustomer.id}`,
+            payload,
+          )
+        : await api.post<TradeCustomer>("/trade/customers", payload);
       if (response.code !== 0 || !response.data)
-        throw new Error(response.message || "创建客户失败");
+        throw new Error(
+          response.message || (editingCustomer ? "更新客户失败" : "创建客户失败"),
+        );
       setCustomerModalOpen(false);
       setNotice(
-        response.data.integration_warning ||
-          `客户「${response.data.name}」已建档。内部建档提示不会发送给 WhatsApp 客户。`,
+        editingCustomer
+          ? `客户「${response.data.name}」资料已更新。`
+          : response.data.integration_warning ||
+              `客户「${response.data.name}」已建档。内部建档提示不会发送给 WhatsApp 客户。`,
       );
-      setOrderDraft((current) => ({
-        ...current,
-        customer_id: response.data!.id,
-      }));
+      if (!editingCustomer) {
+        setOrderDraft((current) => ({
+          ...current,
+          customer_id: response.data!.id,
+        }));
+      }
+      setEditingCustomer(null);
       await loadData(true);
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "创建客户失败");
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : editingCustomer
+            ? "更新客户失败"
+            : "创建客户失败",
+      );
     } finally {
       setSavingCustomer(false);
     }
+  };
+
+  const openCustomerDelete = (customer: TradeCustomer) => {
+    setCustomerDeleteTarget(customer);
+    setCustomerDeleteReason("");
+    setError("");
+  };
+
+  const submitCustomerDelete = async () => {
+    if (!customerDeleteTarget) return;
+    if (!tradeAccess?.is_admin && !customerDeleteReason.trim()) {
+      setError("请填写删除客户的原因，管理员审批时会看到这段说明。");
+      return;
+    }
+    setDeletingCustomer(true);
+    setError("");
+    try {
+      const response = tradeAccess?.is_admin
+        ? await api.delete<TradeCustomerDeleteRequest>(
+            `/trade/customers/${customerDeleteTarget.id}`,
+          )
+        : await api.post<TradeCustomerDeleteRequest>(
+            `/trade/customers/${customerDeleteTarget.id}/delete-request`,
+            { reason: customerDeleteReason.trim() },
+          );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "提交客户删除操作失败");
+      setNotice(
+        tradeAccess?.is_admin
+          ? `客户「${customerDeleteTarget.name}」已删除，历史订单和客户频道仍然保留。`
+          : `客户「${customerDeleteTarget.name}」的删除申请已提交，等待管理员审批。`,
+      );
+      if (tradeAccess?.is_admin) {
+        setCustomerFilter("all");
+      }
+      setCustomerDeleteTarget(null);
+      setCustomerDeleteReason("");
+      await loadData(true);
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "提交客户删除操作失败",
+      );
+    } finally {
+      setDeletingCustomer(false);
+    }
+  };
+
+  const rejectCustomerDelete = async (
+    request: TradeCustomerDeleteRequest,
+  ) => {
+    if (!window.confirm(`确认拒绝删除客户「${request.customer_name}」吗？`))
+      return;
+    setDecidingCustomerDeleteID(request.id);
+    setError("");
+    try {
+      const response = await api.put<TradeCustomerDeleteRequest>(
+        `/trade/customer-delete-requests/${request.id}/decision`,
+        { decision: "reject", comment: "管理员拒绝删除申请" },
+      );
+      if (response.code !== 0)
+        throw new Error(response.message || "拒绝删除申请失败");
+      setNotice(`已拒绝客户「${request.customer_name}」的删除申请。`);
+      if (customerDeleteRequests.length <= 1)
+        setCustomerDeleteApprovalsOpen(false);
+      await loadData(true);
+    } catch (decisionError) {
+      setError(
+        decisionError instanceof Error
+          ? decisionError.message
+          : "拒绝删除申请失败",
+      );
+    } finally {
+      setDecidingCustomerDeleteID(null);
+    }
+  };
+
+  const approveCustomerDelete = (request: TradeCustomerDeleteRequest) => {
+    const customer = customers.find((item) => item.id === request.customer_id);
+    if (!customer) {
+      setError("客户资料已经不存在，请刷新页面后重试。");
+      return;
+    }
+    setCustomerDeleteApprovalsOpen(false);
+    openCustomerDelete(customer);
   };
 
   const openOrderModal = (customerID = 0) => {
@@ -2543,6 +2718,21 @@ export default function TradeWorkspacePage() {
                   </button>
                 )}
                 {activeView === "customers" &&
+                  tradeAccess?.is_admin && (
+                    <button
+                      type="button"
+                      onClick={() => setCustomerDeleteApprovalsOpen(true)}
+                      className={`inline-flex h-9 shrink-0 items-center gap-2 rounded-lg border px-3 text-sm font-medium ${customerDeleteRequests.length > 0 ? "border-amber-200 bg-amber-50 text-amber-800" : "border-slate-200 text-slate-500"}`}
+                      title="审批员工提交的客户删除申请"
+                    >
+                      <ShieldCheck className="h-4 w-4" />
+                      <span>删除审批</span>
+                      <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] font-semibold tabular-nums">
+                        {customerDeleteRequests.length}
+                      </span>
+                    </button>
+                  )}
+                {activeView === "customers" &&
                   tradeAccess?.can_create_customers && (
                     <button
                       type="button"
@@ -3325,6 +3515,14 @@ export default function TradeWorkspacePage() {
                               customer.email ||
                               "未填写联系人"}
                           </div>
+                          {customer.notes && (
+                            <div
+                              className="mt-1 max-w-xl truncate text-xs text-slate-500"
+                              title={customer.notes}
+                            >
+                              备注：{customer.notes}
+                            </div>
+                          )}
                         </div>
                       </div>
                       <div className="grid grid-cols-3 gap-4 text-xs text-slate-500 md:w-80">
@@ -3348,6 +3546,25 @@ export default function TradeWorkspacePage() {
                         </div>
                       </div>
                       <div className="flex items-center justify-end gap-1">
+                        {pendingCustomerDeleteByCustomer.has(customer.id) && (
+                          <button
+                            type="button"
+                            disabled={!tradeAccess?.is_admin}
+                            onClick={() => {
+                              if (tradeAccess?.is_admin)
+                                setCustomerDeleteApprovalsOpen(true);
+                            }}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-2.5 text-xs font-semibold text-amber-800 disabled:cursor-default"
+                            title={
+                              tradeAccess?.is_admin
+                                ? "打开客户删除审批"
+                                : "等待管理员审批删除"
+                            }
+                          >
+                            <Clock3 className="h-3.5 w-3.5" />
+                            待审批
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => viewCustomerOrders(customer)}
@@ -3365,6 +3582,28 @@ export default function TradeWorkspacePage() {
                             title="打开客户频道"
                           >
                             <MessageSquare className="h-4 w-4" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => openEditCustomer(customer)}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100"
+                          title="编辑客户资料"
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </button>
+                        {!pendingCustomerDeleteByCustomer.has(customer.id) && (
+                          <button
+                            type="button"
+                            onClick={() => openCustomerDelete(customer)}
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-600 hover:bg-rose-50"
+                            title={
+                              tradeAccess?.is_admin
+                                ? "删除客户"
+                                : "申请删除客户"
+                            }
+                          >
+                            <Trash2 className="h-4 w-4" />
                           </button>
                         )}
                         <button
@@ -3451,44 +3690,55 @@ export default function TradeWorkspacePage() {
           <div
             className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
-              if (event.target === event.currentTarget && !savingCustomer)
+              if (event.target === event.currentTarget && !savingCustomer) {
                 setCustomerModalOpen(false);
+                setEditingCustomer(null);
+              }
             }}
           >
             <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
-                  <h2 className="font-semibold">录入客户</h2>
+                  <h2 className="font-semibold">
+                    {editingCustomer ? "编辑客户资料" : "录入客户"}
+                  </h2>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    客户建档提示仅供内部员工查看，不会转发给 WhatsApp 客户。
+                    {editingCustomer
+                      ? `${editingCustomer.customer_code} · 姓名、联系人和备注都可以修改或清空。`
+                      : "客户建档提示仅供内部员工查看，不会转发给 WhatsApp 客户。"}
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setCustomerModalOpen(false)}
+                  onClick={() => {
+                    setCustomerModalOpen(false);
+                    setEditingCustomer(null);
+                  }}
                   className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto p-4">
-                <div className="mb-4 flex border-b border-slate-200">
-                  <button
-                    type="button"
-                    onClick={() => setCustomerMode("manual")}
-                    className={`border-b-2 px-3 py-2 text-sm font-medium ${customerMode === "manual" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
-                  >
-                    手工录入
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCustomerMode("whatsapp")}
-                    className={`border-b-2 px-3 py-2 text-sm font-medium ${customerMode === "whatsapp" ? "border-emerald-600 text-emerald-700" : "border-transparent text-slate-400"}`}
-                  >
-                    从 WhatsApp 录入
-                  </button>
-                </div>
-                {customerMode === "whatsapp" && (
+                {!editingCustomer && (
+                  <div className="mb-4 flex border-b border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => setCustomerMode("manual")}
+                      className={`border-b-2 px-3 py-2 text-sm font-medium ${customerMode === "manual" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+                    >
+                      手工录入
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCustomerMode("whatsapp")}
+                      className={`border-b-2 px-3 py-2 text-sm font-medium ${customerMode === "whatsapp" ? "border-emerald-600 text-emerald-700" : "border-transparent text-slate-400"}`}
+                    >
+                      从 WhatsApp 录入
+                    </button>
+                  </div>
+                )}
+                {!editingCustomer && customerMode === "whatsapp" && (
                   <div className="mb-4 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
                     {whatsAppLoading ? (
                       <div className="flex h-32 items-center justify-center text-sm text-emerald-700">
@@ -3644,6 +3894,19 @@ export default function TradeWorkspacePage() {
                     />
                   </label>
                   <label className="text-sm font-medium text-slate-700">
+                    州/省/地区
+                    <input
+                      value={customerDraft.region}
+                      onChange={(event) =>
+                        setCustomerDraft((current) => ({
+                          ...current,
+                          region: event.target.value,
+                        }))
+                      }
+                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
+                    />
+                  </label>
+                  <label className="text-sm font-medium text-slate-700">
                     客户来源
                     <select
                       value={customerDraft.source}
@@ -3680,6 +3943,27 @@ export default function TradeWorkspacePage() {
                       <option value="C">C · 潜在客户</option>
                     </select>
                   </label>
+                  <label className="text-sm font-medium text-slate-700">
+                    客户状态
+                    <select
+                      value={customerDraft.status}
+                      onChange={(event) =>
+                        setCustomerDraft((current) => ({
+                          ...current,
+                          status: event.target.value as TradeCustomer["status"],
+                        }))
+                      }
+                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 outline-none"
+                    >
+                      {Object.entries(CUSTOMER_STATUS_LABELS).map(
+                        ([value, label]) => (
+                          <option key={value} value={value}>
+                            {label}
+                          </option>
+                        ),
+                      )}
+                    </select>
+                  </label>
                   <label className="text-sm font-medium text-slate-700 sm:col-span-2">
                     标签
                     <input
@@ -3708,30 +3992,35 @@ export default function TradeWorkspacePage() {
                     />
                   </label>
                 </div>
-                <label className="mt-4 flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={customerDraft.create_channel}
-                    onChange={(event) =>
-                      setCustomerDraft((current) => ({
-                        ...current,
-                        create_channel: event.target.checked,
-                      }))
-                    }
-                    className="h-4 w-4 accent-slate-900"
-                  />
-                  <span>
-                    <span className="font-medium">自动建立客户频道</span>
-                    <span className="ml-2 text-xs text-slate-400">
-                      用于沟通、文件和业务协作
+                {!editingCustomer && (
+                  <label className="mt-4 flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={customerDraft.create_channel}
+                      onChange={(event) =>
+                        setCustomerDraft((current) => ({
+                          ...current,
+                          create_channel: event.target.checked,
+                        }))
+                      }
+                      className="h-4 w-4 accent-slate-900"
+                    />
+                    <span>
+                      <span className="font-medium">自动建立客户频道</span>
+                      <span className="ml-2 text-xs text-slate-400">
+                        用于沟通、文件和业务协作
+                      </span>
                     </span>
-                  </span>
-                </label>
+                  </label>
+                )}
               </div>
               <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
                 <button
                   type="button"
-                  onClick={() => setCustomerModalOpen(false)}
+                  onClick={() => {
+                    setCustomerModalOpen(false);
+                    setEditingCustomer(null);
+                  }}
                   className="h-9 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-600"
                 >
                   取消
@@ -3745,7 +4034,199 @@ export default function TradeWorkspacePage() {
                   {savingCustomer && (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   )}
-                  保存客户
+                  {editingCustomer ? "保存修改" : "保存客户"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {customerDeleteApprovalsOpen && tradeAccess?.is_admin && (
+          <div
+            className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget)
+                setCustomerDeleteApprovalsOpen(false);
+            }}
+          >
+            <div className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                <div>
+                  <h2 className="font-semibold">客户删除审批</h2>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    只有管理员同意后客户档案才会删除，历史订单和客户频道继续保留。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCustomerDeleteApprovalsOpen(false)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                {customerDeleteRequests.length === 0 ? (
+                  <div className="flex h-40 flex-col items-center justify-center text-sm text-slate-400">
+                    <ShieldCheck className="mb-2 h-7 w-7 text-emerald-500" />
+                    暂无待审批的客户删除申请
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {customerDeleteRequests.map((request) => (
+                      <div
+                        key={request.id}
+                        className="rounded-lg border border-slate-200 p-4"
+                      >
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-semibold text-slate-900">
+                                {request.customer_name}
+                              </span>
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-500">
+                                {request.customer_code}
+                              </span>
+                            </div>
+                            <div className="mt-1 text-xs text-slate-500">
+                              申请人：{request.requester_name || "账号已删除"} ·{" "}
+                              {formatDate(request.requested_at)}
+                            </div>
+                            <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm leading-6 text-amber-900">
+                              {request.reason || "未填写删除原因"}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => void rejectCustomerDelete(request)}
+                              disabled={decidingCustomerDeleteID === request.id}
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                            >
+                              拒绝
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => approveCustomerDelete(request)}
+                              disabled={decidingCustomerDeleteID === request.id}
+                              className="inline-flex h-9 items-center gap-2 rounded-lg bg-rose-600 px-3 text-sm font-semibold text-white disabled:opacity-40"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                              同意删除
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="flex justify-end border-t border-slate-200 px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setCustomerDeleteApprovalsOpen(false)}
+                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-600"
+                >
+                  完成
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {customerDeleteTarget && (
+          <div
+            className="fixed inset-0 z-[60] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !deletingCustomer)
+                setCustomerDeleteTarget(null);
+            }}
+          >
+            <div className="w-full max-w-lg overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                <div>
+                  <h2 className="font-semibold">
+                    {tradeAccess?.is_admin
+                      ? "确认删除客户"
+                      : "申请删除客户"}
+                  </h2>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    {customerDeleteTarget.customer_code} ·{" "}
+                    {customerDeleteTarget.name}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCustomerDeleteTarget(null)}
+                  disabled={deletingCustomer}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-40"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="space-y-4 p-4">
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-sm leading-6 text-amber-900">
+                  {tradeAccess?.is_admin
+                    ? `删除后客户不会再出现在客户列表，也不能用于新建询价；已有 ${customerDeleteTarget.order_count} 个历史订单及客户频道会继续保留。`
+                    : "提交后不会立即删除，需要管理员查看原因并同意。审批前客户资料仍可正常使用。"}
+                </div>
+                {tradeAccess?.is_admin &&
+                  pendingCustomerDeleteByCustomer.get(
+                    customerDeleteTarget.id,
+                  ) && (
+                    <div className="rounded-lg border border-slate-200 px-3 py-3 text-sm text-slate-600">
+                      <div className="text-xs font-semibold text-slate-400">
+                        员工申请原因
+                      </div>
+                      <div className="mt-1 leading-6">
+                        {
+                          pendingCustomerDeleteByCustomer.get(
+                            customerDeleteTarget.id,
+                          )?.reason
+                        }
+                      </div>
+                    </div>
+                  )}
+                {!tradeAccess?.is_admin && (
+                  <label className="block text-sm font-medium text-slate-700">
+                    删除原因<span className="text-rose-500"> *</span>
+                    <textarea
+                      value={customerDeleteReason}
+                      onChange={(event) =>
+                        setCustomerDeleteReason(event.target.value)
+                      }
+                      className="mt-1.5 min-h-28 w-full resize-y rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-slate-400"
+                      placeholder="说明客户重复、录入错误或不再使用等原因"
+                    />
+                  </label>
+                )}
+              </div>
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setCustomerDeleteTarget(null)}
+                  disabled={deletingCustomer}
+                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-600 disabled:opacity-40"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void submitCustomerDelete()}
+                  disabled={
+                    deletingCustomer ||
+                    (!tradeAccess?.is_admin && !customerDeleteReason.trim())
+                  }
+                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-rose-600 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  {deletingCustomer ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  {tradeAccess?.is_admin ? "确认删除" : "提交申请"}
                 </button>
               </div>
             </div>

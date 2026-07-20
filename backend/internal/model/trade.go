@@ -64,6 +64,24 @@ type TradeCustomer struct {
 	UpdatedAt          time.Time `json:"updated_at"`
 }
 
+type TradeCustomerDeleteRequest struct {
+	ID              int64      `json:"id"`
+	CustomerID      int64      `json:"customer_id"`
+	CustomerCode    string     `json:"customer_code"`
+	CustomerName    string     `json:"customer_name"`
+	CustomerCompany string     `json:"customer_company"`
+	RequestedBy     *int64     `json:"requested_by,omitempty"`
+	RequesterName   string     `json:"requester_name"`
+	Reason          string     `json:"reason"`
+	Status          string     `json:"status"`
+	DecidedBy       *int64     `json:"decided_by,omitempty"`
+	DeciderName     string     `json:"decider_name"`
+	DecisionComment string     `json:"decision_comment"`
+	RequestedAt     time.Time  `json:"requested_at"`
+	DecidedAt       *time.Time `json:"decided_at,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
 type TradeOrderItem struct {
 	ID               int64          `json:"id"`
 	OrderID          int64          `json:"order_id"`
@@ -488,6 +506,34 @@ type CreateTradeCustomerRequest struct {
 	Tags              []string `json:"tags"`
 	Notes             string   `json:"notes"`
 	CreateChannel     *bool    `json:"create_channel"`
+}
+
+type UpdateTradeCustomerRequest struct {
+	Name              string   `json:"name" binding:"required"`
+	CompanyName       string   `json:"company_name"`
+	Country           string   `json:"country"`
+	Region            string   `json:"region"`
+	ContactName       string   `json:"contact_name"`
+	Email             string   `json:"email"`
+	Phone             string   `json:"phone"`
+	Source            string   `json:"source"`
+	Status            string   `json:"status"`
+	CustomerLevel     string   `json:"customer_level"`
+	WhatsAppAccountID *int64   `json:"whatsapp_account_id"`
+	WhatsAppChatID    string   `json:"whatsapp_chat_id"`
+	WhatsAppChatName  string   `json:"whatsapp_chat_name"`
+	AvatarURL         string   `json:"avatar_url"`
+	Tags              []string `json:"tags"`
+	Notes             string   `json:"notes"`
+}
+
+type TradeCustomerDeleteRequestInput struct {
+	Reason string `json:"reason"`
+}
+
+type TradeCustomerDeleteDecisionInput struct {
+	Decision string `json:"decision" binding:"required"`
+	Comment  string `json:"comment"`
 }
 
 type CreateTradeOrderItemRequest struct {

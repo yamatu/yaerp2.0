@@ -419,6 +419,219 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 	return customer, nil
 }
 
+func (s *TradeService) UpdateCustomer(userID, customerID int64, request *model.UpdateTradeCustomerRequest) (*model.TradeCustomer, error) {
+	access, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !access.profile.CanViewCustomers {
+		return nil, fmt.Errorf("当前岗位没有编辑客户资料的权限")
+	}
+	current, err := s.repo.GetCustomer(customerID, userID, access.profile.CanViewAllOrders)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := normalizeTradeCustomerUpdate(request)
+	if err != nil {
+		return nil, err
+	}
+	updated.ID = current.ID
+	updated.OwnerID = current.OwnerID
+	updated.CustomerCode = current.CustomerCode
+	updated.ChannelID = current.ChannelID
+	if err := s.repo.UpdateCustomer(updated); err != nil {
+		if strings.Contains(err.Error(), "uq_trade_customers_owner_whatsapp_chat") {
+			return nil, fmt.Errorf("该 WhatsApp 会话已经关联到其他客户")
+		}
+		return nil, err
+	}
+	return s.repo.GetCustomer(customerID, userID, access.profile.CanViewAllOrders)
+}
+
+func normalizeTradeCustomerUpdate(request *model.UpdateTradeCustomerRequest) (*model.TradeCustomer, error) {
+	if request == nil {
+		return nil, fmt.Errorf("客户资料不能为空")
+	}
+	name := strings.TrimSpace(request.Name)
+	if name == "" {
+		return nil, fmt.Errorf("客户名称不能为空")
+	}
+	source := strings.ToLower(strings.TrimSpace(request.Source))
+	if source == "" {
+		source = "manual"
+	}
+	if !validTradeCustomerSource(source) {
+		return nil, fmt.Errorf("不支持的客户来源")
+	}
+	status := strings.ToLower(strings.TrimSpace(request.Status))
+	if status == "" {
+		status = "lead"
+	}
+	if !validTradeCustomerStatus(status) {
+		return nil, fmt.Errorf("不支持的客户状态")
+	}
+	level := strings.ToUpper(strings.TrimSpace(request.CustomerLevel))
+	if level == "" {
+		level = "B"
+	}
+	if level != "A" && level != "B" && level != "C" {
+		return nil, fmt.Errorf("客户等级仅支持 A、B、C")
+	}
+	companyName := strings.TrimSpace(request.CompanyName)
+	if companyName == "" {
+		companyName = name
+	}
+	return &model.TradeCustomer{
+		Name: name, CompanyName: companyName, Country: strings.TrimSpace(request.Country),
+		Region: strings.TrimSpace(request.Region), ContactName: strings.TrimSpace(request.ContactName),
+		Email: strings.TrimSpace(request.Email), Phone: strings.TrimSpace(request.Phone), Source: source,
+		Status: status, CustomerLevel: level, WhatsAppAccountID: request.WhatsAppAccountID,
+		WhatsAppChatID:   strings.TrimSpace(request.WhatsAppChatID),
+		WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
+		AvatarURL:        strings.TrimSpace(request.AvatarURL), Tags: normalizeTradeTags(request.Tags),
+		Notes: strings.TrimSpace(request.Notes),
+	}, nil
+}
+
+func (s *TradeService) ListCustomerDeleteRequests(userID int64, status string) ([]model.TradeCustomerDeleteRequest, error) {
+	admin, err := s.isAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status != "" && status != "pending" && status != "approved" && status != "rejected" && status != "cancelled" {
+		return nil, fmt.Errorf("无效的客户删除申请状态")
+	}
+	return s.repo.ListCustomerDeleteRequests(userID, admin, status)
+}
+
+func (s *TradeService) RequestCustomerDelete(userID, customerID int64, input *model.TradeCustomerDeleteRequestInput) (*model.TradeCustomerDeleteRequest, error) {
+	access, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !access.profile.CanViewCustomers {
+		return nil, fmt.Errorf("当前岗位没有访问客户资料的权限")
+	}
+	customer, err := s.repo.GetCustomer(customerID, userID, access.profile.CanViewAllOrders)
+	if err != nil {
+		return nil, err
+	}
+	reason := ""
+	if input != nil {
+		reason = strings.TrimSpace(input.Reason)
+	}
+	if reason == "" {
+		return nil, fmt.Errorf("请填写删除客户的原因，便于管理员审批")
+	}
+	if len(reason) > 2000 {
+		return nil, fmt.Errorf("删除原因不能超过 2000 个字符")
+	}
+	if existing, existingErr := s.repo.GetPendingCustomerDeleteRequest(customerID); existingErr == nil {
+		return existing, nil
+	} else if !errors.Is(existingErr, sql.ErrNoRows) {
+		return nil, existingErr
+	}
+	request, err := s.repo.CreateCustomerDeleteRequest(customerID, userID, reason)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyCustomerDeleteRequested(customer, request)
+	return request, nil
+}
+
+func (s *TradeService) DecideCustomerDeleteRequest(userID, requestID int64, input *model.TradeCustomerDeleteDecisionInput) (*model.TradeCustomerDeleteRequest, error) {
+	admin, err := s.isAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !admin {
+		return nil, fmt.Errorf("仅管理员可以审批客户删除申请")
+	}
+	if input == nil {
+		return nil, fmt.Errorf("审批内容不能为空")
+	}
+	decision := strings.ToLower(strings.TrimSpace(input.Decision))
+	if decision != "approve" && decision != "reject" {
+		return nil, fmt.Errorf("审批决定仅支持 approve/reject")
+	}
+	comment := strings.TrimSpace(input.Comment)
+	if len(comment) > 2000 {
+		return nil, fmt.Errorf("审批意见不能超过 2000 个字符")
+	}
+	request, err := s.repo.DecideCustomerDeleteRequest(requestID, userID, decision, comment)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyCustomerDeleteDecision(request)
+	return request, nil
+}
+
+func (s *TradeService) DeleteCustomer(userID, customerID int64) (*model.TradeCustomerDeleteRequest, error) {
+	admin, err := s.isAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !admin {
+		return nil, fmt.Errorf("删除客户需要管理员审批，请先提交删除申请")
+	}
+	if _, err := s.repo.GetCustomer(customerID, userID, true); err != nil {
+		return nil, err
+	}
+	request, err := s.repo.AdminDeleteCustomer(customerID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if request.RequestedBy != nil && *request.RequestedBy != userID {
+		s.notifyCustomerDeleteDecision(request)
+	}
+	return request, nil
+}
+
+func (s *TradeService) notifyCustomerDeleteRequested(customer *model.TradeCustomer, request *model.TradeCustomerDeleteRequest) {
+	if customer == nil || request == nil || s.automationRepo == nil || s.userRepo == nil {
+		return
+	}
+	adminIDs, err := s.userRepo.ListAdminIDs()
+	if err != nil || len(adminIDs) == 0 {
+		return
+	}
+	metadata, _ := json.Marshal(map[string]any{
+		"request_id": request.ID, "customer_id": customer.ID, "customer_code": customer.CustomerCode,
+	})
+	entityID := request.ID
+	createdFor, err := s.automationRepo.CreateNotifications(adminIDs, model.UserNotification{
+		NotificationType: "trade_customer_delete", Title: "客户删除申请：" + customer.Name,
+		Content: request.RequesterName + " 申请删除客户 " + customer.CustomerCode + "，请进入外贸客户列表审批。",
+		LinkURL: "/trade", EntityType: "trade_customer_delete_request", EntityID: &entityID, Metadata: metadata,
+	})
+	if err == nil && len(createdFor) > 0 && s.notificationHook != nil {
+		go s.notificationHook(createdFor)
+	}
+}
+
+func (s *TradeService) notifyCustomerDeleteDecision(request *model.TradeCustomerDeleteRequest) {
+	if request == nil || request.RequestedBy == nil || s.automationRepo == nil {
+		return
+	}
+	statusLabel := "已拒绝"
+	if request.Status == "approved" {
+		statusLabel = "已同意"
+	}
+	metadata, _ := json.Marshal(map[string]any{
+		"request_id": request.ID, "customer_id": request.CustomerID, "status": request.Status,
+	})
+	entityID := request.ID
+	createdFor, err := s.automationRepo.CreateNotifications([]int64{*request.RequestedBy}, model.UserNotification{
+		NotificationType: "trade_customer_delete", Title: "客户删除申请" + statusLabel,
+		Content: fmt.Sprintf("客户 %s（%s）的删除申请%s。", request.CustomerName, request.CustomerCode, statusLabel),
+		LinkURL: "/trade", EntityType: "trade_customer_delete_request", EntityID: &entityID, Metadata: metadata,
+	})
+	if err == nil && len(createdFor) > 0 && s.notificationHook != nil {
+		go s.notificationHook(createdFor)
+	}
+}
+
 func (s *TradeService) getCustomer(userID, customerID int64) (*model.TradeCustomer, error) {
 	access, err := s.loadTradeUserAccess(userID)
 	if err != nil {
@@ -471,7 +684,7 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 	if err != nil {
 		return nil, err
 	}
-	customer, err := s.repo.GetCustomer(order.CustomerID, userID, true)
+	customer, err := s.repo.GetCustomerIncludingDeleted(order.CustomerID, userID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1772,7 +1985,7 @@ func (s *TradeService) syncOrderWorkspaceInternal(userID, orderID int64) error {
 	if err != nil {
 		return err
 	}
-	customer, err := s.repo.GetCustomer(order.CustomerID, userID, true)
+	customer, err := s.repo.GetCustomerIncludingDeleted(order.CustomerID, userID, true)
 	if err != nil {
 		return err
 	}
@@ -2805,6 +3018,15 @@ func buildTradeOrderItems(inputs []model.CreateTradeOrderItemRequest) ([]model.T
 func validTradeCustomerSource(source string) bool {
 	switch source {
 	case "manual", "whatsapp", "email", "website", "exhibition", "referral", "marketplace", "other":
+		return true
+	default:
+		return false
+	}
+}
+
+func validTradeCustomerStatus(status string) bool {
+	switch status {
+	case "lead", "active", "inactive", "blocked":
 		return true
 	default:
 		return false

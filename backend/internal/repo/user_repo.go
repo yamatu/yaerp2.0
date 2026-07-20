@@ -202,6 +202,30 @@ func (r *UserRepo) IsDefaultAdminUser(id int64) (bool, error) {
 	return username == "admin", nil
 }
 
+func (r *UserRepo) ListAdminIDs() ([]int64, error) {
+	rows, err := r.db.Query(
+		`SELECT DISTINCT u.id
+		 FROM users u
+		 JOIN user_roles ur ON ur.user_id=u.id
+		 JOIN roles role ON role.id=ur.role_id
+		 WHERE u.status=1 AND role.code='admin'
+		 ORDER BY u.id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list admin users: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (r *UserRepo) List(page, size int) ([]model.User, int64, error) {
 	var total int64
 	if err := r.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&total); err != nil {

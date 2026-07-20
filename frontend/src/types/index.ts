@@ -1155,6 +1155,24 @@ export interface TradeCustomer {
   updated_at: string;
 }
 
+export interface TradeCustomerDeleteRequest {
+  id: number;
+  customer_id: number;
+  customer_code: string;
+  customer_name: string;
+  customer_company: string;
+  requested_by?: number;
+  requester_name: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected" | "cancelled";
+  decided_by?: number;
+  decider_name: string;
+  decision_comment: string;
+  requested_at: string;
+  decided_at?: string;
+  updated_at: string;
+}
+
 export interface TradeOrderItem {
   id: number;
   order_id: number;
