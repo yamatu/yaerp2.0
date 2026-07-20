@@ -221,6 +221,11 @@ export default function HomePage() {
   const [creating, setCreating] = useState(false);
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
+  const [folderBeingRenamed, setFolderBeingRenamed] =
+    useState<Folder | null>(null);
+  const [folderRenameName, setFolderRenameName] = useState("");
+  const [folderRenameSaving, setFolderRenameSaving] = useState(false);
+  const [folderRenameError, setFolderRenameError] = useState("");
   const [newName, setNewName] = useState("");
   const [profile, setProfile] = useState<AuthUser | null>(getStoredUser());
   const [whatsAppResource, setWhatsAppResource] =
@@ -1250,6 +1255,45 @@ export default function HomePage() {
     }
   };
 
+  const closeFolderRenameDialog = () => {
+    if (folderRenameSaving) return;
+    setFolderBeingRenamed(null);
+    setFolderRenameName("");
+    setFolderRenameError("");
+  };
+
+  const handleRenameFolder = async () => {
+    if (!folderBeingRenamed || folderRenameSaving) return;
+
+    const name = folderRenameName.trim();
+    if (!name) {
+      setFolderRenameError("请输入文件夹名称。");
+      return;
+    }
+    if ([...name].length > 256) {
+      setFolderRenameError("文件夹名称不能超过 256 个字符。");
+      return;
+    }
+    if (name === folderBeingRenamed.name) {
+      closeFolderRenameDialog();
+      return;
+    }
+
+    setFolderRenameSaving(true);
+    setFolderRenameError("");
+    try {
+      await renameFolder(folderBeingRenamed.id, name);
+      setFolderBeingRenamed(null);
+      setFolderRenameName("");
+    } catch (err) {
+      setFolderRenameError(
+        err instanceof Error ? err.message : "重命名文件夹失败，请稍后重试。",
+      );
+    } finally {
+      setFolderRenameSaving(false);
+    }
+  };
+
   const handleAssignWorkbook = async () => {
     if (!assigningWorkbook || selectedAssigneeIds.length === 0) return;
 
@@ -2070,6 +2114,22 @@ export default function HomePage() {
                             <button
                               type="button"
                               onClick={() => {
+                                setFolderBeingRenamed(folder);
+                                setFolderRenameName(folder.name);
+                                setFolderRenameError("");
+                              }}
+                              className="ui-tooltip rounded-full p-1.5 text-slate-300 transition hover:bg-slate-100 hover:text-slate-700"
+                              title="重命名文件夹"
+                              aria-label={`重命名文件夹 ${folder.name}`}
+                              data-tooltip="重命名文件夹"
+                            >
+                              <PencilLine className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          {canManageFolder(folder) && (
+                            <button
+                              type="button"
+                              onClick={() => {
                                 setSharingFolder(folder);
                                 setSelectedShares({});
                                 setShareMessage("");
@@ -2792,6 +2852,96 @@ export default function HomePage() {
                 </div>
               )}
           </section>
+
+          {folderBeingRenamed && (
+            <div
+              className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="rename-folder-title"
+            >
+              <form
+                className="w-full max-w-md rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleRenameFolder();
+                }}
+              >
+                <div className="mb-6 flex items-start justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
+                      Rename Folder
+                    </div>
+                    <h2
+                      id="rename-folder-title"
+                      className="mt-2 text-2xl font-semibold text-slate-950"
+                    >
+                      重命名文件夹
+                    </h2>
+                    <p className="mt-2 text-sm text-slate-500">
+                      修改后，文件夹内的工作簿和共享设置不会改变。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={closeFolderRenameDialog}
+                    disabled={folderRenameSaving}
+                    className="ui-tooltip rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    title="关闭重命名"
+                    aria-label="关闭重命名"
+                    data-tooltip="关闭"
+                    data-tooltip-side="left"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+
+                <label
+                  htmlFor="folder-rename-name"
+                  className="mb-2 block text-sm font-semibold text-slate-700"
+                >
+                  文件夹名称
+                </label>
+                <input
+                  id="folder-rename-name"
+                  type="text"
+                  value={folderRenameName}
+                  onChange={(event) => {
+                    setFolderRenameName(event.target.value);
+                    if (folderRenameError) setFolderRenameError("");
+                  }}
+                  maxLength={256}
+                  disabled={folderRenameSaving}
+                  className="h-11 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  autoFocus
+                />
+                <div className="mt-2 flex min-h-5 items-start justify-between gap-3 text-xs">
+                  <span className="text-rose-600">{folderRenameError}</span>
+                  <span className="flex-shrink-0 text-slate-400">
+                    {[...folderRenameName].length}/256
+                  </span>
+                </div>
+
+                <div className="mt-5 flex justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={closeFolderRenameDialog}
+                    disabled={folderRenameSaving}
+                    className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={folderRenameSaving || !folderRenameName.trim()}
+                    className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {folderRenameSaving ? "保存中..." : "保存名称"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
 
           {sharingFolder && (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">

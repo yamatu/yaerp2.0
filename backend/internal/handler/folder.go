@@ -3,6 +3,8 @@ package handler
 import (
 	"errors"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"yaerp/internal/model"
 	"yaerp/internal/service"
@@ -10,6 +12,19 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+const maxFolderNameLength = 256
+
+func normalizeFolderName(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", errors.New("folder name is required")
+	}
+	if utf8.RuneCountInString(name) > maxFolderNameLength {
+		return "", errors.New("folder name must not exceed 256 characters")
+	}
+	return name, nil
+}
 
 type FolderHandler struct {
 	folderService *service.FolderService
@@ -28,8 +43,14 @@ func (h *FolderHandler) CreateFolder(c *gin.Context) {
 		return
 	}
 
+	name, err := normalizeFolderName(req.Name)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
 	folder := &model.Folder{
-		Name:     req.Name,
+		Name:     name,
 		ParentID: req.ParentID,
 		OwnerID:  userID,
 	}
@@ -85,6 +106,16 @@ func (h *FolderHandler) UpdateFolder(c *gin.Context) {
 		response.BadRequest(c, "invalid request body")
 		return
 	}
+	if req.Name == nil {
+		response.BadRequest(c, "folder name is required")
+		return
+	}
+
+	name, err := normalizeFolderName(*req.Name)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
 
 	folder, err := h.folderService.Get(id)
 	if err != nil {
@@ -92,9 +123,7 @@ func (h *FolderHandler) UpdateFolder(c *gin.Context) {
 		return
 	}
 
-	if req.Name != nil {
-		folder.Name = *req.Name
-	}
+	folder.Name = name
 
 	if err := h.folderService.UpdateForUser(userID, folder); err != nil {
 		if errors.Is(err, service.ErrFolderManageDenied) {

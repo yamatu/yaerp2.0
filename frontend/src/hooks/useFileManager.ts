@@ -75,7 +75,10 @@ export function useFileManager() {
 
   const renameFolder = useCallback(
     async (folderId: number, newName: string) => {
-      await api.put(`/folders/${folderId}`, { name: newName })
+      const response = await api.put(`/folders/${folderId}`, { name: newName })
+      if (response.code !== 0) {
+        throw new Error(response.message || '重命名文件夹失败')
+      }
       await refresh()
     },
     [refresh]
