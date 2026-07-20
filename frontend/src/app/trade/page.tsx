@@ -8176,7 +8176,7 @@ export default function TradeWorkspacePage() {
 
         {orderItemDeleteTarget && detailOrder && (
           <div
-            className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
+            className="fixed inset-0 z-[120] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !deletingOrderItem)
                 setOrderItemDeleteTarget(null);
