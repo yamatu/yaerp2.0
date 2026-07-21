@@ -62,6 +62,7 @@ func (s *TradeService) loadTradeUserAccess(userID int64) (*tradeUserAccess, erro
 	}
 	manager := admin || codes["manager"]
 	legacyOwnerMode := !admin && len(positions) == 0
+	canViewOrderProgress := admin || manager || len(positions) > 0
 	canManageCustomerData := admin || manager || codes["sales"] || legacyOwnerMode
 	canManageSupplierData := admin || manager || codes["sourcing"] || codes["quotation"] || codes["purchasing"]
 	scopeLabel := "仅显示本人负责的业务单"
@@ -71,13 +72,14 @@ func (s *TradeService) loadTradeUserAccess(userID int64) (*tradeUserAccess, erro
 	case manager:
 		scopeLabel = "业务负责人：全部外贸流程"
 	case len(positionNames) > 0:
-		scopeLabel = fmt.Sprintf("岗位任务：%s", joinTradeLabels(positionNames))
+		scopeLabel = fmt.Sprintf("岗位进度：%s（详细数据按岗位权限显示）", joinTradeLabels(positionNames))
 	}
 	return &tradeUserAccess{
 		profile: model.TradeAccessProfile{
 			UserID: userID, IsAdmin: admin, IsManager: manager,
 			PositionCodes: positionCodes, PositionNames: positionNames, AllowedStages: allowedStages,
-			CanViewAllOrders: admin || manager, CanViewCustomers: canManageCustomerData,
+			CanViewAllOrders: admin || manager, CanViewOrderProgress: canViewOrderProgress,
+			CanViewCustomers:   canManageCustomerData,
 			CanCreateCustomers: canManageCustomerData, CanCreateOrders: canManageCustomerData,
 			CanViewSuppliers: canManageSupplierData, CanManageSuppliers: canManageSupplierData,
 			ScopeLabel: scopeLabel,
@@ -102,7 +104,18 @@ func (s *TradeService) canViewTradeOrder(userID int64, order *model.TradeOrder, 
 	if order == nil || access == nil {
 		return false
 	}
-	return access.profile.CanViewAllOrders || order.OwnerID == userID || access.stageAccess[order.Stage]
+	return access.profile.CanViewAllOrders || access.profile.CanViewOrderProgress || order.OwnerID == userID || access.stageAccess[order.Stage]
+}
+
+func tradeOrderScopeStages(access *tradeUserAccess) []string {
+	if access == nil {
+		return nil
+	}
+	if !access.profile.CanViewOrderProgress || access.profile.CanViewAllOrders {
+		return access.profile.AllowedStages
+	}
+	stages := append([]string{}, tradeStageOrder...)
+	return append(stages, model.TradeStageCancelled)
 }
 
 func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder, access *tradeUserAccess) (*model.TradeOrderAccess, error) {
@@ -116,6 +129,8 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	customerContactRole := codes["sales"] || codes["quotation"]
 	supplierRole := codes["sourcing"] || codes["quotation"] || codes["purchasing"]
 	result := &model.TradeOrderAccess{
+		VisibleSheetNames:      []string{},
+		EditableSheetNames:     []string{},
 		CanViewCustomer:        full || owner || customerRole,
 		CanViewCustomerContact: full || owner || customerContactRole,
 		CanViewCustomerPricing: full || owner || codes["sales"] || codes["quotation"],
@@ -126,7 +141,7 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		CanViewPacking:         full || codes["packing"] || codes["logistics"],
 		CanViewShipment:        full || owner || codes["sales"] || codes["logistics"],
 		CanViewProfit:          full,
-		CanViewTimeline:        full || owner,
+		CanViewTimeline:        full || owner || access.profile.CanViewOrderProgress,
 		CanSyncWorkbook:        full,
 	}
 	switch {
@@ -137,7 +152,7 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	case owner:
 		result.ScopeLabel = "本人业务单：隐藏非职责敏感数据"
 	default:
-		result.ScopeLabel = "受限任务视图"
+		result.ScopeLabel = "流程进度可见：详细数据按岗位权限隐藏"
 	}
 
 	visible := map[string]bool{"订单总览": true}
@@ -299,7 +314,9 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		}
 		redactTradeWorkflowData(item, orderAccess)
 	}
-	if !orderAccess.CanViewTimeline && len(order.Events) > 0 {
+	if orderAccess.CanViewTimeline && !access.profile.CanViewAllOrders && order.OwnerID != userID {
+		redactTradeTimelineDetails(order.Events, order.Stage, access.stageAccess[order.Stage])
+	} else if !orderAccess.CanViewTimeline && len(order.Events) > 0 {
 		var relevant *model.TradeOrderStageEvent
 		for index := len(order.Events) - 1; index >= 0; index-- {
 			if order.Events[index].ToStage == order.Stage {
@@ -316,6 +333,27 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		}
 	}
 	return nil
+}
+
+func redactTradeTimelineDetails(events []model.TradeOrderStageEvent, currentStage string, canViewCurrentTask bool) {
+	visibleDetailIndex := -1
+	if canViewCurrentTask {
+		for index := len(events) - 1; index >= 0; index-- {
+			if events[index].ToStage == currentStage {
+				visibleDetailIndex = index
+				break
+			}
+		}
+	}
+	for index := range events {
+		events[index].Snapshot = map[string]any{}
+		if index == visibleDetailIndex {
+			continue
+		}
+		events[index].ActorID = nil
+		events[index].ActorName = ""
+		events[index].Note = ""
+	}
 }
 
 func redactTradeCustomerContact(customer *model.TradeCustomer) {

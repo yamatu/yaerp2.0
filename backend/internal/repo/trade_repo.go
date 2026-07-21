@@ -1840,8 +1840,8 @@ func (r *TradeRepo) CreatePaymentProof(proof *model.TradePaymentProof) error {
 
 func (r *TradeRepo) ListPaymentProofs(orderID int64) ([]model.TradePaymentProof, error) {
 	rows, err := r.db.Query(
-		`SELECT p.id,p.order_id,p.quote_id,p.attachment_id,a.filename,p.note,p.uploaded_by,
-		 COALESCE(u.username,''),p.gallery_directory_id,p.created_at
+		`SELECT p.id,p.order_id,p.quote_id,p.attachment_id,a.filename,a.mime_type,a.size,p.note,p.uploaded_by,
+			 COALESCE(u.username,''),p.gallery_directory_id,p.created_at
 		 FROM trade_customer_payment_proofs p
 		 JOIN attachments a ON a.id=p.attachment_id
 		 LEFT JOIN users u ON u.id=p.uploaded_by
@@ -1857,6 +1857,7 @@ func (r *TradeRepo) ListPaymentProofs(orderID int64) ([]model.TradePaymentProof,
 		var directoryID sql.NullInt64
 		if err := rows.Scan(
 			&proof.ID, &proof.OrderID, &proof.QuoteID, &proof.AttachmentID, &proof.Filename,
+			&proof.MimeType, &proof.Size,
 			&proof.Note, &proof.UploadedBy, &proof.UploadedByName, &directoryID, &proof.CreatedAt,
 		); err != nil {
 			return nil, err

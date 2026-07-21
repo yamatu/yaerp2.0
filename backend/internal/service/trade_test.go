@@ -87,20 +87,29 @@ func TestBuildTradeProfitSummarySameCurrency(t *testing.T) {
 	}
 }
 
-func TestBuildTradeProfitSummaryRequiresCrossCurrencyRate(t *testing.T) {
+func TestBuildTradeProfitSummaryInfersCNYCostRateFromQuoteRate(t *testing.T) {
 	order := &model.TradeOrder{
 		Stage: model.TradeStageCompleted, Currency: "USD", TotalAmount: 1000,
 		QuoteExchangeRateCNY: 7,
 	}
 	item := model.TradeOrderItem{ID: 1, LineNo: 1, Quantity: 10, QuotedPrice: 100, PurchaseCurrency: "CNY", PurchasePrice: 60}
 	profit := buildTradeProfitSummary(order, []model.TradeOrderItem{item})
-	if profit.CostComplete || profit.Finalized || len(profit.Warnings) == 0 {
-		t.Fatalf("missing exchange rate should keep profit provisional: %#v", profit)
+	if !profit.CostComplete || !profit.Finalized || math.Abs(profit.ProductCost-(600.0/7.0)) > 0.0001 {
+		t.Fatalf("CNY purchase cost should use the inverse quote rate: %#v", profit)
 	}
 	item.WorkflowData = map[string]any{"cost_exchange_rate": 0.14}
 	profit = buildTradeProfitSummary(order, []model.TradeOrderItem{item})
 	if !profit.CostComplete || math.Abs(profit.ProductCost-84) > 0.0001 || math.Abs(profit.ProfitAmount-916) > 0.0001 {
 		t.Fatalf("exchange rate was not applied: %#v", profit)
+	}
+}
+
+func TestBuildTradeProfitSummaryRequiresUnknownCrossCurrencyRate(t *testing.T) {
+	order := &model.TradeOrder{Stage: model.TradeStageCompleted, Currency: "USD", TotalAmount: 1000, QuoteExchangeRateCNY: 7}
+	item := model.TradeOrderItem{ID: 1, LineNo: 1, Quantity: 10, QuotedPrice: 100, PurchaseCurrency: "EUR", PurchasePrice: 60}
+	profit := buildTradeProfitSummary(order, []model.TradeOrderItem{item})
+	if profit.CostComplete || profit.Finalized || len(profit.Warnings) == 0 {
+		t.Fatalf("unknown cross-currency rate should keep profit provisional: %#v", profit)
 	}
 }
 
@@ -144,6 +153,22 @@ func TestBuildTradeProfitSummaryCustomerForwarderIgnoresFreight(t *testing.T) {
 	profit := buildTradeProfitSummary(order, items)
 	if !profit.Finalized || profit.FreightRevenue != 0 || profit.ActualFreightCost != 0 || profit.FreightProfit != 0 {
 		t.Fatalf("customer forwarder should not affect freight profit: %#v", profit)
+	}
+}
+
+func TestNormalizeTradeShippingStatus(t *testing.T) {
+	for input, expected := range map[string]string{
+		"":    "未发货",
+		"未到":  "未发货",
+		"待订舱": "未发货",
+		"已发货": "已发货",
+		"到了":  "已发货",
+		"运输中": "已发货",
+		"已签收": "已发货",
+	} {
+		if actual := normalizeTradeShippingStatus(input); actual != expected {
+			t.Fatalf("normalizeTradeShippingStatus(%q) = %q, want %q", input, actual, expected)
+		}
 	}
 }
 
@@ -411,12 +436,12 @@ func TestTradeOrderAdvanceBlockers(t *testing.T) {
 	}
 
 	order.Stage = model.TradeStageShipment
-	order.Shipment = &model.TradeShipment{OrderID: order.ID, Carrier: "物流公司", BookingNo: "BK-001", ShippingStatus: "运输中"}
+	order.Shipment = &model.TradeShipment{OrderID: order.ID, Carrier: "物流公司", BookingNo: "BK-001", ShippingStatus: "未发货"}
 	if blockers := tradeOrderAdvanceBlockers(order); len(blockers) != 3 {
 		t.Fatalf("incomplete shipment should require carrier, arrival and payment proof, got %#v", blockers)
 	}
 	order.Shipment.Carrier = "DHL"
-	order.Shipment.ShippingStatus = "到了"
+	order.Shipment.ShippingStatus = "已发货"
 	order.CustomerQuotes[0].PaymentProofs = []model.TradePaymentProof{{ID: 1, OrderID: order.ID, QuoteID: 1}}
 	if blockers := tradeOrderAdvanceBlockers(order); len(blockers) != 0 {
 		t.Fatalf("complete shipment should have no blockers, got %#v", blockers)

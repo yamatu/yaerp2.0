@@ -5,9 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
-  ArrowRight,
   BarChart3,
-  BellRing,
   Boxes,
   BriefcaseBusiness,
   CalendarDays,
@@ -59,6 +57,8 @@ import { CustomerCombobox } from "@/components/trade/CustomerCombobox";
 import { FolderCombobox } from "@/components/trade/FolderCombobox";
 import { OrderItemCombobox } from "@/components/trade/OrderItemCombobox";
 import { PackingGroupsModal } from "@/components/trade/PackingGroupsModal";
+import { PaymentProofPanel } from "@/components/trade/PaymentProofPanel";
+import { StageFlowActions } from "@/components/trade/StageFlowActions";
 import { SupplierCombobox } from "@/components/trade/SupplierCombobox";
 import { WhatsAppAvatarImage } from "@/components/whatsapp/WhatsAppAvatarImage";
 import api from "@/lib/api";
@@ -655,7 +655,19 @@ const STAGE_DATA_FIELDS: Partial<Record<TradeStage, StageDataField[]>> = {
   ],
 };
 
-const SHIPMENT_STATUSES = ["未到", "到了"];
+const SHIPMENT_STATUSES = ["未发货", "已发货"];
+
+function normalizeShipmentStatus(status?: string) {
+  const value = status?.trim() || "";
+  if (
+    ["已发货", "到了", "已离港", "运输中", "已到港", "已签收"].includes(
+      value,
+    )
+  ) {
+    return "已发货";
+  }
+  return "未发货";
+}
 
 function emptyStageShipmentDraft(order?: TradeOrder): StageShipmentDraft {
   return {
@@ -665,11 +677,9 @@ function emptyStageShipmentDraft(order?: TradeOrder): StageShipmentDraft {
     etd: order?.shipment?.etd?.slice(0, 10) || "",
     eta: order?.shipment?.eta?.slice(0, 10) || "",
     bl_no: order?.shipment?.bl_no || "",
-    shipping_status: ["未到", "到了"].includes(
-      order?.shipment?.shipping_status || "",
-    )
-      ? order?.shipment?.shipping_status || "未到"
-      : "未到",
+    shipping_status: normalizeShipmentStatus(
+      order?.shipment?.shipping_status,
+    ),
     actual_freight_currency: order?.shipment?.actual_freight_currency || "CNY",
     actual_freight_amount:
       (order?.shipment?.actual_freight_amount || 0) > 0
@@ -2560,24 +2570,32 @@ export default function TradeWorkspacePage() {
     }
   };
 
-  const uploadCustomerPaymentProof = async (
+  const uploadCustomerPaymentProofs = async (
     quoteID: number,
-    file: File,
+    files: File[],
   ) => {
-    if (!detailOrder) return;
+    if (!detailOrder || files.length === 0) return;
     setUploadingPaymentProof(true);
     setError("");
     try {
-      const body = new FormData();
-      body.append("file", file);
-      const response = await api.form<TradePaymentProof>(
-        `/trade/orders/${detailOrder.id}/customer-quotes/${quoteID}/payment-proofs`,
-        body,
-      );
-      if (response.code !== 0)
-        throw new Error(response.message || "上传付款凭证失败");
+      for (const file of files) {
+        const body = new FormData();
+        body.append("file", file);
+        const response = await api.form<TradePaymentProof>(
+          `/trade/orders/${detailOrder.id}/customer-quotes/${quoteID}/payment-proofs`,
+          body,
+        );
+        if (response.code !== 0)
+          throw new Error(
+            response.message || `上传付款凭证 ${file.name} 失败`,
+          );
+      }
       await loadOrderDetail(detailOrder.id, false);
-      setNotice("客户付款凭证已保存到图库并关联报价轮次。");
+      setNotice(
+        files.length > 1
+          ? `已上传 ${files.length} 份付款凭证并关联报价轮次。`
+          : "客户付款凭证已上传并关联报价轮次。",
+      );
     } catch (proofError) {
       setError(
         proofError instanceof Error ? proofError.message : "上传付款凭证失败",
@@ -6554,10 +6572,11 @@ export default function TradeWorkspacePage() {
                     {detailOrder.access && (
                       <div className="border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-medium text-slate-600">
                         {detailOrder.access.scope_label} · 可查看{" "}
-                        {detailOrder.access.visible_sheet_names.length}{" "}
+                        {(detailOrder.access.visible_sheet_names || []).length}{" "}
                         张流程工作表
-                        {detailOrder.access.editable_sheet_names.length > 0 &&
-                          `，可编辑 ${detailOrder.access.editable_sheet_names.join("、")}`}
+                        {(detailOrder.access.editable_sheet_names || []).length >
+                          0 &&
+                          `，可编辑 ${(detailOrder.access.editable_sheet_names || []).join("、")}`}
                       </div>
                     )}
                     <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-sky-50/70 px-4 py-2.5 text-xs text-sky-800">
@@ -7326,45 +7345,17 @@ export default function TradeWorkspacePage() {
                                             </button>
                                           )}
                                         </div>
-                                        <div className="mt-2 flex flex-wrap items-center gap-2">
-                                          {(quote.payment_proofs || []).map((proof) => (
-                                            <a
-                                              key={proof.id}
-                                              href={proof.attachment_url}
-                                              target="_blank"
-                                              rel="noreferrer"
-                                              className="inline-flex items-center gap-1.5 rounded-md bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
-                                            >
-                                              <ImagePlus className="h-3.5 w-3.5" />
-                                              {proof.filename || "付款凭证"}
-                                            </a>
-                                          ))}
-                                          {detailOrder.can_operate_stage && (
-                                            <label className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border border-slate-200 px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
-                                              {uploadingPaymentProof ? (
-                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                              ) : (
-                                                <ImagePlus className="h-3.5 w-3.5" />
-                                              )}
-                                              上传付款截图
-                                              <input
-                                                type="file"
-                                                accept="image/*"
-                                                className="hidden"
-                                                disabled={uploadingPaymentProof}
-                                                onChange={(event) => {
-                                                  const file = event.target.files?.[0];
-                                                  event.currentTarget.value = "";
-                                                  if (file)
-                                                    void uploadCustomerPaymentProof(
-                                                      quote.id,
-                                                      file,
-                                                    );
-                                                }}
-                                              />
-                                            </label>
-                                          )}
-                                        </div>
+                                        <PaymentProofPanel
+                                          proofs={quote.payment_proofs || []}
+                                          canUpload={detailOrder.can_operate_stage}
+                                          uploading={uploadingPaymentProof}
+                                          onUpload={(files) =>
+                                            uploadCustomerPaymentProofs(
+                                              quote.id,
+                                              files,
+                                            )
+                                          }
+                                        />
                                       </div>
                                     )}
                                   </article>
@@ -7409,58 +7400,26 @@ export default function TradeWorkspacePage() {
                                     ` · ${acceptedQuote.payment_currency || acceptedQuote.currency} ${acceptedQuote.paid_amount}`}
                                 </span>
                               </div>
-                              <div className="mt-3 flex flex-wrap items-center gap-2">
-                                {(acceptedQuote.payment_proofs || []).map(
-                                  (proof) => (
-                                    <a
-                                      key={proof.id}
-                                      href={proof.attachment_url}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-xs text-slate-600 shadow-sm"
-                                    >
-                                      <ImagePlus className="h-3.5 w-3.5" />
-                                      {proof.filename || "付款凭证"}
-                                    </a>
-                                  ),
-                                )}
-                                {detailOrder.can_operate_stage && (
-                                  <>
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        openPaymentEditor(acceptedQuote)
-                                      }
-                                      className="h-8 rounded-lg border border-emerald-200 bg-white px-3 text-xs font-semibold text-emerald-700"
-                                    >
-                                      登记付款金额
-                                    </button>
-                                    <label className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600">
-                                      {uploadingPaymentProof ? (
-                                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                      ) : (
-                                        <ImagePlus className="h-3.5 w-3.5" />
-                                      )}
-                                      上传付款截图
-                                      <input
-                                        type="file"
-                                        accept="image/*"
-                                        className="hidden"
-                                        disabled={uploadingPaymentProof}
-                                        onChange={(event) => {
-                                          const file = event.target.files?.[0];
-                                          event.currentTarget.value = "";
-                                          if (file)
-                                            void uploadCustomerPaymentProof(
-                                              acceptedQuote.id,
-                                              file,
-                                            );
-                                        }}
-                                      />
-                                    </label>
-                                  </>
-                                )}
-                              </div>
+                              {detailOrder.can_operate_stage && (
+                                <button
+                                  type="button"
+                                  onClick={() => openPaymentEditor(acceptedQuote)}
+                                  className="mt-3 h-8 rounded-lg border border-emerald-200 bg-white px-3 text-xs font-semibold text-emerald-700"
+                                >
+                                  登记付款金额
+                                </button>
+                              )}
+                              <PaymentProofPanel
+                                proofs={acceptedQuote.payment_proofs || []}
+                                canUpload={detailOrder.can_operate_stage}
+                                uploading={uploadingPaymentProof}
+                                onUpload={(files) =>
+                                  uploadCustomerPaymentProofs(
+                                    acceptedQuote.id,
+                                    files,
+                                  )
+                                }
+                              />
                             </section>
                           );
                         })()}
@@ -7876,6 +7835,60 @@ export default function TradeWorkspacePage() {
                           </div>
                         </div>
                       )}
+                      {detailViewStage === detailOrder.stage &&
+                        detailOrder.can_operate_stage &&
+                        (detailOrder.can_return ||
+                          nextStage(detailOrder.stage)) && (
+                          <StageFlowActions
+                            positionName={
+                              detailOrder.required_position_name ||
+                              "业务负责人"
+                            }
+                            blockers={detailOrder.advance_blockers || []}
+                            note={advanceNote}
+                            flowing={flowing}
+                            returnLabel={
+                              previousStage(detailOrder.stage)
+                                ? stageDefinition(
+                                    previousStage(detailOrder.stage)!,
+                                  )?.label
+                                : undefined
+                            }
+                            advanceLabel={
+                              nextStage(detailOrder.stage)
+                                ? stageDefinition(nextStage(detailOrder.stage)!)
+                                    ?.label
+                                : undefined
+                            }
+                            showRework={[
+                              "receiving",
+                              "inspection",
+                              "packing",
+                              "shipment",
+                              "completed",
+                            ].includes(detailOrder.stage)}
+                            onNoteChange={setAdvanceNote}
+                            onReturn={
+                              detailOrder.can_return &&
+                              previousStage(detailOrder.stage)
+                                ? () =>
+                                    void flowOrder(
+                                      previousStage(detailOrder.stage)!,
+                                    )
+                                : undefined
+                            }
+                            onAdvance={
+                              nextStage(detailOrder.stage)
+                                ? () =>
+                                    void flowOrder(nextStage(detailOrder.stage)!)
+                                : undefined
+                            }
+                            onRework={() => {
+                              setReturnToPurchaseReason("");
+                              setReturnToPurchaseOpen(true);
+                            }}
+                          />
+                        )}
                       <div className="mt-6 flex items-center justify-between gap-3">
                         <div>
                           <h3 className="text-sm font-semibold">
@@ -7946,141 +7959,15 @@ export default function TradeWorkspacePage() {
                                   </span>
                                 </div>
                                 <p className="mt-1 text-xs leading-5 text-slate-500">
-                                  {event.note} · {event.actor_name || "系统"}
+                                  {event.note || "阶段状态已更新"}
+                                  {event.note &&
+                                    ` · ${event.actor_name || "系统"}`}
                                 </p>
                               </div>
                             </div>
                           );
                         })}
                       </div>
-                      {detailViewStage === detailOrder.stage &&
-                        detailOrder.can_operate_stage &&
-                        (detailOrder.can_return ||
-                          nextStage(detailOrder.stage)) && (
-                          <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                            <div className="flex items-center justify-between gap-3">
-                              <div>
-                                <div className="text-sm font-semibold">
-                                  流程交接
-                                </div>
-                                <p className="mt-0.5 text-xs text-slate-400">
-                                  当前由“
-                                  {detailOrder.required_position_name ||
-                                    "业务负责人"}
-                                  ”处理；系统会先校验本环节资料，交接后记录时间线并通知目标职位。
-                                </p>
-                              </div>
-                              <BellRing className="h-5 w-5 text-slate-500" />
-                            </div>
-                            {(detailOrder.advance_blockers || []).length >
-                              0 && (
-                              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
-                                <div className="flex items-center gap-2 text-sm font-semibold text-amber-800">
-                                  <ClipboardCheck className="h-4 w-4" />
-                                  推进前还需完成
-                                </div>
-                                <ul className="mt-1.5 space-y-1 text-xs leading-5 text-amber-700">
-                                  {(detailOrder.advance_blockers || []).map(
-                                    (blocker) => (
-                                      <li key={blocker}>· {blocker}</li>
-                                    ),
-                                  )}
-                                </ul>
-                              </div>
-                            )}
-                            <textarea
-                              value={advanceNote}
-                              onChange={(event) =>
-                                setAdvanceNote(event.target.value)
-                              }
-                              className="mt-3 min-h-20 w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none"
-                              placeholder="填写交接说明、退回原因或下一环节注意事项（可选）"
-                            />
-                            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-                              <div className="flex flex-wrap gap-2">
-                                {detailOrder.can_return &&
-                                  previousStage(detailOrder.stage) && (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        void flowOrder(
-                                          previousStage(detailOrder.stage)!,
-                                        )
-                                      }
-                                      disabled={flowing}
-                                      className="inline-flex h-9 items-center gap-2 rounded-lg border border-amber-200 bg-white px-4 text-sm font-semibold text-amber-700 disabled:opacity-40"
-                                    >
-                                      {flowing ? (
-                                        <Loader2 className="h-4 w-4 animate-spin" />
-                                      ) : (
-                                        <ArrowLeft className="h-4 w-4" />
-                                      )}
-                                      退回
-                                      {
-                                        stageDefinition(
-                                          previousStage(detailOrder.stage)!,
-                                        )?.label
-                                      }
-                                    </button>
-                                  )}
-                                {[
-                                  "receiving",
-                                  "inspection",
-                                  "packing",
-                                  "shipment",
-                                  "completed",
-                                ].includes(detailOrder.stage) && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setReturnToPurchaseReason("");
-                                      setReturnToPurchaseOpen(true);
-                                    }}
-                                    disabled={flowing}
-                                    className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-40"
-                                  >
-                                    <RotateCcw className="h-4 w-4" />
-                                    采购/发货异常
-                                  </button>
-                                )}
-                              </div>
-                              {nextStage(detailOrder.stage) && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    void flowOrder(
-                                      nextStage(detailOrder.stage)!,
-                                    )
-                                  }
-                                  disabled={
-                                    flowing ||
-                                    (detailOrder.advance_blockers || [])
-                                      .length > 0
-                                  }
-                                  title={
-                                    (detailOrder.advance_blockers || [])
-                                      .length > 0
-                                      ? "请先完成本环节必填资料"
-                                      : "推进到下一业务环节"
-                                  }
-                                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
-                                >
-                                  {flowing ? (
-                                    <Loader2 className="h-4 w-4 animate-spin" />
-                                  ) : (
-                                    <ArrowRight className="h-4 w-4" />
-                                  )}
-                                  推进到
-                                  {
-                                    stageDefinition(
-                                      nextStage(detailOrder.stage)!,
-                                    )?.label
-                                  }
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        )}
                     </div>
                   </>
                 )}

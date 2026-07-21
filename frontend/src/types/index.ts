@@ -1330,6 +1330,8 @@ export interface TradePaymentProof {
   attachment_url: string;
   thumbnail_url: string;
   filename: string;
+  mime_type: string;
+  size: number;
   note: string;
   uploaded_by: number;
   uploaded_by_name: string;
@@ -1407,6 +1409,7 @@ export interface TradeAccessProfile {
   position_names: string[];
   allowed_stages: TradeStage[];
   can_view_all_orders: boolean;
+  can_view_order_progress: boolean;
   can_view_customers: boolean;
   can_create_customers: boolean;
   can_create_orders: boolean;

@@ -227,6 +227,8 @@ type TradePaymentProof struct {
 	AttachmentURL      string    `json:"attachment_url"`
 	ThumbnailURL       string    `json:"thumbnail_url"`
 	Filename           string    `json:"filename"`
+	MimeType           string    `json:"mime_type"`
+	Size               int64     `json:"size"`
 	Note               string    `json:"note"`
 	UploadedBy         int64     `json:"uploaded_by"`
 	UploadedByName     string    `json:"uploaded_by_name"`
@@ -297,19 +299,20 @@ type TradePIProfile struct {
 }
 
 type TradeAccessProfile struct {
-	UserID             int64    `json:"user_id"`
-	IsAdmin            bool     `json:"is_admin"`
-	IsManager          bool     `json:"is_manager"`
-	PositionCodes      []string `json:"position_codes"`
-	PositionNames      []string `json:"position_names"`
-	AllowedStages      []string `json:"allowed_stages"`
-	CanViewAllOrders   bool     `json:"can_view_all_orders"`
-	CanViewCustomers   bool     `json:"can_view_customers"`
-	CanCreateCustomers bool     `json:"can_create_customers"`
-	CanCreateOrders    bool     `json:"can_create_orders"`
-	CanViewSuppliers   bool     `json:"can_view_suppliers"`
-	CanManageSuppliers bool     `json:"can_manage_suppliers"`
-	ScopeLabel         string   `json:"scope_label"`
+	UserID               int64    `json:"user_id"`
+	IsAdmin              bool     `json:"is_admin"`
+	IsManager            bool     `json:"is_manager"`
+	PositionCodes        []string `json:"position_codes"`
+	PositionNames        []string `json:"position_names"`
+	AllowedStages        []string `json:"allowed_stages"`
+	CanViewAllOrders     bool     `json:"can_view_all_orders"`
+	CanViewOrderProgress bool     `json:"can_view_order_progress"`
+	CanViewCustomers     bool     `json:"can_view_customers"`
+	CanCreateCustomers   bool     `json:"can_create_customers"`
+	CanCreateOrders      bool     `json:"can_create_orders"`
+	CanViewSuppliers     bool     `json:"can_view_suppliers"`
+	CanManageSuppliers   bool     `json:"can_manage_suppliers"`
+	ScopeLabel           string   `json:"scope_label"`
 }
 
 type TradeOrderAccess struct {

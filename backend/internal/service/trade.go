@@ -145,7 +145,7 @@ func (s *TradeService) Dashboard(userID int64) (*model.TradeDashboard, error) {
 		return nil, err
 	}
 	return s.repo.DashboardScoped(
-		userID, access.profile.CanViewAllOrders, access.profile.AllowedStages,
+		userID, access.profile.CanViewAllOrders, tradeOrderScopeStages(access),
 		access.profile.CanViewCustomers,
 	)
 }
@@ -672,7 +672,7 @@ func (s *TradeService) ListOrders(userID int64, filter model.TradeOrderFilter) (
 	if err != nil {
 		return nil, err
 	}
-	orders, err := s.repo.ListOrdersScoped(userID, access.profile.CanViewAllOrders, access.profile.AllowedStages, filter)
+	orders, err := s.repo.ListOrdersScoped(userID, access.profile.CanViewAllOrders, tradeOrderScopeStages(access), filter)
 	if err != nil {
 		return nil, err
 	}
@@ -1081,7 +1081,7 @@ func (s *TradeService) UpdateStageData(userID, orderID int64, request *model.Upd
 		shipment := &model.TradeShipment{
 			OrderID: orderID, BookingNo: strings.TrimSpace(request.Shipment.BookingNo),
 			Carrier: strings.TrimSpace(request.Shipment.Carrier), VesselFlight: strings.TrimSpace(request.Shipment.VesselFlight),
-			BLNo: strings.TrimSpace(request.Shipment.BLNo), ShippingStatus: strings.TrimSpace(request.Shipment.ShippingStatus),
+			BLNo: strings.TrimSpace(request.Shipment.BLNo), ShippingStatus: normalizeTradeShippingStatus(request.Shipment.ShippingStatus),
 			ActualFreightCurrency:  strings.ToUpper(strings.TrimSpace(request.Shipment.ActualFreightCurrency)),
 			ActualFreightAmount:    nonNegativeTradeValue(request.Shipment.ActualFreightAmount),
 			ActualFreightToCNYRate: nonNegativeTradeValue(request.Shipment.ActualFreightToCNYRate),
@@ -1107,9 +1107,6 @@ func (s *TradeService) UpdateStageData(userID, orderID int64, request *model.Upd
 		shipment.ETA, err = parseTradeDate(request.Shipment.ETA)
 		if err != nil {
 			return nil, fmt.Errorf("ETA 日期格式无效")
-		}
-		if shipment.ShippingStatus == "" {
-			shipment.ShippingStatus = "待订舱"
 		}
 		if err := s.repo.UpsertShipment(shipment); err != nil {
 			return nil, err
@@ -1246,6 +1243,14 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		warnings[message] = struct{}{}
 		summary.Warnings = append(summary.Warnings, message)
 	}
+	quoteRateCNY := nonNegativeTradeValue(order.QuoteExchangeRateCNY)
+	if strings.EqualFold(currency, "CNY") {
+		quoteRateCNY = 1
+	} else if quoteRateCNY <= 0 {
+		summary.CNYComplete = false
+		addWarning(fmt.Sprintf("缺少 %s 兑人民币的报价汇率", currency))
+	}
+	summary.ExchangeRateCNY = quoteRateCNY
 	if len(items) == 0 {
 		summary.CostComplete = false
 		addWarning("订单没有产品明细")
@@ -1263,21 +1268,19 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 			addWarning(fmt.Sprintf("第 %d 行尚未录入对客报价", item.LineNo))
 		}
 		purchaseCurrency := strings.ToUpper(firstNonEmptyTrade(item.PurchaseCurrency, currency))
-		rate := tradeWorkflowFloat(&item, "cost_exchange_rate")
-		if strings.EqualFold(purchaseCurrency, currency) {
-			if rate <= 0 {
-				rate = 1
-			}
-		} else if rate <= 0 {
+		rate := tradeProfitExchangeRate(currency, quoteRateCNY, &item)
+		if rate <= 0 {
 			lineComplete = false
-			rate = 1
 			addWarning(fmt.Sprintf("第 %d 行缺少 %s 转 %s 的成本换算率", item.LineNo, purchaseCurrency, currency))
 		}
 		if item.PurchasePrice <= 0 {
 			lineComplete = false
 			addWarning(fmt.Sprintf("第 %d 行尚未录入采购价", item.LineNo))
 		}
-		purchaseCost := quantity * nonNegativeTradeValue(item.PurchasePrice) * rate
+		purchaseCost := 0.0
+		if rate > 0 {
+			purchaseCost = quantity * nonNegativeTradeValue(item.PurchasePrice) * rate
+		}
 		lineProfit := revenue - purchaseCost
 		lineMargin := 0.0
 		if revenue != 0 {
@@ -1309,15 +1312,6 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 	if order.TotalAmount > 0 {
 		summary.Revenue = order.TotalAmount
 	}
-	quoteRateCNY := nonNegativeTradeValue(order.QuoteExchangeRateCNY)
-	if strings.EqualFold(currency, "CNY") {
-		quoteRateCNY = 1
-	} else if quoteRateCNY <= 0 {
-		summary.CNYComplete = false
-		addWarning(fmt.Sprintf("缺少 %s 兑人民币的报价汇率", currency))
-	}
-	summary.ExchangeRateCNY = quoteRateCNY
-
 	actualFreightCNY := 0.0
 	if freightMode == "quoted" {
 		actualCurrency := strings.ToUpper(firstNonEmptyTrade(order.ActualFreightCurrency, "CNY"))
@@ -1377,13 +1371,20 @@ func tradeStageAtOrAfter(stage, target string) bool {
 	return stageIndex >= 0 && targetIndex >= 0 && stageIndex >= targetIndex
 }
 
-func tradeProfitExchangeRate(orderCurrency string, item *model.TradeOrderItem) float64 {
+func tradeProfitExchangeRate(orderCurrency string, quoteRateCNY float64, item *model.TradeOrderItem) float64 {
 	rate := tradeWorkflowFloat(item, "cost_exchange_rate")
 	if rate > 0 {
 		return rate
 	}
-	if item == nil || strings.EqualFold(firstNonEmptyTrade(item.PurchaseCurrency, orderCurrency), orderCurrency) {
+	if item == nil {
 		return 1
+	}
+	purchaseCurrency := strings.ToUpper(firstNonEmptyTrade(item.PurchaseCurrency, orderCurrency))
+	if strings.EqualFold(purchaseCurrency, orderCurrency) {
+		return 1
+	}
+	if purchaseCurrency == "CNY" && quoteRateCNY > 0 {
+		return 1 / quoteRateCNY
 	}
 	return 0
 }
@@ -1393,6 +1394,15 @@ func tradeFreightModeLabel(mode string) string {
 		return "我方报价运费"
 	}
 	return "客户自有货代"
+}
+
+func normalizeTradeShippingStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "已发货", "到了", "已离港", "运输中", "已到港", "已签收":
+		return "已发货"
+	default:
+		return "未发货"
+	}
 }
 
 func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.AdvanceTradeOrderRequest) (*model.TradeOrder, error) {
@@ -2045,31 +2055,39 @@ func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(strings.ToLower(attachment.MimeType), "image/") {
+	mimeType := strings.ToLower(strings.TrimSpace(attachment.MimeType))
+	isImage := strings.HasPrefix(mimeType, "image/")
+	isPDF := mimeType == "application/pdf" || (mimeType == "" && strings.HasSuffix(strings.ToLower(header.Filename), ".pdf"))
+	if !isImage && !isPDF {
 		_ = s.uploadSvc.DeleteFile(attachment.ID)
-		return nil, fmt.Errorf("付款凭证必须是图片")
+		return nil, fmt.Errorf("付款凭证仅支持图片或 PDF")
 	}
-	directoryID := order.PaymentGalleryDirectoryID
-	if directoryID == nil {
-		visibility := "private"
-		directory, createErr := s.uploadSvc.CreateGalleryDirectory(userID, "付款凭证 - "+order.OrderNo, nil, &visibility)
-		if createErr != nil {
-			_ = s.uploadSvc.DeleteFile(attachment.ID)
-			return nil, createErr
+	effectiveAttachmentID := attachment.ID
+	var directoryID *int64
+	if isImage {
+		directoryID = order.PaymentGalleryDirectoryID
+		if directoryID == nil {
+			visibility := "private"
+			directory, createErr := s.uploadSvc.CreateGalleryDirectory(userID, "付款凭证 - "+order.OrderNo, nil, &visibility)
+			if createErr != nil {
+				_ = s.uploadSvc.DeleteFile(attachment.ID)
+				return nil, createErr
+			}
+			directoryID = &directory.ID
+			if err := s.repo.SetPaymentGalleryDirectory(orderID, directory.ID); err != nil {
+				_ = s.uploadSvc.DeleteFile(attachment.ID)
+				return nil, err
+			}
 		}
-		directoryID = &directory.ID
-		if err := s.repo.SetPaymentGalleryDirectory(orderID, directory.ID); err != nil {
+		var duplicate bool
+		effectiveAttachmentID, duplicate, err = s.uploadSvc.SaveImageToGalleryDeduplicated(attachment.ID, directoryID, nil, userID)
+		if err != nil {
 			_ = s.uploadSvc.DeleteFile(attachment.ID)
 			return nil, err
 		}
-	}
-	effectiveAttachmentID, duplicate, err := s.uploadSvc.SaveImageToGalleryDeduplicated(attachment.ID, directoryID, nil, userID)
-	if err != nil {
-		_ = s.uploadSvc.DeleteFile(attachment.ID)
-		return nil, err
-	}
-	if duplicate && effectiveAttachmentID != attachment.ID {
-		_ = s.uploadSvc.DeleteFile(attachment.ID)
+		if duplicate && effectiveAttachmentID != attachment.ID {
+			_ = s.uploadSvc.DeleteFile(attachment.ID)
+		}
 	}
 	proof := &model.TradePaymentProof{
 		OrderID: orderID, QuoteID: quoteID, AttachmentID: effectiveAttachmentID,
@@ -2083,6 +2101,8 @@ func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64
 	}
 	if canonical, canonicalErr := s.uploadSvc.GetAttachment(effectiveAttachmentID); canonicalErr == nil {
 		proof.Filename = canonical.Filename
+		proof.MimeType = canonical.MimeType
+		proof.Size = canonical.Size
 	}
 	proof.AttachmentURL, _ = s.uploadSvc.GetFileURL(effectiveAttachmentID)
 	proof.ThumbnailURL = s.uploadSvc.GetThumbnailURL(effectiveAttachmentID, 480)
@@ -2754,7 +2774,7 @@ func (s *TradeService) syncChangedTradeRows(userID, orderID, sheetID int64, shee
 			shipment := &model.TradeShipment{
 				OrderID: orderID, BookingNo: tradeString(values["booking_no"]), Carrier: tradeString(values["carrier"]),
 				VesselFlight: tradeString(values["vessel_flight"]), BLNo: tradeString(values["bl_no"]),
-				ShippingStatus:         firstNonEmptyTrade(tradeString(values["shipping_status"]), "待订舱"),
+				ShippingStatus:         normalizeTradeShippingStatus(tradeString(values["shipping_status"])),
 				ActualFreightCurrency:  strings.ToUpper(firstNonEmptyTrade(tradeString(values["actual_freight_currency"]), "CNY")),
 				ActualFreightAmount:    nonNegativeTradeValue(tradeFloat(values["actual_freight_amount"])),
 				ActualFreightToCNYRate: nonNegativeTradeValue(tradeFloat(values["actual_freight_to_cny_rate"])),
@@ -3150,9 +3170,9 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 		if strings.TrimSpace(shipment.BookingNo) == "" {
 			blockers = append(blockers, "请填写物流订单号")
 		}
-		status := strings.TrimSpace(shipment.ShippingStatus)
-		if status != "到了" {
-			blockers = append(blockers, "物流状态更新为“到了”后才能完成订单")
+		status := normalizeTradeShippingStatus(shipment.ShippingStatus)
+		if status != "已发货" {
+			blockers = append(blockers, "物流状态更新为“已发货”后才能完成订单")
 		}
 		paymentProofFound := false
 		for _, quote := range order.CustomerQuotes {
@@ -3428,7 +3448,7 @@ func tradeWorkbookDefinitionsWithContext(
 			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
 			"quantity": item.Quantity, "unit": item.Unit, "supplier": supplierName, "supplier_quote": supplierQuotePrice,
 			"purchase_currency": firstNonEmptyTrade(item.PurchaseCurrency, order.Currency),
-			"purchase_price":    item.PurchasePrice, "cost_exchange_rate": tradeProfitExchangeRate(order.Currency, &item),
+			"purchase_price":    item.PurchasePrice, "cost_exchange_rate": tradeProfitExchangeRate(order.Currency, order.QuoteExchangeRateCNY, &item),
 			"lead_time_days":  selectedQuote.LeadTimeDays,
 			"purchase_status": firstNonEmptyTrade(tradeWorkflowString(&item, "purchase_status"), "待采购"),
 		})
@@ -3532,7 +3552,7 @@ func tradeWorkbookDefinitionsWithContext(
 			tradeColumn("vessel_flight", "船名/航班", "text", 150), tradeColumn("etd", "ETD", "date", 100),
 			tradeColumn("eta", "ETA", "date", 100), tradeColumn("bl_no", "提单号", "text", 150),
 			tradeColumn("destination", "目的港", "text", 160),
-			tradeSelectColumn("shipping_status", "运输状态", []string{"待订舱", "已订舱", "已装柜", "已离港", "运输中", "已到港", "已签收"}, standardStatusColors(), false, 110),
+			tradeSelectColumn("shipping_status", "运输状态", []string{"未发货", "已发货"}, standardStatusColors(), false, 110),
 			tradeColumn("actual_freight_currency", "实际运费币种", "text", 110),
 			tradeColumn("actual_freight_amount", "实际运费", "number", 100),
 			tradeColumn("actual_freight_to_cny_rate", "实际运费兑人民币", "number", 135),
@@ -3761,7 +3781,7 @@ func nonNegativeTradeDifference(total, completed float64) float64 {
 func tradeShipmentRow(order *model.TradeOrder, shipment *model.TradeShipment) map[string]any {
 	row := map[string]any{
 		"booking_no": "", "carrier": "", "vessel_flight": "", "etd": "", "eta": "", "bl_no": "",
-		"destination": order.DestinationPort, "shipping_status": "待订舱",
+		"destination": order.DestinationPort, "shipping_status": "未发货",
 		"actual_freight_currency": "CNY", "actual_freight_amount": 0, "actual_freight_to_cny_rate": 1,
 		"actual_freight_notes": "", "notes": "",
 	}
@@ -3774,7 +3794,7 @@ func tradeShipmentRow(order *model.TradeOrder, shipment *model.TradeShipment) ma
 	row["etd"] = formatTradeDate(shipment.ETD)
 	row["eta"] = formatTradeDate(shipment.ETA)
 	row["bl_no"] = shipment.BLNo
-	row["shipping_status"] = shipment.ShippingStatus
+	row["shipping_status"] = normalizeTradeShippingStatus(shipment.ShippingStatus)
 	row["actual_freight_currency"] = shipment.ActualFreightCurrency
 	row["actual_freight_amount"] = shipment.ActualFreightAmount
 	row["actual_freight_to_cny_rate"] = shipment.ActualFreightToCNYRate

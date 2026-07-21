@@ -23,6 +23,45 @@ func TestCanViewTradeOrderUsesOwnerOrCurrentStage(t *testing.T) {
 	}
 }
 
+func TestCanViewTradeOrderAllowsConfiguredPositionsToFollowProgress(t *testing.T) {
+	service := &TradeService{}
+	access := &tradeUserAccess{
+		profile:       model.TradeAccessProfile{CanViewOrderProgress: true},
+		positionCodes: map[string]bool{"sales": true},
+		stageAccess:   map[string]bool{model.TradeStageInquiry: true},
+	}
+	order := &model.TradeOrder{OwnerID: 9, Stage: model.TradeStagePacking}
+	if !service.canViewTradeOrder(7, order, access) {
+		t.Fatal("configured trade position should be able to follow order progress after handoff")
+	}
+	stages := tradeOrderScopeStages(access)
+	for _, wanted := range []string{model.TradeStageInquiry, model.TradeStagePacking, model.TradeStageCompleted, model.TradeStageCancelled} {
+		if !containsTradeLabel(stages, wanted) {
+			t.Fatalf("progress scope should include stage %q: %#v", wanted, stages)
+		}
+	}
+}
+
+func TestRedactTradeTimelineDetailsKeepsOnlyCurrentTaskHandoff(t *testing.T) {
+	actorID := int64(5)
+	events := []model.TradeOrderStageEvent{
+		{ID: 1, FromStage: model.TradeStageInquiry, ToStage: model.TradeStageSupplierQuote, ActorID: &actorID, ActorName: "sales", Note: "private inquiry note", Snapshot: map[string]any{"price": 10}},
+		{ID: 2, FromStage: model.TradeStageSupplierQuote, ToStage: model.TradeStageQuotation, ActorID: &actorID, ActorName: "quotation", Note: "current handoff note", Snapshot: map[string]any{"supplier": "private"}},
+	}
+	redactTradeTimelineDetails(events, model.TradeStageQuotation, true)
+	if events[0].Note != "" || events[0].ActorID != nil || events[0].ActorName != "" || len(events[0].Snapshot) != 0 {
+		t.Fatalf("historic timeline details should be redacted: %#v", events[0])
+	}
+	if events[1].Note != "current handoff note" || events[1].ActorName != "quotation" || len(events[1].Snapshot) != 0 {
+		t.Fatalf("current task handoff should keep note and actor but hide snapshot: %#v", events[1])
+	}
+
+	redactTradeTimelineDetails(events, model.TradeStagePacking, false)
+	if events[1].Note != "" || events[1].ActorID != nil || events[1].ActorName != "" {
+		t.Fatalf("progress-only timeline must not expose task details: %#v", events[1])
+	}
+}
+
 func TestTradeOverviewColumnScopeMasksSensitiveFields(t *testing.T) {
 	matrix := emptyPermissionMatrix()
 	matrix.Sheet.CanView = true

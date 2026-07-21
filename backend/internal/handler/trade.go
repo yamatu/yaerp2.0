@@ -595,7 +595,7 @@ func (h *TradeHandler) UploadCustomerPaymentProof(c *gin.Context) {
 	}
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
-		response.BadRequest(c, "请选择付款凭证图片")
+		response.BadRequest(c, "请选择付款凭证图片或 PDF")
 		return
 	}
 	defer file.Close()
