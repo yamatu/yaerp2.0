@@ -125,6 +125,20 @@ func (s *TradeService) isAdmin(userID int64) (bool, error) {
 	return s.permSvc.IsAdmin(userID)
 }
 
+func (s *TradeService) ensureWritableTradeFolder(userID int64, folderID *int64) error {
+	if folderID == nil {
+		return nil
+	}
+	canWrite, err := s.permSvc.CanWriteFolder(*folderID, userID)
+	if err != nil {
+		return err
+	}
+	if !canWrite {
+		return fmt.Errorf("所选工作簿文件夹不存在或没有写入权限")
+	}
+	return nil
+}
+
 func (s *TradeService) Dashboard(userID int64) (*model.TradeDashboard, error) {
 	access, err := s.loadTradeUserAccess(userID)
 	if err != nil {
@@ -325,6 +339,9 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 	if request == nil {
 		return nil, fmt.Errorf("客户资料不能为空")
 	}
+	if err := s.ensureWritableTradeFolder(userID, request.WorkbookFolderID); err != nil {
+		return nil, err
+	}
 	name := strings.TrimSpace(request.Name)
 	if name == "" {
 		return nil, fmt.Errorf("客户名称不能为空")
@@ -367,7 +384,8 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 		ContactName: strings.TrimSpace(request.ContactName), Email: strings.TrimSpace(request.Email),
 		Phone: phone, Source: source, CustomerLevel: level, WhatsAppAccountID: request.WhatsAppAccountID,
 		WhatsAppChatID: request.WhatsAppChatID, WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
-		AvatarURL: strings.TrimSpace(request.AvatarURL), Tags: normalizeTradeTags(request.Tags), Notes: strings.TrimSpace(request.Notes),
+		AvatarURL: strings.TrimSpace(request.AvatarURL), WorkbookFolderID: request.WorkbookFolderID,
+		Tags: normalizeTradeTags(request.Tags), Notes: strings.TrimSpace(request.Notes),
 	}
 	if customer.CompanyName == "" {
 		customer.CompanyName = customer.Name
@@ -431,6 +449,9 @@ func (s *TradeService) UpdateCustomer(userID, customerID int64, request *model.U
 	if err != nil {
 		return nil, err
 	}
+	if err := s.ensureWritableTradeFolder(userID, request.WorkbookFolderID); err != nil {
+		return nil, err
+	}
 	updated, err := normalizeTradeCustomerUpdate(request)
 	if err != nil {
 		return nil, err
@@ -489,7 +510,7 @@ func normalizeTradeCustomerUpdate(request *model.UpdateTradeCustomerRequest) (*m
 		WhatsAppChatID:   strings.TrimSpace(request.WhatsAppChatID),
 		WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
 		AvatarURL:        strings.TrimSpace(request.AvatarURL), Tags: normalizeTradeTags(request.Tags),
-		Notes: strings.TrimSpace(request.Notes),
+		Notes: strings.TrimSpace(request.Notes), WorkbookFolderID: request.WorkbookFolderID,
 	}, nil
 }
 
@@ -702,6 +723,19 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 	} else {
 		return nil, quoteErr
 	}
+	if proofs, proofErr := s.repo.ListPaymentProofs(orderID); proofErr == nil {
+		proofsByQuote := make(map[int64][]model.TradePaymentProof)
+		for index := range proofs {
+			proofs[index].AttachmentURL, _ = s.uploadSvc.GetFileURL(proofs[index].AttachmentID)
+			proofs[index].ThumbnailURL = s.uploadSvc.GetThumbnailURL(proofs[index].AttachmentID, 480)
+			proofsByQuote[proofs[index].QuoteID] = append(proofsByQuote[proofs[index].QuoteID], proofs[index])
+		}
+		for index := range order.CustomerQuotes {
+			order.CustomerQuotes[index].PaymentProofs = proofsByQuote[order.CustomerQuotes[index].ID]
+		}
+	} else {
+		return nil, proofErr
+	}
 	if photos, photoErr := s.repo.ListInspectionPhotos(orderID); photoErr == nil {
 		for index := range photos {
 			photos[index].AttachmentURL, _ = s.uploadSvc.GetFileURL(photos[index].AttachmentID)
@@ -715,6 +749,11 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 		order.Shipment = shipment
 	} else if !errors.Is(shipmentErr, sql.ErrNoRows) {
 		return nil, shipmentErr
+	}
+	if groups, packingErr := s.repo.ListPackingGroups(orderID); packingErr == nil {
+		order.PackingGroups = groups
+	} else {
+		return nil, packingErr
 	}
 	s.enrichOrderPermissions(userID, order)
 	if err := s.redactTradeOrder(userID, order, access); err != nil {
@@ -821,6 +860,13 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	if err != nil {
 		return nil, fmt.Errorf("客户不存在或无权访问")
 	}
+	workspaceFolderID := request.WorkbookFolderID
+	if workspaceFolderID == nil {
+		workspaceFolderID = customer.WorkbookFolderID
+	}
+	if err := s.ensureWritableTradeFolder(userID, workspaceFolderID); err != nil {
+		return nil, err
+	}
 	quoteDeadline, err := parseTradeDate(request.QuoteDeadline)
 	if err != nil {
 		return nil, fmt.Errorf("报价截止日期格式无效")
@@ -850,10 +896,17 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 		Priority: priority, InquiryDate: time.Now(), QuoteDeadline: quoteDeadline,
 		Currency: currency, Incoterm: "", DestinationCountry: strings.TrimSpace(request.DestinationCountry),
 		DestinationPort: strings.TrimSpace(request.DestinationPort), PaymentTerms: paymentMethod, PaymentMethod: paymentMethod,
-		ChannelID: customer.ChannelID, Notes: strings.TrimSpace(request.Notes),
+		ChannelID: customer.ChannelID, WorkspaceFolderID: workspaceFolderID, Notes: strings.TrimSpace(request.Notes),
 	}
 	if err := s.repo.CreateOrder(order, items); err != nil {
 		return nil, err
+	}
+	if request.WorkbookFolderID != nil {
+		if err := s.repo.SetCustomerWorkbookFolder(customer.ID, request.WorkbookFolderID); err != nil {
+			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
+			return nil, err
+		}
+		customer.WorkbookFolderID = request.WorkbookFolderID
 	}
 
 	createWorkspace := request.CreateWorkspace == nil || *request.CreateWorkspace
@@ -866,7 +919,7 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 		}
 		order.WorkbookID = &workbook.ID
 		order.WorkbookSheetID = &firstSheetID
-		if err := s.repo.SetOrderWorkspace(order.ID, order.OwnerID, workbook.ID); err != nil {
+		if err := s.repo.SetOrderWorkspace(order.ID, order.OwnerID, workbook.ID, order.WorkspaceFolderID); err != nil {
 			_ = s.sheetSvc.DeleteWorkbookForUser(userID, workbook.ID)
 			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
 			return nil, err
@@ -1396,6 +1449,11 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 	if err := s.repo.AdvanceOrder(orderID, userID, true, order.Stage, targetStage, note); err != nil {
 		return nil, err
 	}
+	if order.Stage == model.TradeStagePurchase && targetStage == model.TradeStageReceiving && order.ReworkRequired {
+		if err := s.repo.ClearOrderRework(orderID); err != nil {
+			return nil, err
+		}
+	}
 	if order.WorkbookID != nil {
 		if syncErr := s.syncOrderStageToWorkbook(userID, *order.WorkbookID, targetStage); syncErr != nil {
 			log.Printf("sync trade order %d stage to workbook: %v", orderID, syncErr)
@@ -1443,7 +1501,8 @@ func (s *TradeService) createOrderWorkspace(
 	})
 	workbook := &model.Workbook{
 		Name:        fmt.Sprintf("%s %s - %s", order.OrderNo, customer.Name, order.Title),
-		Description: &description, OwnerID: order.OwnerID, Metadata: metadata, Status: 1,
+		Description: &description, OwnerID: order.OwnerID, FolderID: order.WorkspaceFolderID,
+		Metadata: metadata, Status: 1,
 	}
 	if err := s.sheetSvc.CreateWorkbookForUserWithSource(actorID, workbook, "trade_erp", "创建外贸业务工作簿"); err != nil {
 		return nil, 0, fmt.Errorf("创建外贸业务工作簿失败：%w", err)
@@ -1601,6 +1660,110 @@ func (s *TradeService) CreateSupplierQuote(userID, orderID int64, request *model
 	}
 	request.Notes = strings.TrimSpace(request.Notes)
 	if _, err := s.repo.CreateSupplierQuote(orderID, userID, request, validUntil); err != nil {
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		_ = s.syncOrderWorkspaceInternal(userID, orderID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) BatchCreateSupplierQuotes(userID, orderID int64, request *model.BatchTradeSupplierQuoteRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageSupplierQuote)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("只有供应商询价岗位或业务负责人可以录入供应商报价")
+	}
+	if order.Stage != model.TradeStageSupplierQuote {
+		return nil, fmt.Errorf("当前业务单不在供应商询价阶段")
+	}
+	if request == nil || len(request.Quotes) == 0 {
+		return nil, fmt.Errorf("请至少填写一条供应商报价")
+	}
+	validUntils := make([]*time.Time, len(request.Quotes))
+	for index := range request.Quotes {
+		quote := &request.Quotes[index]
+		if quote.OrderItemID <= 0 || quote.SupplierID <= 0 {
+			return nil, fmt.Errorf("第 %d 条报价请选择产品和供应商", index+1)
+		}
+		if quote.UnitPrice < 0 || quote.MOQ < 0 || quote.LeadTimeDays < 0 {
+			return nil, fmt.Errorf("第 %d 条报价的价格、MOQ 或交期不能小于零", index+1)
+		}
+		if _, err := s.repo.GetSupplier(quote.SupplierID); err != nil {
+			return nil, fmt.Errorf("第 %d 条报价的供应商不存在", index+1)
+		}
+		validUntil, err := parseTradeDate(quote.ValidUntil)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 条报价有效期格式无效", index+1)
+		}
+		validUntils[index] = validUntil
+		quote.Currency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(quote.Currency), order.Currency, "USD"))
+		quote.Notes = strings.TrimSpace(quote.Notes)
+	}
+	if err := s.repo.CreateSupplierQuotes(orderID, userID, request.Quotes, validUntils); err != nil {
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		_ = s.syncOrderWorkspaceInternal(userID, orderID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) UpdateSupplierQuote(userID, orderID, quoteID int64, request *model.UpsertTradeSupplierQuoteRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageSupplierQuote)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed || order.Stage != model.TradeStageSupplierQuote {
+		return nil, fmt.Errorf("当前没有编辑供应商报价的权限")
+	}
+	if request == nil || request.OrderItemID <= 0 || request.SupplierID <= 0 {
+		return nil, fmt.Errorf("请选择产品和供应商")
+	}
+	if _, err := s.repo.GetSupplier(request.SupplierID); err != nil {
+		return nil, fmt.Errorf("供应商不存在")
+	}
+	validUntil, err := parseTradeDate(request.ValidUntil)
+	if err != nil {
+		return nil, fmt.Errorf("报价有效期格式无效")
+	}
+	request.Currency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(request.Currency), order.Currency, "USD"))
+	request.Notes = strings.TrimSpace(request.Notes)
+	if err := s.repo.UpdateSupplierQuote(orderID, quoteID, request, validUntil); err != nil {
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		_ = s.syncOrderWorkspaceInternal(userID, orderID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) DeleteSupplierQuote(userID, orderID, quoteID int64) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageSupplierQuote)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed || order.Stage != model.TradeStageSupplierQuote {
+		return nil, fmt.Errorf("当前没有删除供应商报价的权限")
+	}
+	if err := s.repo.DeleteSupplierQuote(orderID, quoteID); err != nil {
 		return nil, err
 	}
 	if order.WorkbookID != nil {
@@ -1799,6 +1962,134 @@ func (s *TradeService) UpdateCustomerQuoteRoundStatus(userID, orderID, quoteID i
 	return s.GetOrder(userID, orderID)
 }
 
+func (s *TradeService) UpdateCustomerQuotePayment(userID, orderID, quoteID int64, request *model.UpdateTradeCustomerPaymentRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("没有登记客户付款的权限")
+	}
+	if request == nil {
+		return nil, fmt.Errorf("付款信息不能为空")
+	}
+	status := strings.ToLower(strings.TrimSpace(request.PaymentStatus))
+	if status != "unpaid" && status != "partial" && status != "paid" {
+		return nil, fmt.Errorf("付款状态仅支持未付款、部分付款或已付款")
+	}
+	quotes, err := s.repo.ListCustomerQuoteRounds(orderID)
+	if err != nil {
+		return nil, err
+	}
+	var selected *model.TradeCustomerQuoteRound
+	for index := range quotes {
+		if quotes[index].ID == quoteID {
+			selected = &quotes[index]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("对客报价不存在")
+	}
+	if selected.Status != "accepted" {
+		return nil, fmt.Errorf("只有客户已接受的报价可以登记付款")
+	}
+	currency := strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(request.PaymentCurrency), selected.Currency, order.Currency, "USD"))
+	amount := nonNegativeTradeValue(request.PaidAmount)
+	if status == "unpaid" {
+		amount = 0
+	} else if amount <= 0 {
+		return nil, fmt.Errorf("部分付款或已付款时，到账金额必须大于零")
+	}
+	if err := s.repo.UpdateCustomerQuotePayment(orderID, quoteID, status, currency, amount); err != nil {
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		_ = s.syncOrderWorkspaceInternal(userID, orderID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64, note string, file multipart.File, header *multipart.FileHeader) (*model.TradePaymentProof, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("没有上传客户付款凭证的权限")
+	}
+	quotes, err := s.repo.ListCustomerQuoteRounds(orderID)
+	if err != nil {
+		return nil, err
+	}
+	found := false
+	for _, quote := range quotes {
+		if quote.ID == quoteID && quote.Status == "accepted" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("客户已接受的报价不存在")
+	}
+	attachment, err := s.uploadSvc.Upload(file, header, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(strings.ToLower(attachment.MimeType), "image/") {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
+		return nil, fmt.Errorf("付款凭证必须是图片")
+	}
+	directoryID := order.PaymentGalleryDirectoryID
+	if directoryID == nil {
+		visibility := "private"
+		directory, createErr := s.uploadSvc.CreateGalleryDirectory(userID, "付款凭证 - "+order.OrderNo, nil, &visibility)
+		if createErr != nil {
+			_ = s.uploadSvc.DeleteFile(attachment.ID)
+			return nil, createErr
+		}
+		directoryID = &directory.ID
+		if err := s.repo.SetPaymentGalleryDirectory(orderID, directory.ID); err != nil {
+			_ = s.uploadSvc.DeleteFile(attachment.ID)
+			return nil, err
+		}
+	}
+	effectiveAttachmentID, duplicate, err := s.uploadSvc.SaveImageToGalleryDeduplicated(attachment.ID, directoryID, nil, userID)
+	if err != nil {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
+		return nil, err
+	}
+	if duplicate && effectiveAttachmentID != attachment.ID {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
+	}
+	proof := &model.TradePaymentProof{
+		OrderID: orderID, QuoteID: quoteID, AttachmentID: effectiveAttachmentID,
+		GalleryDirectoryID: directoryID, Note: strings.TrimSpace(note), UploadedBy: userID,
+	}
+	if err := s.repo.CreatePaymentProof(proof); err != nil {
+		return nil, err
+	}
+	if user, userErr := s.userRepo.GetByID(userID); userErr == nil && user != nil {
+		proof.UploadedByName = user.Username
+	}
+	if canonical, canonicalErr := s.uploadSvc.GetAttachment(effectiveAttachmentID); canonicalErr == nil {
+		proof.Filename = canonical.Filename
+	}
+	proof.AttachmentURL, _ = s.uploadSvc.GetFileURL(effectiveAttachmentID)
+	proof.ThumbnailURL = s.uploadSvc.GetThumbnailURL(effectiveAttachmentID, 480)
+	s.notifyOrderUpdated(orderID)
+	return proof, nil
+}
+
 func (s *TradeService) ListPositions(userID int64) ([]model.TradePosition, error) {
 	positions, err := s.repo.ListPositions()
 	if err != nil {
@@ -1927,8 +2218,16 @@ func (s *TradeService) UpdateLabelSettings(userID, orderID int64, request *model
 	if request.Orientation == "landscape" {
 		pageWidth, pageHeight = pageHeight, pageWidth
 	}
-	usableWidth := pageWidth - request.MarginLeftMM - request.MarginRightMM
-	usableHeight := pageHeight - request.MarginTopMM - request.MarginBottomMM
+	offsetX := request.MarginLeftMM
+	if request.OffsetXMM != nil {
+		offsetX = *request.OffsetXMM
+	}
+	offsetY := request.MarginTopMM
+	if request.OffsetYMM != nil {
+		offsetY = *request.OffsetYMM
+	}
+	usableWidth := pageWidth - offsetX - request.MarginRightMM
+	usableHeight := pageHeight - offsetY - request.MarginBottomMM
 	columns := int((usableWidth + request.GapXMM) / (request.WidthMM + request.GapXMM))
 	rows := int((usableHeight + request.GapYMM) / (request.HeightMM + request.GapYMM))
 	if columns <= 0 || rows <= 0 {
@@ -1937,6 +2236,9 @@ func (s *TradeService) UpdateLabelSettings(userID, orderID int64, request *model
 	capacity := columns * rows
 	if request.StartSlot >= capacity {
 		request.StartSlot = capacity - 1
+	}
+	if offsetX+request.WidthMM > pageWidth || offsetY+request.HeightMM > pageHeight {
+		return nil, fmt.Errorf("标签起始位置超出纸张范围")
 	}
 	if err := s.repo.UpdateLabelSettings(orderID, request); err != nil {
 		return nil, err
@@ -2019,6 +2321,170 @@ func (s *TradeService) UploadInspectionPhoto(userID, orderID int64, itemID *int6
 	return photo, nil
 }
 
+func (s *TradeService) LinkInspectionPhotos(userID, orderID int64, request *model.LinkTradeInspectionPhotosRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageInspection)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed || order.Stage != model.TradeStageInspection {
+		return nil, fmt.Errorf("当前没有关联质检图片的权限")
+	}
+	if request == nil || len(request.AttachmentIDs) == 0 {
+		return nil, fmt.Errorf("请选择至少一张图库图片")
+	}
+	if request.OrderItemID != nil {
+		belongs, belongsErr := s.repo.OrderItemBelongsToOrder(orderID, *request.OrderItemID)
+		if belongsErr != nil {
+			return nil, belongsErr
+		}
+		if !belongs {
+			return nil, fmt.Errorf("所选产品不属于当前业务单")
+		}
+	}
+	seen := make(map[int64]struct{}, len(request.AttachmentIDs))
+	for _, attachmentID := range request.AttachmentIDs {
+		if attachmentID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[attachmentID]; duplicate {
+			continue
+		}
+		seen[attachmentID] = struct{}{}
+		allowed, err := s.uploadSvc.CanAccessGalleryImage(userID, attachmentID)
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			return nil, fmt.Errorf("图库图片 #%d 不存在或无权访问", attachmentID)
+		}
+		attachment, err := s.uploadSvc.GetAttachment(attachmentID)
+		if err != nil || !strings.HasPrefix(strings.ToLower(attachment.MimeType), "image/") {
+			return nil, fmt.Errorf("图库资源 #%d 不是有效图片", attachmentID)
+		}
+		photo := &model.TradeInspectionPhoto{
+			OrderID: orderID, OrderItemID: request.OrderItemID, AttachmentID: attachmentID,
+			Note: strings.TrimSpace(request.Note), UploadedBy: userID,
+		}
+		if err := s.repo.CreateInspectionPhoto(photo); err != nil {
+			return nil, err
+		}
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) UpdatePackingGroups(userID, orderID int64, request *model.UpdateTradePackingGroupsRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStagePacking)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed || order.Stage != model.TradeStagePacking {
+		return nil, fmt.Errorf("当前没有编辑装箱组合的权限")
+	}
+	if request == nil || len(request.Groups) == 0 {
+		return nil, fmt.Errorf("请至少添加一个装箱组合")
+	}
+	items, err := s.repo.ListOrderItems(orderID)
+	if err != nil {
+		return nil, err
+	}
+	itemByID := make(map[int64]model.TradeOrderItem, len(items))
+	for _, item := range items {
+		itemByID[item.ID] = item
+	}
+	packedTotals := make(map[int64]float64)
+	groups := make([]model.TradePackingGroup, 0, len(request.Groups))
+	for groupIndex, input := range request.Groups {
+		if input.LengthCM <= 0 || input.WidthCM <= 0 || input.HeightCM <= 0 || input.WeightKG <= 0 {
+			return nil, fmt.Errorf("第 %d 个箱组请填写有效的长、宽、高和实际重量", groupIndex+1)
+		}
+		if input.Copies <= 0 {
+			return nil, fmt.Errorf("第 %d 个箱组的箱数必须大于零", groupIndex+1)
+		}
+		group := model.TradePackingGroup{
+			OrderID: orderID, GroupNo: groupIndex + 1, LengthCM: input.LengthCM, WidthCM: input.WidthCM,
+			HeightCM: input.HeightCM, WeightKG: input.WeightKG,
+			VolumetricWeightKG: input.LengthCM * input.WidthCM * input.HeightCM / 5000,
+			Copies:             input.Copies, Notes: strings.TrimSpace(input.Notes), Items: []model.TradePackingGroupItem{},
+		}
+		seenItems := make(map[int64]struct{}, len(input.Items))
+		for _, itemInput := range input.Items {
+			item, exists := itemByID[itemInput.OrderItemID]
+			if !exists {
+				return nil, fmt.Errorf("第 %d 个箱组包含不属于订单的产品", groupIndex+1)
+			}
+			if _, duplicate := seenItems[item.ID]; duplicate {
+				return nil, fmt.Errorf("第 %d 个箱组中产品 %s 重复", groupIndex+1, firstNonEmptyTrade(item.SKU, item.ProductName))
+			}
+			if itemInput.Quantity <= 0 {
+				return nil, fmt.Errorf("第 %d 个箱组的产品数量必须大于零", groupIndex+1)
+			}
+			seenItems[item.ID] = struct{}{}
+			packedTotals[item.ID] += itemInput.Quantity * float64(input.Copies)
+			group.Items = append(group.Items, model.TradePackingGroupItem{
+				OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU,
+				ProductName: item.ProductName, Quantity: itemInput.Quantity,
+			})
+		}
+		groups = append(groups, group)
+	}
+	for _, item := range items {
+		expected := firstNonZeroTrade(item.AcceptedQuantity, item.ReceivedQuantity, item.Quantity)
+		if packedTotals[item.ID] > expected+0.000001 {
+			return nil, fmt.Errorf("产品 %s 的装箱数量 %.2f 超过可装数量 %.2f", firstNonEmptyTrade(item.SKU, item.ProductName), packedTotals[item.ID], expected)
+		}
+	}
+	if err := s.repo.ReplacePackingGroups(orderID, groups); err != nil {
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		_ = s.syncOrderWorkspaceInternal(userID, orderID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) ReturnOrderToPurchase(userID, orderID int64, request *model.ReturnTradeOrderToPurchaseRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	if request == nil || strings.TrimSpace(request.Reason) == "" {
+		return nil, fmt.Errorf("请填写采购或发货异常原因")
+	}
+	if order.Stage == model.TradeStageInquiry || order.Stage == model.TradeStageSupplierQuote ||
+		order.Stage == model.TradeStageQuotation || order.Stage == model.TradeStagePurchase ||
+		order.Stage == model.TradeStageCancelled {
+		return nil, fmt.Errorf("当前阶段不能发起重新采购")
+	}
+	allowed, _, err := s.canOperateStage(userID, order)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("只有当前环节负责人、业务负责人或管理员可以退回采购")
+	}
+	reason := strings.TrimSpace(request.Reason)
+	if err := s.repo.MarkOrderForRepurchase(orderID, userID, reason); err != nil {
+		return nil, err
+	}
+	if order.WorkbookID != nil {
+		_ = s.syncOrderWorkspaceInternal(userID, orderID)
+	}
+	order.Stage = model.TradeStagePurchase
+	s.notifyStageAssignees(order, model.TradeStagePurchase, "采购异常待重新处理："+reason)
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
 func (s *TradeService) SyncOrderWorkspace(userID, orderID int64) error {
 	order, err := s.repo.GetOrder(orderID, userID, true)
 	if err != nil {
@@ -2031,13 +2497,54 @@ func (s *TradeService) SyncOrderWorkspace(userID, orderID int64) error {
 	if !s.canViewTradeOrder(userID, order, access) {
 		return sql.ErrNoRows
 	}
-	if order.WorkbookID == nil {
-		return fmt.Errorf("该业务单尚未关联流程工作簿")
-	}
 	if !access.profile.CanViewAllOrders {
 		return fmt.Errorf("没有同步流程工作簿的权限")
 	}
 	return s.syncOrderWorkspaceInternal(userID, orderID)
+}
+
+func (s *TradeService) ensureOrderWorkspace(userID int64, order *model.TradeOrder) error {
+	if order == nil {
+		return fmt.Errorf("业务单不存在")
+	}
+	if order.WorkbookID != nil {
+		exists, err := s.sheetRepo.ActiveWorkbookExists(*order.WorkbookID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+	}
+	items, err := s.repo.ListOrderItems(order.ID)
+	if err != nil {
+		return err
+	}
+	customer, err := s.repo.GetCustomerIncludingDeleted(order.CustomerID, userID, true)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureWritableTradeFolder(userID, order.WorkspaceFolderID); err != nil {
+		order.WorkspaceFolderID = nil
+	}
+	workbook, firstSheetID, err := s.createOrderWorkspace(userID, order, customer, items, true)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.SetOrderWorkspace(order.ID, order.OwnerID, workbook.ID, order.WorkspaceFolderID); err != nil {
+		_ = s.sheetSvc.DeleteWorkbookForUser(userID, workbook.ID)
+		return err
+	}
+	order.WorkbookID = &workbook.ID
+	order.WorkbookSheetID = &firstSheetID
+	if order.ChannelID != nil {
+		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
+			Content:          fmt.Sprintf("业务单 %s 的原流程工作簿不可用，系统已重新创建并完成关联。", order.OrderNo),
+			LinkedWorkbookID: &workbook.ID,
+			InternalOnly:     true,
+		})
+	}
+	return nil
 }
 
 func (s *TradeService) syncOrderWorkspaceInternal(userID, orderID int64) error {
@@ -2045,8 +2552,8 @@ func (s *TradeService) syncOrderWorkspaceInternal(userID, orderID int64) error {
 	if err != nil {
 		return err
 	}
-	if order.WorkbookID == nil {
-		return nil
+	if err := s.ensureOrderWorkspace(userID, order); err != nil {
+		return err
 	}
 	items, err := s.repo.ListOrderItems(orderID)
 	if err != nil {
@@ -2538,6 +3045,24 @@ func (s *TradeService) loadTradeOrderAdvanceBlockers(order *model.TradeOrder) ([
 			}
 			order.Shipment = shipment
 		}
+		if order.CustomerQuotes == nil {
+			quotes, err := s.repo.ListCustomerQuoteRounds(order.ID)
+			if err != nil {
+				return nil, err
+			}
+			proofs, err := s.repo.ListPaymentProofs(order.ID)
+			if err != nil {
+				return nil, err
+			}
+			proofsByQuote := make(map[int64][]model.TradePaymentProof)
+			for _, proof := range proofs {
+				proofsByQuote[proof.QuoteID] = append(proofsByQuote[proof.QuoteID], proof)
+			}
+			for index := range quotes {
+				quotes[index].PaymentProofs = proofsByQuote[quotes[index].ID]
+			}
+			order.CustomerQuotes = quotes
+		}
 	}
 	return tradeOrderAdvanceBlockers(order), nil
 }
@@ -2618,15 +3143,26 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 			blockers = append(blockers, "尚未填写发货跟踪资料")
 			break
 		}
-		if strings.TrimSpace(shipment.Carrier) == "" {
-			blockers = append(blockers, "请填写承运商")
+		carrier := strings.ToUpper(strings.TrimSpace(shipment.Carrier))
+		if carrier != "DHL" && carrier != "FEDEX" {
+			blockers = append(blockers, "物流公司请选择 DHL 或 FedEx")
 		}
-		if strings.TrimSpace(shipment.BookingNo) == "" && strings.TrimSpace(shipment.BLNo) == "" {
-			blockers = append(blockers, "请填写订舱号或提单号")
+		if strings.TrimSpace(shipment.BookingNo) == "" {
+			blockers = append(blockers, "请填写物流订单号")
 		}
 		status := strings.TrimSpace(shipment.ShippingStatus)
-		if status == "" || status == "待订舱" {
-			blockers = append(blockers, "请更新实际发货状态")
+		if status != "到了" {
+			blockers = append(blockers, "物流状态更新为“到了”后才能完成订单")
+		}
+		paymentProofFound := false
+		for _, quote := range order.CustomerQuotes {
+			if quote.Status == "accepted" && len(quote.PaymentProofs) > 0 {
+				paymentProofFound = true
+				break
+			}
+		}
+		if !paymentProofFound {
+			blockers = append(blockers, "完成订单前必须上传客户付款凭证")
 		}
 		if order.FreightMode == "quoted" {
 			if shipment.ActualFreightAmount <= 0 {

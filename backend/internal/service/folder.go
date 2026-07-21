@@ -3,6 +3,8 @@ package service
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"yaerp/internal/model"
 	"yaerp/internal/repo"
@@ -129,6 +131,61 @@ func (s *FolderService) ListContents(parentID *int64, userID int64) (*model.Fold
 		Folders:   filteredFolders,
 		Workbooks: filteredWorkbooks,
 	}, nil
+}
+
+func (s *FolderService) ListWritableOptionsForUser(userID int64) ([]model.FolderOption, error) {
+	folders, err := s.folderRepo.ListAllActive()
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]model.Folder, len(folders))
+	for _, folder := range folders {
+		byID[folder.ID] = folder
+	}
+
+	pathFor := func(folder model.Folder) string {
+		parts := make([]string, 0, 4)
+		seen := make(map[int64]struct{})
+		current := folder
+		for {
+			if _, duplicate := seen[current.ID]; duplicate {
+				break
+			}
+			seen[current.ID] = struct{}{}
+			parts = append(parts, strings.TrimSpace(current.Name))
+			if current.ParentID == nil {
+				break
+			}
+			parent, ok := byID[*current.ParentID]
+			if !ok {
+				break
+			}
+			current = parent
+		}
+		for left, right := 0, len(parts)-1; left < right; left, right = left+1, right-1 {
+			parts[left], parts[right] = parts[right], parts[left]
+		}
+		return strings.Join(parts, " / ")
+	}
+
+	options := make([]model.FolderOption, 0, len(folders))
+	for _, folder := range folders {
+		canWrite, err := s.permService.CanWriteFolder(folder.ID, userID)
+		if err != nil {
+			return nil, err
+		}
+		if !canWrite {
+			continue
+		}
+		options = append(options, model.FolderOption{
+			ID: folder.ID, Name: folder.Name, Path: pathFor(folder), ParentID: folder.ParentID,
+			OwnerID: folder.OwnerID, CanWrite: true,
+		})
+	}
+	sort.Slice(options, func(i, j int) bool {
+		return strings.ToLower(options[i].Path) < strings.ToLower(options[j].Path)
+	})
+	return options, nil
 }
 
 func (s *FolderService) MoveWorkbookForUser(userID, workbookID int64, folderID *int64) error {

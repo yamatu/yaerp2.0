@@ -12,6 +12,7 @@ import {
   Check,
   LayoutGrid,
   Loader2,
+  Move,
   MoveDiagonal2,
   Printer,
   RotateCcw,
@@ -27,8 +28,11 @@ type PaperPreset = "A4" | "A5" | "LETTER" | "CUSTOM";
 type Orientation = "portrait" | "landscape";
 
 interface PrintableLabel {
-  item: TradeOrderItem;
+  key: string;
+  entries: Array<{ item: TradeOrderItem; quantity: number }>;
   copyIndex: number;
+  totalCopies: number;
+  groupNo?: number;
 }
 
 const MM_TO_PX = 96 / 25.4;
@@ -71,8 +75,12 @@ export default function TradeLabelPrintPage() {
   const [gapYMM, setGapYMM] = useState(3);
   const [contentScale, setContentScale] = useState(1);
   const [startSlot, setStartSlot] = useState(0);
+  const [offsetXMM, setOffsetXMM] = useState(10);
+  const [offsetYMM, setOffsetYMM] = useState(10);
   const [selectedItemIDs, setSelectedItemIDs] = useState<number[]>([]);
   const [copies, setCopies] = useState<Record<number, number>>({});
+  const [selectedGroupIDs, setSelectedGroupIDs] = useState<number[]>([]);
+  const [groupCopies, setGroupCopies] = useState<Record<number, number>>({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -117,11 +125,24 @@ export default function TradeLabelPrintPage() {
           clamp(numberOr(loaded.label_content_scale, 1), 0.5, 1.8),
         );
         setStartSlot(Math.max(0, numberOr(loaded.label_start_slot, 0)));
+        setOffsetXMM(
+          numberOr(loaded.label_offset_x_mm, loaded.label_margin_left_mm || 10),
+        );
+        setOffsetYMM(
+          numberOr(loaded.label_offset_y_mm, loaded.label_margin_top_mm || 10),
+        );
         const items = loaded.items || [];
         setSelectedItemIDs(items.map((item) => item.id));
         setCopies(
           Object.fromEntries(
             items.map((item) => [item.id, Math.max(1, item.carton_count || 1)]),
+          ),
+        );
+        const groups = loaded.packing_groups || [];
+        setSelectedGroupIDs(groups.map((group) => group.id));
+        setGroupCopies(
+          Object.fromEntries(
+            groups.map((group) => [group.id, Math.max(1, group.copies || 1)]),
           ),
         );
       } catch (loadError) {
@@ -140,8 +161,8 @@ export default function TradeLabelPrintPage() {
     orientation === "landscape" ? paperWidthMM : paperHeightMM;
 
   const layout = useMemo(() => {
-    const usableWidth = pageWidthMM - marginLeftMM - marginRightMM;
-    const usableHeight = pageHeightMM - marginTopMM - marginBottomMM;
+    const usableWidth = pageWidthMM - offsetXMM - marginRightMM;
+    const usableHeight = pageHeightMM - offsetYMM - marginBottomMM;
     const columns =
       usableWidth > 0 && widthMM > 0
         ? Math.floor((usableWidth + gapXMM) / (widthMM + gapXMM))
@@ -162,9 +183,9 @@ export default function TradeLabelPrintPage() {
     gapYMM,
     heightMM,
     marginBottomMM,
-    marginLeftMM,
     marginRightMM,
-    marginTopMM,
+    offsetXMM,
+    offsetYMM,
     pageHeightMM,
     pageWidthMM,
     widthMM,
@@ -177,14 +198,51 @@ export default function TradeLabelPrintPage() {
 
   const printableItems = useMemo(() => {
     if (!order) return [];
+    const groups = order.packing_groups || [];
+    if (groups.length > 0) {
+      const itemByID = new Map(
+        (order.items || []).map((item) => [item.id, item]),
+      );
+      return groups.flatMap((group) => {
+        if (!selectedGroupIDs.includes(group.id)) return [];
+        const entries = (group.items || []).flatMap((entry) => {
+          const item = itemByID.get(entry.order_item_id);
+          return item ? [{ item, quantity: entry.quantity }] : [];
+        });
+        if (entries.length === 0) return [];
+        const totalCopies = clamp(
+          Math.round(groupCopies[group.id] || group.copies || 1),
+          1,
+          500,
+        );
+        return Array.from({ length: totalCopies }, (_, copyIndex) => ({
+          key: `group-${group.id}-${copyIndex}`,
+          entries,
+          copyIndex,
+          totalCopies,
+          groupNo: group.group_no,
+        }));
+      });
+    }
     return (order.items || []).flatMap((item) => {
       if (!selectedItemIDs.includes(item.id)) return [];
+      const totalCopies = clamp(Math.round(copies[item.id] || 1), 1, 500);
       return Array.from(
-        { length: clamp(Math.round(copies[item.id] || 1), 1, 500) },
-        (_, copyIndex) => ({ item, copyIndex }),
+        { length: totalCopies },
+        (_, copyIndex) => ({
+          key: `item-${item.id}-${copyIndex}`,
+          entries: [
+            {
+              item,
+              quantity: item.packed_quantity || item.quantity,
+            },
+          ],
+          copyIndex,
+          totalCopies,
+        }),
       );
     });
-  }, [copies, order, selectedItemIDs]);
+  }, [copies, groupCopies, order, selectedGroupIDs, selectedItemIDs]);
 
   const printablePages = useMemo(() => {
     if (layout.capacity <= 0 || printableItems.length === 0) return [];
@@ -220,7 +278,7 @@ export default function TradeLabelPrintPage() {
     if (widthMM < 20 || heightMM < 15)
       return "标签宽度不能小于 20mm，高度不能小于 15mm。";
     if (layout.usableWidth <= 0 || layout.usableHeight <= 0)
-      return "页边距超过了纸张可用范围。";
+      return "标签起点或页边距超过了纸张可用范围。";
     if (layout.capacity <= 0)
       return "当前标签尺寸无法排入纸张，请缩小标签或边距。";
     return "";
@@ -231,6 +289,8 @@ export default function TradeLabelPrintPage() {
     layout.usableWidth,
     paperHeightMM,
     paperWidthMM,
+    offsetXMM,
+    offsetYMM,
     widthMM,
   ]);
 
@@ -255,6 +315,8 @@ export default function TradeLabelPrintPage() {
     setGapYMM(3);
     setContentScale(1);
     setStartSlot(0);
+    setOffsetXMM(10);
+    setOffsetYMM(10);
   };
 
   const saveLayout = async () => {
@@ -279,13 +341,15 @@ export default function TradeLabelPrintPage() {
           gap_y_mm: gapYMM,
           content_scale: contentScale,
           start_slot: startSlot,
+          offset_x_mm: offsetXMM,
+          offset_y_mm: offsetYMM,
         },
       );
       if (response.code !== 0 || !response.data) {
         throw new Error(response.message || "保存标签排版失败");
       }
       setOrder(response.data);
-      setNotice("纸张、标签尺寸和起始位置已保存。");
+      setNotice("纸张、标签尺寸和自由起始位置已保存。");
     } catch (saveError) {
       setError(
         saveError instanceof Error ? saveError.message : "保存标签排版失败",
@@ -346,25 +410,81 @@ export default function TradeLabelPrintPage() {
     window.addEventListener("pointercancel", handleEnd);
   };
 
+  const beginLabelDrag = (
+    event: ReactPointerEvent<HTMLElement>,
+    slotIndex: number,
+  ) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startOffsetX = offsetXMM;
+    const startOffsetY = offsetYMM;
+    const column = slotIndex % Math.max(1, layout.columns);
+    const row = Math.floor(slotIndex / Math.max(1, layout.columns));
+    const previousCursor = document.body.style.cursor;
+    const previousSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const handleMove = (moveEvent: PointerEvent) => {
+      const scale = Math.max(0.1, previewScale * MM_TO_PX);
+      const columnOffset = column * (widthMM + gapXMM);
+      const rowOffset = row * (heightMM + gapYMM);
+      const maxX = Math.max(
+        0,
+        pageWidthMM - marginRightMM - widthMM - columnOffset,
+      );
+      const maxY = Math.max(
+        0,
+        pageHeightMM - marginBottomMM - heightMM - rowOffset,
+      );
+      setOffsetXMM(
+        Math.round(
+          clamp(startOffsetX + (moveEvent.clientX - startX) / scale, 0, maxX) *
+            2,
+        ) / 2,
+      );
+      setOffsetYMM(
+        Math.round(
+          clamp(startOffsetY + (moveEvent.clientY - startY) / scale, 0, maxY) *
+            2,
+        ) / 2,
+      );
+    };
+    const handleEnd = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleEnd);
+      window.removeEventListener("pointercancel", handleEnd);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousSelect;
+      setNotice("标签起始位置已调整，点击“保存排版”后长期保留。");
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleEnd);
+    window.addEventListener("pointercancel", handleEnd);
+  };
+
   const renderLabel = (
     entry: PrintableLabel,
     key: string,
     preview = false,
     resizable = false,
+    slotIndex = 0,
   ) => {
-    const { item, copyIndex } = entry;
-    const cartonSize =
-      typeof item.workflow_data?.carton_size === "string"
-        ? item.workflow_data.carton_size
-        : "";
+    const { entries, copyIndex, totalCopies } = entry;
     return (
       <article
         key={key}
-        className={`trade-label-cell relative overflow-hidden border-[0.35mm] border-black bg-white text-black ${resizable ? "ring-[0.8mm] ring-sky-400 ring-offset-[0.6mm]" : ""}`}
+        onPointerDown={
+          preview && resizable
+            ? (event) => beginLabelDrag(event, slotIndex)
+            : undefined
+        }
+        className={`trade-label-cell relative h-full w-full overflow-hidden border-[0.35mm] border-black bg-white text-black ${resizable ? "touch-none cursor-grab ring-[0.8mm] ring-sky-400 ring-offset-[0.6mm] active:cursor-grabbing" : ""}`}
       >
         <div className="flex h-full w-full items-center justify-center overflow-hidden">
           <div
-            className="flex h-full w-full flex-col justify-between p-[5mm]"
+            className="flex h-full w-full flex-col p-[4mm]"
             style={{
               transform: `scale(${contentScale})`,
               transformOrigin: "center",
@@ -374,41 +494,58 @@ export default function TradeLabelPrintPage() {
               <div className="text-[9px] font-semibold uppercase">
                 {order?.order_no}
               </div>
-              <div className="mt-[1.5mm] truncate text-[17px] font-bold leading-tight">
+              <div className="mt-[1mm] truncate text-[16px] font-bold leading-tight">
                 {order?.customer_name}
               </div>
-              <div className="mt-[0.8mm] truncate text-[10px]">
-                {order?.customer_company}
+              <div className="mt-[0.5mm] flex items-center justify-between gap-[2mm] text-[9px]">
+                <span className="min-w-0 truncate">{order?.customer_company}</span>
+                {entry.groupNo && (
+                  <span className="shrink-0 font-semibold">BOX {entry.groupNo}</span>
+                )}
               </div>
             </div>
-            <div>
-              <div className="border-y-[0.45mm] border-black py-[1.5mm]">
-                <div className="text-[8px] uppercase">SKU</div>
-                <div className="mt-[0.8mm] break-all text-[21px] font-black leading-none">
-                  {item.sku || `LINE-${item.line_no}`}
-                </div>
+            <div className="mt-[2mm] min-h-0 flex-1 overflow-hidden border-y-[0.45mm] border-black py-[1mm]">
+              <div className="grid grid-cols-[1fr_auto] gap-[2mm] text-[7px] font-semibold uppercase">
+                <span>SKU / Product</span>
+                <span>Quantity</span>
               </div>
-              <div className="mt-[1.5mm] flex items-end justify-between gap-[2mm]">
-                <div className="min-w-0">
-                  <div className="truncate text-[10px] font-semibold">
-                    {item.product_name}
+              <div className="mt-[0.5mm] space-y-[0.65mm]">
+                {entries.map(({ item, quantity }) => (
+                  <div
+                    key={item.id}
+                    className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-[2mm]"
+                    style={{
+                      fontSize:
+                        entries.length > 8
+                          ? "7px"
+                          : entries.length > 4
+                            ? "9px"
+                            : "11px",
+                      lineHeight: 1.05,
+                    }}
+                  >
+                    <span className="min-w-0">
+                      <strong className="block truncate">
+                        {item.sku || `LINE-${item.line_no}`}
+                      </strong>
+                      <span className="block truncate text-[0.75em] font-normal">
+                        {[item.product_name, item.specification]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    </span>
+                    <strong className="shrink-0 tabular-nums">
+                      {quantity} {item.unit}
+                    </strong>
                   </div>
-                  <div className="mt-[0.5mm] truncate text-[8px]">
-                    {[item.specification, cartonSize]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </div>
-                </div>
-                <div className="shrink-0 text-right">
-                  <div className="text-[8px] uppercase">Quantity</div>
-                  <div className="text-[19px] font-black leading-none">
-                    {item.packed_quantity || item.quantity}
-                  </div>
-                  <div className="text-[8px]">
-                    {item.unit} · {copyIndex + 1}/{copies[item.id] || 1}
-                  </div>
-                </div>
+                ))}
               </div>
+            </div>
+            <div className="mt-[1mm] flex items-end justify-between text-[8px]">
+              <span>{entry.groupNo ? `PACKING GROUP ${entry.groupNo}` : "SKU LABEL"}</span>
+              <span className="font-semibold tabular-nums">
+                {copyIndex + 1}/{totalCopies}
+              </span>
             </div>
           </div>
         </div>
@@ -441,30 +578,37 @@ export default function TradeLabelPrintPage() {
           width: `${pageWidthMM}mm`,
           height: `${pageHeightMM}mm`,
           boxSizing: "border-box",
-          padding: `${marginTopMM}mm ${marginRightMM}mm ${marginBottomMM}mm ${marginLeftMM}mm`,
-          display: "grid",
-          gridTemplateColumns: `repeat(${layout.columns}, ${widthMM}mm)`,
-          gridTemplateRows: `repeat(${layout.rows}, ${heightMM}mm)`,
-          columnGap: `${gapXMM}mm`,
-          rowGap: `${gapYMM}mm`,
-          alignContent: "start",
-          justifyContent: "start",
+          position: "relative",
+          overflow: "hidden",
           breakAfter:
             !preview && pageIndex < printablePages.length - 1 ? "page" : "auto",
         }}
       >
-        {slots.map((entry, slotIndex) =>
-          entry ? (
-            renderLabel(
-              entry,
-              `${pageIndex}-${slotIndex}-${entry.item.id}`,
-              preview,
-              preview && pageIndex === 0 && slotIndex === firstFilledSlot,
-            )
-          ) : (
-            <div key={`${pageIndex}-${slotIndex}`} />
-          ),
-        )}
+        {slots.map((entry, slotIndex) => {
+          if (!entry) return null;
+          const column = slotIndex % layout.columns;
+          const row = Math.floor(slotIndex / layout.columns);
+          return (
+            <div
+              key={`${pageIndex}-${slotIndex}-${entry.key}`}
+              style={{
+                position: "absolute",
+                left: `${offsetXMM + column * (widthMM + gapXMM)}mm`,
+                top: `${offsetYMM + row * (heightMM + gapYMM)}mm`,
+                width: `${widthMM}mm`,
+                height: `${heightMM}mm`,
+              }}
+            >
+              {renderLabel(
+                entry,
+                `${pageIndex}-${slotIndex}-${entry.key}`,
+                preview,
+                preview && pageIndex === 0 && slotIndex === firstFilledSlot,
+                slotIndex,
+              )}
+            </div>
+          );
+        })}
       </div>
     );
   };
@@ -475,10 +619,24 @@ export default function TradeLabelPrintPage() {
     value: number;
     setValue: (value: number) => void;
   }> = [
-    { label: "上", value: marginTopMM, setValue: setMarginTopMM },
+    {
+      label: "上",
+      value: marginTopMM,
+      setValue: (value) => {
+        setMarginTopMM(value);
+        setOffsetYMM(value);
+      },
+    },
     { label: "右", value: marginRightMM, setValue: setMarginRightMM },
     { label: "下", value: marginBottomMM, setValue: setMarginBottomMM },
-    { label: "左", value: marginLeftMM, setValue: setMarginLeftMM },
+    {
+      label: "左",
+      value: marginLeftMM,
+      setValue: (value) => {
+        setMarginLeftMM(value);
+        setOffsetXMM(value);
+      },
+    },
   ];
 
   return (
@@ -540,7 +698,7 @@ export default function TradeLabelPrintPage() {
               <div>
                 <h2 className="text-sm font-semibold">纸张与标签</h2>
                 <p className="mt-0.5 text-xs text-slate-400">
-                  先设置纸张，再选择第一张标签的起始位置。
+                  在纸面拖动首张标签，右下角拖动调整尺寸。
                 </p>
               </div>
               <button
@@ -719,12 +877,56 @@ export default function TradeLabelPrintPage() {
               <div>
                 <h3 className="text-sm font-semibold">起始标签位</h3>
                 <p className="mt-0.5 text-[11px] text-slate-400">
-                  已用过部分标签纸时，从空白位置开始打印。
+                  可在右侧 A4 预览中直接拖动首张标签到任意位置。
                 </p>
               </div>
-              <span className="shrink-0 rounded-md bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-600">
-                第 {startSlot + 1} 格
-              </span>
+              <Move className="h-4 w-4 shrink-0 text-sky-600" />
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2 rounded-lg border border-sky-100 bg-sky-50/60 p-2.5">
+              <label className="text-[11px] font-medium text-slate-600">
+                横向位置 X / mm
+                <input
+                  type="number"
+                  min="0"
+                  max={Math.max(0, pageWidthMM - widthMM)}
+                  step="0.5"
+                  value={offsetXMM}
+                  onChange={(event) =>
+                    setOffsetXMM(
+                      clamp(
+                        Number(event.target.value),
+                        0,
+                        Math.max(0, pageWidthMM - widthMM),
+                      ),
+                    )
+                  }
+                  className="mt-1 h-8 w-full rounded-md border border-sky-200 bg-white px-2 text-xs"
+                />
+              </label>
+              <label className="text-[11px] font-medium text-slate-600">
+                纵向位置 Y / mm
+                <input
+                  type="number"
+                  min="0"
+                  max={Math.max(0, pageHeightMM - heightMM)}
+                  step="0.5"
+                  value={offsetYMM}
+                  onChange={(event) =>
+                    setOffsetYMM(
+                      clamp(
+                        Number(event.target.value),
+                        0,
+                        Math.max(0, pageHeightMM - heightMM),
+                      ),
+                    )
+                  }
+                  className="mt-1 h-8 w-full rounded-md border border-sky-200 bg-white px-2 text-xs"
+                />
+              </label>
+              <div className="col-span-2 flex items-center justify-between text-[10px] text-sky-700">
+                <span>当前起点：{offsetXMM.toFixed(1)}, {offsetYMM.toFixed(1)} mm</span>
+                <span>第 {startSlot + 1} 格开始</span>
+              </div>
             </div>
             {layout.capacity > 0 && (
               <div
@@ -774,25 +976,106 @@ export default function TradeLabelPrintPage() {
             </button>
 
             <div className="mt-5 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">标签内容</h3>
+              <h3 className="text-sm font-semibold">
+                {(order?.packing_groups || []).length > 0
+                  ? "装箱标签"
+                  : "标签内容"}
+              </h3>
               <button
                 type="button"
-                onClick={() =>
+                onClick={() => {
+                  if ((order?.packing_groups || []).length > 0) {
+                    setSelectedGroupIDs(
+                      selectedGroupIDs.length ===
+                        (order?.packing_groups || []).length
+                        ? []
+                        : (order?.packing_groups || []).map(
+                            (group) => group.id,
+                          ),
+                    );
+                    return;
+                  }
                   setSelectedItemIDs(
                     selectedItemIDs.length === (order?.items || []).length
                       ? []
                       : (order?.items || []).map((item) => item.id),
-                  )
-                }
+                  );
+                }}
                 className="text-xs font-medium text-sky-700"
               >
-                {selectedItemIDs.length === (order?.items || []).length
-                  ? "取消全选"
-                  : "全选"}
+                {(order?.packing_groups || []).length > 0
+                  ? selectedGroupIDs.length ===
+                    (order?.packing_groups || []).length
+                    ? "取消全选"
+                    : "全选"
+                  : selectedItemIDs.length === (order?.items || []).length
+                    ? "取消全选"
+                    : "全选"}
               </button>
             </div>
             <div className="mt-2 max-h-[45vh] space-y-2 overflow-y-auto pr-1">
-              {(order?.items || []).map((item) => {
+              {(order?.packing_groups || []).length > 0
+                ? (order?.packing_groups || []).map((group) => {
+                    const selected = selectedGroupIDs.includes(group.id);
+                    return (
+                      <div
+                        key={group.id}
+                        className={`rounded-lg border p-2.5 ${selected ? "border-orange-200 bg-orange-50" : "border-slate-200"}`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSelectedGroupIDs((current) =>
+                              selected
+                                ? current.filter((id) => id !== group.id)
+                                : [...current, group.id],
+                            )
+                          }
+                          className="flex w-full items-start gap-2 text-left"
+                        >
+                          <span
+                            className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${selected ? "border-orange-600 bg-orange-600 text-white" : "border-slate-300"}`}
+                          >
+                            {selected && <Check className="h-3 w-3" />}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-xs font-semibold">
+                              箱组 {group.group_no} · {group.copies} 箱
+                            </span>
+                            <span className="mt-0.5 block truncate text-[11px] text-slate-400">
+                              {(group.items || [])
+                                .map(
+                                  (item) =>
+                                    `${item.sku || item.product_name} × ${item.quantity}`,
+                                )
+                                .join("、")}
+                            </span>
+                          </span>
+                        </button>
+                        <label className="mt-2 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                          打印箱数
+                          <input
+                            type="number"
+                            min="1"
+                            max="500"
+                            value={groupCopies[group.id] || group.copies || 1}
+                            onChange={(event) =>
+                              setGroupCopies((current) => ({
+                                ...current,
+                                [group.id]: clamp(
+                                  Number(event.target.value) || 1,
+                                  1,
+                                  500,
+                                ),
+                              }))
+                            }
+                            className="h-7 w-20 rounded-md border border-slate-200 bg-white px-2 text-right text-xs"
+                          />
+                        </label>
+                      </div>
+                    );
+                  })
+                : (order?.items || []).map((item) => {
                 const selected = selectedItemIDs.includes(item.id);
                 return (
                   <div

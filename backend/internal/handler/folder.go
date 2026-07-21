@@ -93,6 +93,15 @@ func (h *FolderHandler) ListContents(c *gin.Context) {
 	response.OK(c, contents)
 }
 
+func (h *FolderHandler) ListWritableOptions(c *gin.Context) {
+	options, err := h.folderService.ListWritableOptionsForUser(c.GetInt64("user_id"))
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, options)
+}
+
 func (h *FolderHandler) UpdateFolder(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)

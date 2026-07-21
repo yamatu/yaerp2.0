@@ -434,6 +434,68 @@ func (h *TradeHandler) CreateSupplierQuote(c *gin.Context) {
 	response.OK(c, order)
 }
 
+func (h *TradeHandler) BatchCreateSupplierQuotes(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.BatchTradeSupplierQuoteRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.BatchCreateSupplierQuotes(c.GetInt64("user_id"), orderID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) UpdateSupplierQuote(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的供应商报价编号")
+		return
+	}
+	var request model.UpsertTradeSupplierQuoteRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdateSupplierQuote(c.GetInt64("user_id"), orderID, quoteID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) DeleteSupplierQuote(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的供应商报价编号")
+		return
+	}
+	order, err := h.service.DeleteSupplierQuote(c.GetInt64("user_id"), orderID, quoteID)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) SelectSupplierQuote(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {
@@ -494,6 +556,57 @@ func (h *TradeHandler) UpdateCustomerQuoteRoundStatus(c *gin.Context) {
 		return
 	}
 	response.OK(c, order)
+}
+
+func (h *TradeHandler) UpdateCustomerQuotePayment(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的对客报价编号")
+		return
+	}
+	var request model.UpdateTradeCustomerPaymentRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdateCustomerQuotePayment(c.GetInt64("user_id"), orderID, quoteID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) UploadCustomerPaymentProof(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的对客报价编号")
+		return
+	}
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "请选择付款凭证图片")
+		return
+	}
+	defer file.Close()
+	proof, err := h.service.UploadCustomerPaymentProof(
+		c.GetInt64("user_id"), orderID, quoteID, c.PostForm("note"), file, header,
+	)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, proof)
 }
 
 func (h *TradeHandler) ListPositions(c *gin.Context) {
@@ -587,6 +700,63 @@ func (h *TradeHandler) UploadInspectionPhoto(c *gin.Context) {
 		return
 	}
 	response.OK(c, photo)
+}
+
+func (h *TradeHandler) LinkInspectionPhotos(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.LinkTradeInspectionPhotosRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.LinkInspectionPhotos(c.GetInt64("user_id"), orderID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) UpdatePackingGroups(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.UpdateTradePackingGroupsRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdatePackingGroups(c.GetInt64("user_id"), orderID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) ReturnOrderToPurchase(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.ReturnTradeOrderToPurchaseRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.ReturnOrderToPurchase(c.GetInt64("user_id"), orderID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
 }
 
 func (h *TradeHandler) UpdateLabelSettings(c *gin.Context) {

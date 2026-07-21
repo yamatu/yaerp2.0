@@ -342,6 +342,15 @@ export interface FolderContents {
   workbooks: Workbook[];
 }
 
+export interface FolderOption {
+  id: number;
+  name: string;
+  path: string;
+  parent_id?: number | null;
+  owner_id: number;
+  can_write: boolean;
+}
+
 export interface RecycleBinContents {
   folders: Folder[];
   workbooks: Workbook[];
@@ -1146,6 +1155,8 @@ export interface TradeCustomer {
   whatsapp_chat_name: string;
   avatar_url: string;
   channel_id?: number;
+  workbook_folder_id?: number;
+  workbook_folder_name: string;
   tags: string[];
   notes: string;
   order_count: number;
@@ -1266,6 +1277,10 @@ export interface TradeCustomerQuoteRound {
   items: TradeCustomerQuoteItem[];
   customer_feedback: string;
   notes: string;
+  payment_status: "unpaid" | "partial" | "paid";
+  payment_currency: string;
+  paid_amount: number;
+  payment_proofs?: TradePaymentProof[];
   created_by: number;
   created_by_name: string;
   sent_at?: string;
@@ -1305,6 +1320,45 @@ export interface TradeInspectionPhoto {
   uploaded_by_name: string;
   gallery_directory_id?: number;
   created_at: string;
+}
+
+export interface TradePaymentProof {
+  id: number;
+  order_id: number;
+  quote_id: number;
+  attachment_id: number;
+  attachment_url: string;
+  thumbnail_url: string;
+  filename: string;
+  note: string;
+  uploaded_by: number;
+  uploaded_by_name: string;
+  gallery_directory_id?: number;
+  created_at: string;
+}
+
+export interface TradePackingGroupItem {
+  order_item_id: number;
+  line_no: number;
+  sku: string;
+  product_name: string;
+  quantity: number;
+}
+
+export interface TradePackingGroup {
+  id: number;
+  order_id: number;
+  group_no: number;
+  length_cm: number;
+  width_cm: number;
+  height_cm: number;
+  weight_kg: number;
+  volumetric_weight_kg: number;
+  copies: number;
+  items: TradePackingGroupItem[];
+  notes: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface TradePositionMember {
@@ -1533,6 +1587,8 @@ export interface TradeOrder {
   additional_cost_notes: string;
   workbook_id?: number;
   workbook_sheet_id?: number;
+  workspace_folder_id?: number;
+  workspace_folder_name: string;
   channel_id?: number;
   notes: string;
   label_width_mm: number;
@@ -1549,7 +1605,13 @@ export interface TradeOrder {
   label_gap_y_mm: number;
   label_content_scale: number;
   label_start_slot: number;
+  label_offset_x_mm: number;
+  label_offset_y_mm: number;
   inspection_gallery_directory_id?: number;
+  payment_gallery_directory_id?: number;
+  rework_required: boolean;
+  rework_reason: string;
+  rework_count: number;
   item_count: number;
   required_position_code: string;
   required_position_name: string;
@@ -1567,6 +1629,7 @@ export interface TradeOrder {
   supplier_quotes?: TradeSupplierQuote[];
   customer_quotes?: TradeCustomerQuoteRound[];
   inspection_photos?: TradeInspectionPhoto[];
+  packing_groups?: TradePackingGroup[];
   shipment?: TradeShipment;
   profit_summary?: TradeProfitSummary;
 }

@@ -37,6 +37,15 @@ type MoveWorkbookRequest struct {
 	FolderID *int64 `json:"folder_id"`
 }
 
+type FolderOption struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	ParentID *int64 `json:"parent_id,omitempty"`
+	OwnerID  int64  `json:"owner_id"`
+	CanWrite bool   `json:"can_write"`
+}
+
 type SetFolderVisibilityRequest struct {
 	Visibility []FolderVisibility `json:"visibility" binding:"required"`
 }

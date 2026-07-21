@@ -243,6 +243,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.PaymentMethod = ""
 		order.PaymentTerms = ""
 		order.CustomerQuotes = nil
+		order.PaymentGalleryDirectoryID = nil
 	}
 	if !orderAccess.CanViewProfit {
 		order.ActualFreightCurrency = ""
@@ -263,6 +264,9 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	}
 	if !orderAccess.CanViewShipment {
 		order.Shipment = nil
+	}
+	if !orderAccess.CanViewPacking {
+		order.PackingGroups = nil
 	}
 	if !orderAccess.CanViewSupplier {
 		order.SupplierQuotes = nil

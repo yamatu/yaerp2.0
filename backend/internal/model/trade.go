@@ -55,6 +55,8 @@ type TradeCustomer struct {
 	WhatsAppChatName   string    `json:"whatsapp_chat_name"`
 	AvatarURL          string    `json:"avatar_url"`
 	ChannelID          *int64    `json:"channel_id,omitempty"`
+	WorkbookFolderID   *int64    `json:"workbook_folder_id,omitempty"`
+	WorkbookFolderName string    `json:"workbook_folder_name"`
 	Tags               []string  `json:"tags"`
 	Notes              string    `json:"notes"`
 	OrderCount         int64     `json:"order_count"`
@@ -172,6 +174,10 @@ type TradeCustomerQuoteRound struct {
 	Items            []TradeCustomerQuoteItem `json:"items"`
 	CustomerFeedback string                   `json:"customer_feedback"`
 	Notes            string                   `json:"notes"`
+	PaymentStatus    string                   `json:"payment_status"`
+	PaymentCurrency  string                   `json:"payment_currency"`
+	PaidAmount       float64                  `json:"paid_amount"`
+	PaymentProofs    []TradePaymentProof      `json:"payment_proofs,omitempty"`
 	CreatedBy        int64                    `json:"created_by"`
 	CreatedByName    string                   `json:"created_by_name"`
 	SentAt           *time.Time               `json:"sent_at,omitempty"`
@@ -211,6 +217,45 @@ type TradeInspectionPhoto struct {
 	UploadedByName     string    `json:"uploaded_by_name"`
 	GalleryDirectoryID *int64    `json:"gallery_directory_id,omitempty"`
 	CreatedAt          time.Time `json:"created_at"`
+}
+
+type TradePaymentProof struct {
+	ID                 int64     `json:"id"`
+	OrderID            int64     `json:"order_id"`
+	QuoteID            int64     `json:"quote_id"`
+	AttachmentID       int64     `json:"attachment_id"`
+	AttachmentURL      string    `json:"attachment_url"`
+	ThumbnailURL       string    `json:"thumbnail_url"`
+	Filename           string    `json:"filename"`
+	Note               string    `json:"note"`
+	UploadedBy         int64     `json:"uploaded_by"`
+	UploadedByName     string    `json:"uploaded_by_name"`
+	GalleryDirectoryID *int64    `json:"gallery_directory_id,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+type TradePackingGroupItem struct {
+	OrderItemID int64   `json:"order_item_id"`
+	LineNo      int     `json:"line_no"`
+	SKU         string  `json:"sku"`
+	ProductName string  `json:"product_name"`
+	Quantity    float64 `json:"quantity"`
+}
+
+type TradePackingGroup struct {
+	ID                 int64                   `json:"id"`
+	OrderID            int64                   `json:"order_id"`
+	GroupNo            int                     `json:"group_no"`
+	LengthCM           float64                 `json:"length_cm"`
+	WidthCM            float64                 `json:"width_cm"`
+	HeightCM           float64                 `json:"height_cm"`
+	WeightKG           float64                 `json:"weight_kg"`
+	VolumetricWeightKG float64                 `json:"volumetric_weight_kg"`
+	Copies             int                     `json:"copies"`
+	Items              []TradePackingGroupItem `json:"items"`
+	Notes              string                  `json:"notes"`
+	CreatedAt          time.Time               `json:"created_at"`
+	UpdatedAt          time.Time               `json:"updated_at"`
 }
 
 type TradePositionMember struct {
@@ -320,6 +365,8 @@ type TradeOrder struct {
 	AdditionalCostNotes          string                    `json:"additional_cost_notes"`
 	WorkbookID                   *int64                    `json:"workbook_id,omitempty"`
 	WorkbookSheetID              *int64                    `json:"workbook_sheet_id,omitempty"`
+	WorkspaceFolderID            *int64                    `json:"workspace_folder_id,omitempty"`
+	WorkspaceFolderName          string                    `json:"workspace_folder_name"`
 	ChannelID                    *int64                    `json:"channel_id,omitempty"`
 	Notes                        string                    `json:"notes"`
 	LabelWidthMM                 float64                   `json:"label_width_mm"`
@@ -336,7 +383,13 @@ type TradeOrder struct {
 	LabelGapYMM                  float64                   `json:"label_gap_y_mm"`
 	LabelContentScale            float64                   `json:"label_content_scale"`
 	LabelStartSlot               int                       `json:"label_start_slot"`
+	LabelOffsetXMM               float64                   `json:"label_offset_x_mm"`
+	LabelOffsetYMM               float64                   `json:"label_offset_y_mm"`
 	InspectionGalleryDirectoryID *int64                    `json:"inspection_gallery_directory_id,omitempty"`
+	PaymentGalleryDirectoryID    *int64                    `json:"payment_gallery_directory_id,omitempty"`
+	ReworkRequired               bool                      `json:"rework_required"`
+	ReworkReason                 string                    `json:"rework_reason"`
+	ReworkCount                  int                       `json:"rework_count"`
 	ItemCount                    int64                     `json:"item_count"`
 	RequiredPositionCode         string                    `json:"required_position_code"`
 	RequiredPositionName         string                    `json:"required_position_name"`
@@ -354,6 +407,7 @@ type TradeOrder struct {
 	SupplierQuotes               []TradeSupplierQuote      `json:"supplier_quotes,omitempty"`
 	CustomerQuotes               []TradeCustomerQuoteRound `json:"customer_quotes,omitempty"`
 	InspectionPhotos             []TradeInspectionPhoto    `json:"inspection_photos,omitempty"`
+	PackingGroups                []TradePackingGroup       `json:"packing_groups,omitempty"`
 	Shipment                     *TradeShipment            `json:"shipment,omitempty"`
 	ProfitSummary                *TradeProfitSummary       `json:"profit_summary,omitempty"`
 }
@@ -505,6 +559,7 @@ type CreateTradeCustomerRequest struct {
 	AvatarURL         string   `json:"avatar_url"`
 	Tags              []string `json:"tags"`
 	Notes             string   `json:"notes"`
+	WorkbookFolderID  *int64   `json:"workbook_folder_id"`
 	CreateChannel     *bool    `json:"create_channel"`
 }
 
@@ -525,6 +580,7 @@ type UpdateTradeCustomerRequest struct {
 	AvatarURL         string   `json:"avatar_url"`
 	Tags              []string `json:"tags"`
 	Notes             string   `json:"notes"`
+	WorkbookFolderID  *int64   `json:"workbook_folder_id"`
 }
 
 type TradeCustomerDeleteRequestInput struct {
@@ -620,6 +676,7 @@ type CreateTradeOrderRequest struct {
 	Items              []CreateTradeOrderItemRequest `json:"items" binding:"required,min=1,dive"`
 	CreateWorkspace    *bool                         `json:"create_workspace"`
 	SharedWorkspace    *bool                         `json:"shared_workspace"`
+	WorkbookFolderID   *int64                        `json:"workbook_folder_id"`
 }
 
 type AdvanceTradeOrderRequest struct {
@@ -651,6 +708,10 @@ type UpsertTradeSupplierQuoteRequest struct {
 	Notes        string  `json:"notes"`
 }
 
+type BatchTradeSupplierQuoteRequest struct {
+	Quotes []UpsertTradeSupplierQuoteRequest `json:"quotes" binding:"required,min=1,dive"`
+}
+
 type TradeCustomerQuoteItemInput struct {
 	OrderItemID int64   `json:"order_item_id" binding:"required"`
 	UnitPrice   float64 `json:"unit_price" binding:"gt=0"`
@@ -673,6 +734,41 @@ type UpdateTradeCustomerQuoteStatusRequest struct {
 	Notes            string `json:"notes"`
 }
 
+type UpdateTradeCustomerPaymentRequest struct {
+	PaymentStatus   string  `json:"payment_status" binding:"required"`
+	PaymentCurrency string  `json:"payment_currency"`
+	PaidAmount      float64 `json:"paid_amount" binding:"gte=0"`
+}
+
+type LinkTradeInspectionPhotosRequest struct {
+	OrderItemID   *int64  `json:"order_item_id"`
+	AttachmentIDs []int64 `json:"attachment_ids" binding:"required,min=1"`
+	Note          string  `json:"note"`
+}
+
+type TradePackingGroupItemInput struct {
+	OrderItemID int64   `json:"order_item_id" binding:"required"`
+	Quantity    float64 `json:"quantity" binding:"gt=0"`
+}
+
+type TradePackingGroupInput struct {
+	LengthCM float64                      `json:"length_cm" binding:"gte=0"`
+	WidthCM  float64                      `json:"width_cm" binding:"gte=0"`
+	HeightCM float64                      `json:"height_cm" binding:"gte=0"`
+	WeightKG float64                      `json:"weight_kg" binding:"gte=0"`
+	Copies   int                          `json:"copies" binding:"gte=1"`
+	Items    []TradePackingGroupItemInput `json:"items" binding:"required,min=1,dive"`
+	Notes    string                       `json:"notes"`
+}
+
+type UpdateTradePackingGroupsRequest struct {
+	Groups []TradePackingGroupInput `json:"groups" binding:"required,min=1,dive"`
+}
+
+type ReturnTradeOrderToPurchaseRequest struct {
+	Reason string `json:"reason" binding:"required"`
+}
+
 type TradePositionAssignmentsRequest struct {
 	Assignments map[string][]int64 `json:"assignments" binding:"required"`
 }
@@ -693,20 +789,22 @@ type TradePIRequest struct {
 }
 
 type UpdateTradeLabelSettingsRequest struct {
-	WidthMM        float64 `json:"width_mm" binding:"gte=20,lte=300"`
-	HeightMM       float64 `json:"height_mm" binding:"gte=15,lte=300"`
-	PaperSize      string  `json:"paper_size"`
-	PaperWidthMM   float64 `json:"paper_width_mm" binding:"gte=50,lte=500"`
-	PaperHeightMM  float64 `json:"paper_height_mm" binding:"gte=50,lte=500"`
-	Orientation    string  `json:"orientation"`
-	MarginTopMM    float64 `json:"margin_top_mm" binding:"gte=0,lte=100"`
-	MarginRightMM  float64 `json:"margin_right_mm" binding:"gte=0,lte=100"`
-	MarginBottomMM float64 `json:"margin_bottom_mm" binding:"gte=0,lte=100"`
-	MarginLeftMM   float64 `json:"margin_left_mm" binding:"gte=0,lte=100"`
-	GapXMM         float64 `json:"gap_x_mm" binding:"gte=0,lte=50"`
-	GapYMM         float64 `json:"gap_y_mm" binding:"gte=0,lte=50"`
-	ContentScale   float64 `json:"content_scale" binding:"gte=0.5,lte=1.8"`
-	StartSlot      int     `json:"start_slot" binding:"gte=0,lte=500"`
+	WidthMM        float64  `json:"width_mm" binding:"gte=20,lte=300"`
+	HeightMM       float64  `json:"height_mm" binding:"gte=15,lte=300"`
+	PaperSize      string   `json:"paper_size"`
+	PaperWidthMM   float64  `json:"paper_width_mm" binding:"gte=50,lte=500"`
+	PaperHeightMM  float64  `json:"paper_height_mm" binding:"gte=50,lte=500"`
+	Orientation    string   `json:"orientation"`
+	MarginTopMM    float64  `json:"margin_top_mm" binding:"gte=0,lte=100"`
+	MarginRightMM  float64  `json:"margin_right_mm" binding:"gte=0,lte=100"`
+	MarginBottomMM float64  `json:"margin_bottom_mm" binding:"gte=0,lte=100"`
+	MarginLeftMM   float64  `json:"margin_left_mm" binding:"gte=0,lte=100"`
+	GapXMM         float64  `json:"gap_x_mm" binding:"gte=0,lte=50"`
+	GapYMM         float64  `json:"gap_y_mm" binding:"gte=0,lte=50"`
+	ContentScale   float64  `json:"content_scale" binding:"gte=0.5,lte=1.8"`
+	StartSlot      int      `json:"start_slot" binding:"gte=0,lte=500"`
+	OffsetXMM      *float64 `json:"offset_x_mm" binding:"omitempty,gte=0,lte=500"`
+	OffsetYMM      *float64 `json:"offset_y_mm" binding:"omitempty,gte=0,lte=500"`
 }
 
 type TradeOrderFilter struct {

@@ -151,6 +151,33 @@ func (r *FolderRepo) ListSubFolders(parentID *int64) ([]model.Folder, error) {
 	return folders, queryRows.Err()
 }
 
+func (r *FolderRepo) ListAllActive() ([]model.Folder, error) {
+	rows, err := r.db.Query(
+		`SELECT f.id, f.name, f.parent_id, f.owner_id, u.username, f.created_at, f.updated_at
+		 FROM folders f
+		 LEFT JOIN users u ON u.id = f.owner_id
+		 WHERE f.deleted_at IS NULL
+		 ORDER BY f.id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list active folders: %w", err)
+	}
+	defer rows.Close()
+
+	folders := make([]model.Folder, 0)
+	for rows.Next() {
+		var folder model.Folder
+		if err := rows.Scan(
+			&folder.ID, &folder.Name, &folder.ParentID, &folder.OwnerID, &folder.OwnerName,
+			&folder.CreatedAt, &folder.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan active folder: %w", err)
+		}
+		folders = append(folders, folder)
+	}
+	return folders, rows.Err()
+}
+
 func (r *FolderRepo) SetShares(folderID int64, shares []model.FolderShareEntry) error {
 	tx, err := r.db.Begin()
 	if err != nil {

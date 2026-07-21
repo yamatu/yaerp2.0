@@ -35,6 +35,7 @@ import {
   Printer,
   RefreshCw,
   RotateCcw,
+  RotateCw,
   Save,
   Search,
   Send,
@@ -54,6 +55,10 @@ import {
 } from "lucide-react";
 import { AuthGuard } from "@/components/auth/AuthGuard";
 import { CurrencySearchEnhancer } from "@/components/trade/CurrencyCombobox";
+import { CustomerCombobox } from "@/components/trade/CustomerCombobox";
+import { FolderCombobox } from "@/components/trade/FolderCombobox";
+import { OrderItemCombobox } from "@/components/trade/OrderItemCombobox";
+import { PackingGroupsModal } from "@/components/trade/PackingGroupsModal";
 import { SupplierCombobox } from "@/components/trade/SupplierCombobox";
 import { WhatsAppAvatarImage } from "@/components/whatsapp/WhatsAppAvatarImage";
 import api from "@/lib/api";
@@ -61,6 +66,11 @@ import { getStoredUser, isAdmin } from "@/lib/auth";
 import { setReturnTarget } from "@/lib/returnNavigation";
 import { matchesWhatsAppChat } from "@/lib/whatsappSearch";
 import { wsClient } from "@/lib/ws";
+import {
+  imageTransformLabel,
+  transformRemoteImage,
+  type ImageTransform,
+} from "@/lib/imageTransform";
 import type {
   TradeCustomer,
   TradeCustomerDeleteRequest,
@@ -70,13 +80,16 @@ import type {
   TradeBossDashboard,
   TradeDashboard,
   TradeInspectionPhoto,
+  GalleryImage,
   TradeOrder,
   TradeOrderItem,
+  TradePaymentProof,
   TradePIProfile,
   TradePosition,
   TradeSettings,
   TradeStage,
   TradeSupplier,
+  FolderOption,
   User,
   WhatsAppAccount,
   WhatsAppChat,
@@ -109,6 +122,7 @@ interface CustomerDraft {
   whatsapp_chat_id: string;
   whatsapp_chat_name: string;
   avatar_url: string;
+  workbook_folder_id?: number;
 }
 
 interface OrderItemDraft {
@@ -133,6 +147,7 @@ interface OrderDraft {
   notes: string;
   create_workspace: boolean;
   shared_workspace: boolean;
+  workbook_folder_id?: number;
 }
 
 interface SupplierDraft {
@@ -406,6 +421,7 @@ function newCustomerDraft(): CustomerDraft {
     whatsapp_chat_id: "",
     whatsapp_chat_name: "",
     avatar_url: "",
+    workbook_folder_id: undefined,
   };
 }
 
@@ -421,7 +437,11 @@ function newOrderItem(): OrderItemDraft {
   };
 }
 
-function newOrderDraft(customerId = 0, paymentMethod = "T/T 电汇"): OrderDraft {
+function newOrderDraft(
+  customerId = 0,
+  paymentMethod = "T/T 电汇",
+  workbookFolderID?: number,
+): OrderDraft {
   const deadline = new Date();
   deadline.setDate(deadline.getDate() + 3);
   return {
@@ -436,6 +456,7 @@ function newOrderDraft(customerId = 0, paymentMethod = "T/T 电汇"): OrderDraft
     notes: "",
     create_workspace: true,
     shared_workspace: true,
+    workbook_folder_id: workbookFolderID,
   };
 }
 
@@ -458,14 +479,15 @@ function newSupplierQuoteDraft(
   order?: TradeOrder,
   suppliers: TradeSupplier[] = [],
 ): SupplierQuoteDraft {
+  const today = new Date().toISOString().slice(0, 10);
   return {
     order_item_id: order?.items?.[0]?.id || 0,
     supplier_id: suppliers[0]?.id || 0,
     currency: order?.currency || suppliers[0]?.default_currency || "USD",
     unit_price: "",
     moq: "",
-    lead_time_days: "",
-    valid_until: "",
+    lead_time_days: "3",
+    valid_until: today,
     notes: "",
   };
 }
@@ -633,15 +655,7 @@ const STAGE_DATA_FIELDS: Partial<Record<TradeStage, StageDataField[]>> = {
   ],
 };
 
-const SHIPMENT_STATUSES = [
-  "待订舱",
-  "已订舱",
-  "已装柜",
-  "已离港",
-  "运输中",
-  "已到港",
-  "已签收",
-];
+const SHIPMENT_STATUSES = ["未到", "到了"];
 
 function emptyStageShipmentDraft(order?: TradeOrder): StageShipmentDraft {
   return {
@@ -651,7 +665,11 @@ function emptyStageShipmentDraft(order?: TradeOrder): StageShipmentDraft {
     etd: order?.shipment?.etd?.slice(0, 10) || "",
     eta: order?.shipment?.eta?.slice(0, 10) || "",
     bl_no: order?.shipment?.bl_no || "",
-    shipping_status: order?.shipment?.shipping_status || "待订舱",
+    shipping_status: ["未到", "到了"].includes(
+      order?.shipment?.shipping_status || "",
+    )
+      ? order?.shipment?.shipping_status || "未到"
+      : "未到",
     actual_freight_currency: order?.shipment?.actual_freight_currency || "CNY",
     actual_freight_amount:
       (order?.shipment?.actual_freight_amount || 0) > 0
@@ -800,6 +818,7 @@ export default function TradeWorkspacePage() {
     pi_profile: defaultTradePIProfile(),
   });
   const [users, setUsers] = useState<User[]>([]);
+  const [folderOptions, setFolderOptions] = useState<FolderOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [activeView, setActiveView] = useState<TradeView>("orders");
@@ -856,9 +875,30 @@ export default function TradeWorkspacePage() {
   const [savingSupplier, setSavingSupplier] = useState(false);
 
   const [quoteModalOpen, setQuoteModalOpen] = useState(false);
-  const [quoteDraft, setQuoteDraft] = useState<SupplierQuoteDraft>(() =>
+  const [quoteDrafts, setQuoteDrafts] = useState<SupplierQuoteDraft[]>([
     newSupplierQuoteDraft(),
-  );
+  ]);
+  const [activeQuoteDraftIndex, setActiveQuoteDraftIndex] = useState(0);
+  const [editingSupplierQuoteID, setEditingSupplierQuoteID] = useState<
+    number | null
+  >(null);
+  const quoteDraft =
+    quoteDrafts[activeQuoteDraftIndex] ||
+    quoteDrafts[0] ||
+    newSupplierQuoteDraft();
+  const setQuoteDraft = (
+    update:
+      | SupplierQuoteDraft
+      | ((current: SupplierQuoteDraft) => SupplierQuoteDraft),
+  ) => {
+    setQuoteDrafts((current) => {
+      const next = current.length ? [...current] : [newSupplierQuoteDraft()];
+      const index = Math.min(activeQuoteDraftIndex, next.length - 1);
+      next[index] =
+        typeof update === "function" ? update(next[index]) : update;
+      return next;
+    });
+  };
   const [savingQuote, setSavingQuote] = useState(false);
   const [customerQuoteModalOpen, setCustomerQuoteModalOpen] = useState(false);
   const [customerQuoteDraft, setCustomerQuoteDraft] =
@@ -869,6 +909,7 @@ export default function TradeWorkspacePage() {
   const [savingCustomerQuoteStatus, setSavingCustomerQuoteStatus] =
     useState(false);
   const [stageDataModalOpen, setStageDataModalOpen] = useState(false);
+  const [packingGroupsOpen, setPackingGroupsOpen] = useState(false);
   const [stageItemDrafts, setStageItemDrafts] = useState<
     Record<number, StageItemDraft>
   >({});
@@ -892,6 +933,9 @@ export default function TradeWorkspacePage() {
   const [savingSettings, setSavingSettings] = useState(false);
 
   const [detailOrder, setDetailOrder] = useState<TradeOrder | null>(null);
+  const [detailViewStage, setDetailViewStage] = useState<
+    Exclude<TradeStage, "cancelled">
+  >("inquiry");
   const [detailLoading, setDetailLoading] = useState(false);
   const [flowing, setFlowing] = useState(false);
   const [advanceNote, setAdvanceNote] = useState("");
@@ -900,8 +944,23 @@ export default function TradeWorkspacePage() {
   const [inspectionNote, setInspectionNote] = useState("");
   const [inspectionFiles, setInspectionFiles] = useState<File[]>([]);
   const [uploadingInspection, setUploadingInspection] = useState(false);
+  const [galleryPickerOpen, setGalleryPickerOpen] = useState(false);
+  const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([]);
+  const [gallerySelectedIDs, setGallerySelectedIDs] = useState<number[]>([]);
+  const [galleryLoading, setGalleryLoading] = useState(false);
+  const [linkingGalleryImages, setLinkingGalleryImages] = useState(false);
   const [selectedPhoto, setSelectedPhoto] =
     useState<TradeInspectionPhoto | null>(null);
+  const [transformingInspectionPhoto, setTransformingInspectionPhoto] =
+    useState<ImageTransform | null>(null);
+  const [paymentQuoteID, setPaymentQuoteID] = useState<number | null>(null);
+  const [paymentStatus, setPaymentStatus] = useState<
+    "unpaid" | "partial" | "paid"
+  >("unpaid");
+  const [paymentCurrency, setPaymentCurrency] = useState("");
+  const [paidAmount, setPaidAmount] = useState("");
+  const [savingPayment, setSavingPayment] = useState(false);
+  const [uploadingPaymentProof, setUploadingPaymentProof] = useState(false);
   const [profitSettingsOpen, setProfitSettingsOpen] = useState(false);
   const [profitSettingsDraft, setProfitSettingsDraft] =
     useState<ProfitSettingsDraft | null>(null);
@@ -909,6 +968,9 @@ export default function TradeWorkspacePage() {
   const [deleteTarget, setDeleteTarget] = useState<TradeOrder | null>(null);
   const [deletingOrder, setDeletingOrder] = useState(false);
   const [timelineExpanded, setTimelineExpanded] = useState(false);
+  const [returnToPurchaseOpen, setReturnToPurchaseOpen] = useState(false);
+  const [returnToPurchaseReason, setReturnToPurchaseReason] = useState("");
+  const [returningToPurchase, setReturningToPurchase] = useState(false);
   const [piModalOpen, setPIModalOpen] = useState(false);
   const [piDraft, setPIDraft] = useState<TradePIDraft | null>(null);
   const [piPreviewURL, setPIPreviewURL] = useState("");
@@ -933,6 +995,7 @@ export default function TradeWorkspacePage() {
           api.get<TradeCustomerDeleteRequest[]>(
             "/trade/customer-delete-requests?status=pending",
           ),
+          api.get<FolderOption[]>("/folders/options"),
         ] as const;
         const [
           accessResponse,
@@ -943,6 +1006,7 @@ export default function TradeWorkspacePage() {
           positionResponse,
           settingsResponse,
           customerDeleteResponse,
+          folderOptionsResponse,
         ] = await Promise.all(requests);
         const responses = [
           accessResponse,
@@ -953,6 +1017,7 @@ export default function TradeWorkspacePage() {
           positionResponse,
           settingsResponse,
           customerDeleteResponse,
+          folderOptionsResponse,
         ];
         const failed = responses.find((response) => response.code !== 0);
         if (failed) throw new Error(failed.message || "加载外贸业务数据失败");
@@ -963,6 +1028,7 @@ export default function TradeWorkspacePage() {
         setSuppliers(supplierResponse.data || []);
         setPositions(positionResponse.data || []);
         setCustomerDeleteRequests(customerDeleteResponse.data || []);
+        setFolderOptions(folderOptionsResponse.data || []);
         if (accessResponse.data?.can_view_all_orders) {
           const bossResponse = await api.get<TradeBossDashboard>(
             "/trade/boss-dashboard",
@@ -1041,6 +1107,7 @@ export default function TradeWorkspacePage() {
           throw new Error(response.message || "加载业务单详情失败");
         }
         setDetailOrder(response.data);
+        setDetailViewStage(response.data.stage as Exclude<TradeStage, "cancelled">);
         detailOrderIDRef.current = response.data.id;
         if (!inspectionItemID && response.data.items?.length)
           setInspectionItemID(response.data.items[0].id);
@@ -1301,6 +1368,21 @@ export default function TradeWorkspacePage() {
       ),
     );
   }, [positionUserSearch, users]);
+  const inspectorOptions = useMemo(() => {
+    const options = new Map<string, string>();
+    users.forEach((user) => options.set(user.username, user.email || ""));
+    positions.forEach((position) =>
+      position.members.forEach((member) =>
+        options.set(member.username, position.name),
+      ),
+    );
+    if (profile?.username)
+      options.set(profile.username, profile.email || "当前账号");
+    return Array.from(options, ([username, description]) => ({
+      username,
+      description,
+    }));
+  }, [positions, profile?.email, profile?.username, users]);
 
   const customerQuoteAmounts = useMemo(() => {
     if (!customerQuoteDraft)
@@ -1380,6 +1462,7 @@ export default function TradeWorkspacePage() {
       whatsapp_chat_id: customer.whatsapp_chat_id,
       whatsapp_chat_name: customer.whatsapp_chat_name,
       avatar_url: customer.avatar_url,
+      workbook_folder_id: customer.workbook_folder_id,
     });
     setCustomerModalOpen(true);
     setError("");
@@ -1547,7 +1630,16 @@ export default function TradeWorkspacePage() {
       return;
     }
     const selectedID = customerID || orderDraft.customer_id || customers[0].id;
-    setOrderDraft(newOrderDraft(selectedID, settings.payment_methods[0]));
+    const selectedCustomer = customers.find(
+      (customer) => customer.id === selectedID,
+    );
+    setOrderDraft(
+      newOrderDraft(
+        selectedID,
+        settings.payment_methods[0],
+        selectedCustomer?.workbook_folder_id,
+      ),
+    );
     setOrderItems([newOrderItem()]);
     setOrderModalOpen(true);
     setError("");
@@ -1621,10 +1713,13 @@ export default function TradeWorkspacePage() {
       setItemModalOpen(false);
       setAdditionalItems([newOrderItem()]);
       if (quoteModalOpen && firstAddedItem) {
-        setQuoteDraft((current) => ({
+        setQuoteDrafts((current) => [
           ...current,
-          order_item_id: firstAddedItem.id,
-        }));
+          {
+            ...newSupplierQuoteDraft(detailOrder, suppliers),
+            order_item_id: firstAddedItem.id,
+          },
+        ]);
       }
       setNotice(
         `已新增 ${validItems.length} 个产品，并同步到报价、采购、到货、质检和装箱工作表。`,
@@ -1642,6 +1737,11 @@ export default function TradeWorkspacePage() {
       setError("当前账号不是本环节负责人，不能修改环节数据。");
       return;
     }
+    if (detailOrder.stage === "packing") {
+      setPackingGroupsOpen(true);
+      setError("");
+      return;
+    }
     const fields = STAGE_DATA_FIELDS[detailOrder.stage] || [];
     if (detailOrder.stage !== "shipment" && fields.length === 0) {
       setError("当前环节请使用对应的报价功能维护数据。");
@@ -1656,8 +1756,15 @@ export default function TradeWorkspacePage() {
               let value = stageItemValue(item, field);
               if (!value && field.key === "sample_qty")
                 value = String(item.received_quantity || item.quantity || 0);
-              if (!value && field.key === "packed_quantity")
-                value = String(item.packed_quantity || item.quantity || 0);
+              if (!value && field.key === "accepted_quantity")
+                value = String(item.received_quantity || item.quantity || 0);
+              if (
+                !value &&
+                ["received_date", "inspection_date"].includes(field.key)
+              )
+                value = new Date().toISOString().slice(0, 10);
+              if (!value && field.key === "inspector")
+                value = profile?.username || "";
               if (
                 !value &&
                 [
@@ -1850,10 +1957,18 @@ export default function TradeWorkspacePage() {
       setNotice(`供应商「${response.data.name}」已录入。`);
       await loadData(true);
       if (quoteModalOpen)
-        setQuoteDraft((current) => ({
-          ...current,
-          supplier_id: response.data!.id,
-        }));
+        setQuoteDrafts((current) =>
+          current.map((draft, index) =>
+            index === activeQuoteDraftIndex
+              ? {
+                  ...draft,
+                  supplier_id: response.data!.id,
+                  currency:
+                    response.data!.default_currency || draft.currency,
+                }
+              : draft,
+          ),
+        );
     } catch (saveError) {
       setError(
         saveError instanceof Error ? saveError.message : "创建供应商失败",
@@ -1865,6 +1980,7 @@ export default function TradeWorkspacePage() {
 
   const openOrderDetail = async (order: TradeOrder) => {
     setDetailOrder(order);
+    setDetailViewStage(order.stage as Exclude<TradeStage, "cancelled">);
     detailOrderIDRef.current = order.id;
     setAdvanceNote("");
     setInspectionFiles([]);
@@ -2143,26 +2259,73 @@ export default function TradeWorkspacePage() {
     }
   };
 
-  const saveSupplierQuote = async () => {
-    if (!detailOrder || !quoteDraft.order_item_id || !quoteDraft.supplier_id)
-      return setError("请选择产品和供应商。");
-    setSavingQuote(true);
+  const returnOrderToPurchase = async () => {
+    if (!detailOrder || !returnToPurchaseReason.trim()) {
+      setError("请填写发错货、采购错误或需要重购的具体原因。");
+      return;
+    }
+    setReturningToPurchase(true);
     setError("");
     try {
       const response = await api.post<TradeOrder>(
-        `/trade/orders/${detailOrder.id}/supplier-quotes`,
-        {
-          ...quoteDraft,
-          unit_price: Number(quoteDraft.unit_price || 0),
-          moq: Number(quoteDraft.moq || 0),
-          lead_time_days: Number(quoteDraft.lead_time_days || 0),
-        },
+        `/trade/orders/${detailOrder.id}/return-to-purchase`,
+        { reason: returnToPurchaseReason.trim() },
       );
+      if (response.code !== 0 || !response.data) {
+        throw new Error(response.message || "退回采购失败");
+      }
+      setDetailOrder(response.data);
+      setDetailViewStage("purchase");
+      setReturnToPurchaseOpen(false);
+      setReturnToPurchaseReason("");
+      setNotice("订单已标记采购异常并退回采购环节，采购岗位已收到提醒。");
+      await loadData(true);
+    } catch (returnError) {
+      setError(
+        returnError instanceof Error ? returnError.message : "退回采购失败",
+      );
+    } finally {
+      setReturningToPurchase(false);
+    }
+  };
+
+  const saveSupplierQuote = async () => {
+    if (!detailOrder) return;
+    if (
+      quoteDrafts.length === 0 ||
+      quoteDrafts.some(
+        (draft) => !draft.order_item_id || !draft.supplier_id,
+      )
+    )
+      return setError("每条报价都需要选择产品和供应商。");
+    setSavingQuote(true);
+    setError("");
+    try {
+      const quotes = quoteDrafts.map((draft) => ({
+          ...draft,
+          unit_price: Number(draft.unit_price || 0),
+          moq: Number(draft.moq || 0),
+          lead_time_days: Number(draft.lead_time_days || 0),
+      }));
+      const response = editingSupplierQuoteID
+        ? await api.put<TradeOrder>(
+            `/trade/orders/${detailOrder.id}/supplier-quotes/${editingSupplierQuoteID}`,
+            quotes[0],
+          )
+        : await api.post<TradeOrder>(
+            `/trade/orders/${detailOrder.id}/supplier-quotes/batch`,
+            { quotes },
+          );
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "保存供应商报价失败");
       setDetailOrder(response.data);
       setQuoteModalOpen(false);
-      setNotice("供应商报价已保存并同步到流程工作簿。");
+      setEditingSupplierQuoteID(null);
+      setNotice(
+        editingSupplierQuoteID
+          ? "供应商报价已更新并同步到流程工作簿。"
+          : `已保存 ${quotes.length} 条供应商报价并同步到流程工作簿。`,
+      );
       await loadData(true);
     } catch (quoteError) {
       setError(
@@ -2170,6 +2333,28 @@ export default function TradeWorkspacePage() {
       );
     } finally {
       setSavingQuote(false);
+    }
+  };
+
+  const deleteSupplierQuote = async (quoteID: number) => {
+    if (!detailOrder) return;
+    if (!window.confirm("确认删除这条供应商报价吗？")) return;
+    setError("");
+    try {
+      const response = await api.delete<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/supplier-quotes/${quoteID}`,
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "删除供应商报价失败");
+      setDetailOrder(response.data);
+      setNotice("供应商报价已删除并同步到流程工作簿。");
+      await loadData(true);
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "删除供应商报价失败",
+      );
     }
   };
 
@@ -2339,6 +2524,69 @@ export default function TradeWorkspacePage() {
     }
   };
 
+  const openPaymentEditor = (quote: TradeCustomerQuoteRound) => {
+    setPaymentQuoteID(quote.id);
+    setPaymentStatus(quote.payment_status || "unpaid");
+    setPaymentCurrency(quote.payment_currency || quote.currency || "USD");
+    setPaidAmount(quote.paid_amount ? String(quote.paid_amount) : "");
+    setError("");
+  };
+
+  const saveCustomerPayment = async () => {
+    if (!detailOrder || !paymentQuoteID) return;
+    setSavingPayment(true);
+    setError("");
+    try {
+      const response = await api.put<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/customer-quotes/${paymentQuoteID}/payment`,
+        {
+          payment_status: paymentStatus,
+          payment_currency: paymentCurrency.trim().toUpperCase(),
+          paid_amount: Number(paidAmount || 0),
+        },
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "保存付款信息失败");
+      setDetailOrder(response.data);
+      setPaymentQuoteID(null);
+      setNotice("客户付款信息已保存。");
+      await loadData(true);
+    } catch (paymentError) {
+      setError(
+        paymentError instanceof Error ? paymentError.message : "保存付款信息失败",
+      );
+    } finally {
+      setSavingPayment(false);
+    }
+  };
+
+  const uploadCustomerPaymentProof = async (
+    quoteID: number,
+    file: File,
+  ) => {
+    if (!detailOrder) return;
+    setUploadingPaymentProof(true);
+    setError("");
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const response = await api.form<TradePaymentProof>(
+        `/trade/orders/${detailOrder.id}/customer-quotes/${quoteID}/payment-proofs`,
+        body,
+      );
+      if (response.code !== 0)
+        throw new Error(response.message || "上传付款凭证失败");
+      await loadOrderDetail(detailOrder.id, false);
+      setNotice("客户付款凭证已保存到图库并关联报价轮次。");
+    } catch (proofError) {
+      setError(
+        proofError instanceof Error ? proofError.message : "上传付款凭证失败",
+      );
+    } finally {
+      setUploadingPaymentProof(false);
+    }
+  };
+
   const syncWorkbook = async () => {
     if (!detailOrder) return;
     setSyncingWorkbook(true);
@@ -2391,6 +2639,95 @@ export default function TradeWorkspacePage() {
       );
     } finally {
       setUploadingInspection(false);
+    }
+  };
+
+  const openInspectionGalleryPicker = async () => {
+    setGalleryPickerOpen(true);
+    setGallerySelectedIDs([]);
+    setGalleryLoading(true);
+    setError("");
+    try {
+      const response = await api.get<{
+        list: GalleryImage[];
+        total: number;
+        page: number;
+        size: number;
+      }>("/attachments/images?page=1&size=100");
+      if (response.code !== 0)
+        throw new Error(response.message || "加载图库失败");
+      setGalleryImages(response.data?.list || []);
+    } catch (galleryError) {
+      setError(
+        galleryError instanceof Error ? galleryError.message : "加载图库失败",
+      );
+    } finally {
+      setGalleryLoading(false);
+    }
+  };
+
+  const linkInspectionGalleryImages = async () => {
+    if (!detailOrder || gallerySelectedIDs.length === 0) return;
+    setLinkingGalleryImages(true);
+    setError("");
+    try {
+      const response = await api.post<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/inspection-photos/link`,
+        {
+          order_item_id: inspectionItemID || undefined,
+          attachment_ids: gallerySelectedIDs,
+          note: inspectionNote.trim(),
+        },
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "关联图库图片失败");
+      setDetailOrder(response.data);
+      setGalleryPickerOpen(false);
+      setGallerySelectedIDs([]);
+      setNotice(`已关联 ${gallerySelectedIDs.length} 张图库图片到质检记录。`);
+    } catch (linkError) {
+      setError(
+        linkError instanceof Error ? linkError.message : "关联图库图片失败",
+      );
+    } finally {
+      setLinkingGalleryImages(false);
+    }
+  };
+
+  const transformInspectionPhoto = async (transform: ImageTransform) => {
+    if (!selectedPhoto || transformingInspectionPhoto) return;
+    setTransformingInspectionPhoto(transform);
+    setError("");
+    try {
+      const file = await transformRemoteImage(
+        selectedPhoto.attachment_url,
+        selectedPhoto.filename,
+        "image/jpeg",
+        transform,
+      );
+      const body = new FormData();
+      body.append("file", file);
+      const response = await api.form<GalleryImage>(
+        `/gallery/images/${selectedPhoto.attachment_id}/content`,
+        body,
+        "PUT",
+      );
+      if (response.code !== 0)
+        throw new Error(
+          response.message || `${imageTransformLabel(transform)}失败`,
+        );
+      const orderID = selectedPhoto.order_id;
+      setSelectedPhoto(null);
+      await loadOrderDetail(orderID, false);
+      setNotice(`质检图片已${imageTransformLabel(transform)}并保存。`);
+    } catch (transformError) {
+      setError(
+        transformError instanceof Error
+          ? transformError.message
+          : `${imageTransformLabel(transform)}失败`,
+      );
+    } finally {
+      setTransformingInspectionPhoto(null);
     }
   };
 
@@ -4011,6 +4348,24 @@ export default function TradeWorkspacePage() {
                       placeholder="批发商, 欧洲, 重点跟进"
                     />
                   </label>
+                  <div className="sm:col-span-2">
+                    <div className="mb-1.5 text-sm font-medium text-slate-700">
+                      默认流程工作簿文件夹
+                    </div>
+                    <FolderCombobox
+                      folders={folderOptions}
+                      value={customerDraft.workbook_folder_id}
+                      onChange={(folderID) =>
+                        setCustomerDraft((current) => ({
+                          ...current,
+                          workbook_folder_id: folderID,
+                        }))
+                      }
+                    />
+                    <p className="mt-1 text-xs text-slate-400">
+                      此客户后续新建的询价工作簿默认放入该目录，单笔订单仍可另选。
+                    </p>
+                  </div>
                   <label className="text-sm font-medium text-slate-700 sm:col-span-2">
                     备注
                     <textarea
@@ -4294,22 +4649,20 @@ export default function TradeWorkspacePage() {
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                   <label className="text-sm font-medium text-slate-700 sm:col-span-2">
                     客户<span className="text-rose-500"> *</span>
-                    <select
-                      value={orderDraft.customer_id}
-                      onChange={(event) =>
+                    <div className="mt-1.5">
+                      <CustomerCombobox
+                        customers={customers}
+                        value={orderDraft.customer_id}
+                        onChange={(customerID, customer) =>
                         setOrderDraft((current) => ({
                           ...current,
-                          customer_id: Number(event.target.value),
+                            customer_id: customerID,
+                            workbook_folder_id:
+                              customer.workbook_folder_id,
                         }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 outline-none"
-                    >
-                      {customers.map((customer) => (
-                        <option key={customer.id} value={customer.id}>
-                          {customer.name} · {customer.company_name}
-                        </option>
-                      ))}
-                    </select>
+                        }
+                      />
+                    </div>
                   </label>
                   <label className="text-sm font-medium text-slate-700 sm:col-span-2">
                     询价主题<span className="text-rose-500"> *</span>
@@ -4414,6 +4767,24 @@ export default function TradeWorkspacePage() {
                       className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
                     />
                   </label>
+                  <div className="text-sm font-medium text-slate-700 sm:col-span-2">
+                    流程工作簿文件夹
+                    <div className="mt-1.5">
+                      <FolderCombobox
+                        folders={folderOptions}
+                        value={orderDraft.workbook_folder_id}
+                        onChange={(folderID) =>
+                          setOrderDraft((current) => ({
+                            ...current,
+                            workbook_folder_id: folderID,
+                          }))
+                        }
+                      />
+                    </div>
+                    <p className="mt-1 text-xs font-normal text-slate-400">
+                      此客户之后的新询价会默认沿用该目录。
+                    </p>
+                  </div>
                 </div>
                 <div className="mt-6 flex items-center justify-between">
                   <div>
@@ -4819,6 +5190,65 @@ export default function TradeWorkspacePage() {
                 </button>
               </div>
               <div className="p-4">
+                {!editingSupplierQuoteID && (
+                  <div className="mb-4 rounded-lg border border-sky-100 bg-sky-50/60 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-800">
+                          批量报价明细
+                        </p>
+                        <p className="mt-0.5 text-xs text-slate-500">
+                          可以一次填写多个产品或供应商，保存时一次性提交。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setQuoteDrafts((current) => [
+                            ...current,
+                            newSupplierQuoteDraft(detailOrder, suppliers),
+                          ]);
+                          setActiveQuoteDraftIndex(quoteDrafts.length);
+                        }}
+                        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-sky-200 bg-white px-3 text-xs font-semibold text-sky-700 hover:bg-sky-50"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        添加一条
+                      </button>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {quoteDrafts.map((draft, index) => (
+                        <button
+                          key={`${index}-${draft.order_item_id}`}
+                          type="button"
+                          onClick={() => setActiveQuoteDraftIndex(index)}
+                          className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs ${index === activeQuoteDraftIndex ? "bg-sky-600 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200"}`}
+                        >
+                          {index + 1}. {draft.supplier_id ? "已选供应商" : "待填写"}
+                          {quoteDrafts.length > 1 && (
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setQuoteDrafts((current) =>
+                                  current.filter((_, itemIndex) => itemIndex !== index),
+                                );
+                                setActiveQuoteDraftIndex((current) =>
+                                  Math.max(0, Math.min(current, quoteDrafts.length - 2)),
+                                );
+                              }}
+                              className="ml-1 opacity-70 hover:opacity-100"
+                              title="移除这条报价"
+                            >
+                              ×
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="grid gap-4 sm:grid-cols-2">
                   <div className="text-sm font-medium">
                     <div className="flex items-center justify-between gap-2">
@@ -4834,23 +5264,18 @@ export default function TradeWorkspacePage() {
                         </button>
                       )}
                     </div>
-                    <select
-                      value={quoteDraft.order_item_id}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          order_item_id: Number(event.target.value),
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3"
-                    >
-                      {(detailOrder.items || []).map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.line_no}. {item.sku || item.product_name} ·{" "}
-                          {item.product_name}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="mt-1.5">
+                      <OrderItemCombobox
+                        items={detailOrder.items || []}
+                        value={quoteDraft.order_item_id}
+                        onChange={(itemID) =>
+                          setQuoteDraft((current) => ({
+                            ...current,
+                            order_item_id: itemID,
+                          }))
+                        }
+                      />
+                    </div>
                   </div>
                   <div className="text-sm font-medium">
                     <div>供应商</div>
@@ -4929,10 +5354,8 @@ export default function TradeWorkspacePage() {
                     />
                   </label>
                   <label className="text-sm font-medium">
-                    交期/天
-                    <input
-                      type="number"
-                      min="0"
+                    交期
+                    <select
                       value={quoteDraft.lead_time_days}
                       onChange={(event) =>
                         setQuoteDraft((current) => ({
@@ -4940,8 +5363,20 @@ export default function TradeWorkspacePage() {
                           lead_time_days: event.target.value,
                         }))
                       }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3"
-                    />
+                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3"
+                    >
+                      {[2, 3, 4, 7, 10, 15, 30].map((days, index) => (
+                        <option key={days} value={days}>
+                          {index === 0
+                            ? "1-2 天"
+                            : index === 1
+                              ? "2-3 天"
+                              : index === 2
+                                ? "3-4 天"
+                                : `${Math.max(1, days - 2)}-${days} 天`}
+                        </option>
+                      ))}
+                    </select>
                   </label>
                   <label className="text-sm font-medium">
                     报价有效期
@@ -5454,6 +5889,88 @@ export default function TradeWorkspacePage() {
                     <Loader2 className="h-4 w-4 animate-spin" />
                   )}
                   保存状态
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {paymentQuoteID && detailOrder && (
+          <div className="fixed inset-0 z-[105] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
+            <div className="w-full max-w-md rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                <div>
+                  <h2 className="font-semibold">登记客户付款</h2>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    付款凭证可在报价卡片中单独上传。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPaymentQuoteID(null)}
+                  disabled={savingPayment}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="space-y-3 p-4">
+                <label className="block text-sm font-medium">
+                  付款状态
+                  <select
+                    value={paymentStatus}
+                    onChange={(event) =>
+                      setPaymentStatus(
+                        event.target.value as "unpaid" | "partial" | "paid",
+                      )
+                    }
+                    className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3"
+                  >
+                    <option value="unpaid">未付款</option>
+                    <option value="partial">部分付款</option>
+                    <option value="paid">已付款</option>
+                  </select>
+                </label>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="block text-sm font-medium">
+                    到账币种
+                    <input
+                      value={paymentCurrency}
+                      onChange={(event) =>
+                        setPaymentCurrency(event.target.value.toUpperCase())
+                      }
+                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 uppercase"
+                    />
+                  </label>
+                  <label className="block text-sm font-medium">
+                    到账金额
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      value={paidAmount}
+                      onChange={(event) => setPaidAmount(event.target.value)}
+                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3"
+                    />
+                  </label>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setPaymentQuoteID(null)}
+                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void saveCustomerPayment()}
+                  disabled={savingPayment}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-700 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  {savingPayment && <Loader2 className="h-4 w-4 animate-spin" />}
+                  保存付款
                 </button>
               </div>
             </div>
@@ -6000,7 +6517,17 @@ export default function TradeWorkspacePage() {
                           return (
                             <div
                               key={stage.key}
-                              className="relative flex flex-1 flex-col items-center"
+                              className={`relative flex flex-1 cursor-pointer flex-col items-center rounded-lg px-1 py-1 transition ${detailViewStage === stage.key ? "bg-sky-50/80" : "hover:bg-slate-50"}`}
+                              role="button"
+                              tabIndex={0}
+                              title={`查看${stage.label}阶段`}
+                              onClick={() => setDetailViewStage(stage.key)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  setDetailViewStage(stage.key);
+                                }
+                              }}
                             >
                               <div
                                 className={`absolute left-0 right-0 top-4 h-0.5 ${index === 0 ? "left-1/2" : ""} ${index === STAGES.length - 1 ? "right-1/2" : ""} ${done || active ? "bg-emerald-400" : "bg-slate-200"}`}
@@ -6015,7 +6542,7 @@ export default function TradeWorkspacePage() {
                                 )}
                               </div>
                               <div
-                                className={`mt-2 text-xs font-medium ${active ? "text-slate-900" : done ? "text-emerald-700" : "text-slate-400"}`}
+                                className={`mt-2 text-xs font-medium ${detailViewStage === stage.key ? "text-sky-700" : active ? "text-slate-900" : done ? "text-emerald-700" : "text-slate-400"}`}
                               >
                                 {stage.shortLabel}
                               </div>
@@ -6031,6 +6558,34 @@ export default function TradeWorkspacePage() {
                         张流程工作表
                         {detailOrder.access.editable_sheet_names.length > 0 &&
                           `，可编辑 ${detailOrder.access.editable_sheet_names.join("、")}`}
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-sky-50/70 px-4 py-2.5 text-xs text-sky-800">
+                      <span>
+                        正在查看：
+                        <strong className="ml-1">
+                          {stageDefinition(detailViewStage)?.label || detailViewStage}
+                        </strong>
+                        {detailViewStage !== detailOrder.stage && (
+                          <span className="ml-2 text-sky-600">
+                            （当前业务处于{stageDefinition(detailOrder.stage)?.label || detailOrder.stage}）
+                          </span>
+                        )}
+                      </span>
+                      {detailViewStage !== detailOrder.stage && (
+                        <button
+                          type="button"
+                          onClick={() => setDetailViewStage(detailOrder.stage as Exclude<TradeStage, "cancelled">)}
+                          className="inline-flex h-7 items-center rounded-md border border-sky-200 bg-white px-2.5 font-semibold text-sky-700 hover:bg-sky-100"
+                        >
+                          回到当前环节
+                        </button>
+                      )}
+                    </div>
+                    {detailOrder.rework_required && (
+                      <div className="border-b border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-800">
+                        <strong>采购异常待重购：</strong>
+                        {detailOrder.rework_reason || "请重新核对采购资料后继续。"}
                       </div>
                     )}
                     <div className="grid gap-px border-b border-slate-200 bg-slate-200 sm:grid-cols-4">
@@ -6323,7 +6878,9 @@ export default function TradeWorkspacePage() {
                                 className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-sky-200 px-3 text-xs font-semibold text-sky-700 hover:bg-sky-50"
                               >
                                 <SlidersHorizontal className="h-3.5 w-3.5" />
-                                编辑当前环节数据
+                                {detailOrder.stage === "packing"
+                                  ? "编辑装箱组合"
+                                  : "编辑当前环节数据"}
                               </button>
                             )}
                           {detailOrder.access?.can_add_items && (
@@ -6339,7 +6896,7 @@ export default function TradeWorkspacePage() {
                         </div>
                       </div>
                       <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
-                        <table className="w-full min-w-[980px] text-sm">
+                        <table className="w-full min-w-[680px] text-sm">
                           <thead className="bg-slate-50 text-left text-xs text-slate-500">
                             <tr>
                               <th className="px-3 py-2">序号</th>
@@ -6347,26 +6904,35 @@ export default function TradeWorkspacePage() {
                               <th className="px-3 py-2">规格</th>
                               <th className="px-3 py-2 text-right">询价数量</th>
                               <th className="px-3 py-2">当前环节状态</th>
-                              {detailOrder.access
-                                ?.can_view_customer_pricing && (
+                              {detailViewStage === "quotation" &&
+                                detailOrder.access
+                                  ?.can_view_customer_pricing && (
                                 <th className="px-3 py-2 text-right">
                                   当前对客报价
                                 </th>
                               )}
-                              {detailOrder.access?.can_view_supplier && (
+                              {["supplier_quote", "purchase"].includes(
+                                detailViewStage,
+                              ) && detailOrder.access?.can_view_supplier && (
                                 <th className="px-3 py-2">采用供应商</th>
                               )}
-                              {detailOrder.access
-                                ?.can_view_supplier_pricing && (
+                              {["supplier_quote", "purchase"].includes(
+                                detailViewStage,
+                              ) &&
+                                detailOrder.access
+                                  ?.can_view_supplier_pricing && (
                                 <th className="px-3 py-2 text-right">采购价</th>
                               )}
-                              {detailOrder.access?.can_view_receiving && (
+                              {detailViewStage === "receiving" &&
+                                detailOrder.access?.can_view_receiving && (
                                 <th className="px-3 py-2 text-right">到货</th>
                               )}
-                              {detailOrder.access?.can_view_inspection && (
+                              {detailViewStage === "inspection" &&
+                                detailOrder.access?.can_view_inspection && (
                                 <th className="px-3 py-2 text-right">合格</th>
                               )}
-                              {detailOrder.access?.can_view_packing && (
+                              {detailViewStage === "packing" &&
+                                detailOrder.access?.can_view_packing && (
                                 <th className="px-3 py-2 text-right">装箱</th>
                               )}
                             </tr>
@@ -6394,11 +6960,12 @@ export default function TradeWorkspacePage() {
                                 </td>
                                 <td className="px-3 py-2">
                                   <span className="rounded-md bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">
-                                    {stageItemStatus(detailOrder.stage, item)}
+                                    {stageItemStatus(detailViewStage, item)}
                                   </span>
                                 </td>
-                                {detailOrder.access
-                                  ?.can_view_customer_pricing && (
+                                {detailViewStage === "quotation" &&
+                                  detailOrder.access
+                                    ?.can_view_customer_pricing && (
                                   <td className="px-3 py-2 text-right tabular-nums">
                                     {formatMoney(
                                       detailOrder.currency,
@@ -6406,13 +6973,18 @@ export default function TradeWorkspacePage() {
                                     )}
                                   </td>
                                 )}
-                                {detailOrder.access?.can_view_supplier && (
+                                {["supplier_quote", "purchase"].includes(
+                                  detailViewStage,
+                                ) && detailOrder.access?.can_view_supplier && (
                                   <td className="px-3 py-2">
                                     {item.supplier_name || "-"}
                                   </td>
                                 )}
-                                {detailOrder.access
-                                  ?.can_view_supplier_pricing && (
+                                {["supplier_quote", "purchase"].includes(
+                                  detailViewStage,
+                                ) &&
+                                  detailOrder.access
+                                    ?.can_view_supplier_pricing && (
                                   <td className="px-3 py-2 text-right">
                                     {formatMoney(
                                       item.purchase_currency ||
@@ -6421,17 +6993,20 @@ export default function TradeWorkspacePage() {
                                     )}
                                   </td>
                                 )}
-                                {detailOrder.access?.can_view_receiving && (
+                                {detailViewStage === "receiving" &&
+                                  detailOrder.access?.can_view_receiving && (
                                   <td className="px-3 py-2 text-right">
                                     {item.received_quantity || 0}
                                   </td>
                                 )}
-                                {detailOrder.access?.can_view_inspection && (
+                                {detailViewStage === "inspection" &&
+                                  detailOrder.access?.can_view_inspection && (
                                   <td className="px-3 py-2 text-right">
                                     {item.accepted_quantity || 0}
                                   </td>
                                 )}
-                                {detailOrder.access?.can_view_packing && (
+                                {detailViewStage === "packing" &&
+                                  detailOrder.access?.can_view_packing && (
                                   <td className="px-3 py-2 text-right">
                                     {item.packed_quantity || 0}
                                   </td>
@@ -6441,7 +7016,8 @@ export default function TradeWorkspacePage() {
                           </tbody>
                         </table>
                       </div>
-                      {detailOrder.access?.can_view_customer_pricing && (
+                      {detailViewStage === "quotation" &&
+                        detailOrder.access?.can_view_customer_pricing && (
                         <section className="mt-6">
                           <div className="flex items-center justify-between gap-3">
                             <div>
@@ -6720,6 +7296,77 @@ export default function TradeWorkspacePage() {
                                         )}
                                       </div>
                                     )}
+                                    {quote.status === "accepted" && (
+                                      <div className="mt-3 rounded-lg border border-emerald-100 bg-white p-3">
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                          <div>
+                                            <div className="text-xs font-semibold text-slate-700">
+                                              客户付款
+                                            </div>
+                                            <div className="mt-1 text-xs text-slate-500">
+                                              状态：
+                                              <span className="ml-1 font-semibold text-emerald-700">
+                                                {quote.payment_status === "paid"
+                                                  ? "已付款"
+                                                  : quote.payment_status === "partial"
+                                                    ? "部分付款"
+                                                    : "未付款"}
+                                              </span>
+                                              {quote.paid_amount > 0 &&
+                                                ` · ${quote.payment_currency || quote.currency} ${quote.paid_amount}`}
+                                            </div>
+                                          </div>
+                                          {detailOrder.can_operate_stage && (
+                                            <button
+                                              type="button"
+                                              onClick={() => openPaymentEditor(quote)}
+                                              className="h-7 rounded-md border border-emerald-200 px-2.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
+                                            >
+                                              登记付款
+                                            </button>
+                                          )}
+                                        </div>
+                                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                                          {(quote.payment_proofs || []).map((proof) => (
+                                            <a
+                                              key={proof.id}
+                                              href={proof.attachment_url}
+                                              target="_blank"
+                                              rel="noreferrer"
+                                              className="inline-flex items-center gap-1.5 rounded-md bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
+                                            >
+                                              <ImagePlus className="h-3.5 w-3.5" />
+                                              {proof.filename || "付款凭证"}
+                                            </a>
+                                          ))}
+                                          {detailOrder.can_operate_stage && (
+                                            <label className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border border-slate-200 px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+                                              {uploadingPaymentProof ? (
+                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                              ) : (
+                                                <ImagePlus className="h-3.5 w-3.5" />
+                                              )}
+                                              上传付款截图
+                                              <input
+                                                type="file"
+                                                accept="image/*"
+                                                className="hidden"
+                                                disabled={uploadingPaymentProof}
+                                                onChange={(event) => {
+                                                  const file = event.target.files?.[0];
+                                                  event.currentTarget.value = "";
+                                                  if (file)
+                                                    void uploadCustomerPaymentProof(
+                                                      quote.id,
+                                                      file,
+                                                    );
+                                                }}
+                                              />
+                                            </label>
+                                          )}
+                                        </div>
+                                      </div>
+                                    )}
                                   </article>
                                 ),
                               )}
@@ -6727,7 +7374,98 @@ export default function TradeWorkspacePage() {
                           )}
                         </section>
                       )}
-                      {detailOrder.access?.can_view_supplier && (
+                      {detailViewStage === "purchase" &&
+                        detailOrder.access?.can_view_customer_pricing &&
+                        (() => {
+                          const acceptedQuote = (
+                            detailOrder.customer_quotes || []
+                          ).find((quote) => quote.status === "accepted");
+                          if (!acceptedQuote) return null;
+                          return (
+                            <section className="mt-6 rounded-lg border border-emerald-200 bg-emerald-50/40 p-3">
+                              <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div>
+                                  <h3 className="text-sm font-semibold text-slate-900">
+                                    采购前客户付款核对
+                                  </h3>
+                                  <p className="mt-1 text-xs text-slate-500">
+                                    第 {acceptedQuote.round_no} 轮报价 · 应收
+                                    {" "}
+                                    {formatFinancialMoney(
+                                      acceptedQuote.currency,
+                                      acceptedQuote.total_amount,
+                                    )}
+                                  </p>
+                                </div>
+                                <span
+                                  className={`rounded-md px-2 py-1 text-xs font-semibold ${acceptedQuote.payment_status === "paid" ? "bg-emerald-100 text-emerald-700" : acceptedQuote.payment_status === "partial" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}
+                                >
+                                  {acceptedQuote.payment_status === "paid"
+                                    ? "已付款"
+                                    : acceptedQuote.payment_status === "partial"
+                                      ? "部分付款"
+                                      : "未付款"}
+                                  {acceptedQuote.paid_amount > 0 &&
+                                    ` · ${acceptedQuote.payment_currency || acceptedQuote.currency} ${acceptedQuote.paid_amount}`}
+                                </span>
+                              </div>
+                              <div className="mt-3 flex flex-wrap items-center gap-2">
+                                {(acceptedQuote.payment_proofs || []).map(
+                                  (proof) => (
+                                    <a
+                                      key={proof.id}
+                                      href={proof.attachment_url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-xs text-slate-600 shadow-sm"
+                                    >
+                                      <ImagePlus className="h-3.5 w-3.5" />
+                                      {proof.filename || "付款凭证"}
+                                    </a>
+                                  ),
+                                )}
+                                {detailOrder.can_operate_stage && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        openPaymentEditor(acceptedQuote)
+                                      }
+                                      className="h-8 rounded-lg border border-emerald-200 bg-white px-3 text-xs font-semibold text-emerald-700"
+                                    >
+                                      登记付款金额
+                                    </button>
+                                    <label className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600">
+                                      {uploadingPaymentProof ? (
+                                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                      ) : (
+                                        <ImagePlus className="h-3.5 w-3.5" />
+                                      )}
+                                      上传付款截图
+                                      <input
+                                        type="file"
+                                        accept="image/*"
+                                        className="hidden"
+                                        disabled={uploadingPaymentProof}
+                                        onChange={(event) => {
+                                          const file = event.target.files?.[0];
+                                          event.currentTarget.value = "";
+                                          if (file)
+                                            void uploadCustomerPaymentProof(
+                                              acceptedQuote.id,
+                                              file,
+                                            );
+                                        }}
+                                      />
+                                    </label>
+                                  </>
+                                )}
+                              </div>
+                            </section>
+                          );
+                        })()}
+                      {detailViewStage === "supplier_quote" &&
+                        detailOrder.access?.can_view_supplier && (
                         <>
                           <div className="mt-6 flex items-center justify-between gap-3">
                             <div>
@@ -6744,12 +7482,14 @@ export default function TradeWorkspacePage() {
                                 <button
                                   type="button"
                                   onClick={() => {
-                                    setQuoteDraft(
+                                    setQuoteDrafts([
                                       newSupplierQuoteDraft(
                                         detailOrder,
                                         suppliers,
                                       ),
-                                    );
+                                    ]);
+                                    setEditingSupplierQuoteID(null);
+                                    setActiveQuoteDraftIndex(0);
                                     setQuoteModalOpen(true);
                                   }}
                                   className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pink-700 px-3 text-xs font-semibold text-white"
@@ -6770,7 +7510,7 @@ export default function TradeWorkspacePage() {
                                   <th className="px-3 py-2 text-right">交期</th>
                                   <th className="px-3 py-2">有效期</th>
                                   <th className="px-3 py-2">备注</th>
-                                  <th className="px-3 py-2 text-right">采用</th>
+                                  <th className="px-3 py-2 text-right">操作</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -6829,25 +7569,84 @@ export default function TradeWorkspacePage() {
                                           {quote.notes || "-"}
                                         </td>
                                         <td className="px-3 py-2 text-right">
-                                          {quote.is_selected ? (
-                                            <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
-                                              <Check className="h-3.5 w-3.5" />
+                                          {detailOrder.can_operate_stage &&
+                                          detailOrder.stage ===
+                                            "supplier_quote" ? (
+                                            <div className="flex items-center justify-end gap-1.5">
+                                              {quote.is_selected ? (
+                                                <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
+                                                  <Check className="h-3.5 w-3.5" />
+                                                  已采用
+                                                </span>
+                                              ) : (
+                                                <button
+                                                  type="button"
+                                                  onClick={() =>
+                                                    void selectSupplierQuote(
+                                                      quote.id,
+                                                    )
+                                                  }
+                                                  className="h-7 rounded-md border border-slate-200 px-2 text-xs font-semibold hover:bg-slate-50"
+                                                >
+                                                  采用
+                                                </button>
+                                              )}
+                                              <button
+                                                type="button"
+                                                title="编辑供应商报价"
+                                                onClick={() => {
+                                                  setQuoteDrafts([
+                                                    {
+                                                      order_item_id:
+                                                        quote.order_item_id,
+                                                      supplier_id:
+                                                        quote.supplier_id || 0,
+                                                      currency: quote.currency,
+                                                      unit_price: String(
+                                                        quote.unit_price,
+                                                      ),
+                                                      moq: String(quote.moq),
+                                                      lead_time_days: String(
+                                                        quote.lead_time_days,
+                                                      ),
+                                                      valid_until:
+                                                        quote.valid_until?.slice(
+                                                          0,
+                                                          10,
+                                                        ) ||
+                                                        new Date()
+                                                          .toISOString()
+                                                          .slice(0, 10),
+                                                      notes: quote.notes,
+                                                    },
+                                                  ]);
+                                                  setActiveQuoteDraftIndex(0);
+                                                  setEditingSupplierQuoteID(
+                                                    quote.id,
+                                                  );
+                                                  setQuoteModalOpen(true);
+                                                }}
+                                                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100"
+                                              >
+                                                <Pencil className="h-3.5 w-3.5" />
+                                              </button>
+                                              <button
+                                                type="button"
+                                                title="删除供应商报价"
+                                                onClick={() =>
+                                                  void deleteSupplierQuote(
+                                                    quote.id,
+                                                  )
+                                                }
+                                                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-rose-500 hover:bg-rose-50"
+                                              >
+                                                <Trash2 className="h-3.5 w-3.5" />
+                                              </button>
+                                            </div>
+                                          ) : quote.is_selected ? (
+                                            <span className="text-xs font-semibold text-emerald-700">
                                               已采用
                                             </span>
-                                          ) : detailOrder.can_operate_stage &&
-                                            detailOrder.stage ===
-                                              "supplier_quote" ? (
-                                            <button
-                                              type="button"
-                                              onClick={() =>
-                                                void selectSupplierQuote(
-                                                  quote.id,
-                                                )
-                                              }
-                                              className="h-7 rounded-md border border-slate-200 px-2 text-xs font-semibold hover:bg-slate-50"
-                                            >
-                                              采用
-                                            </button>
                                           ) : (
                                             <span className="text-xs text-slate-400">
                                               待负责岗位处理
@@ -6863,7 +7662,89 @@ export default function TradeWorkspacePage() {
                           </div>
                         </>
                       )}
-                      {detailOrder.access?.can_view_inspection && (
+                      {detailViewStage === "packing" &&
+                        detailOrder.access?.can_view_packing && (
+                          <section className="mt-6">
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div>
+                                <h3 className="text-sm font-semibold">
+                                  装箱组合与抛重
+                                </h3>
+                                <p className="mt-0.5 text-xs text-slate-400">
+                                  同一箱组内可混装多个 SKU；每种装法分别记录尺寸、实重和箱数。
+                                </p>
+                              </div>
+                              {detailOrder.can_operate_stage &&
+                                detailOrder.stage === "packing" && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setPackingGroupsOpen(true)}
+                                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-orange-600 px-3 text-xs font-semibold text-white hover:bg-orange-700"
+                                  >
+                                    <Boxes className="h-3.5 w-3.5" />
+                                    编辑装箱组合
+                                  </button>
+                                )}
+                            </div>
+                            {(detailOrder.packing_groups || []).length === 0 ? (
+                              <div className="mt-3 rounded-lg border border-dashed border-slate-200 py-10 text-center text-sm text-slate-400">
+                                尚未配置装箱组合
+                              </div>
+                            ) : (
+                              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                {(detailOrder.packing_groups || []).map(
+                                  (group) => (
+                                    <article
+                                      key={group.id}
+                                      className="rounded-lg border border-slate-200 bg-white p-3"
+                                    >
+                                      <div className="flex items-start justify-between gap-3">
+                                        <div>
+                                          <div className="text-sm font-semibold text-slate-800">
+                                            箱组 {group.group_no} · {group.copies} 箱
+                                          </div>
+                                          <div className="mt-1 text-xs text-slate-400">
+                                            {group.length_cm} × {group.width_cm} × {group.height_cm} cm
+                                          </div>
+                                        </div>
+                                        <div className="text-right text-xs">
+                                          <div className="font-semibold text-slate-700">
+                                            实重 {group.weight_kg} kg
+                                          </div>
+                                          <div className="mt-1 text-orange-600">
+                                            抛重 {group.volumetric_weight_kg.toFixed(2)} kg
+                                          </div>
+                                        </div>
+                                      </div>
+                                      <div className="mt-3 space-y-1 border-t border-slate-100 pt-2">
+                                        {(group.items || []).map((item) => (
+                                          <div
+                                            key={item.order_item_id}
+                                            className="flex items-center justify-between gap-3 text-xs"
+                                          >
+                                            <span className="min-w-0 truncate text-slate-600">
+                                              {item.line_no}. {item.sku || item.product_name}
+                                            </span>
+                                            <span className="shrink-0 font-semibold tabular-nums text-slate-800">
+                                              每箱 {item.quantity}
+                                            </span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                      {group.notes && (
+                                        <div className="mt-2 rounded-md bg-slate-50 px-2 py-1.5 text-xs text-slate-500">
+                                          {group.notes}
+                                        </div>
+                                      )}
+                                    </article>
+                                  ),
+                                )}
+                              </div>
+                            )}
+                          </section>
+                        )}
+                      {detailViewStage === "inspection" &&
+                        detailOrder.access?.can_view_inspection && (
                         <div className="mt-6">
                           <div className="flex items-center justify-between">
                             <div>
@@ -6879,7 +7760,7 @@ export default function TradeWorkspacePage() {
                           </div>
                           {detailOrder.can_operate_stage &&
                             detailOrder.stage === "inspection" && (
-                              <div className="mt-3 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[180px_1fr_auto]">
+                              <div className="mt-3 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[180px_1fr_auto_auto]">
                                 <select
                                   value={inspectionItemID}
                                   onChange={(event) =>
@@ -6922,8 +7803,16 @@ export default function TradeWorkspacePage() {
                                     }
                                   />
                                 </label>
+                                <button
+                                  type="button"
+                                  onClick={() => void openInspectionGalleryPicker()}
+                                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 hover:bg-sky-50"
+                                >
+                                  <Images className="h-4 w-4" />
+                                  从图库选择
+                                </button>
                                 {inspectionFiles.length > 0 && (
-                                  <div className="text-xs text-slate-500 sm:col-span-2">
+                                  <div className="text-xs text-slate-500 sm:col-span-3">
                                     已选择 {inspectionFiles.length} 张：
                                     {inspectionFiles
                                       .map((file) => file.name)
@@ -6937,7 +7826,7 @@ export default function TradeWorkspacePage() {
                                     uploadingInspection ||
                                     inspectionFiles.length === 0
                                   }
-                                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-teal-700 px-3 text-sm font-semibold text-white disabled:opacity-40 sm:col-start-3"
+                                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-teal-700 px-3 text-sm font-semibold text-white disabled:opacity-40 sm:col-start-4"
                                 >
                                   {uploadingInspection ? (
                                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -7064,7 +7953,8 @@ export default function TradeWorkspacePage() {
                           );
                         })}
                       </div>
-                      {detailOrder.can_operate_stage &&
+                      {detailViewStage === detailOrder.stage &&
+                        detailOrder.can_operate_stage &&
                         (detailOrder.can_return ||
                           nextStage(detailOrder.stage)) && (
                           <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
@@ -7107,7 +7997,7 @@ export default function TradeWorkspacePage() {
                               placeholder="填写交接说明、退回原因或下一环节注意事项（可选）"
                             />
                             <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-                              <div>
+                              <div className="flex flex-wrap gap-2">
                                 {detailOrder.can_return &&
                                   previousStage(detailOrder.stage) && (
                                     <button
@@ -7133,6 +8023,26 @@ export default function TradeWorkspacePage() {
                                       }
                                     </button>
                                   )}
+                                {[
+                                  "receiving",
+                                  "inspection",
+                                  "packing",
+                                  "shipment",
+                                  "completed",
+                                ].includes(detailOrder.stage) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setReturnToPurchaseReason("");
+                                      setReturnToPurchaseOpen(true);
+                                    }}
+                                    disabled={flowing}
+                                    className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-40"
+                                  >
+                                    <RotateCcw className="h-4 w-4" />
+                                    采购/发货异常
+                                  </button>
+                                )}
                               </div>
                               {nextStage(detailOrder.stage) && (
                                 <button
@@ -7853,33 +8763,41 @@ export default function TradeWorkspacePage() {
               <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
                 {detailOrder.stage === "shipment" ? (
                   <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                    {[
-                      ["booking_no", "订舱号", "text"],
-                      ["carrier", "承运人", "text"],
-                      ["vessel_flight", "船名 / 航班", "text"],
-                      ["etd", "ETD", "date"],
-                      ["eta", "ETA", "date"],
-                      ["bl_no", "提单号", "text"],
-                    ].map(([key, label, type]) => (
-                      <label key={key} className="block">
-                        <span className="mb-1.5 block text-xs font-medium text-slate-600">
-                          {label}
-                        </span>
-                        <input
-                          type={type}
-                          value={
-                            stageShipmentDraft[key as keyof StageShipmentDraft]
-                          }
-                          onChange={(event) =>
-                            setStageShipmentDraft((current) => ({
-                              ...current,
-                              [key]: event.target.value,
-                            }))
-                          }
-                          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                        />
-                      </label>
-                    ))}
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-600">
+                        物流公司
+                      </span>
+                      <select
+                        value={stageShipmentDraft.carrier}
+                        onChange={(event) =>
+                          setStageShipmentDraft((current) => ({
+                            ...current,
+                            carrier: event.target.value,
+                          }))
+                        }
+                        className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                      >
+                        <option value="">选择物流公司</option>
+                        <option value="DHL">DHL</option>
+                        <option value="FedEx">FedEx</option>
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-600">
+                        物流订单号
+                      </span>
+                      <input
+                        value={stageShipmentDraft.booking_no}
+                        onChange={(event) =>
+                          setStageShipmentDraft((current) => ({
+                            ...current,
+                            booking_no: event.target.value,
+                          }))
+                        }
+                        placeholder="DHL / FedEx tracking number"
+                        className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                      />
+                    </label>
                     <label className="block">
                       <span className="mb-1.5 block text-xs font-medium text-slate-600">
                         运输状态
@@ -8021,21 +8939,6 @@ export default function TradeWorkspacePage() {
                         客户使用自有货代，本订单不向客户报价运费，也不要求录入我方实际运费。
                       </div>
                     )}
-                    <label className="block sm:col-span-2 lg:col-span-3">
-                      <span className="mb-1.5 block text-xs font-medium text-slate-600">
-                        发货备注
-                      </span>
-                      <textarea
-                        value={stageShipmentDraft.notes}
-                        onChange={(event) =>
-                          setStageShipmentDraft((current) => ({
-                            ...current,
-                            notes: event.target.value,
-                          }))
-                        }
-                        className="min-h-24 w-full resize-y rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                      />
-                    </label>
                   </div>
                 ) : (
                   <div className="space-y-3">
@@ -8092,7 +8995,78 @@ export default function TradeWorkspacePage() {
                                 <span className="mb-1.5 block text-xs font-medium text-slate-600">
                                   {field.label}
                                 </span>
-                                {field.type === "select" ? (
+                                {field.key === "inspector" ? (
+                                  <>
+                                    <input
+                                      list={`trade-inspectors-${item.id}`}
+                                      value={
+                                        stageItemDrafts[item.id]?.[field.key] ||
+                                        ""
+                                      }
+                                      onChange={(event) =>
+                                        updateStageItemDraft(
+                                          item.id,
+                                          field.key,
+                                          event.target.value,
+                                        )
+                                      }
+                                      placeholder="搜索或填写质检员"
+                                      className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                                    />
+                                    <datalist id={`trade-inspectors-${item.id}`}>
+                                      {inspectorOptions.map((user) => (
+                                        <option
+                                          key={user.username}
+                                          value={user.username}
+                                        >
+                                          {user.description}
+                                        </option>
+                                      ))}
+                                    </datalist>
+                                  </>
+                                ) : field.key === "accepted_quantity" &&
+                                  Number(
+                                    stageItemDrafts[item.id]?.sample_qty ||
+                                      item.received_quantity ||
+                                      item.quantity,
+                                  ) <= 500 ? (
+                                  <select
+                                    value={
+                                      stageItemDrafts[item.id]?.[field.key] ||
+                                      ""
+                                    }
+                                    onChange={(event) =>
+                                      updateStageItemDraft(
+                                        item.id,
+                                        field.key,
+                                        event.target.value,
+                                      )
+                                    }
+                                    className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                                  >
+                                    {Array.from(
+                                      {
+                                        length:
+                                          Math.max(
+                                            0,
+                                            Math.floor(
+                                              Number(
+                                                stageItemDrafts[item.id]
+                                                  ?.sample_qty ||
+                                                  item.received_quantity ||
+                                                  item.quantity,
+                                              ),
+                                            ),
+                                          ) + 1,
+                                      },
+                                      (_, quantity) => (
+                                        <option key={quantity} value={quantity}>
+                                          {quantity}
+                                        </option>
+                                      ),
+                                    )}
+                                  </select>
+                                ) : field.type === "select" ? (
                                   <select
                                     value={
                                       stageItemDrafts[item.id]?.[field.key] ||
@@ -8242,6 +9216,209 @@ export default function TradeWorkspacePage() {
           </div>
         )}
 
+        {packingGroupsOpen && detailOrder && (
+          <PackingGroupsModal
+            order={detailOrder}
+            onClose={() => setPackingGroupsOpen(false)}
+            onError={setError}
+            onSaved={(updatedOrder) => {
+              setDetailOrder(updatedOrder);
+              setPackingGroupsOpen(false);
+              setNotice("装箱组合、产品装箱数量和流程工作簿已同步更新。");
+              void loadData(true);
+            }}
+          />
+        )}
+
+        {galleryPickerOpen && detailOrder && (
+          <div
+            className="fixed inset-0 z-[98] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !linkingGalleryImages)
+                setGalleryPickerOpen(false);
+            }}
+          >
+            <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-4 py-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">
+                    从图库选择质检图片
+                  </h2>
+                  <p className="mt-1 text-xs text-slate-400">
+                    可多选；图片会关联到当前订单
+                    {inspectionItemID
+                      ? `的第 ${(detailOrder.items || []).find((item) => item.id === inspectionItemID)?.line_no || ""} 行产品`
+                      : "整单"}
+                    。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setGalleryPickerOpen(false)}
+                  disabled={linkingGalleryImages}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-40"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
+                {galleryLoading ? (
+                  <div className="flex h-60 items-center justify-center text-sm text-slate-400">
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    加载图库...
+                  </div>
+                ) : galleryImages.length === 0 ? (
+                  <div className="flex h-60 items-center justify-center text-sm text-slate-400">
+                    图库中暂无可用图片
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                    {galleryImages.map((image) => {
+                      const selected = gallerySelectedIDs.includes(image.id);
+                      return (
+                        <button
+                          key={image.id}
+                          type="button"
+                          onClick={() =>
+                            setGallerySelectedIDs((current) =>
+                              selected
+                                ? current.filter((id) => id !== image.id)
+                                : [...current, image.id],
+                            )
+                          }
+                          className={`relative overflow-hidden rounded-lg border bg-white text-left ${selected ? "border-teal-500 ring-2 ring-teal-100" : "border-slate-200 hover:border-teal-300"}`}
+                        >
+                          <span
+                            className={`absolute left-2 top-2 z-10 flex h-6 w-6 items-center justify-center rounded-md border shadow-sm ${selected ? "border-teal-600 bg-teal-600 text-white" : "border-white bg-white/95 text-slate-400"}`}
+                          >
+                            {selected && <Check className="h-3.5 w-3.5" />}
+                          </span>
+                          <div className="aspect-square bg-slate-100">
+                            <img
+                              src={image.thumbnail_url || image.url}
+                              alt={image.filename}
+                              className="h-full w-full object-cover"
+                              loading="lazy"
+                            />
+                          </div>
+                          <div className="p-2">
+                            <div className="truncate text-xs font-semibold text-slate-700">
+                              {image.filename}
+                            </div>
+                            <div className="mt-0.5 truncate text-[10px] text-slate-400">
+                              {image.uploader_name || `用户 #${image.uploader_id}`}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-4 py-3">
+                <span className="text-xs text-slate-500">
+                  已选择 {gallerySelectedIDs.length} 张图片
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setGalleryPickerOpen(false)}
+                    disabled={linkingGalleryImages}
+                    className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 disabled:opacity-40"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void linkInspectionGalleryImages()}
+                    disabled={
+                      linkingGalleryImages || gallerySelectedIDs.length === 0
+                    }
+                    className="inline-flex h-9 items-center gap-2 rounded-lg bg-teal-700 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                  >
+                    {linkingGalleryImages ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <ImagePlus className="h-4 w-4" />
+                    )}
+                    关联到质检
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {returnToPurchaseOpen && detailOrder && (
+          <div
+            className="fixed inset-0 z-[98] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget && !returningToPurchase)
+                setReturnToPurchaseOpen(false);
+            }}
+          >
+            <div className="w-full max-w-lg rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-start justify-between border-b border-slate-200 px-4 py-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">
+                    采购或发货异常
+                  </h2>
+                  <p className="mt-1 text-xs text-slate-400">
+                    订单将退回采购环节，保留原流程记录，并通知采购岗位重新处理。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setReturnToPurchaseOpen(false)}
+                  disabled={returningToPurchase}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="p-4">
+                <label className="block text-xs font-medium text-slate-600">
+                  异常原因
+                  <textarea
+                    autoFocus
+                    value={returnToPurchaseReason}
+                    onChange={(event) =>
+                      setReturnToPurchaseReason(event.target.value)
+                    }
+                    placeholder="例如：供应商发错型号，需要退货并重新采购正确产品"
+                    className="mt-2 min-h-28 w-full resize-y rounded-lg border border-slate-200 px-3 py-2 text-sm leading-6 outline-none focus:border-rose-300 focus:ring-2 focus:ring-rose-100"
+                  />
+                </label>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setReturnToPurchaseOpen(false)}
+                  disabled={returningToPurchase}
+                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 disabled:opacity-40"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void returnOrderToPurchase()}
+                  disabled={returningToPurchase || !returnToPurchaseReason.trim()}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-rose-600 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  {returningToPurchase ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-4 w-4" />
+                  )}
+                  退回采购
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {selectedPhoto && (
           <div
             className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/90 p-3"
@@ -8260,13 +9437,43 @@ export default function TradeWorkspacePage() {
                     {selectedPhoto.uploaded_by_name}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setSelectedPhoto(null)}
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-                >
-                  <X className="h-4 w-4" />
-                </button>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => void transformInspectionPhoto("rotate-left")}
+                    disabled={Boolean(transformingInspectionPhoto)}
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40"
+                    title="向左旋转并保存"
+                  >
+                    {transformingInspectionPhoto === "rotate-left" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RotateCcw className="h-4 w-4" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void transformInspectionPhoto("rotate-right")}
+                    disabled={Boolean(transformingInspectionPhoto)}
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40"
+                    title="向右旋转并保存"
+                  >
+                    {transformingInspectionPhoto === "rotate-right" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RotateCw className="h-4 w-4" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedPhoto(null)}
+                    disabled={Boolean(transformingInspectionPhoto)}
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-40"
+                    title="关闭"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
               <img
                 src={selectedPhoto.attachment_url}

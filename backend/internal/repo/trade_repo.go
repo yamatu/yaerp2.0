@@ -59,26 +59,29 @@ const tradeCustomerSelect = `
 	SELECT c.id, c.customer_code, c.owner_id, COALESCE(u.username, ''), c.name, c.company_name,
 	       c.country, c.region, c.contact_name, c.email, c.phone, c.source, c.status,
 	       c.customer_level, c.whatsapp_account_id, COALESCE(c.whatsapp_chat_id, ''),
-	       c.whatsapp_chat_name, c.avatar_url, c.channel_id, c.tags, c.notes,
+	       c.whatsapp_chat_name, c.avatar_url, c.channel_id, c.workbook_folder_id,
+	       COALESCE(wf.name, ''), c.tags, c.notes,
 	       COUNT(o.id), COUNT(o.id) FILTER (WHERE o.stage NOT IN ('completed', 'cancelled')),
 	       c.created_at, c.updated_at
 	FROM trade_customers c
 	LEFT JOIN users u ON u.id = c.owner_id
+	LEFT JOIN folders wf ON wf.id = c.workbook_folder_id
 	LEFT JOIN trade_orders o ON o.customer_id = c.id AND o.deleted_at IS NULL`
 
 const tradeCustomerGroupBy = `
-	GROUP BY c.id, u.username`
+	GROUP BY c.id, u.username, wf.name`
 
 func scanTradeCustomer(scanner tradeRowScanner) (*model.TradeCustomer, error) {
 	var customer model.TradeCustomer
-	var whatsappAccountID, channelID sql.NullInt64
+	var whatsappAccountID, channelID, workbookFolderID sql.NullInt64
 	var tagsRaw []byte
 	if err := scanner.Scan(
 		&customer.ID, &customer.CustomerCode, &customer.OwnerID, &customer.OwnerName,
 		&customer.Name, &customer.CompanyName, &customer.Country, &customer.Region,
 		&customer.ContactName, &customer.Email, &customer.Phone, &customer.Source,
 		&customer.Status, &customer.CustomerLevel, &whatsappAccountID, &customer.WhatsAppChatID,
-		&customer.WhatsAppChatName, &customer.AvatarURL, &channelID, &tagsRaw, &customer.Notes,
+		&customer.WhatsAppChatName, &customer.AvatarURL, &channelID, &workbookFolderID,
+		&customer.WorkbookFolderName, &tagsRaw, &customer.Notes,
 		&customer.OrderCount, &customer.OpenOrderCount, &customer.CreatedAt, &customer.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -88,6 +91,9 @@ func scanTradeCustomer(scanner tradeRowScanner) (*model.TradeCustomer, error) {
 	}
 	if channelID.Valid {
 		customer.ChannelID = &channelID.Int64
+	}
+	if workbookFolderID.Valid {
+		customer.WorkbookFolderID = &workbookFolderID.Int64
 	}
 	customer.Tags = []string{}
 	if len(tagsRaw) > 0 {
@@ -111,13 +117,13 @@ func (r *TradeRepo) CreateCustomer(customer *model.TradeCustomer) error {
 		`INSERT INTO trade_customers (
 			customer_code, owner_id, name, company_name, country, region, contact_name, email, phone,
 			source, status, customer_level, whatsapp_account_id, whatsapp_chat_id, whatsapp_chat_name,
-			avatar_url, tags, notes, created_at, updated_at
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'lead',$11,$12,NULLIF($13,''),$14,$15,$16,$17,$18,$18)
+			avatar_url, workbook_folder_id, tags, notes, created_at, updated_at
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'lead',$11,$12,NULLIF($13,''),$14,$15,$16,$17,$18,$19,$19)
 		 RETURNING id`,
 		customer.CustomerCode, customer.OwnerID, customer.Name, customer.CompanyName, customer.Country,
 		customer.Region, customer.ContactName, customer.Email, customer.Phone, customer.Source,
 		customer.CustomerLevel, customer.WhatsAppAccountID, customer.WhatsAppChatID,
-		customer.WhatsAppChatName, customer.AvatarURL, tags, customer.Notes, now,
+		customer.WhatsAppChatName, customer.AvatarURL, customer.WorkbookFolderID, tags, customer.Notes, now,
 	).Scan(&customer.ID)
 	if err != nil {
 		return fmt.Errorf("create trade customer: %w", err)
@@ -140,13 +146,14 @@ func (r *TradeRepo) UpdateCustomer(customer *model.TradeCustomer) error {
 		`UPDATE trade_customers SET
 		 name=$2,company_name=$3,country=$4,region=$5,contact_name=$6,email=$7,phone=$8,
 		 source=$9,status=$10,customer_level=$11,whatsapp_account_id=$12,
-		 whatsapp_chat_id=NULLIF($13,''),whatsapp_chat_name=$14,avatar_url=$15,tags=$16,notes=$17,
+		 whatsapp_chat_id=NULLIF($13,''),whatsapp_chat_name=$14,avatar_url=$15,
+		 workbook_folder_id=$16,tags=$17,notes=$18,
 		 updated_at=NOW()
 		 WHERE id=$1 AND deleted_at IS NULL`,
 		customer.ID, customer.Name, customer.CompanyName, customer.Country, customer.Region,
 		customer.ContactName, customer.Email, customer.Phone, customer.Source, customer.Status,
 		customer.CustomerLevel, customer.WhatsAppAccountID, customer.WhatsAppChatID,
-		customer.WhatsAppChatName, customer.AvatarURL, tags, customer.Notes,
+		customer.WhatsAppChatName, customer.AvatarURL, customer.WorkbookFolderID, tags, customer.Notes,
 	)
 	if err != nil {
 		return fmt.Errorf("update trade customer: %w", err)
@@ -167,6 +174,20 @@ func (r *TradeRepo) SetCustomerChannel(customerID, ownerID, channelID int64) err
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (r *TradeRepo) SetCustomerWorkbookFolder(customerID int64, folderID *int64) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_customers SET workbook_folder_id=$2,updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`, customerID, folderID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
 		return sql.ErrNoRows
 	}
 	return nil
@@ -417,13 +438,14 @@ func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrde
 		`INSERT INTO trade_orders (
 			order_no, customer_id, owner_id, title, stage, priority, inquiry_date, quote_deadline,
 			expected_ship_date, currency, incoterm, destination_country, destination_port,
-			payment_terms, payment_method, total_amount, channel_id, notes, stage_updated_at, created_at, updated_at
-		 ) VALUES ($1,$2,$3,$4,'inquiry',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18,$18)
+			payment_terms, payment_method, total_amount, channel_id, workspace_folder_id, notes,
+			stage_updated_at, created_at, updated_at
+		 ) VALUES ($1,$2,$3,$4,'inquiry',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19,$19)
 		 RETURNING id`,
 		order.OrderNo, order.CustomerID, order.OwnerID, order.Title, order.Priority, order.InquiryDate,
 		order.QuoteDeadline, order.ExpectedShipDate, order.Currency, order.Incoterm,
 		order.DestinationCountry, order.DestinationPort, order.PaymentTerms, order.PaymentMethod,
-		order.TotalAmount, order.ChannelID, order.Notes, now,
+		order.TotalAmount, order.ChannelID, order.WorkspaceFolderID, order.Notes, now,
 	).Scan(&order.ID)
 	if err != nil {
 		return fmt.Errorf("create trade order: %w", err)
@@ -632,11 +654,11 @@ func (r *TradeRepo) SoftDeleteOrder(orderID, deletedBy int64) error {
 	return nil
 }
 
-func (r *TradeRepo) SetOrderWorkspace(orderID, ownerID, workbookID int64) error {
+func (r *TradeRepo) SetOrderWorkspace(orderID, ownerID, workbookID int64, folderID *int64) error {
 	result, err := r.db.Exec(
-		`UPDATE trade_orders SET workbook_id = $3, updated_at = NOW()
+		`UPDATE trade_orders SET workbook_id = $3, workspace_folder_id = $4, updated_at = NOW()
 		 WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL`,
-		orderID, ownerID, workbookID,
+		orderID, ownerID, workbookID, folderID,
 	)
 	if err != nil {
 		return fmt.Errorf("link trade workbook: %w", err)
@@ -661,21 +683,24 @@ const tradeOrderSelect = `
 	       o.additional_cost_amount, o.additional_cost_notes,
 	       o.workbook_id,
 	       (SELECT s.id FROM sheets s WHERE s.workbook_id = o.workbook_id ORDER BY s.sort_order, s.id LIMIT 1),
-	       o.channel_id, o.notes, o.label_width_mm, o.label_height_mm,
+	       o.workspace_folder_id, COALESCE(wf.name,''), o.channel_id, o.notes, o.label_width_mm, o.label_height_mm,
 	       o.label_paper_size, o.label_paper_width_mm, o.label_paper_height_mm, o.label_orientation,
 	       o.label_margin_top_mm, o.label_margin_right_mm, o.label_margin_bottom_mm, o.label_margin_left_mm,
 	       o.label_gap_x_mm, o.label_gap_y_mm, o.label_content_scale, o.label_start_slot,
-	       o.inspection_gallery_directory_id,
+	       o.label_offset_x_mm, o.label_offset_y_mm, o.inspection_gallery_directory_id,
+	       o.payment_gallery_directory_id, o.rework_required, o.rework_reason, o.rework_count,
 	       (SELECT COUNT(*) FROM trade_order_items item WHERE item.order_id = o.id),
 	       o.stage_updated_at, o.created_at, o.updated_at
 	FROM (SELECT * FROM trade_orders WHERE deleted_at IS NULL) o
 	JOIN trade_customers c ON c.id = o.customer_id
-	LEFT JOIN users u ON u.id = o.owner_id`
+	LEFT JOIN users u ON u.id = o.owner_id
+	LEFT JOIN folders wf ON wf.id = o.workspace_folder_id`
 
 func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 	var order model.TradeOrder
 	var quoteDeadline, expectedShipDate sql.NullTime
-	var workbookID, workbookSheetID, channelID, inspectionGalleryDirectoryID sql.NullInt64
+	var workbookID, workbookSheetID, workspaceFolderID, channelID sql.NullInt64
+	var inspectionGalleryDirectoryID, paymentGalleryDirectoryID sql.NullInt64
 	if err := scanner.Scan(
 		&order.ID, &order.OrderNo, &order.CustomerID, &order.CustomerName, &order.CustomerCompany,
 		&order.CustomerAvatarURL, &order.OwnerID, &order.OwnerName, &order.Title, &order.Stage,
@@ -685,11 +710,13 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 		&order.FreightMode, &order.QuotedFreightAmount, &order.ActualFreightCurrency,
 		&order.ActualFreightAmount, &order.ActualFreightToCNYRate, &order.ActualFreightNotes,
 		&order.AdditionalCostAmount, &order.AdditionalCostNotes,
-		&workbookID, &workbookSheetID, &channelID, &order.Notes,
+		&workbookID, &workbookSheetID, &workspaceFolderID, &order.WorkspaceFolderName, &channelID, &order.Notes,
 		&order.LabelWidthMM, &order.LabelHeightMM, &order.LabelPaperSize, &order.LabelPaperWidthMM,
 		&order.LabelPaperHeightMM, &order.LabelOrientation, &order.LabelMarginTopMM, &order.LabelMarginRightMM,
 		&order.LabelMarginBottomMM, &order.LabelMarginLeftMM, &order.LabelGapXMM, &order.LabelGapYMM,
-		&order.LabelContentScale, &order.LabelStartSlot, &inspectionGalleryDirectoryID, &order.ItemCount,
+		&order.LabelContentScale, &order.LabelStartSlot, &order.LabelOffsetXMM, &order.LabelOffsetYMM,
+		&inspectionGalleryDirectoryID, &paymentGalleryDirectoryID, &order.ReworkRequired,
+		&order.ReworkReason, &order.ReworkCount, &order.ItemCount,
 		&order.StageUpdatedAt, &order.CreatedAt, &order.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -706,11 +733,17 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 	if workbookSheetID.Valid {
 		order.WorkbookSheetID = &workbookSheetID.Int64
 	}
+	if workspaceFolderID.Valid {
+		order.WorkspaceFolderID = &workspaceFolderID.Int64
+	}
 	if channelID.Valid {
 		order.ChannelID = &channelID.Int64
 	}
 	if inspectionGalleryDirectoryID.Valid {
 		order.InspectionGalleryDirectoryID = &inspectionGalleryDirectoryID.Int64
+	}
+	if paymentGalleryDirectoryID.Valid {
+		order.PaymentGalleryDirectoryID = &paymentGalleryDirectoryID.Int64
 	}
 	return &order, nil
 }
@@ -1184,6 +1217,117 @@ func (r *TradeRepo) CreateSupplierQuote(orderID, userID int64, request *model.Up
 	return scanTradeSupplierQuote(r.db.QueryRow(tradeSupplierQuoteSelect+` WHERE q.id=$1`, quoteID))
 }
 
+func (r *TradeRepo) CreateSupplierQuotes(orderID, userID int64, requests []model.UpsertTradeSupplierQuoteRequest, validUntils []*time.Time) error {
+	if len(requests) == 0 || len(requests) != len(validUntils) {
+		return fmt.Errorf("invalid supplier quote batch")
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var nextRow int
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(sheet_row_index)+1,0) FROM trade_supplier_quotes WHERE order_id=$1`, orderID,
+	).Scan(&nextRow); err != nil {
+		return err
+	}
+	for index := range requests {
+		request := requests[index]
+		result, err := tx.Exec(
+			`INSERT INTO trade_supplier_quotes(order_id,order_item_id,supplier_id,sheet_row_index,currency,unit_price,moq,
+			 lead_time_days,valid_until,notes,created_by,created_at,updated_at)
+			 SELECT $1,item.id,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW()
+			 FROM trade_order_items item WHERE item.id=$2 AND item.order_id=$1`,
+			orderID, request.OrderItemID, request.SupplierID, nextRow+index, request.Currency,
+			request.UnitPrice, request.MOQ, request.LeadTimeDays, validUntils[index], request.Notes, userID,
+		)
+		if err != nil {
+			return err
+		}
+		if affected, _ := result.RowsAffected(); affected == 0 {
+			return fmt.Errorf("supplier quote item %d does not belong to order", request.OrderItemID)
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *TradeRepo) UpdateSupplierQuote(orderID, quoteID int64, request *model.UpsertTradeSupplierQuoteRequest, validUntil *time.Time) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var selected bool
+	var oldItemID int64
+	if err := tx.QueryRow(
+		`SELECT order_item_id,is_selected FROM trade_supplier_quotes WHERE id=$1 AND order_id=$2 FOR UPDATE`, quoteID, orderID,
+	).Scan(&oldItemID, &selected); err != nil {
+		return err
+	}
+	result, err := tx.Exec(
+		`UPDATE trade_supplier_quotes q SET order_item_id=item.id,supplier_id=$4,currency=$5,unit_price=$6,
+		 moq=$7,lead_time_days=$8,valid_until=$9,notes=$10,updated_at=NOW()
+		 FROM trade_order_items item
+		 WHERE q.id=$1 AND q.order_id=$2 AND item.id=$3 AND item.order_id=$2`,
+		quoteID, orderID, request.OrderItemID, request.SupplierID, request.Currency, request.UnitPrice,
+		request.MOQ, request.LeadTimeDays, validUntil, request.Notes,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	if selected {
+		if _, err := tx.Exec(`UPDATE trade_supplier_quotes SET is_selected=FALSE,updated_at=NOW()
+		 WHERE order_id=$1 AND order_item_id=$2 AND id<>$3`, orderID, request.OrderItemID, quoteID); err != nil {
+			return err
+		}
+		if oldItemID != request.OrderItemID {
+			if _, err := tx.Exec(`UPDATE trade_order_items SET supplier_name='',purchase_price=0,
+			 purchase_currency='',status='待供应商报价',updated_at=NOW() WHERE id=$1 AND order_id=$2`, oldItemID, orderID); err != nil {
+				return err
+			}
+		}
+		var supplierName string
+		if err := tx.QueryRow(`SELECT COALESCE(name,'') FROM trade_suppliers WHERE id=$1`, request.SupplierID).Scan(&supplierName); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE trade_order_items SET supplier_name=$2,purchase_price=$3,
+		 purchase_currency=$4,updated_at=NOW() WHERE id=$1 AND order_id=$5`, request.OrderItemID,
+			supplierName, request.UnitPrice, request.Currency, orderID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *TradeRepo) DeleteSupplierQuote(orderID, quoteID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var itemID int64
+	var selected bool
+	if err := tx.QueryRow(
+		`DELETE FROM trade_supplier_quotes WHERE id=$1 AND order_id=$2
+		 RETURNING order_item_id,is_selected`, quoteID, orderID,
+	).Scan(&itemID, &selected); err != nil {
+		return err
+	}
+	if selected {
+		if _, err := tx.Exec(`UPDATE trade_order_items SET supplier_name='',purchase_price=0,
+		 purchase_currency='',status='待供应商报价',updated_at=NOW() WHERE id=$1 AND order_id=$2`, itemID, orderID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (r *TradeRepo) UpsertSupplierQuoteFromSheet(orderID, itemID, supplierID int64, sheetRowIndex int, currency string, unitPrice, moq float64, leadTime int, validUntil *time.Time, notes string, userID int64) (int64, error) {
 	var quoteID int64
 	err := r.db.QueryRow(
@@ -1236,6 +1380,7 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 		&quote.ID, &quote.OrderID, &quote.RoundNo, &quote.Currency, &quote.Status,
 		&quote.GoodsAmount, &quote.ExchangeRateCNY, &quote.FreightMode, &quote.FreightAmount,
 		&quote.TotalAmount, &quote.TotalAmountCNY, &itemsRaw, &quote.CustomerFeedback, &quote.Notes,
+		&quote.PaymentStatus, &quote.PaymentCurrency, &quote.PaidAmount,
 		&quote.CreatedBy, &quote.CreatedByName, &sentAt, &quote.CreatedAt, &quote.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -1255,7 +1400,8 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 const tradeCustomerQuoteRoundSelect = `
 	SELECT q.id,q.order_id,q.round_no,q.currency,q.status,q.goods_amount,q.exchange_rate_cny,
 	       q.freight_mode,q.freight_amount,q.total_amount,q.total_amount_cny,q.item_prices,
-	       q.customer_feedback,q.notes,q.created_by,COALESCE(u.username,''),q.sent_at,q.created_at,q.updated_at
+	       q.customer_feedback,q.notes,q.payment_status,q.payment_currency,q.paid_amount,
+	       q.created_by,COALESCE(u.username,''),q.sent_at,q.created_at,q.updated_at
 	FROM trade_customer_quote_rounds q
 	LEFT JOIN users u ON u.id=q.created_by`
 
@@ -1408,6 +1554,22 @@ func (r *TradeRepo) UpdateCustomerQuoteRoundStatus(orderID, quoteID int64, statu
 		return sql.ErrNoRows
 	}
 	return tx.Commit()
+}
+
+func (r *TradeRepo) UpdateCustomerQuotePayment(orderID, quoteID int64, status, currency string, amount float64) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_customer_quote_rounds
+		 SET payment_status=$3,payment_currency=$4,paid_amount=$5,updated_at=NOW()
+		 WHERE id=$1 AND order_id=$2`,
+		quoteID, orderID, status, currency, amount,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *TradeRepo) ListPositions() ([]model.TradePosition, error) {
@@ -1614,6 +1776,12 @@ func (r *TradeRepo) SetInspectionGalleryDirectory(orderID, directoryID int64) er
 	return err
 }
 
+func (r *TradeRepo) SetPaymentGalleryDirectory(orderID, directoryID int64) error {
+	_, err := r.db.Exec(`UPDATE trade_orders SET payment_gallery_directory_id=$2,updated_at=NOW()
+	 WHERE id=$1 AND deleted_at IS NULL`, orderID, directoryID)
+	return err
+}
+
 func (r *TradeRepo) CreateInspectionPhoto(photo *model.TradeInspectionPhoto) error {
 	return r.db.QueryRow(
 		`INSERT INTO trade_inspection_photos(order_id,order_item_id,attachment_id,gallery_directory_id,note,uploaded_by,created_at)
@@ -1659,16 +1827,187 @@ func (r *TradeRepo) ListInspectionPhotos(orderID int64) ([]model.TradeInspection
 	return result, rows.Err()
 }
 
+func (r *TradeRepo) CreatePaymentProof(proof *model.TradePaymentProof) error {
+	return r.db.QueryRow(
+		`INSERT INTO trade_customer_payment_proofs(order_id,quote_id,attachment_id,gallery_directory_id,note,uploaded_by,created_at)
+		 SELECT $1,q.id,$3,$4,$5,$6,NOW()
+		 FROM trade_customer_quote_rounds q WHERE q.id=$2 AND q.order_id=$1
+		 ON CONFLICT(quote_id,attachment_id) DO UPDATE SET gallery_directory_id=EXCLUDED.gallery_directory_id,
+		 note=EXCLUDED.note RETURNING id,created_at`,
+		proof.OrderID, proof.QuoteID, proof.AttachmentID, proof.GalleryDirectoryID, proof.Note, proof.UploadedBy,
+	).Scan(&proof.ID, &proof.CreatedAt)
+}
+
+func (r *TradeRepo) ListPaymentProofs(orderID int64) ([]model.TradePaymentProof, error) {
+	rows, err := r.db.Query(
+		`SELECT p.id,p.order_id,p.quote_id,p.attachment_id,a.filename,p.note,p.uploaded_by,
+		 COALESCE(u.username,''),p.gallery_directory_id,p.created_at
+		 FROM trade_customer_payment_proofs p
+		 JOIN attachments a ON a.id=p.attachment_id
+		 LEFT JOIN users u ON u.id=p.uploaded_by
+		 WHERE p.order_id=$1 ORDER BY p.created_at DESC,p.id DESC`, orderID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]model.TradePaymentProof, 0)
+	for rows.Next() {
+		var proof model.TradePaymentProof
+		var directoryID sql.NullInt64
+		if err := rows.Scan(
+			&proof.ID, &proof.OrderID, &proof.QuoteID, &proof.AttachmentID, &proof.Filename,
+			&proof.Note, &proof.UploadedBy, &proof.UploadedByName, &directoryID, &proof.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if directoryID.Valid {
+			proof.GalleryDirectoryID = &directoryID.Int64
+		}
+		result = append(result, proof)
+	}
+	return result, rows.Err()
+}
+
+func (r *TradeRepo) ListPackingGroups(orderID int64) ([]model.TradePackingGroup, error) {
+	rows, err := r.db.Query(
+		`SELECT id,order_id,group_no,length_cm,width_cm,height_cm,weight_kg,
+		 volumetric_weight_kg,copies,items,notes,created_at,updated_at
+		 FROM trade_packing_groups WHERE order_id=$1 ORDER BY group_no,id`, orderID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	groups := make([]model.TradePackingGroup, 0)
+	for rows.Next() {
+		var group model.TradePackingGroup
+		var itemsRaw []byte
+		if err := rows.Scan(
+			&group.ID, &group.OrderID, &group.GroupNo, &group.LengthCM, &group.WidthCM,
+			&group.HeightCM, &group.WeightKG, &group.VolumetricWeightKG, &group.Copies,
+			&itemsRaw, &group.Notes, &group.CreatedAt, &group.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		group.Items = []model.TradePackingGroupItem{}
+		if err := json.Unmarshal(itemsRaw, &group.Items); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+func (r *TradeRepo) ReplacePackingGroups(orderID int64, groups []model.TradePackingGroup) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM trade_packing_groups WHERE order_id=$1`, orderID); err != nil {
+		return err
+	}
+	packedByItem := make(map[int64]float64)
+	cartonsByItem := make(map[int64]int)
+	for index := range groups {
+		group := &groups[index]
+		itemsRaw, err := json.Marshal(group.Items)
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(
+			`INSERT INTO trade_packing_groups(order_id,group_no,length_cm,width_cm,height_cm,weight_kg,
+			 volumetric_weight_kg,copies,items,notes,created_at,updated_at)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW()) RETURNING id,created_at,updated_at`,
+			orderID, group.GroupNo, group.LengthCM, group.WidthCM, group.HeightCM, group.WeightKG,
+			group.VolumetricWeightKG, group.Copies, itemsRaw, group.Notes,
+		).Scan(&group.ID, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return err
+		}
+		for _, item := range group.Items {
+			packedByItem[item.OrderItemID] += item.Quantity * float64(group.Copies)
+			cartonsByItem[item.OrderItemID] += group.Copies
+		}
+	}
+	if _, err := tx.Exec(`UPDATE trade_order_items SET packed_quantity=0,carton_count=0,updated_at=NOW() WHERE order_id=$1`, orderID); err != nil {
+		return err
+	}
+	for itemID, quantity := range packedByItem {
+		result, err := tx.Exec(
+			`UPDATE trade_order_items SET packed_quantity=$3,carton_count=$4,status='已装箱',updated_at=NOW()
+			 WHERE id=$1 AND order_id=$2`, itemID, orderID, quantity, cartonsByItem[itemID],
+		)
+		if err != nil {
+			return err
+		}
+		if affected, _ := result.RowsAffected(); affected == 0 {
+			return fmt.Errorf("packing item %d does not belong to order", itemID)
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *TradeRepo) MarkOrderForRepurchase(orderID, actorID int64, reason string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var fromStage string
+	if err := tx.QueryRow(
+		`SELECT stage FROM trade_orders WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, orderID,
+	).Scan(&fromStage); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_orders SET stage='purchase',stage_updated_at=NOW(),rework_required=TRUE,
+		 rework_reason=$2,rework_count=rework_count+1,updated_at=NOW() WHERE id=$1`, orderID, reason,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_order_items SET status='采购错误，待重新采购',updated_at=NOW() WHERE order_id=$1`, orderID,
+	); err != nil {
+		return err
+	}
+	snapshot, _ := json.Marshal(map[string]any{"rework_reason": reason, "source_stage": fromStage})
+	if _, err := tx.Exec(
+		`INSERT INTO trade_order_stage_events(order_id,from_stage,to_stage,actor_id,note,snapshot)
+		 VALUES($1,$2,'purchase',$3,$4,$5)`, orderID, fromStage, actorID, "发货异常，退回采购："+reason, snapshot,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *TradeRepo) ClearOrderRework(orderID int64) error {
+	_, err := r.db.Exec(
+		`UPDATE trade_orders SET rework_required=FALSE,rework_reason='',updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`, orderID,
+	)
+	return err
+}
+
 func (r *TradeRepo) UpdateLabelSettings(orderID int64, request *model.UpdateTradeLabelSettingsRequest) error {
+	offsetX := request.MarginLeftMM
+	if request.OffsetXMM != nil {
+		offsetX = *request.OffsetXMM
+	}
+	offsetY := request.MarginTopMM
+	if request.OffsetYMM != nil {
+		offsetY = *request.OffsetYMM
+	}
 	_, err := r.db.Exec(`UPDATE trade_orders SET label_width_mm=$2,label_height_mm=$3,label_paper_size=$4,
 	 label_paper_width_mm=$5,label_paper_height_mm=$6,label_orientation=$7,label_margin_top_mm=$8,
 	 label_margin_right_mm=$9,label_margin_bottom_mm=$10,label_margin_left_mm=$11,label_gap_x_mm=$12,
-	 label_gap_y_mm=$13,label_content_scale=$14,label_start_slot=$15,updated_at=NOW()
+	 label_gap_y_mm=$13,label_content_scale=$14,label_start_slot=$15,label_offset_x_mm=$16,
+	 label_offset_y_mm=$17,updated_at=NOW()
 	 WHERE id=$1 AND deleted_at IS NULL`,
 		orderID, request.WidthMM, request.HeightMM, request.PaperSize, request.PaperWidthMM,
 		request.PaperHeightMM, request.Orientation, request.MarginTopMM, request.MarginRightMM,
 		request.MarginBottomMM, request.MarginLeftMM, request.GapXMM, request.GapYMM,
-		request.ContentScale, request.StartSlot)
+		request.ContentScale, request.StartSlot, offsetX, offsetY)
 	return err
 }
 

@@ -173,6 +173,17 @@ func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	return &wb, nil
 }
 
+func (r *SheetRepo) ActiveWorkbookExists(id int64) (bool, error) {
+	if id <= 0 {
+		return false, nil
+	}
+	var exists bool
+	err := r.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM workbooks WHERE id=$1 AND deleted_at IS NULL)`, id,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workbook, int64, error) {
 	var total int64
 	countQuery := `SELECT COUNT(*) FROM workbooks WHERE deleted_at IS NULL`
