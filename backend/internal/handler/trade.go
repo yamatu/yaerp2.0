@@ -630,6 +630,50 @@ func (h *TradeHandler) DeleteCustomerPaymentProof(c *gin.Context) {
 	response.OKMsg(c, "付款凭证已移入回收站，30天内可还原")
 }
 
+func (h *TradeHandler) UploadPIBankImage(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的对客报价编号")
+		return
+	}
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "请选择 PI 收款信息图片")
+		return
+	}
+	defer file.Close()
+	order, err := h.service.UploadTradePIBankImage(c.GetInt64("user_id"), orderID, quoteID, file, header)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) RemovePIBankImage(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的对客报价编号")
+		return
+	}
+	order, err := h.service.RemoveTradePIBankImage(c.GetInt64("user_id"), orderID, quoteID)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) ListPositions(c *gin.Context) {
 	positions, err := h.service.ListPositions(c.GetInt64("user_id"))
 	if err != nil {

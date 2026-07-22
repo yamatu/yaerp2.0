@@ -1304,6 +1304,8 @@ export interface TradeCustomerQuoteRound {
   payment_currency: string;
   paid_amount: number;
   payment_proofs?: TradePaymentProof[];
+  pi_bank_details_image_attachment_id?: number;
+  pi_bank_details_image_url?: string;
   created_by: number;
   created_by_name: string;
   sent_at?: string;

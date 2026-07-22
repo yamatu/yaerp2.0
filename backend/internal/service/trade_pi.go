@@ -57,8 +57,9 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 		return nil, fmt.Errorf("请先在外贸设置中配置 PI 公司资料")
 	}
 	bankDetailsImageDataURI := ""
-	if profile.BankDetailsImageAttachmentID != nil {
-		attachment, data, imageErr := s.uploadSvc.ReadAttachmentBytes(*profile.BankDetailsImageAttachmentID)
+	bankImageAttachmentID := tradePIBankImageAttachmentID(&profile, quote)
+	if bankImageAttachmentID != nil {
+		attachment, data, imageErr := s.uploadSvc.ReadAttachmentBytes(*bankImageAttachmentID)
 		if imageErr != nil {
 			return nil, fmt.Errorf("读取 PI 银行信息图片失败: %w", imageErr)
 		}
@@ -108,6 +109,16 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 		Total:    quote.TotalAmount,
 		Data:     pdfData,
 	}, nil
+}
+
+func tradePIBankImageAttachmentID(profile *model.TradePIProfile, quote *model.TradeCustomerQuoteRound) *int64 {
+	if quote != nil && quote.PIBankDetailsImageAttachmentID != nil && *quote.PIBankDetailsImageAttachmentID > 0 {
+		return quote.PIBankDetailsImageAttachmentID
+	}
+	if profile != nil && profile.BankDetailsImageAttachmentID != nil && *profile.BankDetailsImageAttachmentID > 0 {
+		return profile.BankDetailsImageAttachmentID
+	}
+	return nil
 }
 
 func (s *TradeService) SendTradePIToCustomer(userID, orderID int64, request *model.TradePIRequest) (*model.ChannelMessage, error) {

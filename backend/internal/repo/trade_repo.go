@@ -1375,12 +1375,14 @@ func (r *TradeRepo) SelectSupplierQuote(orderID, quoteID, userID int64) error {
 func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQuoteRound, error) {
 	var quote model.TradeCustomerQuoteRound
 	var itemsRaw []byte
+	var piBankImageID sql.NullInt64
 	var sentAt sql.NullTime
 	if err := scanner.Scan(
 		&quote.ID, &quote.OrderID, &quote.RoundNo, &quote.Currency, &quote.Status,
 		&quote.GoodsAmount, &quote.ExchangeRateCNY, &quote.FreightMode, &quote.FreightAmount,
 		&quote.TotalAmount, &quote.TotalAmountCNY, &itemsRaw, &quote.CustomerFeedback, &quote.Notes,
 		&quote.PaymentStatus, &quote.PaymentCurrency, &quote.PaidAmount,
+		&piBankImageID,
 		&quote.CreatedBy, &quote.CreatedByName, &sentAt, &quote.CreatedAt, &quote.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -1394,6 +1396,9 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 	if sentAt.Valid {
 		quote.SentAt = &sentAt.Time
 	}
+	if piBankImageID.Valid {
+		quote.PIBankDetailsImageAttachmentID = &piBankImageID.Int64
+	}
 	return &quote, nil
 }
 
@@ -1401,6 +1406,7 @@ const tradeCustomerQuoteRoundSelect = `
 	SELECT q.id,q.order_id,q.round_no,q.currency,q.status,q.goods_amount,q.exchange_rate_cny,
 	       q.freight_mode,q.freight_amount,q.total_amount,q.total_amount_cny,q.item_prices,
 	       q.customer_feedback,q.notes,q.payment_status,q.payment_currency,q.paid_amount,
+	       q.pi_bank_details_image_attachment_id,
 	       q.created_by,COALESCE(u.username,''),q.sent_at,q.created_at,q.updated_at
 	FROM trade_customer_quote_rounds q
 	LEFT JOIN users u ON u.id=q.created_by`
@@ -1420,6 +1426,61 @@ func (r *TradeRepo) ListCustomerQuoteRounds(orderID int64) ([]model.TradeCustome
 		result = append(result, *quote)
 	}
 	return result, rows.Err()
+}
+
+func (r *TradeRepo) UpdateCustomerQuotePIBankImage(orderID, quoteID int64, attachmentID *int64) (*int64, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var previous sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT pi_bank_details_image_attachment_id
+		 FROM trade_customer_quote_rounds
+		 WHERE id=$1 AND order_id=$2 FOR UPDATE`,
+		quoteID, orderID,
+	).Scan(&previous); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(
+		`UPDATE trade_customer_quote_rounds
+		 SET pi_bank_details_image_attachment_id=$3,updated_at=NOW()
+		 WHERE id=$1 AND order_id=$2`,
+		quoteID, orderID, attachmentID,
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if !previous.Valid {
+		return nil, nil
+	}
+	return &previous.Int64, nil
+}
+
+func (r *TradeRepo) ListPIBankImageOrderIDsByAttachment(attachmentID int64) ([]int64, error) {
+	rows, err := r.db.Query(
+		`SELECT DISTINCT order_id
+		 FROM trade_customer_quote_rounds
+		 WHERE pi_bank_details_image_attachment_id=$1`,
+		attachmentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	orderIDs := make([]int64, 0)
+	for rows.Next() {
+		var orderID int64
+		if err := rows.Scan(&orderID); err != nil {
+			return nil, err
+		}
+		orderIDs = append(orderIDs, orderID)
+	}
+	return orderIDs, rows.Err()
 }
 
 func (r *TradeRepo) CreateCustomerQuoteRound(round *model.TradeCustomerQuoteRound) error {

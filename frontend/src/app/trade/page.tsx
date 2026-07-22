@@ -1038,6 +1038,9 @@ export default function TradeWorkspacePage() {
   const [piModalOpen, setPIModalOpen] = useState(false);
   const [piDraft, setPIDraft] = useState<TradePIDraft | null>(null);
   const [piPreviewURL, setPIPreviewURL] = useState("");
+  const [uploadingPIQuoteBankImage, setUploadingPIQuoteBankImage] =
+    useState(false);
+  const piQuoteBankImageInputRef = useRef<HTMLInputElement>(null);
   const [piAction, setPIAction] = useState<
     "preview" | "download" | "send" | null
   >(null);
@@ -1528,6 +1531,14 @@ export default function TradeWorkspacePage() {
         (quote) => quote.id === piDraft?.quote_id,
       ) || null,
     [detailOrder?.customer_quotes, piDraft?.quote_id],
+  );
+
+  const selectedPIBankImageURL =
+    selectedPIQuote?.pi_bank_details_image_url ||
+    settings.pi_profile.bank_details_image_url ||
+    "";
+  const selectedPIUsesQuoteBankImage = Boolean(
+    selectedPIQuote?.pi_bank_details_image_attachment_id,
   );
 
   const openCustomerModal = (mode: "manual" | "whatsapp" = "manual") => {
@@ -2163,6 +2174,73 @@ export default function TradeWorkspacePage() {
   const updatePIDraft = (patch: Partial<TradePIDraft>) => {
     setPIDraft((current) => (current ? { ...current, ...patch } : current));
     setPIPreviewURL("");
+  };
+
+  const uploadPIQuoteBankImage = async (file?: File) => {
+    if (!file || !detailOrder || !selectedPIQuote) return;
+    if (!file.type.toLowerCase().startsWith("image/")) {
+      setError("PI 收款信息仅支持图片文件。");
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setError("PI 收款信息图片不能超过 20MB。");
+      return;
+    }
+    setUploadingPIQuoteBankImage(true);
+    setError("");
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const response = await api.form<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/customer-quotes/${selectedPIQuote.id}/pi-bank-image`,
+        body,
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "保存本次 PI 收款图片失败");
+      setDetailOrder(response.data);
+      setPIPreviewURL("");
+      setNotice(
+        `第 ${selectedPIQuote.round_no} 轮报价的 PI 收款图片已保存。`,
+      );
+    } catch (uploadError) {
+      setError(
+        uploadError instanceof Error
+          ? uploadError.message
+          : "保存本次 PI 收款图片失败",
+      );
+    } finally {
+      setUploadingPIQuoteBankImage(false);
+      if (piQuoteBankImageInputRef.current)
+        piQuoteBankImageInputRef.current.value = "";
+    }
+  };
+
+  const removePIQuoteBankImage = async () => {
+    if (!detailOrder || !selectedPIQuote) return;
+    setUploadingPIQuoteBankImage(true);
+    setError("");
+    try {
+      const response = await api.delete<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/customer-quotes/${selectedPIQuote.id}/pi-bank-image`,
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "移除本次 PI 收款图片失败");
+      setDetailOrder(response.data);
+      setPIPreviewURL("");
+      setNotice(
+        settings.pi_profile.bank_details_image_attachment_id
+          ? "本次 PI 收款图片已移除，现已恢复使用默认银行图片。"
+          : "本次 PI 收款图片已移除，现已恢复使用结构化银行资料。",
+      );
+    } catch (removeError) {
+      setError(
+        removeError instanceof Error
+          ? removeError.message
+          : "移除本次 PI 收款图片失败",
+      );
+    } finally {
+      setUploadingPIQuoteBankImage(false);
+    }
   };
 
   const loadPIBlob = async (download: boolean) => {
@@ -8341,7 +8419,11 @@ export default function TradeWorkspacePage() {
           <div
             className="fixed inset-0 z-[92] flex items-end justify-center bg-slate-950/55 p-0 lg:items-center lg:p-4"
             onMouseDown={(event) => {
-              if (event.target === event.currentTarget && !piAction)
+              if (
+                event.target === event.currentTarget &&
+                !piAction &&
+                !uploadingPIQuoteBankImage
+              )
                 closePIModal();
             }}
           >
@@ -8359,7 +8441,7 @@ export default function TradeWorkspacePage() {
                 <button
                   type="button"
                   onClick={closePIModal}
-                  disabled={Boolean(piAction)}
+                  disabled={Boolean(piAction) || uploadingPIQuoteBankImage}
                   className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-40"
                   title="关闭"
                 >
@@ -8375,10 +8457,11 @@ export default function TradeWorkspacePage() {
                     </span>
                     <select
                       value={piDraft.quote_id}
+                      disabled={uploadingPIQuoteBankImage}
                       onChange={(event) =>
                         updatePIDraft({ quote_id: Number(event.target.value) })
                       }
-                      className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+                      className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100 disabled:opacity-50"
                     >
                       {(detailOrder.customer_quotes || [])
                         .filter(
@@ -8489,20 +8572,14 @@ export default function TradeWorkspacePage() {
                     />
                   </label>
 
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                     <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="text-xs font-semibold text-slate-700">
+                      <div className="min-w-0">
+                        <div className="truncate text-xs font-semibold text-slate-700">
                           {settings.pi_profile.company_name}
                         </div>
                         <div className="mt-1 text-[11px] leading-5 text-slate-400">
-                          {settings.pi_profile.bank_details_image_attachment_id
-                            ? "银行账户图片已配置"
-                            : settings.pi_profile.bank_name ||
-                              "尚未配置收款银行"}{" "}
-                          ·{" "}
-                          {settings.pi_profile.account_number ||
-                            "结构化账号可作为图片缺失时的备用信息"}
+                          第 {selectedPIQuote.round_no} 轮报价独立保存收款图片
                         </div>
                       </div>
                       <button
@@ -8517,6 +8594,87 @@ export default function TradeWorkspacePage() {
                         编辑抬头
                       </button>
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => piQuoteBankImageInputRef.current?.click()}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        void uploadPIQuoteBankImage(
+                          Array.from(event.dataTransfer.files).find((file) =>
+                            file.type.toLowerCase().startsWith("image/"),
+                          ),
+                        );
+                      }}
+                      disabled={uploadingPIQuoteBankImage}
+                      className="mt-3 flex min-h-32 w-full items-center justify-center overflow-hidden rounded-lg border border-dashed border-slate-300 bg-white p-2 text-left transition hover:border-indigo-300 hover:bg-indigo-50/30 disabled:opacity-60"
+                    >
+                      {selectedPIBankImageURL ? (
+                        <img
+                          src={selectedPIBankImageURL}
+                          alt="本次 PI 收款信息"
+                          className="max-h-40 max-w-full object-contain"
+                        />
+                      ) : (
+                        <span className="flex flex-col items-center gap-2 px-4 py-5 text-center">
+                          {uploadingPIQuoteBankImage ? (
+                            <Loader2 className="h-5 w-5 animate-spin text-indigo-600" />
+                          ) : (
+                            <ImagePlus className="h-5 w-5 text-indigo-600" />
+                          )}
+                          <span className="text-xs font-semibold text-slate-700">
+                            点击或拖入本次 PI 收款图片
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            上传后立即保存，支持 JPG、PNG、WebP 等图片
+                          </span>
+                        </span>
+                      )}
+                    </button>
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[11px] text-slate-400">
+                        {selectedPIUsesQuoteBankImage
+                          ? "当前使用本轮报价专属图片"
+                          : selectedPIBankImageURL
+                            ? "当前使用外贸设置中的默认图片"
+                            : "当前使用结构化银行账户资料"}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => piQuoteBankImageInputRef.current?.click()}
+                          disabled={uploadingPIQuoteBankImage}
+                          className="inline-flex h-8 items-center gap-1.5 rounded-md border border-indigo-200 bg-white px-2.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                        >
+                          {uploadingPIQuoteBankImage ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <ImagePlus className="h-3.5 w-3.5" />
+                          )}
+                          {selectedPIUsesQuoteBankImage ? "更换" : "上传"}
+                        </button>
+                        {selectedPIUsesQuoteBankImage && (
+                          <button
+                            type="button"
+                            onClick={() => void removePIQuoteBankImage()}
+                            disabled={uploadingPIQuoteBankImage}
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-rose-200 bg-white text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                            title="移除本轮收款图片"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <input
+                      ref={piQuoteBankImageInputRef}
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(event) =>
+                        void uploadPIQuoteBankImage(event.target.files?.[0])
+                      }
+                    />
                   </div>
                 </div>
 
@@ -8692,15 +8850,29 @@ export default function TradeWorkspacePage() {
                           ))}
                           <tr>
                             <td className="w-[23%] border border-black bg-yellow-50 px-2 py-2 text-center font-bold">Bank Account:</td>
-                            <td className="h-40 border border-black p-3 align-middle">
-                              {settings.pi_profile.bank_details_image_url ? (
+                            <td
+                              className="relative h-40 border border-black p-3 align-middle"
+                              onDragOver={(event) => event.preventDefault()}
+                              onDrop={(event) => {
+                                event.preventDefault();
+                                void uploadPIQuoteBankImage(
+                                  Array.from(event.dataTransfer.files).find(
+                                    (file) =>
+                                      file.type
+                                        .toLowerCase()
+                                        .startsWith("image/"),
+                                  ),
+                                );
+                              }}
+                            >
+                              {selectedPIBankImageURL ? (
                                 <img
-                                  src={settings.pi_profile.bank_details_image_url}
+                                  src={selectedPIBankImageURL}
                                   alt="Bank account details"
-                                  className="max-h-36 max-w-full object-contain object-left"
+                                  className="max-h-36 max-w-[calc(100%_-_36px)] object-contain object-left"
                                 />
                               ) : (
-                                <div className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1 leading-5">
+                                <div className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1 pr-9 leading-5">
                                   <span className="text-slate-500">Account Name</span><strong>{settings.pi_profile.account_name || settings.pi_profile.company_name || "-"}</strong>
                                   <span className="text-slate-500">Bank Name</span><strong>{settings.pi_profile.bank_name || "-"}</strong>
                                   <span className="text-slate-500">Account No.</span><strong>{settings.pi_profile.account_number || "-"}</strong>
@@ -8708,6 +8880,25 @@ export default function TradeWorkspacePage() {
                                   <span className="text-slate-500">Bank Address</span><strong>{settings.pi_profile.bank_address || "-"}</strong>
                                 </div>
                               )}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  piQuoteBankImageInputRef.current?.click()
+                                }
+                                disabled={uploadingPIQuoteBankImage}
+                                className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 bg-white/95 text-indigo-700 shadow-sm hover:bg-indigo-50 disabled:opacity-50"
+                                title={
+                                  selectedPIUsesQuoteBankImage
+                                    ? "更换本轮 PI 收款图片"
+                                    : "上传本轮 PI 收款图片"
+                                }
+                              >
+                                {uploadingPIQuoteBankImage ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <ImagePlus className="h-3.5 w-3.5" />
+                                )}
+                              </button>
                             </td>
                           </tr>
                           <tr>
@@ -8745,7 +8936,7 @@ export default function TradeWorkspacePage() {
                   <button
                     type="button"
                     onClick={() => void previewPI()}
-                    disabled={Boolean(piAction)}
+                    disabled={Boolean(piAction) || uploadingPIQuoteBankImage}
                     className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
                   >
                     {piAction === "preview" ? (
@@ -8758,7 +8949,7 @@ export default function TradeWorkspacePage() {
                   <button
                     type="button"
                     onClick={() => void downloadPI()}
-                    disabled={Boolean(piAction)}
+                    disabled={Boolean(piAction) || uploadingPIQuoteBankImage}
                     className="inline-flex h-9 items-center gap-2 rounded-lg border border-indigo-200 px-3 text-sm font-semibold text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"
                   >
                     {piAction === "download" ? (
@@ -8771,7 +8962,11 @@ export default function TradeWorkspacePage() {
                   <button
                     type="button"
                     onClick={() => void sendPI()}
-                    disabled={Boolean(piAction) || !detailOrder.channel_id}
+                    disabled={
+                      Boolean(piAction) ||
+                      uploadingPIQuoteBankImage ||
+                      !detailOrder.channel_id
+                    }
                     title={
                       detailOrder.channel_id
                         ? "发送到客户频道，并按频道联动设置发送到 WhatsApp"

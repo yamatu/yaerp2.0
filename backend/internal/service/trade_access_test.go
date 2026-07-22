@@ -164,6 +164,25 @@ func TestRedactTradePaymentRecordsKeepsAllScope(t *testing.T) {
 	}
 }
 
+func TestRedactTradePIBankImagesRequiresPIAccess(t *testing.T) {
+	attachmentID := int64(18)
+	quotes := []model.TradeCustomerQuoteRound{{
+		PIBankDetailsImageAttachmentID: &attachmentID,
+		PIBankDetailsImageURL:          "/files/18/content",
+	}}
+	redactTradePIBankImages(quotes, &model.TradeOrderAccess{})
+	if quotes[0].PIBankDetailsImageAttachmentID != nil || quotes[0].PIBankDetailsImageURL != "" {
+		t.Fatalf("PI bank image must be hidden without PI access: %#v", quotes[0])
+	}
+
+	quotes[0].PIBankDetailsImageAttachmentID = &attachmentID
+	quotes[0].PIBankDetailsImageURL = "/files/18/content"
+	redactTradePIBankImages(quotes, &model.TradeOrderAccess{CanViewPI: true})
+	if quotes[0].PIBankDetailsImageAttachmentID == nil || quotes[0].PIBankDetailsImageURL == "" {
+		t.Fatalf("PI bank image should remain visible to PI users: %#v", quotes[0])
+	}
+}
+
 func TestTradePaymentReviewQuotesHidesQuotePricing(t *testing.T) {
 	quotes := []model.TradeCustomerQuoteRound{
 		{ID: 1, Status: "draft", GoodsAmount: 90},

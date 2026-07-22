@@ -298,7 +298,11 @@ func (s *TradeService) AuthorizePaymentAttachment(userID, attachmentID int64) (b
 	if err != nil {
 		return false, false, err
 	}
-	if len(references) == 0 {
+	piOrderIDs, err := s.repo.ListPIBankImageOrderIDsByAttachment(attachmentID)
+	if err != nil {
+		return false, false, err
+	}
+	if len(references) == 0 && len(piOrderIDs) == 0 {
 		return false, true, nil
 	}
 	access, err := s.loadTradeUserAccess(userID)
@@ -330,6 +334,25 @@ func (s *TradeService) AuthorizePaymentAttachment(userID, attachmentID int64) (b
 			continue
 		}
 		if orderAccess.CanViewAllPaymentRecords || reference.UploadedBy == userID {
+			return true, true, nil
+		}
+	}
+	for _, orderID := range piOrderIDs {
+		order, orderErr := s.repo.GetOrder(orderID, userID, true)
+		if errors.Is(orderErr, sql.ErrNoRows) {
+			continue
+		}
+		if orderErr != nil {
+			return true, false, orderErr
+		}
+		if !s.canViewTradeOrder(userID, order, access) {
+			continue
+		}
+		orderAccess, accessErr := s.orderAccessForUser(userID, order, access)
+		if accessErr != nil {
+			return true, false, accessErr
+		}
+		if orderAccess.CanViewPI {
 			return true, true, nil
 		}
 	}
@@ -365,6 +388,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.Notes = ""
 	}
 	redactTradePaymentRecords(userID, order.CustomerQuotes, orderAccess)
+	redactTradePIBankImages(order.CustomerQuotes, orderAccess)
 	if !orderAccess.CanViewCustomerPricing {
 		order.TotalAmount = 0
 		order.QuotedGoodsAmount = 0
@@ -486,6 +510,16 @@ func redactTradePaymentRecords(userID int64, quotes []model.TradeCustomerQuoteRo
 			}
 		}
 		quote.PaymentProofs = visibleProofs
+	}
+}
+
+func redactTradePIBankImages(quotes []model.TradeCustomerQuoteRound, access *model.TradeOrderAccess) {
+	if access != nil && access.CanViewPI {
+		return
+	}
+	for quoteIndex := range quotes {
+		quotes[quoteIndex].PIBankDetailsImageAttachmentID = nil
+		quotes[quoteIndex].PIBankDetailsImageURL = ""
 	}
 }
 

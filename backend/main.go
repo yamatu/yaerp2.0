@@ -288,6 +288,8 @@ func main() {
 		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/payment", tradeHandler.UpdateCustomerQuotePayment)
 		api.POST("/trade/orders/:id/customer-quotes/:quoteId/payment-proofs", tradeHandler.UploadCustomerPaymentProof)
 		api.DELETE("/trade/orders/:id/payment-proofs/:proofId", tradeHandler.DeleteCustomerPaymentProof)
+		api.POST("/trade/orders/:id/customer-quotes/:quoteId/pi-bank-image", tradeHandler.UploadPIBankImage)
+		api.DELETE("/trade/orders/:id/customer-quotes/:quoteId/pi-bank-image", tradeHandler.RemovePIBankImage)
 		api.POST("/trade/orders/:id/pi/pdf", tradeHandler.GeneratePI)
 		api.POST("/trade/orders/:id/pi/send", tradeHandler.SendPI)
 		api.POST("/trade/orders/:id/sync-workbook", tradeHandler.SyncOrderWorkspace)

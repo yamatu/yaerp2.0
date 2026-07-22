@@ -164,29 +164,31 @@ type TradeCustomerQuoteItem struct {
 }
 
 type TradeCustomerQuoteRound struct {
-	ID               int64                    `json:"id"`
-	OrderID          int64                    `json:"order_id"`
-	RoundNo          int                      `json:"round_no"`
-	Currency         string                   `json:"currency"`
-	Status           string                   `json:"status"`
-	GoodsAmount      float64                  `json:"goods_amount"`
-	ExchangeRateCNY  float64                  `json:"exchange_rate_cny"`
-	FreightMode      string                   `json:"freight_mode"`
-	FreightAmount    float64                  `json:"freight_amount"`
-	TotalAmount      float64                  `json:"total_amount"`
-	TotalAmountCNY   float64                  `json:"total_amount_cny"`
-	Items            []TradeCustomerQuoteItem `json:"items"`
-	CustomerFeedback string                   `json:"customer_feedback"`
-	Notes            string                   `json:"notes"`
-	PaymentStatus    string                   `json:"payment_status"`
-	PaymentCurrency  string                   `json:"payment_currency"`
-	PaidAmount       float64                  `json:"paid_amount"`
-	PaymentProofs    []TradePaymentProof      `json:"payment_proofs,omitempty"`
-	CreatedBy        int64                    `json:"created_by"`
-	CreatedByName    string                   `json:"created_by_name"`
-	SentAt           *time.Time               `json:"sent_at,omitempty"`
-	CreatedAt        time.Time                `json:"created_at"`
-	UpdatedAt        time.Time                `json:"updated_at"`
+	ID                             int64                    `json:"id"`
+	OrderID                        int64                    `json:"order_id"`
+	RoundNo                        int                      `json:"round_no"`
+	Currency                       string                   `json:"currency"`
+	Status                         string                   `json:"status"`
+	GoodsAmount                    float64                  `json:"goods_amount"`
+	ExchangeRateCNY                float64                  `json:"exchange_rate_cny"`
+	FreightMode                    string                   `json:"freight_mode"`
+	FreightAmount                  float64                  `json:"freight_amount"`
+	TotalAmount                    float64                  `json:"total_amount"`
+	TotalAmountCNY                 float64                  `json:"total_amount_cny"`
+	Items                          []TradeCustomerQuoteItem `json:"items"`
+	CustomerFeedback               string                   `json:"customer_feedback"`
+	Notes                          string                   `json:"notes"`
+	PaymentStatus                  string                   `json:"payment_status"`
+	PaymentCurrency                string                   `json:"payment_currency"`
+	PaidAmount                     float64                  `json:"paid_amount"`
+	PaymentProofs                  []TradePaymentProof      `json:"payment_proofs,omitempty"`
+	PIBankDetailsImageAttachmentID *int64                   `json:"pi_bank_details_image_attachment_id,omitempty"`
+	PIBankDetailsImageURL          string                   `json:"pi_bank_details_image_url,omitempty"`
+	CreatedBy                      int64                    `json:"created_by"`
+	CreatedByName                  string                   `json:"created_by_name"`
+	SentAt                         *time.Time               `json:"sent_at,omitempty"`
+	CreatedAt                      time.Time                `json:"created_at"`
+	UpdatedAt                      time.Time                `json:"updated_at"`
 }
 
 type TradeShipment struct {

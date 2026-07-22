@@ -719,6 +719,11 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 		return nil, quoteErr
 	}
 	if customerQuotes, quoteErr := s.repo.ListCustomerQuoteRounds(orderID); quoteErr == nil {
+		for index := range customerQuotes {
+			if attachmentID := customerQuotes[index].PIBankDetailsImageAttachmentID; attachmentID != nil {
+				customerQuotes[index].PIBankDetailsImageURL, _ = s.uploadSvc.GetFileURL(*attachmentID)
+			}
+		}
 		order.CustomerQuotes = customerQuotes
 	} else {
 		return nil, quoteErr
@@ -2097,6 +2102,69 @@ func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64
 	proof.ThumbnailURL = s.uploadSvc.GetThumbnailURL(attachment.ID, 480)
 	s.notifyOrderUpdated(orderID)
 	return proof, nil
+}
+
+func (s *TradeService) UploadTradePIBankImage(userID, orderID, quoteID int64, file multipart.File, header *multipart.FileHeader) (*model.TradeOrder, error) {
+	order, err := s.GetOrder(userID, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	if order.Access == nil || !order.Access.CanGeneratePI {
+		return nil, fmt.Errorf("没有修改当前 PI 收款图片的权限")
+	}
+	if _, err := selectTradePIQuote(order.CustomerQuotes, &model.TradePIRequest{QuoteID: quoteID}); err != nil {
+		return nil, err
+	}
+	if file == nil || header == nil {
+		return nil, fmt.Errorf("请选择收款信息图片")
+	}
+	if header.Size <= 0 {
+		return nil, fmt.Errorf("收款信息图片不能为空")
+	}
+	if header.Size > 20<<20 {
+		return nil, fmt.Errorf("收款信息图片不能超过 20MB")
+	}
+	attachment, err := s.uploadSvc.Upload(file, header, userID)
+	if err != nil {
+		return nil, err
+	}
+	mimeType := strings.ToLower(strings.TrimSpace(attachment.MimeType))
+	if !strings.HasPrefix(mimeType, "image/") {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
+		return nil, fmt.Errorf("PI 收款信息仅支持图片文件")
+	}
+	previousAttachmentID, err := s.repo.UpdateCustomerQuotePIBankImage(orderID, quoteID, &attachment.ID)
+	if err != nil {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
+		return nil, err
+	}
+	if previousAttachmentID != nil && *previousAttachmentID != attachment.ID {
+		_ = s.uploadSvc.DeleteFile(*previousAttachmentID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func (s *TradeService) RemoveTradePIBankImage(userID, orderID, quoteID int64) (*model.TradeOrder, error) {
+	order, err := s.GetOrder(userID, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	if order.Access == nil || !order.Access.CanGeneratePI {
+		return nil, fmt.Errorf("没有修改当前 PI 收款图片的权限")
+	}
+	if _, err := selectTradePIQuote(order.CustomerQuotes, &model.TradePIRequest{QuoteID: quoteID}); err != nil {
+		return nil, err
+	}
+	previousAttachmentID, err := s.repo.UpdateCustomerQuotePIBankImage(orderID, quoteID, nil)
+	if err != nil {
+		return nil, err
+	}
+	if previousAttachmentID != nil {
+		_ = s.uploadSvc.DeleteFile(*previousAttachmentID)
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
 }
 
 func (s *TradeService) DeleteCustomerPaymentProof(userID, orderID, proofID int64) error {

@@ -258,6 +258,25 @@ func TestTradePISelectionAndHTML(t *testing.T) {
 	}
 }
 
+func TestTradePIBankImagePrefersQuoteRoundOverride(t *testing.T) {
+	defaultImageID := int64(11)
+	quoteImageID := int64(22)
+	profile := &model.TradePIProfile{BankDetailsImageAttachmentID: &defaultImageID}
+	quote := &model.TradeCustomerQuoteRound{PIBankDetailsImageAttachmentID: &quoteImageID}
+	selected := tradePIBankImageAttachmentID(profile, quote)
+	if selected == nil || *selected != quoteImageID {
+		t.Fatalf("quote-specific PI bank image should win, got %#v", selected)
+	}
+	quote.PIBankDetailsImageAttachmentID = nil
+	selected = tradePIBankImageAttachmentID(profile, quote)
+	if selected == nil || *selected != defaultImageID {
+		t.Fatalf("default PI profile image should be the fallback, got %#v", selected)
+	}
+	if selected := tradePIBankImageAttachmentID(&model.TradePIProfile{}, quote); selected != nil {
+		t.Fatalf("empty PI image configuration should return nil, got %#v", selected)
+	}
+}
+
 func TestMergeTradeDestinationRemovesBlankAndDuplicateValues(t *testing.T) {
 	if actual := mergeTradeDestination("Brazil", " Santos ", "brazil", ""); actual != "Brazil · Santos" {
 		t.Fatalf("mergeTradeDestination() = %q", actual)
