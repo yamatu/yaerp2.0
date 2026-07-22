@@ -6482,7 +6482,7 @@ export default function TradeWorkspacePage() {
                 ) : settingsTab === "payment_permissions" ? (
                   <div className="space-y-3">
                     <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5 text-xs leading-5 text-sky-800">
-                      <strong>权限规则：</strong>“仅本人记录”只能查看并上传自己名下的付款凭证；“全部记录”可查看所有员工凭证并登记付款金额；“禁止访问”不显示付款核对区域。
+                      <strong>权限规则：</strong>订单负责人在自己的订单中始终可以上传凭证，并且默认只看到本人上传的内容。“当前任务仅本人凭证”只在员工负责当前流程时生效；“全部订单凭证”才允许跨订单查看全部员工凭证并核对金额。
                     </div>
                     <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500">
                       <Search className="h-4 w-4" />
@@ -6545,9 +6545,9 @@ export default function TradeWorkspacePage() {
                                 className="h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
                                 aria-label={`${user.username} 的付款记录权限`}
                               >
-                                <option value="none">禁止访问</option>
-                                <option value="own">仅本人记录（可上传）</option>
-                                <option value="all">全部记录（可核对金额）</option>
+                                <option value="none">不额外授权</option>
+                                <option value="own">当前任务仅本人凭证（可上传）</option>
+                                <option value="all">全部订单凭证（可核对金额）</option>
                               </select>
                             </div>
                           );

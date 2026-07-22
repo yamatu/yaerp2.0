@@ -61,6 +61,54 @@ func TestTradeCustomerAccessScopeRequiresCustomerResponsibility(t *testing.T) {
 	}
 }
 
+func TestTradePaymentRecordScopeUsesOrderAndTaskBoundaries(t *testing.T) {
+	canView, canViewAll, canUpload, canManage := tradePaymentRecordScope(
+		false, true, false, model.TradePaymentRecordAccessNone,
+	)
+	if !canView || canViewAll || !canUpload || canManage {
+		t.Fatal("an order owner must be able to upload and view only their own payment proofs")
+	}
+
+	canView, canViewAll, canUpload, canManage = tradePaymentRecordScope(
+		false, false, false, model.TradePaymentRecordAccessOwn,
+	)
+	if canView || canViewAll || canUpload || canManage {
+		t.Fatal("own-record access must not expose payment proofs on unrelated orders")
+	}
+
+	canView, canViewAll, canUpload, canManage = tradePaymentRecordScope(
+		false, false, true, model.TradePaymentRecordAccessOwn,
+	)
+	if !canView || canViewAll || !canUpload || canManage {
+		t.Fatal("a current task assignee with own-record access must only manage their own proof")
+	}
+
+	canView, canViewAll, canUpload, canManage = tradePaymentRecordScope(
+		false, false, false, model.TradePaymentRecordAccessAll,
+	)
+	if !canView || !canViewAll || !canUpload || !canManage {
+		t.Fatal("explicit all-record access must retain reconciliation permissions")
+	}
+}
+
+func TestTradeSupplierAccessScopeRequiresMatchingCurrentStage(t *testing.T) {
+	codes := map[string]bool{"quotation": true, "warehouse": true}
+	canView, canViewPricing := tradeSupplierAccessScope(false, model.TradeStageReceiving, codes)
+	if canView || canViewPricing {
+		t.Fatal("holding another supplier-related position must not expose purchase costs during receiving")
+	}
+
+	canView, canViewPricing = tradeSupplierAccessScope(false, model.TradeStageQuotation, codes)
+	if !canView || !canViewPricing {
+		t.Fatal("the active quotation role needs supplier pricing to prepare the customer quote")
+	}
+
+	canView, canViewPricing = tradeSupplierAccessScope(true, model.TradeStageCompleted, map[string]bool{})
+	if !canView || !canViewPricing {
+		t.Fatal("full-access managers must retain supplier cost visibility")
+	}
+}
+
 func TestRedactTradeTimelineDetailsKeepsOnlyCurrentTaskHandoff(t *testing.T) {
 	actorID := int64(5)
 	events := []model.TradeOrderStageEvent{
@@ -167,6 +215,26 @@ func TestTradeOverviewColumnScopeMasksSensitiveFields(t *testing.T) {
 	}
 	if _, masked := matrix.Columns["order_no"]; masked {
 		t.Fatal("business order number should remain visible")
+	}
+}
+
+func TestTradePurchaseSheetMasksSupplierCostColumns(t *testing.T) {
+	for _, sheetName := range []string{"供应商询价", "采购跟进"} {
+		matrix := emptyPermissionMatrix()
+		matrix.Sheet.CanView = true
+		matrix.DefaultPermission = "read"
+		applyTradeSheetColumnScope(matrix, sheetName, &model.TradeOrderAccess{})
+		columns := []string{"supplier"}
+		if sheetName == "供应商询价" {
+			columns = append(columns, "currency", "unit_price")
+		} else {
+			columns = append(columns, "supplier_quote", "purchase_currency", "purchase_price", "cost_exchange_rate")
+		}
+		for _, column := range columns {
+			if matrix.Columns[column] != "none" {
+				t.Fatalf("sheet %q column %q should be masked, got %q", sheetName, column, matrix.Columns[column])
+			}
+		}
 	}
 }
 

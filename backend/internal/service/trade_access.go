@@ -144,6 +144,31 @@ func tradeCustomerAccessScope(full, owner, currentTask bool, codes map[string]bo
 	return allowed, allowed, allowed
 }
 
+func tradeSupplierAccessScope(full bool, stage string, codes map[string]bool) (bool, bool) {
+	if full {
+		return true, true
+	}
+	allowed := false
+	switch stage {
+	case model.TradeStageSupplierQuote:
+		allowed = codes["sourcing"]
+	case model.TradeStageQuotation:
+		allowed = codes["quotation"]
+	case model.TradeStagePurchase:
+		allowed = codes["purchasing"]
+	}
+	return allowed, allowed
+}
+
+func tradePaymentRecordScope(full, owner, currentTask bool, configuredAccess string) (bool, bool, bool, bool) {
+	configuredAccess = normalizeTradePaymentRecordAccess(configuredAccess)
+	canViewAll := full || configuredAccess == model.TradePaymentRecordAccessAll
+	canViewOwn := owner || (currentTask && configuredAccess == model.TradePaymentRecordAccessOwn)
+	canView := canViewAll || canViewOwn
+	canUpload := canViewAll || owner || (currentTask && configuredAccess == model.TradePaymentRecordAccessOwn)
+	return canView, canViewAll, canUpload, canViewAll
+}
+
 func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder, access *tradeUserAccess) (*model.TradeOrderAccess, error) {
 	if order == nil || access == nil {
 		return nil, fmt.Errorf("业务单访问范围不能为空")
@@ -154,29 +179,32 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	canViewCustomer, canViewCustomerContact, canViewCustomerPricing := tradeCustomerAccessScope(
 		full, owner, access.stageAccess[order.Stage], codes,
 	)
-	supplierRole := codes["sourcing"] || codes["quotation"] || codes["purchasing"]
+	canViewSupplier, canViewSupplierPricing := tradeSupplierAccessScope(full, order.Stage, codes)
+	canViewPayments, canViewAllPayments, canUploadPaymentProofs, canManagePaymentStatus := tradePaymentRecordScope(
+		full, owner, access.stageAccess[order.Stage], access.profile.PaymentRecordAccess,
+	)
 	result := &model.TradeOrderAccess{
-		VisibleSheetNames:      []string{},
-		EditableSheetNames:     []string{},
-		CanViewCustomer:        canViewCustomer,
-		CanViewCustomerContact: canViewCustomerContact,
-		CanViewCustomerPricing: canViewCustomerPricing,
-		CanViewSupplier:        full || supplierRole,
-		CanViewSupplierPricing: full || supplierRole,
-		CanViewReceiving:       full || codes["purchasing"] || codes["warehouse"] || codes["quality"],
-		CanViewInspection:      full || codes["quality"] || codes["packing"],
-		CanViewPacking:         full || codes["packing"] || codes["logistics"],
-		CanViewShipment:        full || owner || codes["sales"] || codes["logistics"],
-		CanViewProfit:          full,
-		CanViewTimeline:        full || owner || access.profile.CanViewOrderProgress,
-		CanSyncWorkbook:        full,
-		CanViewPI:              full || owner,
-		CanGeneratePI:          full || owner,
+		VisibleSheetNames:        []string{},
+		EditableSheetNames:       []string{},
+		CanViewCustomer:          canViewCustomer,
+		CanViewCustomerContact:   canViewCustomerContact,
+		CanViewCustomerPricing:   canViewCustomerPricing,
+		CanViewSupplier:          canViewSupplier,
+		CanViewSupplierPricing:   canViewSupplierPricing,
+		CanViewReceiving:         full || codes["purchasing"] || codes["warehouse"] || codes["quality"],
+		CanViewInspection:        full || codes["quality"] || codes["packing"],
+		CanViewPacking:           full || codes["packing"] || codes["logistics"],
+		CanViewShipment:          full || owner || codes["sales"] || codes["logistics"],
+		CanViewProfit:            full,
+		CanViewTimeline:          full || owner || access.profile.CanViewOrderProgress,
+		CanSyncWorkbook:          full,
+		CanViewPI:                full || owner,
+		CanGeneratePI:            full || owner,
+		CanViewPaymentRecords:    canViewPayments,
+		CanViewAllPaymentRecords: canViewAllPayments,
+		CanUploadPaymentProofs:   canUploadPaymentProofs,
+		CanManagePaymentStatus:   canManagePaymentStatus,
 	}
-	result.CanViewPaymentRecords = access.profile.PaymentRecordAccess != model.TradePaymentRecordAccessNone
-	result.CanViewAllPaymentRecords = access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessAll
-	result.CanUploadPaymentProofs = result.CanViewPaymentRecords
-	result.CanManagePaymentStatus = result.CanViewAllPaymentRecords
 	switch {
 	case full:
 		result.ScopeLabel = "完整流程权限"
@@ -277,9 +305,6 @@ func (s *TradeService) AuthorizePaymentAttachment(userID, attachmentID int64) (b
 	if err != nil {
 		return true, false, err
 	}
-	if access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessNone {
-		return true, false, nil
-	}
 	for _, reference := range references {
 		if reference.DeletedAt != nil {
 			if access.profile.IsAdmin {
@@ -297,7 +322,14 @@ func (s *TradeService) AuthorizePaymentAttachment(userID, attachmentID int64) (b
 		if !s.canViewTradeOrder(userID, order, access) {
 			continue
 		}
-		if access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessAll || reference.UploadedBy == userID {
+		orderAccess, accessErr := s.orderAccessForUser(userID, order, access)
+		if accessErr != nil {
+			return true, false, accessErr
+		}
+		if !orderAccess.CanViewPaymentRecords {
+			continue
+		}
+		if orderAccess.CanViewAllPaymentRecords || reference.UploadedBy == userID {
 			return true, true, nil
 		}
 	}
@@ -375,6 +407,12 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	}
 	if !orderAccess.CanViewSupplier {
 		order.SupplierQuotes = nil
+	} else if !orderAccess.CanViewSupplierPricing {
+		for index := range order.SupplierQuotes {
+			quote := &order.SupplierQuotes[index]
+			quote.Currency = ""
+			quote.UnitPrice = 0
+		}
 	}
 	for index := range order.Items {
 		item := &order.Items[index]
@@ -596,6 +634,27 @@ func applyTradeSheetColumnScope(matrix *model.PermissionMatrix, sheetName string
 	}
 	if sheetName == "询价明细" && !access.CanViewCustomerPricing {
 		matrix.Columns["target_price"] = "none"
+	}
+	if sheetName == "供应商询价" {
+		if !access.CanViewSupplier {
+			matrix.Columns["supplier"] = "none"
+		}
+		if !access.CanViewSupplierPricing {
+			matrix.Columns["currency"] = "none"
+			matrix.Columns["unit_price"] = "none"
+		}
+		return
+	}
+	if sheetName == "采购跟进" {
+		if !access.CanViewSupplier {
+			matrix.Columns["supplier"] = "none"
+		}
+		if !access.CanViewSupplierPricing {
+			for _, column := range []string{"supplier_quote", "purchase_currency", "purchase_price", "cost_exchange_rate"} {
+				matrix.Columns[column] = "none"
+			}
+		}
+		return
 	}
 	if sheetName != "订单总览" {
 		return
