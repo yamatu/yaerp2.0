@@ -244,6 +244,13 @@ interface TradePIDraft {
   notes: string;
 }
 
+interface UploadedAttachment {
+  id: number;
+  filename: string;
+  mime_type: string;
+  size: number;
+}
+
 type TradeView = "orders" | "customers" | "suppliers" | "boss";
 type SettingsTab = "positions" | "payment_permissions" | "payments" | "pi";
 
@@ -263,6 +270,8 @@ function defaultTradePIProfile(): TradePIProfile {
     account_number: "",
     swift_code: "",
     beneficiary_address: "",
+    bank_details_image_attachment_id: undefined,
+    bank_details_image_url: "",
     default_notes:
       "All banking charges outside the beneficiary bank are for the buyer's account.",
   };
@@ -296,6 +305,20 @@ function formatTradeInputDate(date: Date) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function formatTradeDestination(...values: Array<string | undefined>) {
+  const seen = new Set<string>();
+  return values
+    .map((value) => value?.trim() || "")
+    .filter((value) => {
+      if (!value) return false;
+      const key = value.toLocaleLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .join(" · ");
 }
 
 function formatTradeMonth(value: string) {
@@ -969,6 +992,8 @@ export default function TradeWorkspacePage() {
     defaultTradePIProfile,
   );
   const [savingSettings, setSavingSettings] = useState(false);
+  const [uploadingPIBankImage, setUploadingPIBankImage] = useState(false);
+  const piBankImageInputRef = useRef<HTMLInputElement>(null);
 
   const [detailOrder, setDetailOrder] = useState<TradeOrder | null>(null);
   const [detailViewStage, setDetailViewStage] = useState<
@@ -999,6 +1024,7 @@ export default function TradeWorkspacePage() {
   const [paidAmount, setPaidAmount] = useState("");
   const [savingPayment, setSavingPayment] = useState(false);
   const [uploadingPaymentProof, setUploadingPaymentProof] = useState(false);
+  const [deletingPaymentProofID, setDeletingPaymentProofID] = useState<number | null>(null);
   const [profitSettingsOpen, setProfitSettingsOpen] = useState(false);
   const [profitSettingsDraft, setProfitSettingsDraft] =
     useState<ProfitSettingsDraft | null>(null);
@@ -1093,9 +1119,10 @@ export default function TradeWorkspacePage() {
           payment_record_permissions: [],
           pi_profile: defaultTradePIProfile(),
         };
-        if (!loadedSettings.pi_profile) {
-          loadedSettings.pi_profile = defaultTradePIProfile();
-        }
+        loadedSettings.pi_profile = {
+          ...defaultTradePIProfile(),
+          ...(loadedSettings.pi_profile || {}),
+        };
         loadedSettings.payment_record_permissions =
           loadedSettings.payment_record_permissions || [];
         setSettings(loadedSettings);
@@ -2088,7 +2115,7 @@ export default function TradeWorkspacePage() {
   };
 
   const openPIModal = () => {
-    if (!detailOrder?.access?.can_view_customer_pricing) {
+    if (!detailOrder?.access?.can_generate_pi) {
       setError("当前账号没有生成客户 PI 的权限。");
       return;
     }
@@ -2104,13 +2131,11 @@ export default function TradeWorkspacePage() {
     const today = new Date();
     const validUntil = new Date(today);
     validUntil.setDate(validUntil.getDate() + 14);
-    const destination = [
+    const destination = formatTradeDestination(
       detailOrder.incoterm,
       detailOrder.destination_country,
       detailOrder.destination_port,
-    ]
-      .filter(Boolean)
-      .join(" ");
+    );
     setPIDraft({
       quote_id: selected.id,
       issue_date: formatTradeInputDate(today),
@@ -2667,6 +2692,28 @@ export default function TradeWorkspacePage() {
     }
   };
 
+  const deleteCustomerPaymentProof = async (proof: TradePaymentProof) => {
+    if (!detailOrder || !tradeAccess?.is_admin) return;
+    if (!window.confirm(`确定删除付款凭证「${proof.filename || `#${proof.id}`}」吗？删除后可在回收站保留 30 天。`)) return;
+    setDeletingPaymentProofID(proof.id);
+    setError("");
+    try {
+      const response = await api.delete(
+        `/trade/orders/${detailOrder.id}/payment-proofs/${proof.id}`,
+      );
+      if (response.code !== 0)
+        throw new Error(response.message || "删除付款凭证失败");
+      await loadOrderDetail(detailOrder.id, false);
+      setNotice("付款凭证已移入回收站，30 天内可由管理员还原。");
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error ? deleteError.message : "删除付款凭证失败",
+      );
+    } finally {
+      setDeletingPaymentProofID(null);
+    }
+  };
+
   const syncWorkbook = async () => {
     if (!detailOrder) return;
     setSyncingWorkbook(true);
@@ -2832,6 +2879,49 @@ export default function TradeWorkspacePage() {
     }
   };
 
+  const uploadPIBankDetailsImage = async (file?: File) => {
+    if (!file) return;
+    if (!file.type.toLowerCase().startsWith("image/")) {
+      setError("PI 银行信息仅支持图片文件。");
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setError("PI 银行信息图片不能超过 20MB。");
+      return;
+    }
+    setUploadingPIBankImage(true);
+    setError("");
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const response = await api.form<UploadedAttachment>("/upload", body);
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "上传银行信息图片失败");
+      let imageURL = window.URL.createObjectURL(file);
+      const urlResponse = await api.get<{ url: string }>(
+        `/files/${response.data.id}`,
+      );
+      if (urlResponse.code === 0 && urlResponse.data?.url) {
+        imageURL = urlResponse.data.url;
+      }
+      setPIProfileDraft((current) => ({
+        ...current,
+        bank_details_image_attachment_id: response.data?.id,
+        bank_details_image_url: imageURL,
+      }));
+      setNotice("银行账户图片已上传，请保存设置后应用到 PI。");
+    } catch (uploadError) {
+      setError(
+        uploadError instanceof Error
+          ? uploadError.message
+          : "上传银行信息图片失败",
+      );
+    } finally {
+      setUploadingPIBankImage(false);
+      if (piBankImageInputRef.current) piBankImageInputRef.current.value = "";
+    }
+  };
+
   const saveTradeSettings = async () => {
     setSavingSettings(true);
     setError("");
@@ -2861,7 +2951,10 @@ export default function TradeWorkspacePage() {
           ),
         ) as Record<number, TradePaymentRecordAccess>,
       );
-      setPIProfileDraft(response.data.pi_profile);
+      setPIProfileDraft({
+        ...defaultTradePIProfile(),
+        ...(response.data.pi_profile || {}),
+      });
       setNotice(
         settingsTab === "pi"
           ? "PI 公司抬头与收款资料已保存。"
@@ -3349,12 +3442,10 @@ export default function TradeWorkspacePage() {
                                 {order.item_count} 项
                               </td>
                               <td className="px-4 py-3">
-                                <div>
-                                  {order.destination_country || "未设置"}
-                                </div>
-                                <div className="mt-0.5 text-xs text-slate-400">
-                                  {order.destination_port}
-                                </div>
+                                {formatTradeDestination(
+                                  order.destination_country,
+                                  order.destination_port,
+                                ) || "未设置"}
                               </td>
                               <td className="px-4 py-3">
                                 {formatDate(order.quote_deadline)}
@@ -4836,29 +4927,18 @@ export default function TradeWorkspacePage() {
                       className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
                     />
                   </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    目的国家
+                  <label className="text-sm font-medium text-slate-700 sm:col-span-2">
+                    目的地 / 目的港
                     <input
                       value={orderDraft.destination_country}
                       onChange={(event) =>
                         setOrderDraft((current) => ({
                           ...current,
                           destination_country: event.target.value,
+                          destination_port: "",
                         }))
                       }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    目的港
-                    <input
-                      value={orderDraft.destination_port}
-                      onChange={(event) =>
-                        setOrderDraft((current) => ({
-                          ...current,
-                          destination_port: event.target.value,
-                        }))
-                      }
+                      placeholder="例如 巴西 · Santos，或客户完整收货地址"
                       className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
                     />
                   </label>
@@ -6592,6 +6672,74 @@ export default function TradeWorkspacePage() {
                           </label>
                         ))}
                       </div>
+                      <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div>
+                            <div className="text-sm font-semibold text-slate-800">
+                              银行账户信息图片
+                            </div>
+                            <p className="mt-1 text-xs leading-5 text-slate-400">
+                              可上传带二维码、账户说明或多币种收款信息的完整图片，生成 PI 时会原样放入 Bank Account 区域。
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => piBankImageInputRef.current?.click()}
+                              disabled={uploadingPIBankImage}
+                              className="inline-flex h-9 items-center gap-2 rounded-lg border border-sky-200 bg-white px-3 text-xs font-semibold text-sky-700 hover:bg-sky-50 disabled:opacity-50"
+                            >
+                              {uploadingPIBankImage ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <ImagePlus className="h-4 w-4" />
+                              )}
+                              {piProfileDraft.bank_details_image_attachment_id
+                                ? "更换图片"
+                                : "上传图片"}
+                            </button>
+                            {piProfileDraft.bank_details_image_attachment_id && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setPIProfileDraft((current) => ({
+                                    ...current,
+                                    bank_details_image_attachment_id: undefined,
+                                    bank_details_image_url: "",
+                                  }))
+                                }
+                                disabled={uploadingPIBankImage}
+                                className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                                title="移除银行账户图片"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            )}
+                            <input
+                              ref={piBankImageInputRef}
+                              type="file"
+                              accept="image/*"
+                              className="hidden"
+                              onChange={(event) =>
+                                void uploadPIBankDetailsImage(event.target.files?.[0])
+                              }
+                            />
+                          </div>
+                        </div>
+                        {piProfileDraft.bank_details_image_url ? (
+                          <div className="mt-3 overflow-hidden rounded-lg border border-slate-200 bg-white p-2">
+                            <img
+                              src={piProfileDraft.bank_details_image_url}
+                              alt="PI 银行账户信息"
+                              className="max-h-64 w-full object-contain object-left"
+                            />
+                          </div>
+                        ) : (
+                          <div className="mt-3 flex h-28 items-center justify-center rounded-lg border border-dashed border-slate-300 bg-white text-xs text-slate-400">
+                            未上传时，PI 会使用上方结构化银行字段。
+                          </div>
+                        )}
+                      </div>
                     </div>
                     <label className="block">
                       <span className="mb-1.5 block text-xs font-medium text-slate-600">
@@ -6627,7 +6775,7 @@ export default function TradeWorkspacePage() {
                       ? savePositionAssignments()
                       : saveTradeSettings())
                   }
-                  disabled={savingSettings}
+                  disabled={savingSettings || uploadingPIBankImage}
                   className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
                 >
                   {savingSettings ? (
@@ -6792,7 +6940,10 @@ export default function TradeWorkspacePage() {
                         <div className="mt-1 text-sm font-semibold">
                           {detailOrder.access?.can_view_customer ||
                           detailOrder.access?.can_view_shipment
-                            ? `${detailOrder.destination_country || "未设置"} ${detailOrder.destination_port}`
+                            ? formatTradeDestination(
+                                detailOrder.destination_country,
+                                detailOrder.destination_port,
+                              ) || "未设置"
                             : "按岗位隐藏"}
                         </div>
                       </div>
@@ -6845,7 +6996,7 @@ export default function TradeWorkspacePage() {
                             客户频道
                           </button>
                         )}
-                        {detailOrder.access?.can_view_customer_pricing && (
+                        {detailOrder.access?.can_generate_pi && (
                           <button
                             type="button"
                             onClick={openPIModal}
@@ -7530,6 +7681,9 @@ export default function TradeWorkspacePage() {
                                               ?.can_upload_payment_proofs,
                                           )}
                                           uploading={uploadingPaymentProof}
+                                          canDelete={Boolean(tradeAccess?.is_admin)}
+                                          deletingID={deletingPaymentProofID}
+                                          onDelete={deleteCustomerPaymentProof}
                                           onUpload={(files) =>
                                             uploadCustomerPaymentProofs(
                                               quote.id,
@@ -7617,6 +7771,9 @@ export default function TradeWorkspacePage() {
                                     ?.can_upload_payment_proofs,
                                 )}
                                 uploading={uploadingPaymentProof}
+                                canDelete={Boolean(tradeAccess?.is_admin)}
+                                deletingID={deletingPaymentProofID}
+                                onDelete={deleteCustomerPaymentProof}
                                 onUpload={(files) =>
                                   uploadCustomerPaymentProofs(
                                     acceptedQuote.id,
@@ -8339,10 +8496,13 @@ export default function TradeWorkspacePage() {
                           {settings.pi_profile.company_name}
                         </div>
                         <div className="mt-1 text-[11px] leading-5 text-slate-400">
-                          {settings.pi_profile.bank_name || "尚未配置收款银行"}{" "}
+                          {settings.pi_profile.bank_details_image_attachment_id
+                            ? "银行账户图片已配置"
+                            : settings.pi_profile.bank_name ||
+                              "尚未配置收款银行"}{" "}
                           ·{" "}
                           {settings.pi_profile.account_number ||
-                            "尚未配置收款账号"}
+                            "结构化账号可作为图片缺失时的备用信息"}
                         </div>
                       </div>
                       <button
@@ -8368,159 +8528,210 @@ export default function TradeWorkspacePage() {
                       className="mx-auto h-[760px] w-full max-w-[760px] border border-slate-200 bg-white shadow-sm"
                     />
                   ) : (
-                    <div className="mx-auto min-h-[760px] w-full max-w-[760px] bg-white p-7 shadow-sm sm:p-10">
-                      <div className="flex items-start justify-between gap-6 border-b-4 border-slate-900 pb-5">
-                        <div>
-                          <div className="text-lg font-black text-slate-900">
-                            {settings.pi_profile.company_name}
-                          </div>
-                          <div className="mt-2 max-w-sm whitespace-pre-line text-xs leading-5 text-slate-500">
-                            {[
-                              settings.pi_profile.address,
-                              settings.pi_profile.phone,
-                              settings.pi_profile.email,
-                            ]
-                              .filter(Boolean)
-                              .join("\n")}
-                          </div>
-                        </div>
-                        <div className="text-right">
-                          <div className="text-2xl font-black tracking-wide text-slate-900">
-                            PROFORMA
-                            <br />
-                            INVOICE
-                          </div>
-                          <div className="mt-2 text-xs font-semibold text-slate-500">
-                            PI-{detailOrder.order_no}-R
-                            {selectedPIQuote.round_no}
-                          </div>
-                        </div>
+                    <div className="mx-auto min-h-[760px] w-full max-w-[760px] bg-white p-5 text-[10px] text-black shadow-sm sm:p-7">
+                      <div className="border-b-2 border-emerald-600 py-4 text-center text-2xl font-black">
+                        PROFORMA INVOICE
                       </div>
-                      <div className="mt-5 grid grid-cols-2 border border-slate-200 text-xs">
-                        <div className="p-4">
-                          <div className="text-[10px] font-semibold uppercase text-slate-400">
-                            Seller
-                          </div>
-                          <div className="mt-1.5 font-bold">
-                            {settings.pi_profile.company_name}
-                          </div>
-                        </div>
-                        <div className="border-l border-slate-200 p-4">
-                          <div className="text-[10px] font-semibold uppercase text-slate-400">
-                            Bill To
-                          </div>
-                          <div className="mt-1.5 font-bold">
-                            {detailOrder.customer_company ||
-                              detailOrder.customer_name}
-                          </div>
-                          <div className="mt-1 text-slate-500">
-                            {detailOrder.customer_name}
-                          </div>
-                        </div>
-                      </div>
-                      <div className="mt-4 grid grid-cols-4 border border-slate-200 text-xs">
-                        {[
-                          ["Issue Date", piDraft.issue_date],
-                          ["Valid Until", piDraft.valid_until],
-                          ["Order", detailOrder.order_no],
-                          ["Currency", selectedPIQuote.currency],
-                        ].map(([label, value], index) => (
-                          <div
-                            key={label}
-                            className={`p-3 ${index > 0 ? "border-l border-slate-200" : ""}`}
-                          >
-                            <div className="text-[9px] font-semibold uppercase text-slate-400">
-                              {label}
-                            </div>
-                            <div className="mt-1 font-semibold">{value}</div>
-                          </div>
-                        ))}
-                      </div>
-                      <table className="mt-5 w-full border-collapse text-xs">
-                        <thead>
-                          <tr className="bg-slate-900 text-left text-white">
-                            <th className="px-3 py-2">SKU</th>
-                            <th className="px-3 py-2">Description</th>
-                            <th className="px-3 py-2 text-right">Qty</th>
-                            <th className="px-3 py-2 text-right">Unit Price</th>
-                            <th className="px-3 py-2 text-right">Amount</th>
-                          </tr>
-                        </thead>
+                      <table className="w-full table-fixed border-collapse">
                         <tbody>
-                          {selectedPIQuote.items.map((item) => (
-                            <tr key={item.order_item_id}>
-                              <td className="border border-slate-200 px-3 py-2">
-                                {item.sku}
+                          <tr className="bg-yellow-50 text-center font-bold">
+                            <td className="border border-black px-2 py-1.5">
+                              PI DATE 合同日
+                            </td>
+                            <td className="border border-black px-2 py-1.5">
+                              PI NO. 合同号
+                            </td>
+                          </tr>
+                          <tr className="text-center font-semibold">
+                            <td className="border border-black px-2 py-1.5">
+                              {piDraft.issue_date}
+                            </td>
+                            <td className="border border-black px-2 py-1.5">
+                              PI-{detailOrder.order_no}-R
+                              {selectedPIQuote.round_no}
+                            </td>
+                          </tr>
+                          <tr className="bg-yellow-50 text-center font-bold">
+                            <td className="border border-black px-2 py-1.5">
+                              Seller 卖方
+                            </td>
+                            <td className="border border-black px-2 py-1.5">
+                              Buyer 买方
+                            </td>
+                          </tr>
+                          {[
+                            [
+                              "Company:",
+                              settings.pi_profile.company_name,
+                              "Company:",
+                              detailOrder.customer_company || detailOrder.customer_name,
+                            ],
+                            [
+                              "Add:",
+                              settings.pi_profile.address,
+                              "Add:",
+                              formatTradeDestination(
+                                detailOrder.customer?.country,
+                                detailOrder.customer?.region,
+                                detailOrder.destination_country,
+                                detailOrder.destination_port,
+                              ),
+                            ],
+                            [
+                              "Contact:",
+                              settings.pi_profile.contact_name,
+                              "Contact:",
+                              detailOrder.customer?.contact_name || detailOrder.customer_name,
+                            ],
+                            [
+                              "Tel:",
+                              settings.pi_profile.phone,
+                              "Tel:",
+                              detailOrder.customer?.phone,
+                            ],
+                            [
+                              "Email:",
+                              settings.pi_profile.email,
+                              "Email:",
+                              detailOrder.customer?.email,
+                            ],
+                          ].map(([sellerLabel, sellerValue, buyerLabel, buyerValue]) => (
+                            <tr key={`${sellerLabel}-${buyerLabel}`}>
+                              <td className="border border-black px-2 py-1.5 align-top">
+                                <span className="mr-1 font-bold">{sellerLabel}</span>
+                                <span className="font-semibold">{sellerValue || "-"}</span>
                               </td>
-                              <td className="border border-slate-200 px-3 py-2 font-semibold">
-                                {item.product_name}
-                              </td>
-                              <td className="border border-slate-200 px-3 py-2 text-right">
-                                {item.quantity} {item.unit}
-                              </td>
-                              <td className="border border-slate-200 px-3 py-2 text-right">
-                                {item.unit_price.toFixed(2)}
-                              </td>
-                              <td className="border border-slate-200 px-3 py-2 text-right font-semibold">
-                                {item.amount.toFixed(2)}
+                              <td className="border border-black px-2 py-1.5 align-top">
+                                <span className="mr-1 font-bold">{buyerLabel}</span>
+                                <span className="font-semibold">{buyerValue || "-"}</span>
                               </td>
                             </tr>
                           ))}
-                          {selectedPIQuote.freight_mode === "quoted" && (
-                            <tr>
-                              <td
-                                colSpan={4}
-                                className="border border-slate-200 px-3 py-2"
-                              >
-                                Freight
-                              </td>
-                              <td className="border border-slate-200 px-3 py-2 text-right font-semibold">
-                                {selectedPIQuote.freight_amount.toFixed(2)}
-                              </td>
-                            </tr>
-                          )}
-                          <tr className="bg-slate-100">
-                            <td
-                              colSpan={4}
-                              className="border border-slate-200 px-3 py-3 font-bold"
-                            >
-                              TOTAL ({selectedPIQuote.currency})
+                        </tbody>
+                      </table>
+                      <table className="w-full table-fixed border-collapse">
+                        <thead>
+                          <tr className="bg-yellow-50 text-center font-bold">
+                            <th className="w-[5%] border border-black px-1 py-1.5">No.</th>
+                            <th className="w-[18%] border border-black px-1 py-1.5">Products<br />产品</th>
+                            <th className="w-[23%] border border-black px-1 py-1.5">Model Number</th>
+                            <th className="w-[14%] border border-black px-1 py-1.5">Order Quantity<br />订单数</th>
+                            <th className="w-[15%] border border-black px-1 py-1.5">UNIT PRICE<br />({selectedPIQuote.currency}) 单价</th>
+                            <th className="w-[15%] border border-black px-1 py-1.5">Total<br />({selectedPIQuote.currency}) 合计金额</th>
+                            <th className="w-[10%] border border-black px-1 py-1.5">Remarks<br />备注</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Array.from({
+                            length: Math.max(4, selectedPIQuote.items.length),
+                          }).map((_, index) => {
+                            const item = selectedPIQuote.items[index];
+                            return (
+                              <tr key={item?.order_item_id || `blank-${index}`} className="h-8">
+                                <td className="border border-black px-1 text-center">{index + 1}</td>
+                                <td className="border border-black px-1">{item?.product_name || ""}</td>
+                                <td className="border border-black px-1 font-semibold">{item?.sku || ""}</td>
+                                <td className="border border-black px-1 text-center">
+                                  {item ? `${item.quantity} ${item.unit || ""}` : ""}
+                                </td>
+                                <td className="border border-black px-1 text-right">
+                                  {item
+                                    ? `${selectedPIQuote.currency} ${item.unit_price.toFixed(2)}`
+                                    : ""}
+                                </td>
+                                <td className="border border-black px-1 text-right font-semibold">
+                                  {item
+                                    ? `${selectedPIQuote.currency} ${item.amount.toFixed(2)}`
+                                    : ""}
+                                </td>
+                                <td className="border border-black px-1" />
+                              </tr>
+                            );
+                          })}
+                          {selectedPIQuote.freight_mode === "quoted" &&
+                            selectedPIQuote.freight_amount > 0 && (
+                              <tr className="h-8">
+                                <td className="border border-black" />
+                                <td className="border border-black px-1">Freight<br />运费</td>
+                                <td className="border border-black" />
+                                <td className="border border-black" />
+                                <td className="border border-black" />
+                                <td className="border border-black px-1 text-right font-semibold">
+                                  {selectedPIQuote.currency} {selectedPIQuote.freight_amount.toFixed(2)}
+                                </td>
+                                <td className="border border-black" />
+                              </tr>
+                            )}
+                          <tr className="h-8">
+                            <td colSpan={4} className="border border-black" />
+                            <td className="border border-black bg-yellow-50 px-2 text-center font-bold">Total:</td>
+                            <td className="border border-black px-2 text-right font-bold">
+                              {selectedPIQuote.currency} {selectedPIQuote.total_amount.toFixed(2)}
                             </td>
-                            <td className="border border-slate-200 px-3 py-3 text-right text-sm font-black">
-                              {selectedPIQuote.total_amount.toFixed(2)}
+                            <td className="border border-black" />
+                          </tr>
+                        </tbody>
+                      </table>
+                      <table className="w-full table-fixed border-collapse">
+                        <tbody>
+                          {[
+                            ["备货期 Prepare time:", piDraft.delivery_time || "As agreed"],
+                            ["Payment Plan 付款计划:", piDraft.payment_method || "As agreed"],
+                            [
+                              "Ship to:",
+                              formatTradeDestination(
+                                detailOrder.destination_country,
+                                detailOrder.destination_port,
+                              ) || "As agreed",
+                            ],
+                          ].map(([label, value]) => (
+                            <tr key={label}>
+                              <td className="w-[23%] border border-black bg-yellow-50 px-2 py-2 text-center font-bold">{label}</td>
+                              <td className="border border-black px-2 py-2 font-semibold">{value}</td>
+                            </tr>
+                          ))}
+                          <tr>
+                            <td className="w-[23%] border border-black bg-yellow-50 px-2 py-2 text-center font-bold">Bank Account:</td>
+                            <td className="h-40 border border-black p-3 align-middle">
+                              {settings.pi_profile.bank_details_image_url ? (
+                                <img
+                                  src={settings.pi_profile.bank_details_image_url}
+                                  alt="Bank account details"
+                                  className="max-h-36 max-w-full object-contain object-left"
+                                />
+                              ) : (
+                                <div className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1 leading-5">
+                                  <span className="text-slate-500">Account Name</span><strong>{settings.pi_profile.account_name || settings.pi_profile.company_name || "-"}</strong>
+                                  <span className="text-slate-500">Bank Name</span><strong>{settings.pi_profile.bank_name || "-"}</strong>
+                                  <span className="text-slate-500">Account No.</span><strong>{settings.pi_profile.account_number || "-"}</strong>
+                                  <span className="text-slate-500">SWIFT / BIC</span><strong>{settings.pi_profile.swift_code || "-"}</strong>
+                                  <span className="text-slate-500">Bank Address</span><strong>{settings.pi_profile.bank_address || "-"}</strong>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                          <tr>
+                            <td className="border border-black bg-yellow-50 px-2 py-2 text-center font-bold">其他 Others:</td>
+                            <td className="whitespace-pre-line border border-black px-2 py-2">
+                              {[
+                                `Validity / 有效期: ${piDraft.valid_until}`,
+                                `Delivery terms / 交付条款: ${piDraft.delivery_terms || "As agreed"}`,
+                                piDraft.notes,
+                                settings.pi_profile.default_notes,
+                              ]
+                                .filter(Boolean)
+                                .join("\n")}
+                            </td>
+                          </tr>
+                          <tr>
+                            <td className="border border-black bg-yellow-50 px-2 py-2 text-center font-bold">Seller Rep. Signature<br />卖方代表签字</td>
+                            <td className="h-14 border border-black px-2 text-center align-bottom font-semibold">
+                              {settings.pi_profile.contact_name || settings.pi_profile.company_name}
+                              <span className="ml-10">Buyer Rep. Signature / 买方代表签字: ____________________</span>
                             </td>
                           </tr>
                         </tbody>
                       </table>
-                      <div className="mt-6 grid gap-5 border-t border-slate-300 pt-5 text-xs sm:grid-cols-2">
-                        <div>
-                          <div className="font-bold uppercase text-slate-700">
-                            Commercial Terms
-                          </div>
-                          <div className="mt-2 grid grid-cols-[90px_1fr] gap-1 leading-5">
-                            <span className="text-slate-400">Payment</span>
-                            <span>{piDraft.payment_method || "-"}</span>
-                            <span className="text-slate-400">Delivery</span>
-                            <span>{piDraft.delivery_terms || "-"}</span>
-                            <span className="text-slate-400">Lead Time</span>
-                            <span>{piDraft.delivery_time || "-"}</span>
-                          </div>
-                        </div>
-                        <div>
-                          <div className="font-bold uppercase text-slate-700">
-                            Beneficiary Bank
-                          </div>
-                          <div className="mt-2 leading-5 text-slate-500">
-                            {settings.pi_profile.bank_name || "Not configured"}
-                            <br />
-                            {settings.pi_profile.account_name}
-                            <br />
-                            {settings.pi_profile.account_number}
-                            <br />
-                            {settings.pi_profile.swift_code}
-                          </div>
-                        </div>
-                      </div>
                     </div>
                   )}
                 </div>

@@ -119,7 +119,7 @@ func main() {
 	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
 	channelService.SetImportService(importService)
 	folderService := service.NewFolderService(folderRepo, userRepo, sheetRepo, permService)
-	recycleBinService := service.NewRecycleBinService(recycleBinRepo, permService)
+	recycleBinService := service.NewRecycleBinService(recycleBinRepo, permService, uploadService)
 	backupService := service.NewBackupService(cfg, db, minioClient)
 	go recycleBinService.StartCleanup(context.Background(), 6*time.Hour)
 	go backupService.StartAutomaticBackups(context.Background())
@@ -287,6 +287,7 @@ func main() {
 		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/status", tradeHandler.UpdateCustomerQuoteRoundStatus)
 		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/payment", tradeHandler.UpdateCustomerQuotePayment)
 		api.POST("/trade/orders/:id/customer-quotes/:quoteId/payment-proofs", tradeHandler.UploadCustomerPaymentProof)
+		api.DELETE("/trade/orders/:id/payment-proofs/:proofId", tradeHandler.DeleteCustomerPaymentProof)
 		api.POST("/trade/orders/:id/pi/pdf", tradeHandler.GeneratePI)
 		api.POST("/trade/orders/:id/pi/send", tradeHandler.SendPI)
 		api.POST("/trade/orders/:id/sync-workbook", tradeHandler.SyncOrderWorkspace)
@@ -447,6 +448,8 @@ func main() {
 		api.DELETE("/recycle-bin/folders/:id", recycleBinHandler.DeleteFolder)
 		api.POST("/recycle-bin/trade-orders/:id/restore", recycleBinHandler.RestoreTradeOrder)
 		api.DELETE("/recycle-bin/trade-orders/:id", recycleBinHandler.DeleteTradeOrder)
+		api.POST("/recycle-bin/trade-payment-proofs/:id/restore", recycleBinHandler.RestoreTradePaymentProof)
+		api.DELETE("/recycle-bin/trade-payment-proofs/:id", recycleBinHandler.DeleteTradePaymentProof)
 
 		// AI Chat
 		api.GET("/ai/assistants", aiHandler.ListAvailableAssistants)

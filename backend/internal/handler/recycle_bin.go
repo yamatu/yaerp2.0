@@ -51,6 +51,14 @@ func (h *RecycleBinHandler) DeleteTradeOrder(c *gin.Context) {
 	h.handleResourceAction(c, h.service.DeleteTradeOrderPermanently, "trade order permanently deleted")
 }
 
+func (h *RecycleBinHandler) RestoreTradePaymentProof(c *gin.Context) {
+	h.handleResourceAction(c, h.service.RestoreTradePaymentProof, "trade payment proof restored")
+}
+
+func (h *RecycleBinHandler) DeleteTradePaymentProof(c *gin.Context) {
+	h.handleResourceAction(c, h.service.DeleteTradePaymentProofPermanently, "trade payment proof permanently deleted")
+}
+
 func (h *RecycleBinHandler) handleResourceAction(
 	c *gin.Context,
 	action func(userID, resourceID int64) error,

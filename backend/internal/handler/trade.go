@@ -609,6 +609,27 @@ func (h *TradeHandler) UploadCustomerPaymentProof(c *gin.Context) {
 	response.OK(c, proof)
 }
 
+func (h *TradeHandler) DeleteCustomerPaymentProof(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	proofID, err := strconv.ParseInt(c.Param("proofId"), 10, 64)
+	if err != nil || proofID <= 0 {
+		response.BadRequest(c, "无效的付款凭证编号")
+		return
+	}
+	if err := h.service.DeleteCustomerPaymentProof(c.GetInt64("user_id"), orderID, proofID); errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "付款凭证不存在")
+		return
+	} else if err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
+	response.OKMsg(c, "付款凭证已移入回收站，30天内可还原")
+}
+
 func (h *TradeHandler) ListPositions(c *gin.Context) {
 	positions, err := h.service.ListPositions(c.GetInt64("user_id"))
 	if err != nil {

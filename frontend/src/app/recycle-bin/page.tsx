@@ -1,11 +1,11 @@
 'use client'
 
-import { ArchiveRestore, ArrowLeft, BriefcaseBusiness, Clock3, FileSpreadsheet, Folder, RefreshCw, Trash2 } from 'lucide-react'
+import { ArchiveRestore, ArrowLeft, BriefcaseBusiness, Clock3, FileSpreadsheet, FileText, Folder, RefreshCw, Trash2 } from 'lucide-react'
 import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import api from '@/lib/api'
-import type { DeletedTradeOrder, Folder as FolderResource, RecycleBinContents, Workbook } from '@/types'
+import type { DeletedTradeOrder, DeletedTradePaymentProof, Folder as FolderResource, RecycleBinContents, Workbook } from '@/types'
 
 const TRADE_STAGE_LABELS: Record<string, string> = {
   inquiry: '客户询价',
@@ -37,8 +37,15 @@ function remainingDays(deletedAt: string | undefined, retentionDays: number) {
   return Math.max(0, Math.ceil((expiresAt - Date.now()) / (24 * 60 * 60 * 1000)))
 }
 
+function formatFileSize(size = 0) {
+  if (size <= 0) return ''
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
 export default function RecycleBinPage() {
-  const [contents, setContents] = useState<RecycleBinContents>({ folders: [], workbooks: [], trade_orders: [], retention_days: 30 })
+  const [contents, setContents] = useState<RecycleBinContents>({ folders: [], workbooks: [], trade_orders: [], trade_payment_proofs: [], retention_days: 30 })
   const [loading, setLoading] = useState(true)
   const [actionKey, setActionKey] = useState('')
   const [message, setMessage] = useState('')
@@ -50,7 +57,14 @@ export default function RecycleBinPage() {
     try {
       const response = await api.get<RecycleBinContents>('/recycle-bin')
       if (response.code !== 0 || !response.data) throw new Error(response.message || '加载回收站失败')
-      setContents(response.data)
+      setContents({
+        ...response.data,
+        folders: response.data.folders || [],
+        workbooks: response.data.workbooks || [],
+        trade_orders: response.data.trade_orders || [],
+        trade_payment_proofs: response.data.trade_payment_proofs || [],
+        retention_days: response.data.retention_days || 30,
+      })
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载回收站失败')
     } finally {
@@ -62,22 +76,25 @@ export default function RecycleBinPage() {
     void loadContents()
   }, [loadContents])
 
-  const total = contents.folders.length + contents.workbooks.length + contents.trade_orders.length
+  const total = contents.folders.length + contents.workbooks.length + contents.trade_orders.length + contents.trade_payment_proofs.length
   const retentionDays = contents.retention_days || 30
   const oldestRemaining = useMemo(() => {
     const days = [
       ...contents.folders.map((folder) => remainingDays(folder.deleted_at, retentionDays)),
       ...contents.workbooks.map((workbook) => remainingDays(workbook.deleted_at, retentionDays)),
       ...contents.trade_orders.map((order) => remainingDays(order.deleted_at, retentionDays)),
+      ...contents.trade_payment_proofs.map((proof) => remainingDays(proof.deleted_at, retentionDays)),
     ]
     return days.length > 0 ? Math.min(...days) : retentionDays
-  }, [contents.folders, contents.trade_orders, contents.workbooks, retentionDays])
+  }, [contents.folders, contents.trade_orders, contents.trade_payment_proofs, contents.workbooks, retentionDays])
 
-  const runAction = async (kind: 'folders' | 'workbooks' | 'trade-orders', id: number, action: 'restore' | 'delete', name: string) => {
+  const runAction = async (kind: 'folders' | 'workbooks' | 'trade-orders' | 'trade-payment-proofs', id: number, action: 'restore' | 'delete', name: string) => {
     if (action === 'delete') {
       const detail = kind === 'trade-orders'
         ? '订单内的产品、报价、流程记录和关联工作簿都会永久删除，且无法还原。'
-        : '此操作无法还原。'
+        : kind === 'trade-payment-proofs'
+          ? '付款凭证文件会同时永久删除，且无法还原。'
+          : '此操作无法还原。'
       if (!window.confirm(`确定要永久删除「${name}」吗？${detail}`)) return
     }
     const key = `${kind}-${id}-${action}`
@@ -165,6 +182,35 @@ export default function RecycleBinPage() {
     )
   }
 
+  const renderPaymentProof = (proof: DeletedTradePaymentProof) => {
+    const name = proof.filename || `付款凭证 #${proof.id}`
+    const isImage = proof.mime_type?.toLowerCase().startsWith('image/')
+    return (
+      <div key={proof.id} className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 last:border-b-0 lg:flex-row lg:items-center">
+        <div className="flex min-w-0 flex-1 items-start gap-3">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-rose-50 text-rose-700">
+            {isImage && proof.thumbnail_url ? <img src={proof.thumbnail_url} alt={name} className="h-full w-full object-cover" /> : <FileText className="h-5 w-5" />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-semibold text-slate-950">{name}</div>
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
+              <span>业务单：{proof.order_no} {proof.order_title}</span>
+              <span>第 {proof.quote_round_no} 轮报价</span>
+              <span>上传人：{proof.uploaded_by_name || `用户 #${proof.uploaded_by}`}</span>
+              {proof.size > 0 && <span>{formatFileSize(proof.size)}</span>}
+            </div>
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-400">
+              <span>删除人：{proof.deleted_by_name || `用户 #${proof.deleted_by_id || '-'}`}</span>
+              <span>{formatDate(proof.deleted_at)}</span>
+              {proof.note && <span className="truncate">备注：{proof.note}</span>}
+            </div>
+          </div>
+        </div>
+        <ResourceActions days={remainingDays(proof.deleted_at, retentionDays)} busy={actionKey.startsWith(`trade-payment-proofs-${proof.id}-`)} onRestore={() => void runAction('trade-payment-proofs', proof.id, 'restore', name)} onDelete={() => void runAction('trade-payment-proofs', proof.id, 'delete', name)} />
+      </div>
+    )
+  }
+
   return (
     <AuthGuard>
       <div className="min-h-screen bg-slate-100 p-3 md:p-5">
@@ -180,9 +226,10 @@ export default function RecycleBinPage() {
             <button type="button" onClick={() => void loadContents()} disabled={loading} className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />刷新</button>
           </header>
 
-          <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <section className="grid grid-cols-2 gap-3 lg:grid-cols-5">
             <div className="rounded-lg border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-4 sm:py-4"><div className="text-xs text-slate-500">待处理内容</div><div className="mt-1 text-2xl font-semibold text-slate-950">{total}</div></div>
             <div className="rounded-lg border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-4 sm:py-4"><div className="text-xs text-slate-500">业务订单</div><div className="mt-1 text-2xl font-semibold text-slate-950">{contents.trade_orders.length}</div></div>
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-4 sm:py-4"><div className="text-xs text-slate-500">付款凭证</div><div className="mt-1 text-2xl font-semibold text-slate-950">{contents.trade_payment_proofs.length}</div></div>
             <div className="rounded-lg border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-4 sm:py-4"><div className="text-xs text-slate-500">工作簿与目录</div><div className="mt-1 text-2xl font-semibold text-slate-950">{contents.workbooks.length + contents.folders.length}</div></div>
             <div className="rounded-lg border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-4 sm:py-4"><div className="text-xs text-slate-500">最近到期</div><div className="mt-1 text-2xl font-semibold text-slate-950">{total > 0 ? `${oldestRemaining} 天` : '-'}</div></div>
           </section>
@@ -193,10 +240,11 @@ export default function RecycleBinPage() {
           {loading ? (
             <div className="flex h-56 items-center justify-center rounded-lg border border-slate-200 bg-white text-sm text-slate-500"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />正在加载回收站</div>
           ) : total === 0 ? (
-            <div className="flex h-64 flex-col items-center justify-center rounded-lg border border-slate-200 bg-white text-center shadow-sm"><Trash2 className="h-8 w-8 text-slate-300" /><div className="mt-3 text-sm font-semibold text-slate-700">回收站为空</div><div className="mt-1 text-xs text-slate-400">删除的业务订单、工作簿和文件夹会出现在这里</div></div>
+            <div className="flex h-64 flex-col items-center justify-center rounded-lg border border-slate-200 bg-white text-center shadow-sm"><Trash2 className="h-8 w-8 text-slate-300" /><div className="mt-3 text-sm font-semibold text-slate-700">回收站为空</div><div className="mt-1 text-xs text-slate-400">删除的业务订单、付款凭证、工作簿和文件夹会出现在这里</div></div>
           ) : (
             <div className="space-y-3">
               {contents.trade_orders.length > 0 && <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"><div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3"><div><div className="text-sm font-semibold text-slate-800">已删除业务订单</div><div className="mt-0.5 text-xs text-slate-500">还原时会一并恢复产品、报价、流程记录和关联工作簿</div></div><span className="text-xs text-slate-500">{contents.trade_orders.length} 个</span></div>{contents.trade_orders.map(renderTradeOrder)}</section>}
+              {contents.trade_payment_proofs.length > 0 && <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"><div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3"><div><div className="text-sm font-semibold text-slate-800">已删除付款凭证</div><div className="mt-0.5 text-xs text-slate-500">仅管理员可恢复或永久删除，恢复后会回到原报价轮次</div></div><span className="text-xs text-slate-500">{contents.trade_payment_proofs.length} 个</span></div>{contents.trade_payment_proofs.map(renderPaymentProof)}</section>}
               {contents.folders.length > 0 && <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"><div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3"><span className="text-sm font-semibold text-slate-800">已删除文件夹</span><span className="text-xs text-slate-500">{contents.folders.length} 个</span></div>{contents.folders.map(renderFolder)}</section>}
               {contents.workbooks.length > 0 && <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"><div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3"><span className="text-sm font-semibold text-slate-800">已删除工作簿</span><span className="text-xs text-slate-500">{contents.workbooks.length} 个</span></div>{contents.workbooks.map(renderWorkbook)}</section>}
             </div>

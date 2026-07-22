@@ -239,9 +239,13 @@ func TestTradePISelectionAndHTML(t *testing.T) {
 		IssueDate:     time.Date(2026, 7, 19, 0, 0, 0, 0, time.Local),
 		ValidUntil:    time.Date(2026, 8, 2, 0, 0, 0, 0, time.Local),
 		PaymentMethod: "T/T", DeliveryTerms: "FOB Shanghai", DeliveryTime: "14 days",
+		BankDetailsImageDataURI: "data:image/png;base64,cGk=",
 	}
 	htmlDoc := renderTradePIHTML(document)
-	for _, expected := range []string{"PROFORMA", "PI-FT-TEST-PI-R2", "Example Buyer LLC", "Industrial Motor", "120.00", "FOB Shanghai"} {
+	for _, expected := range []string{
+		"PROFORMA INVOICE", "PI DATE 合同日", "PI-FT-TEST-PI-R2", "Example Buyer LLC",
+		"Industrial Motor", "120.00", "FOB Shanghai", "Bank Account:", "data:image/png;base64,cGk=",
+	} {
 		if !strings.Contains(htmlDoc, expected) {
 			t.Fatalf("PI HTML missing %q", expected)
 		}
@@ -251,6 +255,12 @@ func TestTradePISelectionAndHTML(t *testing.T) {
 	}
 	if words := tradePIAmountWords("USD", 120.35); words != "USD ONE HUNDRED TWENTY AND 35/100 ONLY" {
 		t.Fatalf("amount words = %q", words)
+	}
+}
+
+func TestMergeTradeDestinationRemovesBlankAndDuplicateValues(t *testing.T) {
+	if actual := mergeTradeDestination("Brazil", " Santos ", "brazil", ""); actual != "Brazil · Santos" {
+		t.Fatalf("mergeTradeDestination() = %q", actual)
 	}
 }
 

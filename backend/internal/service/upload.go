@@ -129,6 +129,18 @@ func (s *UploadService) GetAttachment(id int64) (*model.Attachment, error) {
 	return s.attachmentRepo.GetByID(id)
 }
 
+func (s *UploadService) ReadAttachmentBytes(id int64) (*model.Attachment, []byte, error) {
+	attachment, err := s.attachmentRepo.GetByID(id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("attachment not found: %w", err)
+	}
+	data, err := s.minioClient.GetObjectBytes(context.Background(), attachment.ObjectKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read attachment: %w", err)
+	}
+	return attachment, data, nil
+}
+
 func (s *UploadService) GetThumbnailURL(id int64, size int) string {
 	attachment, err := s.attachmentRepo.GetByID(id)
 	if err != nil {

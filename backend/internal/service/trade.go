@@ -890,12 +890,13 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	if paymentMethod == "" {
 		paymentMethod = strings.TrimSpace(request.PaymentTerms)
 	}
+	destination := mergeTradeDestination(request.DestinationCountry, request.DestinationPort)
 	order := &model.TradeOrder{
 		CustomerID: customer.ID, CustomerName: customer.Name, CustomerCompany: customer.CompanyName,
 		OwnerID: customer.OwnerID, OwnerName: customer.OwnerName, Title: strings.TrimSpace(request.Title),
 		Priority: priority, InquiryDate: time.Now(), QuoteDeadline: quoteDeadline,
-		Currency: currency, Incoterm: "", DestinationCountry: strings.TrimSpace(request.DestinationCountry),
-		DestinationPort: strings.TrimSpace(request.DestinationPort), PaymentTerms: paymentMethod, PaymentMethod: paymentMethod,
+		Currency: currency, Incoterm: "", DestinationCountry: destination,
+		DestinationPort: "", PaymentTerms: paymentMethod, PaymentMethod: paymentMethod,
 		ChannelID: customer.ChannelID, WorkspaceFolderID: workspaceFolderID, Notes: strings.TrimSpace(request.Notes),
 	}
 	if err := s.repo.CreateOrder(order, items); err != nil {
@@ -2098,6 +2099,24 @@ func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64
 	return proof, nil
 }
 
+func (s *TradeService) DeleteCustomerPaymentProof(userID, orderID, proofID int64) error {
+	admin, err := s.isAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if !admin {
+		return fmt.Errorf("仅管理员可以删除付款凭证")
+	}
+	if _, err := s.repo.GetOrder(orderID, userID, true); err != nil {
+		return sql.ErrNoRows
+	}
+	if err := s.repo.SoftDeletePaymentProof(orderID, proofID, userID); err != nil {
+		return err
+	}
+	s.notifyOrderUpdated(orderID)
+	return nil
+}
+
 func (s *TradeService) ListPositions(userID int64) ([]model.TradePosition, error) {
 	positions, err := s.repo.ListPositions()
 	if err != nil {
@@ -2151,6 +2170,7 @@ func (s *TradeService) GetSettings(userID int64) (*model.TradeSettings, error) {
 	if !admin {
 		settings.PaymentRecordPermissions = []model.TradePaymentRecordPermission{}
 	}
+	s.hydrateTradePIProfile(&settings.PIProfile)
 	return settings, nil
 }
 
@@ -2174,8 +2194,22 @@ func (s *TradeService) UpdateSettings(userID int64, request *model.UpdateTradeSe
 		return nil, err
 	}
 	profile := current.PIProfile
+	previousBankImageID := profile.BankDetailsImageAttachmentID
 	if request.PIProfile != nil {
-		profile = normalizeTradePIProfile(*request.PIProfile)
+		profile = *request.PIProfile
+	}
+	profile = normalizeTradePIProfile(profile)
+	if profile.BankDetailsImageAttachmentID != nil {
+		attachment, attachmentErr := s.uploadSvc.GetAttachment(*profile.BankDetailsImageAttachmentID)
+		if attachmentErr != nil {
+			return nil, fmt.Errorf("PI 银行信息图片不存在")
+		}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(attachment.MimeType)), "image/") {
+			return nil, fmt.Errorf("PI 银行信息仅支持图片文件")
+		}
+		if attachment.Size > 20<<20 {
+			return nil, fmt.Errorf("PI 银行信息图片不能超过 20MB")
+		}
 	}
 	paymentRecordPermissions := current.PaymentRecordPermissions
 	if request.PaymentRecordPermissions != nil {
@@ -2196,6 +2230,10 @@ func (s *TradeService) UpdateSettings(userID int64, request *model.UpdateTradeSe
 	if err := s.repo.UpdateSettings(userID, settings); err != nil {
 		return nil, err
 	}
+	if previousBankImageID != nil && (profile.BankDetailsImageAttachmentID == nil || *previousBankImageID != *profile.BankDetailsImageAttachmentID) {
+		_ = s.uploadSvc.DeleteFile(*previousBankImageID)
+	}
+	s.hydrateTradePIProfile(&settings.PIProfile)
 	return settings, nil
 }
 
@@ -2236,8 +2274,19 @@ func normalizeTradePIProfile(profile model.TradePIProfile) model.TradePIProfile 
 	profile.AccountNumber = strings.TrimSpace(profile.AccountNumber)
 	profile.SwiftCode = strings.ToUpper(strings.TrimSpace(profile.SwiftCode))
 	profile.BeneficiaryAddress = strings.TrimSpace(profile.BeneficiaryAddress)
+	if profile.BankDetailsImageAttachmentID != nil && *profile.BankDetailsImageAttachmentID <= 0 {
+		profile.BankDetailsImageAttachmentID = nil
+	}
+	profile.BankDetailsImageURL = ""
 	profile.DefaultNotes = strings.TrimSpace(profile.DefaultNotes)
 	return profile
+}
+
+func (s *TradeService) hydrateTradePIProfile(profile *model.TradePIProfile) {
+	if profile == nil || profile.BankDetailsImageAttachmentID == nil {
+		return
+	}
+	profile.BankDetailsImageURL, _ = s.uploadSvc.GetFileURL(*profile.BankDetailsImageAttachmentID)
 }
 
 func (s *TradeService) UpdateLabelSettings(userID, orderID int64, request *model.UpdateTradeLabelSettingsRequest) (*model.TradeOrder, error) {
@@ -2784,8 +2833,11 @@ func (s *TradeService) syncChangedTradeRows(userID, orderID, sheetID int64, shee
 			}
 			order.Priority = tradePriorityValue(tradeString(values["priority"]))
 			order.Currency = strings.ToUpper(firstNonEmptyTrade(tradeString(values["currency"]), order.Currency))
-			order.DestinationCountry = tradeString(values["destination_country"])
-			order.DestinationPort = tradeString(values["destination_port"])
+			order.DestinationCountry = mergeTradeDestination(
+				tradeString(values["destination_country"]),
+				tradeString(values["destination_port"]),
+			)
+			order.DestinationPort = ""
 			order.QuoteDeadline, _ = parseTradeDate(tradeString(values["quote_deadline"]))
 			order.PaymentMethod = tradeString(values["payment_method"])
 			order.Notes = tradeString(values["notes"])
@@ -3371,8 +3423,7 @@ func tradeWorkbookDefinitionsWithContext(
 				tradeSelectColumn("priority", "优先级", priorityOptions, priorityColors, false, 90),
 				tradeColumn("owner", "负责人", "text", 100),
 				tradeColumn("currency", "币种", "text", 70),
-				tradeColumn("destination_country", "目的国家", "text", 120),
-				tradeColumn("destination_port", "目的港", "text", 140),
+				tradeColumn("destination_country", "目的地 / 目的港", "text", 220),
 				tradeColumn("quote_deadline", "报价截止", "date", 110),
 				tradeColumn("payment_method", "付款方式", "text", 190),
 				tradeCurrencyColumn("goods_amount", "商品报价", order.Currency, 110),
@@ -3394,10 +3445,10 @@ func tradeWorkbookDefinitionsWithContext(
 				"order_no": order.OrderNo, "customer": firstNonEmptyTrade(customer.CompanyName, customer.Name),
 				"stage": tradeStageLabel(order.Stage), "priority": tradePriorityLabel(order.Priority),
 				"owner": order.OwnerName, "currency": order.Currency,
-				"destination_country": order.DestinationCountry, "destination_port": order.DestinationPort,
-				"quote_deadline": formatTradeDate(order.QuoteDeadline),
-				"payment_method": firstNonEmptyTrade(order.PaymentMethod, order.PaymentTerms),
-				"goods_amount":   profit.GoodsRevenue, "quoted_freight": profit.FreightRevenue,
+				"destination_country": mergeTradeDestination(order.DestinationCountry, order.DestinationPort),
+				"quote_deadline":      formatTradeDate(order.QuoteDeadline),
+				"payment_method":      firstNonEmptyTrade(order.PaymentMethod, order.PaymentTerms),
+				"goods_amount":        profit.GoodsRevenue, "quoted_freight": profit.FreightRevenue,
 				"quote_exchange_rate_cny": profit.ExchangeRateCNY,
 				"sales_amount":            profit.Revenue, "product_cost": profit.ProductCost,
 				"actual_freight": profit.ActualFreightCost, "freight_profit": profit.FreightProfit,

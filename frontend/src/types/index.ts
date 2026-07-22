@@ -355,7 +355,30 @@ export interface RecycleBinContents {
   folders: Folder[];
   workbooks: Workbook[];
   trade_orders: DeletedTradeOrder[];
+  trade_payment_proofs: DeletedTradePaymentProof[];
   retention_days: number;
+}
+
+export interface DeletedTradePaymentProof {
+  id: number;
+  order_id: number;
+  order_no: string;
+  order_title: string;
+  quote_id: number;
+  quote_round_no: number;
+  attachment_id: number;
+  attachment_url: string;
+  thumbnail_url: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+  note: string;
+  uploaded_by: number;
+  uploaded_by_name: string;
+  deleted_at?: string;
+  deleted_by_id?: number;
+  deleted_by_name: string;
+  created_at: string;
 }
 
 export interface DeletedTradeOrder {
@@ -1406,6 +1429,8 @@ export interface TradePIProfile {
   account_number: string;
   swift_code: string;
   beneficiary_address: string;
+  bank_details_image_attachment_id?: number;
+  bank_details_image_url?: string;
   default_notes: string;
 }
 
@@ -1446,6 +1471,8 @@ export interface TradeOrderAccess {
   can_view_all_payment_records: boolean;
   can_upload_payment_proofs: boolean;
   can_manage_payment_status: boolean;
+  can_view_pi: boolean;
+  can_generate_pi: boolean;
   visible_sheet_names: string[];
   editable_sheet_names: string[];
 }

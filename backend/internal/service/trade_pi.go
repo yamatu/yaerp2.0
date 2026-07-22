@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/base64"
 	"fmt"
 	"html"
 	"math"
@@ -22,16 +23,17 @@ type TradePIFile struct {
 }
 
 type tradePIDocument struct {
-	Order         *model.TradeOrder
-	Quote         *model.TradeCustomerQuoteRound
-	Profile       model.TradePIProfile
-	PINumber      string
-	IssueDate     time.Time
-	ValidUntil    time.Time
-	PaymentMethod string
-	DeliveryTerms string
-	DeliveryTime  string
-	Notes         string
+	Order                   *model.TradeOrder
+	Quote                   *model.TradeCustomerQuoteRound
+	Profile                 model.TradePIProfile
+	PINumber                string
+	IssueDate               time.Time
+	ValidUntil              time.Time
+	PaymentMethod           string
+	DeliveryTerms           string
+	DeliveryTime            string
+	Notes                   string
+	BankDetailsImageDataURI string
 }
 
 func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.TradePIRequest) (*TradePIFile, error) {
@@ -39,7 +41,7 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 	if err != nil {
 		return nil, err
 	}
-	if order.Access == nil || !order.Access.CanViewCustomer || !order.Access.CanViewCustomerContact || !order.Access.CanViewCustomerPricing {
+	if order.Access == nil || !order.Access.CanGeneratePI || !order.Access.CanViewCustomer || !order.Access.CanViewCustomerContact || !order.Access.CanViewCustomerPricing {
 		return nil, fmt.Errorf("没有生成客户 PI 的权限")
 	}
 	quote, err := selectTradePIQuote(order.CustomerQuotes, request)
@@ -54,6 +56,18 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 	if profile.CompanyName == "" {
 		return nil, fmt.Errorf("请先在外贸设置中配置 PI 公司资料")
 	}
+	bankDetailsImageDataURI := ""
+	if profile.BankDetailsImageAttachmentID != nil {
+		attachment, data, imageErr := s.uploadSvc.ReadAttachmentBytes(*profile.BankDetailsImageAttachmentID)
+		if imageErr != nil {
+			return nil, fmt.Errorf("读取 PI 银行信息图片失败: %w", imageErr)
+		}
+		mimeType := strings.ToLower(strings.TrimSpace(attachment.MimeType))
+		if !strings.HasPrefix(mimeType, "image/") {
+			return nil, fmt.Errorf("PI 银行信息附件不是图片")
+		}
+		bankDetailsImageDataURI = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	}
 
 	issueDate, validUntil, err := tradePIDates(request)
 	if err != nil {
@@ -65,7 +79,7 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 	}
 	deliveryTerms := strings.TrimSpace(request.DeliveryTerms)
 	if deliveryTerms == "" {
-		destination := strings.TrimSpace(strings.Join([]string{order.DestinationCountry, order.DestinationPort}, " "))
+		destination := mergeTradeDestination(order.DestinationCountry, order.DestinationPort)
 		deliveryTerms = strings.TrimSpace(strings.Join([]string{order.Incoterm, destination}, " "))
 	}
 	if deliveryTerms == "" {
@@ -81,6 +95,7 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 		IssueDate: issueDate, ValidUntil: validUntil,
 		PaymentMethod: paymentMethod, DeliveryTerms: deliveryTerms,
 		DeliveryTime: deliveryTime, Notes: strings.TrimSpace(request.Notes),
+		BankDetailsImageDataURI: bankDetailsImageDataURI,
 	}
 	pdfData, err := renderTradePIPDF(document)
 	if err != nil {
@@ -195,75 +210,97 @@ func renderTradePIHTML(document *tradePIDocument) string {
 	if totalAmount <= 0 {
 		totalAmount = goodsAmount + quote.FreightAmount
 	}
-	customerName := firstNonEmptyTrade(order.CustomerCompany, order.CustomerName)
+	customerName := firstNonEmptyTrade(order.CustomerCompany, order.CustomerName, "-")
 	customerContact := ""
 	customerEmail := ""
 	customerPhone := ""
-	customerCountry := ""
+	customerAddress := ""
 	if order.Customer != nil {
 		customerName = firstNonEmptyTrade(order.Customer.CompanyName, order.Customer.Name, customerName)
 		customerContact = order.Customer.ContactName
 		customerEmail = order.Customer.Email
 		customerPhone = order.Customer.Phone
-		customerCountry = strings.TrimSpace(strings.Join([]string{order.Customer.Country, order.Customer.Region}, " "))
+		customerAddress = mergeTradeDestination(order.Customer.Country, order.Customer.Region)
 	}
 
 	var rows strings.Builder
 	for index, item := range quote.Items {
+		matched := tradePIOrderItem(order.Items, item.OrderItemID)
 		rows.WriteString("<tr><td class=\"center\">")
 		rows.WriteString(strconv.Itoa(index + 1))
 		rows.WriteString("</td><td>")
-		rows.WriteString(html.EscapeString(item.SKU))
-		rows.WriteString("</td><td><strong>")
 		rows.WriteString(html.EscapeString(item.ProductName))
+		rows.WriteString("</td><td><strong>")
+		rows.WriteString(html.EscapeString(item.SKU))
 		rows.WriteString("</strong>")
-		if matched := tradePIOrderItem(order.Items, item.OrderItemID); matched != nil && strings.TrimSpace(matched.Specification) != "" {
-			rows.WriteString("<div class=\"muted\">")
+		if matched != nil && strings.TrimSpace(matched.Specification) != "" {
+			rows.WriteString("<div class=\"subtle\">")
 			rows.WriteString(html.EscapeString(matched.Specification))
 			rows.WriteString("</div>")
 		}
-		rows.WriteString("</td><td class=\"number\">")
-		rows.WriteString(formatTradePINumber(item.Quantity))
 		rows.WriteString("</td><td class=\"center\">")
-		rows.WriteString(html.EscapeString(item.Unit))
+		rows.WriteString(formatTradePINumber(item.Quantity))
+		if strings.TrimSpace(item.Unit) != "" {
+			rows.WriteString(" ")
+			rows.WriteString(html.EscapeString(item.Unit))
+		}
 		rows.WriteString("</td><td class=\"number\">")
+		rows.WriteString(html.EscapeString(quote.Currency))
+		rows.WriteString(" ")
 		rows.WriteString(formatTradePIMoney(item.UnitPrice))
 		rows.WriteString("</td><td class=\"number strong\">")
+		rows.WriteString(html.EscapeString(quote.Currency))
+		rows.WriteString(" ")
 		rows.WriteString(formatTradePIMoney(item.Amount))
+		rows.WriteString("</td><td>")
+		if matched != nil {
+			rows.WriteString(html.EscapeString(strings.TrimSpace(matched.Description)))
+		}
 		rows.WriteString("</td></tr>")
 	}
-
-	freightRow := ""
+	for index := len(quote.Items); index < 4; index++ {
+		rows.WriteString(`<tr class="blank-row"><td class="center">` + strconv.Itoa(index+1) + `</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>`)
+	}
 	if quote.FreightMode == "quoted" && quote.FreightAmount > 0 {
-		freightRow = `<tr class="summary-row"><td colspan="6">Freight</td><td class="number strong">` +
-			formatTradePIMoney(quote.FreightAmount) + `</td></tr>`
+		rows.WriteString(`<tr><td></td><td>Freight<br>运费</td><td></td><td></td><td></td><td class="number strong">` + html.EscapeString(quote.Currency) + ` ` + formatTradePIMoney(quote.FreightAmount) + `</td><td></td></tr>`)
 	}
 	notes := strings.TrimSpace(strings.Join([]string{document.Notes, profile.DefaultNotes}, "\n"))
-	amountWords := tradePIAmountWords(quote.Currency, totalAmount)
+	shipTo := mergeTradeDestination(order.DestinationCountry, order.DestinationPort)
+	if shipTo == "" {
+		shipTo = customerAddress
+	}
+	otherTerms := strings.TrimSpace(strings.Join(nonEmptyTradePIStrings(
+		"Validity / 有效期: "+document.ValidUntil.Format("2006-01-02"),
+		"Delivery terms / 交付条款: "+document.DeliveryTerms,
+		notes,
+	), "\n"))
+
+	bankContent := ""
+	if document.BankDetailsImageDataURI != "" {
+		bankContent = `<div class="bank-image"><img src="` + document.BankDetailsImageDataURI + `" alt="Bank account details"></div>`
+	} else {
+		bankContent = `<div class="bank-grid"><span>Account Name</span><strong>` + html.EscapeString(firstNonEmptyTrade(profile.AccountName, profile.CompanyName, "-")) + `</strong><span>Bank Name</span><strong>` + html.EscapeString(firstNonEmptyTrade(profile.BankName, "-")) + `</strong><span>Account No.</span><strong>` + html.EscapeString(firstNonEmptyTrade(profile.AccountNumber, "-")) + `</strong><span>SWIFT / BIC</span><strong>` + html.EscapeString(firstNonEmptyTrade(profile.SwiftCode, "-")) + `</strong><span>Bank Address</span><strong>` + html.EscapeString(firstNonEmptyTrade(profile.BankAddress, "-")) + `</strong><span>Beneficiary Address</span><strong>` + html.EscapeString(firstNonEmptyTrade(profile.BeneficiaryAddress, "-")) + `</strong></div>`
+	}
 
 	var builder strings.Builder
-	builder.Grow(32 * 1024)
+	builder.Grow(28 * 1024)
 	builder.WriteString(`<!doctype html><html><head><meta charset="utf-8"><style>`)
 	builder.WriteString(`@font-face{font-family:'` + sheetPDFBaseFontFamily + `';src:url(data:font/ttf;base64,` + sheetPDFFontBase64 + `) format('truetype');font-weight:100 900}`)
-	builder.WriteString(`@page{size:A4 portrait;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;background:#fff;color:#111827;font-family:'` + sheetPDFBaseFontFamily + `',Arial,sans-serif;font-size:10px;line-height:1.45}`)
-	builder.WriteString(`.page{width:210mm;min-height:297mm;padding:14mm 15mm 13mm;position:relative}.top{display:flex;justify-content:space-between;gap:12mm;border-bottom:1.2mm solid #0f172a;padding-bottom:5mm}.seller{max-width:112mm}.brand{display:inline-flex;align-items:center;gap:3mm}.mark{display:flex;width:11mm;height:11mm;align-items:center;justify-content:center;background:#0f172a;color:#fff;font-size:15px;font-weight:800}.company{font-size:16px;font-weight:800;letter-spacing:.2px}.seller-lines{margin-top:2.5mm;color:#475569;white-space:pre-line}.title{text-align:right}.title h1{margin:0;font-size:24px;letter-spacing:1.5px}.pi-no{margin-top:2mm;font-size:11px;font-weight:700;color:#334155}.meta{display:grid;grid-template-columns:1fr 1fr;margin-top:6mm;border:1px solid #cbd5e1}.party{padding:4mm}.party+ .party{border-left:1px solid #cbd5e1}.eyebrow{font-size:8px;text-transform:uppercase;letter-spacing:1.2px;color:#64748b;font-weight:700}.party-name{margin-top:1.5mm;font-size:13px;font-weight:800}.detail{margin-top:1mm;color:#475569}.facts{display:grid;grid-template-columns:repeat(4,1fr);margin-top:4mm;border:1px solid #cbd5e1}.fact{padding:2.8mm;border-right:1px solid #e2e8f0}.fact:last-child{border-right:0}.fact-value{margin-top:.7mm;font-weight:700}.items{width:100%;border-collapse:collapse;margin-top:6mm}.items thead{display:table-header-group}.items th{background:#0f172a;color:#fff;padding:2.6mm 2mm;text-align:left;font-size:8.5px;letter-spacing:.4px}.items td{border:1px solid #cbd5e1;padding:2.4mm 2mm;vertical-align:top}.items tr{break-inside:avoid}.center{text-align:center}.number{text-align:right;font-variant-numeric:tabular-nums}.strong{font-weight:800}.muted{margin-top:.6mm;color:#64748b;font-size:8.5px}.summary-row td{background:#f8fafc}.total-row td{background:#e2e8f0;font-size:12px}.words{margin-top:2.5mm;padding:2.5mm 3mm;border-left:1mm solid #0f172a;background:#f8fafc;font-size:9px}.terms{display:grid;grid-template-columns:1.05fr .95fr;gap:5mm;margin-top:6mm;break-inside:avoid}.panel{border-top:1px solid #94a3b8;padding-top:3mm}.panel h2{margin:0 0 2mm;font-size:10px;text-transform:uppercase;letter-spacing:.7px}.info-grid{display:grid;grid-template-columns:30mm 1fr;gap:1mm 2mm}.info-label{color:#64748b}.notes{white-space:pre-line;color:#334155}.signature{margin-top:8mm;display:flex;justify-content:flex-end;break-inside:avoid}.signature-box{width:62mm;text-align:center}.signature-line{margin-top:12mm;border-top:1px solid #64748b;padding-top:1.5mm}.footer{position:absolute;left:15mm;right:15mm;bottom:7mm;display:flex;justify-content:space-between;border-top:1px solid #cbd5e1;padding-top:2mm;color:#64748b;font-size:8px}`)
-	builder.WriteString(`</style></head><body><main class="page">`)
-	builder.WriteString(`<section class="top"><div class="seller"><div class="brand"><div class="mark">PI</div><div class="company">` + html.EscapeString(profile.CompanyName) + `</div></div><div class="seller-lines">` + html.EscapeString(strings.Join(nonEmptyTradePIStrings(profile.Address, profile.Phone, profile.Email, profile.TaxID), "\n")) + `</div></div><div class="title"><h1>PROFORMA<br>INVOICE</h1><div class="pi-no">` + html.EscapeString(document.PINumber) + `</div></div></section>`)
-	builder.WriteString(`<section class="meta"><div class="party"><div class="eyebrow">Seller</div><div class="party-name">` + html.EscapeString(profile.CompanyName) + `</div><div class="detail">` + html.EscapeString(firstNonEmptyTrade(profile.ContactName, profile.Email, profile.Phone)) + `</div></div><div class="party"><div class="eyebrow">Bill To</div><div class="party-name">` + html.EscapeString(customerName) + `</div><div class="detail">` + html.EscapeString(strings.Join(nonEmptyTradePIStrings(customerContact, customerEmail, customerPhone, customerCountry), " · ")) + `</div></div></section>`)
-	builder.WriteString(`<section class="facts"><div class="fact"><div class="eyebrow">Issue Date</div><div class="fact-value">` + document.IssueDate.Format("02 Jan 2006") + `</div></div><div class="fact"><div class="eyebrow">Valid Until</div><div class="fact-value">` + document.ValidUntil.Format("02 Jan 2006") + `</div></div><div class="fact"><div class="eyebrow">Order Reference</div><div class="fact-value">` + html.EscapeString(order.OrderNo) + `</div></div><div class="fact"><div class="eyebrow">Currency</div><div class="fact-value">` + html.EscapeString(quote.Currency) + `</div></div></section>`)
-	builder.WriteString(`<table class="items"><thead><tr><th style="width:8mm">No.</th><th style="width:28mm">SKU</th><th>Description</th><th style="width:18mm;text-align:right">Qty</th><th style="width:16mm;text-align:center">Unit</th><th style="width:24mm;text-align:right">Unit Price</th><th style="width:27mm;text-align:right">Amount</th></tr></thead><tbody>`)
+	builder.WriteString(`@page{size:A4 portrait;margin:0}*{box-sizing:border-box}html,body{margin:0;padding:0;background:#fff;color:#111;font-family:'` + sheetPDFBaseFontFamily + `',Arial,sans-serif;font-size:8.5px;line-height:1.25}.page{width:210mm;min-height:297mm;padding:7mm 7mm 6mm}.title{height:15mm;display:flex;align-items:center;justify-content:center;border-bottom:.3mm solid #159447;font-size:21px;font-weight:800}.pi{width:100%;border-collapse:collapse;table-layout:fixed}.pi th,.pi td{border:.25mm solid #222;padding:1.25mm 1.5mm;vertical-align:middle;overflow-wrap:anywhere}.pi .section{background:#fffed2;text-align:center;font-weight:800}.pi .label{width:26mm;text-align:center;font-weight:700;background:#fffed2}.pi .field-label{display:inline-block;min-width:20mm;font-weight:700}.pi .party td{height:7.5mm}.pi .party-value{font-weight:700}.items{width:100%;border-collapse:collapse;table-layout:fixed}.items th,.items td{border:.25mm solid #222;padding:1.4mm 1.2mm;vertical-align:middle}.items th{background:#fffed2;text-align:center;font-weight:800}.items tbody tr{height:7mm;break-inside:avoid}.items .blank-row{height:7mm}.center{text-align:center}.number{text-align:right;font-variant-numeric:tabular-nums}.strong{font-weight:800}.subtle{margin-top:.5mm;font-size:7.5px;color:#444}.terms{width:100%;border-collapse:collapse;table-layout:fixed}.terms td{border:.25mm solid #222;padding:1.5mm;vertical-align:middle}.terms .term-label{width:27mm;background:#fffed2;text-align:center;font-weight:800}.preline{white-space:pre-line}.bank-cell{height:48mm;padding:2mm 3mm!important}.bank-image{height:43mm;display:flex;align-items:center;justify-content:flex-start;overflow:hidden}.bank-image img{display:block;max-width:100%;max-height:43mm;object-fit:contain;object-position:left center}.bank-grid{display:grid;grid-template-columns:28mm minmax(0,1fr);gap:1.2mm 3mm;align-items:start}.bank-grid span{color:#555}.signature-cell{height:15mm;text-align:center;vertical-align:bottom!important}.footer{margin-top:2mm;text-align:right;font-size:7.5px;color:#555}`)
+	builder.WriteString(`</style></head><body><main class="page"><div class="title">PROFORMA INVOICE</div>`)
+	builder.WriteString(`<table class="pi"><colgroup><col style="width:50%"><col style="width:50%"></colgroup><tbody>`)
+	builder.WriteString(`<tr><th class="section">PI DATE 合同日</th><th class="section">PI NO. 合同号</th></tr><tr><td class="center strong">` + document.IssueDate.Format("2006-01-02") + `</td><td class="center strong">` + html.EscapeString(document.PINumber) + `</td></tr>`)
+	builder.WriteString(`<tr><th class="section">Seller 卖方</th><th class="section">Buyer 买方</th></tr>`)
+	builder.WriteString(`<tr class="party"><td><span class="field-label">Company:</span><span class="party-value">` + html.EscapeString(profile.CompanyName) + `</span></td><td><span class="field-label">Company:</span><span class="party-value">` + html.EscapeString(customerName) + `</span></td></tr>`)
+	builder.WriteString(`<tr class="party"><td><span class="field-label">Add:</span>` + html.EscapeString(firstNonEmptyTrade(profile.Address, "-")) + `</td><td><span class="field-label">Add:</span>` + html.EscapeString(firstNonEmptyTrade(customerAddress, shipTo, "-")) + `</td></tr>`)
+	builder.WriteString(`<tr class="party"><td><span class="field-label">Contact:</span>` + html.EscapeString(firstNonEmptyTrade(profile.ContactName, "-")) + `</td><td><span class="field-label">Contact:</span>` + html.EscapeString(firstNonEmptyTrade(customerContact, order.CustomerName, "-")) + `</td></tr>`)
+	builder.WriteString(`<tr class="party"><td><span class="field-label">Tel:</span>` + html.EscapeString(firstNonEmptyTrade(profile.Phone, "-")) + `</td><td><span class="field-label">Tel:</span>` + html.EscapeString(firstNonEmptyTrade(customerPhone, "-")) + `</td></tr>`)
+	builder.WriteString(`<tr class="party"><td><span class="field-label">Email:</span>` + html.EscapeString(firstNonEmptyTrade(profile.Email, "-")) + `</td><td><span class="field-label">Email:</span>` + html.EscapeString(firstNonEmptyTrade(customerEmail, "-")) + `<br><span class="field-label">Tax number:</span>-</td></tr></tbody></table>`)
+	builder.WriteString(`<table class="items"><colgroup><col style="width:6mm"><col style="width:27mm"><col style="width:49mm"><col style="width:27mm"><col style="width:30mm"><col style="width:31mm"><col style="width:26mm"></colgroup><thead><tr><th>No.</th><th>Products<br>产品</th><th>Model Number</th><th>Order Quantity<br>订单数</th><th>UNIT PRICE<br>(` + html.EscapeString(quote.Currency) + `) 单价</th><th>Total<br>(` + html.EscapeString(quote.Currency) + `) 合计金额</th><th>Remarks 备注</th></tr></thead><tbody>`)
 	builder.WriteString(rows.String())
-	builder.WriteString(`<tr class="summary-row"><td colspan="6">Goods Subtotal</td><td class="number strong">` + formatTradePIMoney(goodsAmount) + `</td></tr>`)
-	builder.WriteString(freightRow)
-	builder.WriteString(`<tr class="total-row"><td colspan="6" class="strong">TOTAL (` + html.EscapeString(quote.Currency) + `)</td><td class="number strong">` + formatTradePIMoney(totalAmount) + `</td></tr></tbody></table>`)
-	builder.WriteString(`<div class="words"><strong>Amount in words:</strong> ` + html.EscapeString(amountWords) + `</div>`)
-	builder.WriteString(`<section class="terms"><div class="panel"><h2>Commercial Terms</h2><div class="info-grid"><div class="info-label">Payment</div><div>` + html.EscapeString(document.PaymentMethod) + `</div><div class="info-label">Delivery Terms</div><div>` + html.EscapeString(document.DeliveryTerms) + `</div><div class="info-label">Delivery Time</div><div>` + html.EscapeString(document.DeliveryTime) + `</div></div>`)
-	if notes != "" {
-		builder.WriteString(`<h2 style="margin-top:4mm">Notes</h2><div class="notes">` + html.EscapeString(notes) + `</div>`)
-	}
-	builder.WriteString(`</div><div class="panel"><h2>Beneficiary Bank Details</h2><div class="info-grid"><div class="info-label">Beneficiary</div><div>` + html.EscapeString(firstNonEmptyTrade(profile.AccountName, profile.CompanyName)) + `</div><div class="info-label">Account No.</div><div>` + html.EscapeString(profile.AccountNumber) + `</div><div class="info-label">Bank</div><div>` + html.EscapeString(profile.BankName) + `</div><div class="info-label">Bank Address</div><div>` + html.EscapeString(profile.BankAddress) + `</div><div class="info-label">SWIFT</div><div>` + html.EscapeString(profile.SwiftCode) + `</div><div class="info-label">Beneficiary Address</div><div>` + html.EscapeString(profile.BeneficiaryAddress) + `</div></div></div></section>`)
-	builder.WriteString(`<section class="signature"><div class="signature-box"><div class="signature-line">Authorized Signature</div><strong>` + html.EscapeString(profile.CompanyName) + `</strong></div></section>`)
-	builder.WriteString(`<footer class="footer"><span>` + html.EscapeString(document.PINumber) + `</span><span>This document is computer generated.</span></footer></main></body></html>`)
+	builder.WriteString(`<tr><td colspan="4"></td><td class="center strong">Total:</td><td class="number strong">` + html.EscapeString(quote.Currency) + ` ` + formatTradePIMoney(totalAmount) + `</td><td></td></tr></tbody></table>`)
+	builder.WriteString(`<table class="terms"><tbody><tr><td class="term-label">备货期 Prepare time:</td><td>` + html.EscapeString(firstNonEmptyTrade(document.DeliveryTime, "As agreed")) + `</td></tr><tr><td class="term-label">Payment Plan<br>付款计划:</td><td>` + html.EscapeString(firstNonEmptyTrade(document.PaymentMethod, "As agreed")) + `</td></tr><tr><td class="term-label">Ship to:</td><td class="strong">` + html.EscapeString(firstNonEmptyTrade(shipTo, "As agreed")) + `</td></tr><tr><td class="term-label">Bank Account:</td><td class="bank-cell">` + bankContent + `</td></tr><tr><td class="term-label">其他 Others:</td><td class="preline">` + html.EscapeString(otherTerms) + `</td></tr><tr><td class="term-label">Seller Rep. Signature<br>卖方代表签字</td><td class="signature-cell"><strong>` + html.EscapeString(firstNonEmptyTrade(profile.ContactName, profile.CompanyName)) + `</strong> &nbsp;&nbsp;&nbsp;&nbsp; Buyer Rep. Signature / 买方代表签字: ____________________</td></tr></tbody></table>`)
+	builder.WriteString(`<div class="footer">` + html.EscapeString(document.PINumber) + ` · This document is computer generated.</div></main></body></html>`)
 	return builder.String()
 }
 
@@ -284,6 +321,24 @@ func nonEmptyTradePIStrings(values ...string) []string {
 		}
 	}
 	return result
+}
+
+func mergeTradeDestination(values ...string) string {
+	parts := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, " · ")
 }
 
 func formatTradePIMoney(value float64) string {

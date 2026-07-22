@@ -17,11 +17,12 @@ var ErrRecycleBinAccessDenied = errors.New("recycle bin access denied")
 type RecycleBinService struct {
 	repo                  *repo.RecycleBinRepo
 	permService           *PermissionService
+	uploadService         *UploadService
 	tradeOrderChangedHook func(orderID int64)
 }
 
-func NewRecycleBinService(recycleRepo *repo.RecycleBinRepo, permService *PermissionService) *RecycleBinService {
-	return &RecycleBinService{repo: recycleRepo, permService: permService}
+func NewRecycleBinService(recycleRepo *repo.RecycleBinRepo, permService *PermissionService, uploadService *UploadService) *RecycleBinService {
+	return &RecycleBinService{repo: recycleRepo, permService: permService, uploadService: uploadService}
 }
 
 func (s *RecycleBinService) List(userID int64) (*model.RecycleBinContents, error) {
@@ -33,11 +34,20 @@ func (s *RecycleBinService) List(userID int64) (*model.RecycleBinContents, error
 	if err != nil {
 		return nil, err
 	}
+	paymentProofs := make([]model.DeletedTradePaymentProof, 0)
+	if isAdmin {
+		paymentProofs, err = s.repo.ListDeletedTradePaymentProofs()
+		if err != nil {
+			return nil, err
+		}
+		for index := range paymentProofs {
+			paymentProofs[index].AttachmentURL, _ = s.uploadService.GetFileURL(paymentProofs[index].AttachmentID)
+			paymentProofs[index].ThumbnailURL = s.uploadService.GetThumbnailURL(paymentProofs[index].AttachmentID, 320)
+		}
+	}
 	return &model.RecycleBinContents{
-		Folders:       folders,
-		Workbooks:     workbooks,
-		TradeOrders:   tradeOrders,
-		RetentionDays: RecycleBinRetentionDays,
+		Folders: folders, Workbooks: workbooks, TradeOrders: tradeOrders,
+		TradePaymentProofs: paymentProofs, RetentionDays: RecycleBinRetentionDays,
 	}, nil
 }
 
@@ -73,6 +83,42 @@ func (s *RecycleBinService) DeleteTradeOrderPermanently(userID, orderID int64) e
 	}
 	if s.tradeOrderChangedHook != nil {
 		s.tradeOrderChangedHook(orderID)
+	}
+	return nil
+}
+
+func (s *RecycleBinService) RestoreTradePaymentProof(userID, proofID int64) error {
+	if err := s.requireAdmin(userID); err != nil {
+		return err
+	}
+	proof, err := s.repo.GetDeletedTradePaymentProof(proofID)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.RestoreTradePaymentProof(proofID); err != nil {
+		return err
+	}
+	if s.tradeOrderChangedHook != nil {
+		s.tradeOrderChangedHook(proof.OrderID)
+	}
+	return nil
+}
+
+func (s *RecycleBinService) DeleteTradePaymentProofPermanently(userID, proofID int64) error {
+	if err := s.requireAdmin(userID); err != nil {
+		return err
+	}
+	proof, err := s.repo.GetDeletedTradePaymentProof(proofID)
+	if err != nil {
+		return err
+	}
+	if err := s.uploadService.DeleteFile(proof.AttachmentID); err != nil {
+		if deleteErr := s.repo.DeleteTradePaymentProofPermanently(proofID); deleteErr != nil {
+			return deleteErr
+		}
+	}
+	if s.tradeOrderChangedHook != nil {
+		s.tradeOrderChangedHook(proof.OrderID)
 	}
 	return nil
 }
@@ -148,7 +194,20 @@ func (s *RecycleBinService) requireAdmin(userID int64) error {
 
 func (s *RecycleBinService) CleanupExpired() (int64, error) {
 	cutoff := time.Now().AddDate(0, 0, -RecycleBinRetentionDays)
-	return s.repo.PurgeDeletedBefore(cutoff)
+	attachmentIDs, err := s.repo.ListExpiredTradePaymentProofAttachmentIDs(cutoff)
+	if err != nil {
+		return 0, err
+	}
+	var removedAttachments int64
+	for _, attachmentID := range attachmentIDs {
+		if err := s.uploadService.DeleteFile(attachmentID); err != nil {
+			log.Printf("recycle bin cleanup could not remove payment proof attachment %d: %v", attachmentID, err)
+			continue
+		}
+		removedAttachments++
+	}
+	removedResources, err := s.repo.PurgeDeletedBefore(cutoff)
+	return removedAttachments + removedResources, err
 }
 
 func (s *RecycleBinService) StartCleanup(ctx context.Context, interval time.Duration) {

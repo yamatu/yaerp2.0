@@ -6,6 +6,7 @@ import {
   FileText,
   ImagePlus,
   Loader2,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -16,6 +17,9 @@ interface PaymentProofPanelProps {
   canUpload: boolean;
   uploading: boolean;
   onUpload: (files: File[]) => Promise<void> | void;
+  canDelete?: boolean;
+  deletingID?: number | null;
+  onDelete?: (proof: TradePaymentProof) => Promise<void> | void;
 }
 
 function isImageProof(proof: TradePaymentProof) {
@@ -45,6 +49,9 @@ export function PaymentProofPanel({
   canUpload,
   uploading,
   onUpload,
+  canDelete = false,
+  deletingID = null,
+  onDelete,
 }: PaymentProofPanelProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -79,6 +86,12 @@ export function PaymentProofPanel({
     }
   };
 
+  const deleteProof = async (proof: TradePaymentProof) => {
+    if (!canDelete || !onDelete || deletingID) return;
+    await onDelete(proof);
+    if (preview?.id === proof.id) setPreview(null);
+  };
+
   return (
     <div className="mt-3 space-y-3">
       {proofs.length > 0 && (
@@ -86,38 +99,58 @@ export function PaymentProofPanel({
           {proofs.map((proof) => {
             const image = isImageProof(proof);
             return (
-              <button
-                key={proof.id}
-                type="button"
-                onClick={() => setPreview(proof)}
-                className="group min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white text-left hover:border-emerald-300 hover:shadow-sm"
-                title={`预览 ${proof.filename || "付款凭证"}`}
-              >
-                <div className="flex aspect-[4/3] items-center justify-center overflow-hidden bg-slate-100">
-                  {image ? (
-                    <img
-                      src={proof.thumbnail_url || proof.attachment_url}
-                      alt={proof.filename || "付款凭证"}
-                      className="h-full w-full object-contain"
-                    />
-                  ) : (
-                    <div className="flex flex-col items-center gap-2 text-rose-600">
-                      <FileText className="h-8 w-8" />
-                      <span className="text-xs font-semibold">PDF</span>
+              <div key={proof.id} className="group relative min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setPreview(proof)}
+                  className="w-full min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white text-left hover:border-emerald-300 hover:shadow-sm"
+                  title={`预览 ${proof.filename || "付款凭证"}`}
+                >
+                  <div className="flex aspect-[4/3] items-center justify-center overflow-hidden bg-slate-100">
+                    {image ? (
+                      <img
+                        src={proof.thumbnail_url || proof.attachment_url}
+                        alt={proof.filename || "付款凭证"}
+                        className="h-full w-full object-contain"
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center gap-2 text-rose-600">
+                        <FileText className="h-8 w-8" />
+                        <span className="text-xs font-semibold">PDF</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="px-2.5 py-2">
+                    <div className="truncate pr-7 text-xs font-semibold text-slate-700">
+                      {proof.filename || "付款凭证"}
                     </div>
-                  )}
-                </div>
-                <div className="px-2.5 py-2">
-                  <div className="truncate text-xs font-semibold text-slate-700">
-                    {proof.filename || "付款凭证"}
+                    <div className="mt-0.5 truncate text-[11px] text-slate-400">
+                      {[proof.uploaded_by_name, formatFileSize(proof.size)]
+                        .filter(Boolean)
+                        .join(" · ") || "点击预览"}
+                    </div>
                   </div>
-                  <div className="mt-0.5 truncate text-[11px] text-slate-400">
-                    {[proof.uploaded_by_name, formatFileSize(proof.size)]
-                      .filter(Boolean)
-                      .join(" · ") || "点击预览"}
-                  </div>
-                </div>
-              </button>
+                </button>
+                {canDelete && onDelete && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void deleteProof(proof);
+                    }}
+                    disabled={Boolean(deletingID)}
+                    className="absolute bottom-1.5 right-1.5 inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/95 text-rose-600 shadow-sm ring-1 ring-slate-200 hover:bg-rose-50 disabled:opacity-50"
+                    title="删除付款凭证"
+                    aria-label={`删除 ${proof.filename || "付款凭证"}`}
+                  >
+                    {deletingID === proof.id ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                )}
+              </div>
             );
           })}
         </div>
@@ -207,6 +240,21 @@ export function PaymentProofPanel({
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1">
+                {canDelete && onDelete && (
+                  <button
+                    type="button"
+                    onClick={() => void deleteProof(preview)}
+                    disabled={Boolean(deletingID)}
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                    title="删除付款凭证"
+                  >
+                    {deletingID === preview.id ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-4 w-4" />
+                    )}
+                  </button>
+                )}
                 <a
                   href={preview.attachment_url}
                   target="_blank"

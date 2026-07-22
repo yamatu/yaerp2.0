@@ -42,6 +42,25 @@ func TestCanViewTradeOrderAllowsConfiguredPositionsToFollowProgress(t *testing.T
 	}
 }
 
+func TestTradeCustomerAccessScopeRequiresCustomerResponsibility(t *testing.T) {
+	codes := map[string]bool{"packing": true}
+	canView, canViewContact, canViewPricing := tradeCustomerAccessScope(false, false, true, codes)
+	if canView || canViewContact || canViewPricing {
+		t.Fatal("an unrelated task position must not receive customer data")
+	}
+
+	codes = map[string]bool{"quotation": true}
+	canView, canViewContact, canViewPricing = tradeCustomerAccessScope(false, false, true, codes)
+	if !canView || !canViewContact || !canViewPricing {
+		t.Fatal("the active customer quotation task should receive the customer data it needs")
+	}
+
+	canView, canViewContact, canViewPricing = tradeCustomerAccessScope(false, true, false, map[string]bool{})
+	if !canView || !canViewContact || !canViewPricing {
+		t.Fatal("an order owner must retain access to their own customer")
+	}
+}
+
 func TestRedactTradeTimelineDetailsKeepsOnlyCurrentTaskHandoff(t *testing.T) {
 	actorID := int64(5)
 	events := []model.TradeOrderStageEvent{

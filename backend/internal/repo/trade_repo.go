@@ -1843,7 +1843,7 @@ func (r *TradeRepo) CreatePaymentProof(proof *model.TradePaymentProof) error {
 		 SELECT $1,q.id,$3,$4,$5,$6,NOW()
 		 FROM trade_customer_quote_rounds q WHERE q.id=$2 AND q.order_id=$1
 		 ON CONFLICT(quote_id,attachment_id) DO UPDATE SET gallery_directory_id=EXCLUDED.gallery_directory_id,
-		 note=EXCLUDED.note RETURNING id,created_at`,
+		 note=EXCLUDED.note,deleted_at=NULL,deleted_by=NULL RETURNING id,created_at`,
 		proof.OrderID, proof.QuoteID, proof.AttachmentID, proof.GalleryDirectoryID, proof.Note, proof.UploadedBy,
 	).Scan(&proof.ID, &proof.CreatedAt)
 }
@@ -1855,7 +1855,7 @@ func (r *TradeRepo) ListPaymentProofs(orderID int64) ([]model.TradePaymentProof,
 		 FROM trade_customer_payment_proofs p
 		 JOIN attachments a ON a.id=p.attachment_id
 		 LEFT JOIN users u ON u.id=p.uploaded_by
-		 WHERE p.order_id=$1 ORDER BY p.created_at DESC,p.id DESC`, orderID,
+		 WHERE p.order_id=$1 AND p.deleted_at IS NULL ORDER BY p.created_at DESC,p.id DESC`, orderID,
 	)
 	if err != nil {
 		return nil, err
@@ -1882,7 +1882,7 @@ func (r *TradeRepo) ListPaymentProofs(orderID int64) ([]model.TradePaymentProof,
 
 func (r *TradeRepo) ListPaymentProofReferencesByAttachment(attachmentID int64) ([]model.TradePaymentProof, error) {
 	rows, err := r.db.Query(
-		`SELECT order_id,uploaded_by
+		`SELECT order_id,uploaded_by,deleted_at
 		 FROM trade_customer_payment_proofs
 		 WHERE attachment_id=$1`, attachmentID,
 	)
@@ -1893,12 +1893,28 @@ func (r *TradeRepo) ListPaymentProofReferencesByAttachment(attachmentID int64) (
 	result := make([]model.TradePaymentProof, 0)
 	for rows.Next() {
 		var proof model.TradePaymentProof
-		if err := rows.Scan(&proof.OrderID, &proof.UploadedBy); err != nil {
+		if err := rows.Scan(&proof.OrderID, &proof.UploadedBy, &proof.DeletedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, proof)
 	}
 	return result, rows.Err()
+}
+
+func (r *TradeRepo) SoftDeletePaymentProof(orderID, proofID, deletedBy int64) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_customer_payment_proofs
+		 SET deleted_at=NOW(),deleted_by=$3
+		 WHERE order_id=$1 AND id=$2 AND deleted_at IS NULL`,
+		orderID, proofID, deletedBy,
+	)
+	if err != nil {
+		return fmt.Errorf("delete customer payment proof: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *TradeRepo) ListPackingGroups(orderID int64) ([]model.TradePackingGroup, error) {

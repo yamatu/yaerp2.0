@@ -138,6 +138,12 @@ func tradeOrderScopeStages(access *tradeUserAccess) []string {
 	return append(stages, model.TradeStageCancelled)
 }
 
+func tradeCustomerAccessScope(full, owner, currentTask bool, codes map[string]bool) (bool, bool, bool) {
+	customerTask := currentTask && (codes["sales"] || codes["quotation"])
+	allowed := full || owner || customerTask
+	return allowed, allowed, allowed
+}
+
 func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder, access *tradeUserAccess) (*model.TradeOrderAccess, error) {
 	if order == nil || access == nil {
 		return nil, fmt.Errorf("业务单访问范围不能为空")
@@ -145,15 +151,16 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	full := access.profile.CanViewAllOrders
 	owner := order.OwnerID == userID
 	codes := access.positionCodes
-	customerRole := codes["sales"] || codes["quotation"] || codes["packing"] || codes["logistics"]
-	customerContactRole := codes["sales"] || codes["quotation"]
+	canViewCustomer, canViewCustomerContact, canViewCustomerPricing := tradeCustomerAccessScope(
+		full, owner, access.stageAccess[order.Stage], codes,
+	)
 	supplierRole := codes["sourcing"] || codes["quotation"] || codes["purchasing"]
 	result := &model.TradeOrderAccess{
 		VisibleSheetNames:      []string{},
 		EditableSheetNames:     []string{},
-		CanViewCustomer:        full || owner || customerRole,
-		CanViewCustomerContact: full || owner || customerContactRole,
-		CanViewCustomerPricing: full || owner || codes["sales"] || codes["quotation"],
+		CanViewCustomer:        canViewCustomer,
+		CanViewCustomerContact: canViewCustomerContact,
+		CanViewCustomerPricing: canViewCustomerPricing,
 		CanViewSupplier:        full || supplierRole,
 		CanViewSupplierPricing: full || supplierRole,
 		CanViewReceiving:       full || codes["purchasing"] || codes["warehouse"] || codes["quality"],
@@ -163,6 +170,8 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		CanViewProfit:          full,
 		CanViewTimeline:        full || owner || access.profile.CanViewOrderProgress,
 		CanSyncWorkbook:        full,
+		CanViewPI:              full || owner,
+		CanGeneratePI:          full || owner,
 	}
 	result.CanViewPaymentRecords = access.profile.PaymentRecordAccess != model.TradePaymentRecordAccessNone
 	result.CanViewAllPaymentRecords = access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessAll
@@ -272,6 +281,12 @@ func (s *TradeService) AuthorizePaymentAttachment(userID, attachmentID int64) (b
 		return true, false, nil
 	}
 	for _, reference := range references {
+		if reference.DeletedAt != nil {
+			if access.profile.IsAdmin {
+				return true, true, nil
+			}
+			continue
+		}
 		order, orderErr := s.repo.GetOrder(reference.OrderID, userID, true)
 		if errors.Is(orderErr, sql.ErrNoRows) {
 			continue

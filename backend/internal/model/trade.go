@@ -224,20 +224,22 @@ type TradeInspectionPhoto struct {
 }
 
 type TradePaymentProof struct {
-	ID                 int64     `json:"id"`
-	OrderID            int64     `json:"order_id"`
-	QuoteID            int64     `json:"quote_id"`
-	AttachmentID       int64     `json:"attachment_id"`
-	AttachmentURL      string    `json:"attachment_url"`
-	ThumbnailURL       string    `json:"thumbnail_url"`
-	Filename           string    `json:"filename"`
-	MimeType           string    `json:"mime_type"`
-	Size               int64     `json:"size"`
-	Note               string    `json:"note"`
-	UploadedBy         int64     `json:"uploaded_by"`
-	UploadedByName     string    `json:"uploaded_by_name"`
-	GalleryDirectoryID *int64    `json:"gallery_directory_id,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
+	ID                 int64      `json:"id"`
+	OrderID            int64      `json:"order_id"`
+	QuoteID            int64      `json:"quote_id"`
+	AttachmentID       int64      `json:"attachment_id"`
+	AttachmentURL      string     `json:"attachment_url"`
+	ThumbnailURL       string     `json:"thumbnail_url"`
+	Filename           string     `json:"filename"`
+	MimeType           string     `json:"mime_type"`
+	Size               int64      `json:"size"`
+	Note               string     `json:"note"`
+	UploadedBy         int64      `json:"uploaded_by"`
+	UploadedByName     string     `json:"uploaded_by_name"`
+	GalleryDirectoryID *int64     `json:"gallery_directory_id,omitempty"`
+	DeletedAt          *time.Time `json:"deleted_at,omitempty"`
+	DeletedByID        *int64     `json:"deleted_by_id,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
 }
 
 type TradePackingGroupItem struct {
@@ -293,19 +295,21 @@ type TradePaymentRecordPermission struct {
 }
 
 type TradePIProfile struct {
-	CompanyName        string `json:"company_name"`
-	Address            string `json:"address"`
-	ContactName        string `json:"contact_name"`
-	Phone              string `json:"phone"`
-	Email              string `json:"email"`
-	TaxID              string `json:"tax_id"`
-	BankName           string `json:"bank_name"`
-	BankAddress        string `json:"bank_address"`
-	AccountName        string `json:"account_name"`
-	AccountNumber      string `json:"account_number"`
-	SwiftCode          string `json:"swift_code"`
-	BeneficiaryAddress string `json:"beneficiary_address"`
-	DefaultNotes       string `json:"default_notes"`
+	CompanyName                  string `json:"company_name"`
+	Address                      string `json:"address"`
+	ContactName                  string `json:"contact_name"`
+	Phone                        string `json:"phone"`
+	Email                        string `json:"email"`
+	TaxID                        string `json:"tax_id"`
+	BankName                     string `json:"bank_name"`
+	BankAddress                  string `json:"bank_address"`
+	AccountName                  string `json:"account_name"`
+	AccountNumber                string `json:"account_number"`
+	SwiftCode                    string `json:"swift_code"`
+	BeneficiaryAddress           string `json:"beneficiary_address"`
+	BankDetailsImageAttachmentID *int64 `json:"bank_details_image_attachment_id,omitempty"`
+	BankDetailsImageURL          string `json:"bank_details_image_url,omitempty"`
+	DefaultNotes                 string `json:"default_notes"`
 }
 
 type TradeAccessProfile struct {
@@ -345,6 +349,8 @@ type TradeOrderAccess struct {
 	CanViewAllPaymentRecords bool     `json:"can_view_all_payment_records"`
 	CanUploadPaymentProofs   bool     `json:"can_upload_payment_proofs"`
 	CanManagePaymentStatus   bool     `json:"can_manage_payment_status"`
+	CanViewPI                bool     `json:"can_view_pi"`
+	CanGeneratePI            bool     `json:"can_generate_pi"`
 	VisibleSheetNames        []string `json:"visible_sheet_names"`
 	EditableSheetNames       []string `json:"editable_sheet_names"`
 }

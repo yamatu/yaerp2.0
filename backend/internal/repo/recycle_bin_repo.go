@@ -32,6 +32,17 @@ const deletedTradeOrderSelect = `
 	LEFT JOIN users deleter ON deleter.id = o.deleted_by
 	LEFT JOIN workbooks w ON w.id = o.workbook_id`
 
+const deletedTradePaymentProofSelect = `
+	SELECT p.id,p.order_id,o.order_no,o.title,p.quote_id,q.round_no,p.attachment_id,
+	       a.filename,a.mime_type,a.size,p.note,p.uploaded_by,COALESCE(u.username,''),
+	       p.deleted_at,p.deleted_by,COALESCE(deleter.username,''),p.created_at
+	FROM trade_customer_payment_proofs p
+	JOIN trade_orders o ON o.id=p.order_id
+	JOIN trade_customer_quote_rounds q ON q.id=p.quote_id
+	JOIN attachments a ON a.id=p.attachment_id
+	LEFT JOIN users u ON u.id=p.uploaded_by
+	LEFT JOIN users deleter ON deleter.id=p.deleted_by`
+
 func scanDeletedTradeOrder(scanner interface{ Scan(...any) error }) (*model.DeletedTradeOrder, error) {
 	var order model.DeletedTradeOrder
 	if err := scanner.Scan(
@@ -45,6 +56,19 @@ func scanDeletedTradeOrder(scanner interface{ Scan(...any) error }) (*model.Dele
 		return nil, err
 	}
 	return &order, nil
+}
+
+func scanDeletedTradePaymentProof(scanner interface{ Scan(...any) error }) (*model.DeletedTradePaymentProof, error) {
+	var proof model.DeletedTradePaymentProof
+	if err := scanner.Scan(
+		&proof.ID, &proof.OrderID, &proof.OrderNo, &proof.OrderTitle, &proof.QuoteID,
+		&proof.QuoteRoundNo, &proof.AttachmentID, &proof.Filename, &proof.MimeType,
+		&proof.Size, &proof.Note, &proof.UploadedBy, &proof.UploadedByName,
+		&proof.DeletedAt, &proof.DeletedByID, &proof.DeletedByName, &proof.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &proof, nil
 }
 
 func (r *RecycleBinRepo) List(userID int64, includeAll bool) ([]model.Folder, []model.Workbook, []model.DeletedTradeOrder, error) {
@@ -224,6 +248,41 @@ func (r *RecycleBinRepo) GetDeletedTradeOrder(id int64) (*model.DeletedTradeOrde
 	return order, nil
 }
 
+func (r *RecycleBinRepo) ListDeletedTradePaymentProofs() ([]model.DeletedTradePaymentProof, error) {
+	rows, err := r.db.Query(deletedTradePaymentProofSelect + `
+		WHERE p.deleted_at IS NOT NULL
+		ORDER BY p.deleted_at DESC,p.id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list deleted trade payment proofs: %w", err)
+	}
+	defer rows.Close()
+	proofs := make([]model.DeletedTradePaymentProof, 0)
+	for rows.Next() {
+		proof, err := scanDeletedTradePaymentProof(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan deleted trade payment proof: %w", err)
+		}
+		proofs = append(proofs, *proof)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate deleted trade payment proofs: %w", err)
+	}
+	return proofs, nil
+}
+
+func (r *RecycleBinRepo) GetDeletedTradePaymentProof(id int64) (*model.DeletedTradePaymentProof, error) {
+	proof, err := scanDeletedTradePaymentProof(r.db.QueryRow(
+		deletedTradePaymentProofSelect+` WHERE p.id=$1 AND p.deleted_at IS NOT NULL`, id,
+	))
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("deleted trade payment proof %d not found", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get deleted trade payment proof: %w", err)
+	}
+	return proof, nil
+}
+
 func (r *RecycleBinRepo) RestoreWorkbook(id int64) error {
 	result, err := r.db.Exec(
 		`UPDATE workbooks workbook
@@ -389,6 +448,21 @@ func (r *RecycleBinRepo) RestoreTradeOrder(id, restoredBy int64) error {
 	return nil
 }
 
+func (r *RecycleBinRepo) RestoreTradePaymentProof(id int64) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_customer_payment_proofs
+		 SET deleted_at=NULL,deleted_by=NULL
+		 WHERE id=$1 AND deleted_at IS NOT NULL`, id,
+	)
+	if err != nil {
+		return fmt.Errorf("restore trade payment proof: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return fmt.Errorf("deleted trade payment proof %d not found", id)
+	}
+	return nil
+}
+
 func (r *RecycleBinRepo) DeleteWorkbookPermanently(id int64) error {
 	result, err := r.db.Exec(`DELETE FROM workbooks WHERE id = $1 AND deleted_at IS NOT NULL`, id)
 	if err != nil {
@@ -440,6 +514,39 @@ func (r *RecycleBinRepo) DeleteTradeOrderPermanently(id int64) error {
 		return fmt.Errorf("commit permanent trade order deletion: %w", err)
 	}
 	return nil
+}
+
+func (r *RecycleBinRepo) DeleteTradePaymentProofPermanently(id int64) error {
+	result, err := r.db.Exec(
+		`DELETE FROM trade_customer_payment_proofs WHERE id=$1 AND deleted_at IS NOT NULL`, id,
+	)
+	if err != nil {
+		return fmt.Errorf("permanently delete trade payment proof: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return fmt.Errorf("deleted trade payment proof %d not found", id)
+	}
+	return nil
+}
+
+func (r *RecycleBinRepo) ListExpiredTradePaymentProofAttachmentIDs(cutoff time.Time) ([]int64, error) {
+	rows, err := r.db.Query(
+		`SELECT attachment_id FROM trade_customer_payment_proofs
+		 WHERE deleted_at IS NOT NULL AND deleted_at < $1`, cutoff,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list expired trade payment proof attachments: %w", err)
+	}
+	defer rows.Close()
+	attachmentIDs := make([]int64, 0)
+	for rows.Next() {
+		var attachmentID int64
+		if err := rows.Scan(&attachmentID); err != nil {
+			return nil, err
+		}
+		attachmentIDs = append(attachmentIDs, attachmentID)
+	}
+	return attachmentIDs, rows.Err()
 }
 
 func (r *RecycleBinRepo) DeleteFolderPermanently(folder *model.Folder) error {
@@ -498,6 +605,10 @@ func (r *RecycleBinRepo) PurgeDeletedBefore(cutoff time.Time) (int64, error) {
 	}
 	defer tx.Rollback()
 
+	paymentProofResult, err := tx.Exec(`DELETE FROM trade_customer_payment_proofs WHERE deleted_at IS NOT NULL AND deleted_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("purge deleted trade payment proofs: %w", err)
+	}
 	tradeOrderResult, err := tx.Exec(`DELETE FROM trade_orders WHERE deleted_at IS NOT NULL AND deleted_at < $1`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("purge deleted trade orders: %w", err)
@@ -511,11 +622,12 @@ func (r *RecycleBinRepo) PurgeDeletedBefore(cutoff time.Time) (int64, error) {
 		return 0, fmt.Errorf("purge deleted folders: %w", err)
 	}
 
+	paymentProofCount, _ := paymentProofResult.RowsAffected()
 	tradeOrderCount, _ := tradeOrderResult.RowsAffected()
 	workbookCount, _ := workbookResult.RowsAffected()
 	folderCount, _ := folderResult.RowsAffected()
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit recycle bin cleanup: %w", err)
 	}
-	return tradeOrderCount + workbookCount + folderCount, nil
+	return paymentProofCount + tradeOrderCount + workbookCount + folderCount, nil
 }
