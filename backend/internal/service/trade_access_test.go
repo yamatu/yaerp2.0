@@ -62,6 +62,76 @@ func TestRedactTradeTimelineDetailsKeepsOnlyCurrentTaskHandoff(t *testing.T) {
 	}
 }
 
+func TestRedactTradePaymentRecordsUsesUploaderScope(t *testing.T) {
+	quotes := []model.TradeCustomerQuoteRound{{
+		ID: 1, Status: "accepted", PaymentStatus: "paid", PaymentCurrency: "USD", PaidAmount: 100,
+		PaymentProofs: []model.TradePaymentProof{
+			{ID: 11, UploadedBy: 7, UploadedByName: "current"},
+			{ID: 12, UploadedBy: 9, UploadedByName: "other"},
+		},
+	}}
+	redactTradePaymentRecords(7, quotes, &model.TradeOrderAccess{CanViewPaymentRecords: true})
+	if len(quotes[0].PaymentProofs) != 1 || quotes[0].PaymentProofs[0].UploadedBy != 7 {
+		t.Fatalf("own scope must only retain the current user's proof: %#v", quotes[0].PaymentProofs)
+	}
+	if quotes[0].PaymentStatus != "" || quotes[0].PaidAmount != 0 {
+		t.Fatal("own scope must hide aggregate payment status and amount")
+	}
+
+	redactTradePaymentRecords(7, quotes, &model.TradeOrderAccess{})
+	if quotes[0].PaymentStatus != "" || quotes[0].PaidAmount != 0 || quotes[0].PaymentProofs != nil {
+		t.Fatalf("users without payment access must not receive payment data: %#v", quotes[0])
+	}
+}
+
+func TestRedactTradePaymentRecordsKeepsAllScope(t *testing.T) {
+	quotes := []model.TradeCustomerQuoteRound{{
+		PaymentStatus: "partial", PaymentCurrency: "USD", PaidAmount: 75,
+		PaymentProofs: []model.TradePaymentProof{{ID: 11, UploadedBy: 7}, {ID: 12, UploadedBy: 9}},
+	}}
+	redactTradePaymentRecords(7, quotes, &model.TradeOrderAccess{
+		CanViewPaymentRecords: true, CanViewAllPaymentRecords: true,
+	})
+	if quotes[0].PaymentStatus != "partial" || quotes[0].PaidAmount != 75 || len(quotes[0].PaymentProofs) != 2 {
+		t.Fatalf("all scope should retain the complete payment record: %#v", quotes[0])
+	}
+}
+
+func TestTradePaymentReviewQuotesHidesQuotePricing(t *testing.T) {
+	quotes := []model.TradeCustomerQuoteRound{
+		{ID: 1, Status: "draft", GoodsAmount: 90},
+		{
+			ID: 2, OrderID: 3, RoundNo: 2, Currency: "USD", Status: "accepted",
+			GoodsAmount: 100, TotalAmount: 120, CustomerFeedback: "private negotiation",
+			PaymentStatus: "partial", PaymentCurrency: "USD", PaidAmount: 60,
+			PaymentProofs: []model.TradePaymentProof{{ID: 5, UploadedBy: 7}},
+		},
+	}
+	review := tradePaymentReviewQuotes(quotes)
+	if len(review) != 1 || review[0].ID != 2 {
+		t.Fatalf("payment review should only expose the accepted quote: %#v", review)
+	}
+	if review[0].GoodsAmount != 0 || review[0].TotalAmount != 0 || review[0].CustomerFeedback != "" || len(review[0].Items) != 0 {
+		t.Fatalf("payment review must not expose quote pricing or negotiation details: %#v", review[0])
+	}
+	if review[0].PaymentStatus != "partial" || review[0].PaidAmount != 60 || len(review[0].PaymentProofs) != 1 {
+		t.Fatalf("payment reconciliation fields should remain available: %#v", review[0])
+	}
+}
+
+func TestNormalizeTradePaymentRecordAccess(t *testing.T) {
+	for input, expected := range map[string]string{
+		model.TradePaymentRecordAccessNone: model.TradePaymentRecordAccessNone,
+		model.TradePaymentRecordAccessOwn:  model.TradePaymentRecordAccessOwn,
+		model.TradePaymentRecordAccessAll:  model.TradePaymentRecordAccessAll,
+		"unexpected":                       model.TradePaymentRecordAccessNone,
+	} {
+		if actual := normalizeTradePaymentRecordAccess(input); actual != expected {
+			t.Fatalf("normalize %q: expected %q, got %q", input, expected, actual)
+		}
+	}
+}
+
 func TestTradeOverviewColumnScopeMasksSensitiveFields(t *testing.T) {
 	matrix := emptyPermissionMatrix()
 	matrix.Sheet.CanView = true

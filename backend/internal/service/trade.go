@@ -1977,12 +1977,19 @@ func (s *TradeService) UpdateCustomerQuotePayment(userID, orderID, quoteID int64
 	if err != nil {
 		return nil, fmt.Errorf("业务单不存在或无权访问")
 	}
-	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
+	access, err := s.loadTradeUserAccess(userID)
 	if err != nil {
 		return nil, err
 	}
-	if !allowed {
-		return nil, fmt.Errorf("没有登记客户付款的权限")
+	if !s.canViewTradeOrder(userID, order, access) {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	orderAccess, err := s.orderAccessForUser(userID, order, access)
+	if err != nil {
+		return nil, err
+	}
+	if !orderAccess.CanManagePaymentStatus {
+		return nil, fmt.Errorf("没有核对全部付款记录或登记付款金额的权限")
 	}
 	if request == nil {
 		return nil, fmt.Errorf("付款信息不能为空")
@@ -2030,11 +2037,18 @@ func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64
 	if err != nil {
 		return nil, fmt.Errorf("业务单不存在或无权访问")
 	}
-	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
+	access, err := s.loadTradeUserAccess(userID)
 	if err != nil {
 		return nil, err
 	}
-	if !allowed {
+	if !s.canViewTradeOrder(userID, order, access) {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	orderAccess, err := s.orderAccessForUser(userID, order, access)
+	if err != nil {
+		return nil, err
+	}
+	if !orderAccess.CanUploadPaymentProofs {
 		return nil, fmt.Errorf("没有上传客户付款凭证的权限")
 	}
 	quotes, err := s.repo.ListCustomerQuoteRounds(orderID)
@@ -2062,50 +2076,24 @@ func (s *TradeService) UploadCustomerPaymentProof(userID, orderID, quoteID int64
 		_ = s.uploadSvc.DeleteFile(attachment.ID)
 		return nil, fmt.Errorf("付款凭证仅支持图片或 PDF")
 	}
-	effectiveAttachmentID := attachment.ID
-	var directoryID *int64
-	if isImage {
-		directoryID = order.PaymentGalleryDirectoryID
-		if directoryID == nil {
-			visibility := "private"
-			directory, createErr := s.uploadSvc.CreateGalleryDirectory(userID, "付款凭证 - "+order.OrderNo, nil, &visibility)
-			if createErr != nil {
-				_ = s.uploadSvc.DeleteFile(attachment.ID)
-				return nil, createErr
-			}
-			directoryID = &directory.ID
-			if err := s.repo.SetPaymentGalleryDirectory(orderID, directory.ID); err != nil {
-				_ = s.uploadSvc.DeleteFile(attachment.ID)
-				return nil, err
-			}
-		}
-		var duplicate bool
-		effectiveAttachmentID, duplicate, err = s.uploadSvc.SaveImageToGalleryDeduplicated(attachment.ID, directoryID, nil, userID)
-		if err != nil {
-			_ = s.uploadSvc.DeleteFile(attachment.ID)
-			return nil, err
-		}
-		if duplicate && effectiveAttachmentID != attachment.ID {
-			_ = s.uploadSvc.DeleteFile(attachment.ID)
-		}
-	}
 	proof := &model.TradePaymentProof{
-		OrderID: orderID, QuoteID: quoteID, AttachmentID: effectiveAttachmentID,
-		GalleryDirectoryID: directoryID, Note: strings.TrimSpace(note), UploadedBy: userID,
+		OrderID: orderID, QuoteID: quoteID, AttachmentID: attachment.ID,
+		Note: strings.TrimSpace(note), UploadedBy: userID,
 	}
 	if err := s.repo.CreatePaymentProof(proof); err != nil {
+		_ = s.uploadSvc.DeleteFile(attachment.ID)
 		return nil, err
 	}
 	if user, userErr := s.userRepo.GetByID(userID); userErr == nil && user != nil {
 		proof.UploadedByName = user.Username
 	}
-	if canonical, canonicalErr := s.uploadSvc.GetAttachment(effectiveAttachmentID); canonicalErr == nil {
+	if canonical, canonicalErr := s.uploadSvc.GetAttachment(attachment.ID); canonicalErr == nil {
 		proof.Filename = canonical.Filename
 		proof.MimeType = canonical.MimeType
 		proof.Size = canonical.Size
 	}
-	proof.AttachmentURL, _ = s.uploadSvc.GetFileURL(effectiveAttachmentID)
-	proof.ThumbnailURL = s.uploadSvc.GetThumbnailURL(effectiveAttachmentID, 480)
+	proof.AttachmentURL, _ = s.uploadSvc.GetFileURL(attachment.ID)
+	proof.ThumbnailURL = s.uploadSvc.GetThumbnailURL(attachment.ID, 480)
 	s.notifyOrderUpdated(orderID)
 	return proof, nil
 }
@@ -2152,7 +2140,18 @@ func (s *TradeService) UpdatePositionAssignments(userID int64, request *model.Tr
 }
 
 func (s *TradeService) GetSettings(userID int64) (*model.TradeSettings, error) {
-	return s.repo.GetSettings()
+	settings, err := s.repo.GetSettings()
+	if err != nil {
+		return nil, err
+	}
+	admin, err := s.isAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !admin {
+		settings.PaymentRecordPermissions = []model.TradePaymentRecordPermission{}
+	}
+	return settings, nil
 }
 
 func (s *TradeService) UpdateSettings(userID int64, request *model.UpdateTradeSettingsRequest) (*model.TradeSettings, error) {
@@ -2178,17 +2177,50 @@ func (s *TradeService) UpdateSettings(userID int64, request *model.UpdateTradeSe
 	if request.PIProfile != nil {
 		profile = normalizeTradePIProfile(*request.PIProfile)
 	}
+	paymentRecordPermissions := current.PaymentRecordPermissions
+	if request.PaymentRecordPermissions != nil {
+		paymentRecordPermissions, err = s.normalizeTradePaymentRecordPermissions(request.PaymentRecordPermissions)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if strings.TrimSpace(profile.CompanyName) == "" {
 		return nil, fmt.Errorf("PI 公司名称不能为空")
 	}
 	if strings.TrimSpace(profile.AccountName) == "" {
 		profile.AccountName = profile.CompanyName
 	}
-	settings := &model.TradeSettings{PaymentMethods: methods, PIProfile: profile}
+	settings := &model.TradeSettings{
+		PaymentMethods: methods, PaymentRecordPermissions: paymentRecordPermissions, PIProfile: profile,
+	}
 	if err := s.repo.UpdateSettings(userID, settings); err != nil {
 		return nil, err
 	}
 	return settings, nil
+}
+
+func (s *TradeService) normalizeTradePaymentRecordPermissions(input []model.TradePaymentRecordPermission) ([]model.TradePaymentRecordPermission, error) {
+	byUser := make(map[int64]string, len(input))
+	for _, permission := range input {
+		if permission.UserID <= 0 {
+			return nil, fmt.Errorf("付款记录权限包含无效员工")
+		}
+		user, err := s.userRepo.GetByID(permission.UserID)
+		if err != nil || user == nil || user.Status != 1 {
+			return nil, fmt.Errorf("付款记录权限员工 #%d 不存在或已停用", permission.UserID)
+		}
+		byUser[permission.UserID] = normalizeTradePaymentRecordAccess(permission.Access)
+	}
+	userIDs := make([]int64, 0, len(byUser))
+	for userID := range byUser {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Slice(userIDs, func(left, right int) bool { return userIDs[left] < userIDs[right] })
+	result := make([]model.TradePaymentRecordPermission, 0, len(userIDs))
+	for _, userID := range userIDs {
+		result = append(result, model.TradePaymentRecordPermission{UserID: userID, Access: byUser[userID]})
+	}
+	return result, nil
 }
 
 func normalizeTradePIProfile(profile model.TradePIProfile) model.TradePIProfile {

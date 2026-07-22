@@ -84,6 +84,7 @@ import type {
   TradeOrder,
   TradeOrderItem,
   TradePaymentProof,
+  TradePaymentRecordAccess,
   TradePIProfile,
   TradePosition,
   TradeSettings,
@@ -244,7 +245,7 @@ interface TradePIDraft {
 }
 
 type TradeView = "orders" | "customers" | "suppliers" | "boss";
-type SettingsTab = "positions" | "payments" | "pi";
+type SettingsTab = "positions" | "payment_permissions" | "payments" | "pi";
 
 const TRADE_STATE_KEY = "yaerp:trade:workspace-state:v3";
 
@@ -265,6 +266,29 @@ function defaultTradePIProfile(): TradePIProfile {
     default_notes:
       "All banking charges outside the beneficiary bank are for the buyer's account.",
   };
+}
+
+function defaultPaymentRecordAccess(
+  userID: number,
+  positions: TradePosition[],
+): TradePaymentRecordAccess {
+  if (
+    positions.some(
+      (position) =>
+        position.code === "manager" &&
+        position.members.some((member) => member.user_id === userID),
+    )
+  ) {
+    return "all";
+  }
+  const eligibleCodes = new Set(["sales", "quotation", "purchasing"]);
+  return positions.some(
+    (position) =>
+      eligibleCodes.has(position.code) &&
+      position.members.some((member) => member.user_id === userID),
+  )
+    ? "own"
+    : "none";
 }
 
 function formatTradeInputDate(date: Date) {
@@ -825,6 +849,7 @@ export default function TradeWorkspacePage() {
   const [positions, setPositions] = useState<TradePosition[]>([]);
   const [settings, setSettings] = useState<TradeSettings>({
     payment_methods: ["T/T 电汇"],
+    payment_record_permissions: [],
     pi_profile: defaultTradePIProfile(),
   });
   const [users, setUsers] = useState<User[]>([]);
@@ -936,6 +961,9 @@ export default function TradeWorkspacePage() {
     Record<string, number[]>
   >({});
   const [positionUserSearch, setPositionUserSearch] = useState("");
+  const [paymentPermissionSearch, setPaymentPermissionSearch] = useState("");
+  const [paymentRecordPermissionsDraft, setPaymentRecordPermissionsDraft] =
+    useState<Record<number, TradePaymentRecordAccess>>({});
   const [paymentMethodsText, setPaymentMethodsText] = useState("");
   const [piProfileDraft, setPIProfileDraft] = useState<TradePIProfile>(
     defaultTradePIProfile,
@@ -1062,16 +1090,26 @@ export default function TradeWorkspacePage() {
         }
         const loadedSettings = settingsResponse.data || {
           payment_methods: ["T/T 电汇"],
+          payment_record_permissions: [],
           pi_profile: defaultTradePIProfile(),
         };
         if (!loadedSettings.pi_profile) {
           loadedSettings.pi_profile = defaultTradePIProfile();
         }
+        loadedSettings.payment_record_permissions =
+          loadedSettings.payment_record_permissions || [];
         setSettings(loadedSettings);
         setPaymentMethodsText(
           (loadedSettings.payment_methods || []).join("\n"),
         );
         setPIProfileDraft(loadedSettings.pi_profile);
+        const configuredPaymentPermissions = Object.fromEntries(
+          loadedSettings.payment_record_permissions.map((permission) => [
+            permission.user_id,
+            permission.access,
+          ]),
+        ) as Record<number, TradePaymentRecordAccess>;
+        setPaymentRecordPermissionsDraft(configuredPaymentPermissions);
         setPositionsDraft(
           Object.fromEntries(
             (positionResponse.data || []).map((position) => [
@@ -1082,7 +1120,22 @@ export default function TradeWorkspacePage() {
         );
         if (adminMode) {
           const userResponse = await api.get<User[]>("/users/shareable");
-          if (userResponse.code === 0) setUsers(userResponse.data || []);
+          if (userResponse.code === 0) {
+            const availableUsers = userResponse.data || [];
+            setUsers(availableUsers);
+            setPaymentRecordPermissionsDraft((current) => {
+              const next: Record<number, TradePaymentRecordAccess> = {};
+              availableUsers.forEach((user) => {
+                next[user.id] =
+                  current[user.id] ??
+                  defaultPaymentRecordAccess(
+                    user.id,
+                    positionResponse.data || [],
+                  );
+              });
+              return next;
+            });
+          }
         }
       } catch (loadError) {
         setError(
@@ -1378,6 +1431,15 @@ export default function TradeWorkspacePage() {
       ),
     );
   }, [positionUserSearch, users]);
+  const filteredPaymentPermissionUsers = useMemo(() => {
+    const keyword = paymentPermissionSearch.trim().toLowerCase();
+    if (!keyword) return users;
+    return users.filter((user) =>
+      [user.username, user.email].some((value) =>
+        value?.toLowerCase().includes(keyword),
+      ),
+    );
+  }, [paymentPermissionSearch, users]);
   const inspectorOptions = useMemo(() => {
     const options = new Map<string, string>();
     users.forEach((user) => options.set(user.username, user.email || ""));
@@ -2780,17 +2842,32 @@ export default function TradeWorkspacePage() {
         .filter(Boolean);
       const response = await api.put<TradeSettings>("/trade/settings", {
         payment_methods: paymentMethods,
+        payment_record_permissions: Object.entries(
+          paymentRecordPermissionsDraft,
+        ).map(([userID, access]) => ({
+          user_id: Number(userID),
+          access,
+        })),
         pi_profile: piProfileDraft,
       });
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "保存外贸设置失败");
       setSettings(response.data);
       setPaymentMethodsText(response.data.payment_methods.join("\n"));
+      setPaymentRecordPermissionsDraft(
+        Object.fromEntries(
+          (response.data.payment_record_permissions || []).map(
+            (permission) => [permission.user_id, permission.access],
+          ),
+        ) as Record<number, TradePaymentRecordAccess>,
+      );
       setPIProfileDraft(response.data.pi_profile);
       setNotice(
         settingsTab === "pi"
           ? "PI 公司抬头与收款资料已保存。"
-          : "常用付款方式已保存。",
+          : settingsTab === "payment_permissions"
+            ? "员工付款记录权限已保存。"
+            : "常用付款方式已保存。",
       );
     } catch (saveError) {
       setError(
@@ -6194,25 +6271,32 @@ export default function TradeWorkspacePage() {
                   <X className="h-4 w-4" />
                 </button>
               </div>
-              <div className="flex border-b border-slate-200 px-4">
+              <div className="flex overflow-x-auto border-b border-slate-200 px-4">
                 <button
                   type="button"
                   onClick={() => setSettingsTab("positions")}
-                  className={`border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "positions" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+                  className={`whitespace-nowrap border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "positions" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
                 >
                   职位与交接
                 </button>
                 <button
                   type="button"
+                  onClick={() => setSettingsTab("payment_permissions")}
+                  className={`whitespace-nowrap border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "payment_permissions" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+                >
+                  付款记录权限
+                </button>
+                <button
+                  type="button"
                   onClick={() => setSettingsTab("payments")}
-                  className={`border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "payments" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+                  className={`whitespace-nowrap border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "payments" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
                 >
                   付款方式
                 </button>
                 <button
                   type="button"
                   onClick={() => setSettingsTab("pi")}
-                  className={`border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "pi" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+                  className={`whitespace-nowrap border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "pi" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
                 >
                   PI 抬头与收款
                 </button>
@@ -6315,6 +6399,82 @@ export default function TradeWorkspacePage() {
                       })}
                     </div>
                   </>
+                ) : settingsTab === "payment_permissions" ? (
+                  <div className="space-y-3">
+                    <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5 text-xs leading-5 text-sky-800">
+                      <strong>权限规则：</strong>“仅本人记录”只能查看并上传自己名下的付款凭证；“全部记录”可查看所有员工凭证并登记付款金额；“禁止访问”不显示付款核对区域。
+                    </div>
+                    <label className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500">
+                      <Search className="h-4 w-4" />
+                      <input
+                        value={paymentPermissionSearch}
+                        onChange={(event) =>
+                          setPaymentPermissionSearch(event.target.value)
+                        }
+                        placeholder="搜索员工姓名或邮箱"
+                        className="min-w-0 flex-1 outline-none"
+                      />
+                    </label>
+                    <div className="overflow-hidden rounded-lg border border-slate-200">
+                      <div className="hidden grid-cols-[minmax(0,1fr)_260px] gap-3 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500 sm:grid">
+                        <span>员工</span>
+                        <span>付款记录权限</span>
+                      </div>
+                      {filteredPaymentPermissionUsers.length === 0 ? (
+                        <div className="px-4 py-10 text-center text-sm text-slate-400">
+                          没有匹配的员工
+                        </div>
+                      ) : (
+                        filteredPaymentPermissionUsers.map((user) => {
+                          const roleNames = positions
+                            .filter((position) =>
+                              position.members.some(
+                                (member) => member.user_id === user.id,
+                              ),
+                            )
+                            .map((position) => position.name);
+                          const access =
+                            paymentRecordPermissionsDraft[user.id] ||
+                            defaultPaymentRecordAccess(user.id, positions);
+                          return (
+                            <div
+                              key={user.id}
+                              className="grid gap-2 border-t border-slate-100 px-3 py-3 first:border-t-0 sm:grid-cols-[minmax(0,1fr)_260px] sm:items-center sm:gap-3"
+                            >
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-semibold text-slate-800">
+                                  {user.username}
+                                </div>
+                                <div className="mt-0.5 truncate text-xs text-slate-400">
+                                  {[user.email, roleNames.join("、")]
+                                    .filter(Boolean)
+                                    .join(" · ") || `员工 #${user.id}`}
+                                </div>
+                              </div>
+                              <select
+                                value={access}
+                                onChange={(event) =>
+                                  setPaymentRecordPermissionsDraft(
+                                    (current) => ({
+                                      ...current,
+                                      [user.id]: event.target
+                                        .value as TradePaymentRecordAccess,
+                                    }),
+                                  )
+                                }
+                                className="h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                                aria-label={`${user.username} 的付款记录权限`}
+                              >
+                                <option value="none">禁止访问</option>
+                                <option value="own">仅本人记录（可上传）</option>
+                                <option value="all">全部记录（可核对金额）</option>
+                              </select>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
                 ) : settingsTab === "payments" ? (
                   <div>
                     <label className="block text-sm font-medium">
@@ -7315,27 +7475,39 @@ export default function TradeWorkspacePage() {
                                         )}
                                       </div>
                                     )}
-                                    {quote.status === "accepted" && (
+                                    {quote.status === "accepted" &&
+                                      detailOrder.access
+                                        ?.can_view_payment_records && (
                                       <div className="mt-3 rounded-lg border border-emerald-100 bg-white p-3">
                                         <div className="flex flex-wrap items-center justify-between gap-2">
                                           <div>
                                             <div className="text-xs font-semibold text-slate-700">
                                               客户付款
                                             </div>
-                                            <div className="mt-1 text-xs text-slate-500">
-                                              状态：
-                                              <span className="ml-1 font-semibold text-emerald-700">
-                                                {quote.payment_status === "paid"
-                                                  ? "已付款"
-                                                  : quote.payment_status === "partial"
-                                                    ? "部分付款"
-                                                    : "未付款"}
-                                              </span>
-                                              {quote.paid_amount > 0 &&
-                                                ` · ${quote.payment_currency || quote.currency} ${quote.paid_amount}`}
-                                            </div>
+                                            {detailOrder.access
+                                              ?.can_view_all_payment_records ? (
+                                              <div className="mt-1 text-xs text-slate-500">
+                                                状态：
+                                                <span className="ml-1 font-semibold text-emerald-700">
+                                                  {quote.payment_status ===
+                                                  "paid"
+                                                    ? "已付款"
+                                                    : quote.payment_status ===
+                                                        "partial"
+                                                      ? "部分付款"
+                                                      : "未付款"}
+                                                </span>
+                                                {quote.paid_amount > 0 &&
+                                                  ` · ${quote.payment_currency || quote.currency} ${quote.paid_amount}`}
+                                              </div>
+                                            ) : (
+                                              <div className="mt-1 text-xs text-slate-500">
+                                                仅显示本人上传记录
+                                              </div>
+                                            )}
                                           </div>
-                                          {detailOrder.can_operate_stage && (
+                                          {detailOrder.access
+                                            ?.can_manage_payment_status && (
                                             <button
                                               type="button"
                                               onClick={() => openPaymentEditor(quote)}
@@ -7345,9 +7517,18 @@ export default function TradeWorkspacePage() {
                                             </button>
                                           )}
                                         </div>
+                                        {!detailOrder.access
+                                          ?.can_view_all_payment_records && (
+                                          <p className="mt-2 text-[11px] text-slate-400">
+                                            当前仅显示由你上传的付款凭证。
+                                          </p>
+                                        )}
                                         <PaymentProofPanel
                                           proofs={quote.payment_proofs || []}
-                                          canUpload={detailOrder.can_operate_stage}
+                                          canUpload={Boolean(
+                                            detailOrder.access
+                                              ?.can_upload_payment_proofs,
+                                          )}
                                           uploading={uploadingPaymentProof}
                                           onUpload={(files) =>
                                             uploadCustomerPaymentProofs(
@@ -7366,7 +7547,7 @@ export default function TradeWorkspacePage() {
                         </section>
                       )}
                       {detailViewStage === "purchase" &&
-                        detailOrder.access?.can_view_customer_pricing &&
+                        detailOrder.access?.can_view_payment_records &&
                         (() => {
                           const acceptedQuote = (
                             detailOrder.customer_quotes || []
@@ -7380,27 +7561,41 @@ export default function TradeWorkspacePage() {
                                     采购前客户付款核对
                                   </h3>
                                   <p className="mt-1 text-xs text-slate-500">
-                                    第 {acceptedQuote.round_no} 轮报价 · 应收
-                                    {" "}
-                                    {formatFinancialMoney(
-                                      acceptedQuote.currency,
-                                      acceptedQuote.total_amount,
+                                    第 {acceptedQuote.round_no} 轮报价
+                                    {detailOrder.access
+                                      ?.can_view_customer_pricing && (
+                                      <>
+                                        {" · 应收 "}
+                                        {formatFinancialMoney(
+                                          acceptedQuote.currency,
+                                          acceptedQuote.total_amount,
+                                        )}
+                                      </>
                                     )}
                                   </p>
                                 </div>
-                                <span
-                                  className={`rounded-md px-2 py-1 text-xs font-semibold ${acceptedQuote.payment_status === "paid" ? "bg-emerald-100 text-emerald-700" : acceptedQuote.payment_status === "partial" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}
-                                >
-                                  {acceptedQuote.payment_status === "paid"
-                                    ? "已付款"
-                                    : acceptedQuote.payment_status === "partial"
-                                      ? "部分付款"
-                                      : "未付款"}
-                                  {acceptedQuote.paid_amount > 0 &&
-                                    ` · ${acceptedQuote.payment_currency || acceptedQuote.currency} ${acceptedQuote.paid_amount}`}
-                                </span>
+                                {detailOrder.access
+                                  ?.can_view_all_payment_records ? (
+                                  <span
+                                    className={`rounded-md px-2 py-1 text-xs font-semibold ${acceptedQuote.payment_status === "paid" ? "bg-emerald-100 text-emerald-700" : acceptedQuote.payment_status === "partial" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}
+                                  >
+                                    {acceptedQuote.payment_status === "paid"
+                                      ? "已付款"
+                                      : acceptedQuote.payment_status ===
+                                          "partial"
+                                        ? "部分付款"
+                                        : "未付款"}
+                                    {acceptedQuote.paid_amount > 0 &&
+                                      ` · ${acceptedQuote.payment_currency || acceptedQuote.currency} ${acceptedQuote.paid_amount}`}
+                                  </span>
+                                ) : (
+                                  <span className="rounded-md bg-white px-2 py-1 text-xs font-semibold text-slate-600">
+                                    本人凭证
+                                  </span>
+                                )}
                               </div>
-                              {detailOrder.can_operate_stage && (
+                              {detailOrder.access
+                                ?.can_manage_payment_status && (
                                 <button
                                   type="button"
                                   onClick={() => openPaymentEditor(acceptedQuote)}
@@ -7409,9 +7604,18 @@ export default function TradeWorkspacePage() {
                                   登记付款金额
                                 </button>
                               )}
+                              {!detailOrder.access
+                                ?.can_view_all_payment_records && (
+                                <p className="mt-3 text-[11px] text-slate-500">
+                                  为保护员工付款资料，当前仅显示并允许上传你自己的付款凭证。
+                                </p>
+                              )}
                               <PaymentProofPanel
                                 proofs={acceptedQuote.payment_proofs || []}
-                                canUpload={detailOrder.can_operate_stage}
+                                canUpload={Boolean(
+                                  detailOrder.access
+                                    ?.can_upload_payment_proofs,
+                                )}
                                 uploading={uploadingPaymentProof}
                                 onUpload={(files) =>
                                   uploadCustomerPaymentProofs(

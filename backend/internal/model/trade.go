@@ -13,6 +13,10 @@ const (
 	TradeStageShipment      = "shipment"
 	TradeStageCompleted     = "completed"
 	TradeStageCancelled     = "cancelled"
+
+	TradePaymentRecordAccessNone = "none"
+	TradePaymentRecordAccessOwn  = "own"
+	TradePaymentRecordAccessAll  = "all"
 )
 
 type TradeSupplier struct {
@@ -278,8 +282,14 @@ type TradePosition struct {
 }
 
 type TradeSettings struct {
-	PaymentMethods []string       `json:"payment_methods"`
-	PIProfile      TradePIProfile `json:"pi_profile"`
+	PaymentMethods           []string                       `json:"payment_methods"`
+	PaymentRecordPermissions []TradePaymentRecordPermission `json:"payment_record_permissions"`
+	PIProfile                TradePIProfile                 `json:"pi_profile"`
+}
+
+type TradePaymentRecordPermission struct {
+	UserID int64  `json:"user_id"`
+	Access string `json:"access"`
 }
 
 type TradePIProfile struct {
@@ -312,26 +322,31 @@ type TradeAccessProfile struct {
 	CanCreateOrders      bool     `json:"can_create_orders"`
 	CanViewSuppliers     bool     `json:"can_view_suppliers"`
 	CanManageSuppliers   bool     `json:"can_manage_suppliers"`
+	PaymentRecordAccess  string   `json:"payment_record_access"`
 	ScopeLabel           string   `json:"scope_label"`
 }
 
 type TradeOrderAccess struct {
-	ScopeLabel             string   `json:"scope_label"`
-	CanViewCustomer        bool     `json:"can_view_customer"`
-	CanViewCustomerContact bool     `json:"can_view_customer_contact"`
-	CanViewCustomerPricing bool     `json:"can_view_customer_pricing"`
-	CanViewSupplier        bool     `json:"can_view_supplier"`
-	CanViewSupplierPricing bool     `json:"can_view_supplier_pricing"`
-	CanViewReceiving       bool     `json:"can_view_receiving"`
-	CanViewInspection      bool     `json:"can_view_inspection"`
-	CanViewPacking         bool     `json:"can_view_packing"`
-	CanViewShipment        bool     `json:"can_view_shipment"`
-	CanViewProfit          bool     `json:"can_view_profit"`
-	CanViewTimeline        bool     `json:"can_view_timeline"`
-	CanSyncWorkbook        bool     `json:"can_sync_workbook"`
-	CanAddItems            bool     `json:"can_add_items"`
-	VisibleSheetNames      []string `json:"visible_sheet_names"`
-	EditableSheetNames     []string `json:"editable_sheet_names"`
+	ScopeLabel               string   `json:"scope_label"`
+	CanViewCustomer          bool     `json:"can_view_customer"`
+	CanViewCustomerContact   bool     `json:"can_view_customer_contact"`
+	CanViewCustomerPricing   bool     `json:"can_view_customer_pricing"`
+	CanViewSupplier          bool     `json:"can_view_supplier"`
+	CanViewSupplierPricing   bool     `json:"can_view_supplier_pricing"`
+	CanViewReceiving         bool     `json:"can_view_receiving"`
+	CanViewInspection        bool     `json:"can_view_inspection"`
+	CanViewPacking           bool     `json:"can_view_packing"`
+	CanViewShipment          bool     `json:"can_view_shipment"`
+	CanViewProfit            bool     `json:"can_view_profit"`
+	CanViewTimeline          bool     `json:"can_view_timeline"`
+	CanSyncWorkbook          bool     `json:"can_sync_workbook"`
+	CanAddItems              bool     `json:"can_add_items"`
+	CanViewPaymentRecords    bool     `json:"can_view_payment_records"`
+	CanViewAllPaymentRecords bool     `json:"can_view_all_payment_records"`
+	CanUploadPaymentProofs   bool     `json:"can_upload_payment_proofs"`
+	CanManagePaymentStatus   bool     `json:"can_manage_payment_status"`
+	VisibleSheetNames        []string `json:"visible_sheet_names"`
+	EditableSheetNames       []string `json:"editable_sheet_names"`
 }
 
 type TradeOrder struct {
@@ -777,8 +792,9 @@ type TradePositionAssignmentsRequest struct {
 }
 
 type UpdateTradeSettingsRequest struct {
-	PaymentMethods []string        `json:"payment_methods" binding:"required"`
-	PIProfile      *TradePIProfile `json:"pi_profile"`
+	PaymentMethods           []string                       `json:"payment_methods" binding:"required"`
+	PaymentRecordPermissions []TradePaymentRecordPermission `json:"payment_record_permissions"`
+	PIProfile                *TradePIProfile                `json:"pi_profile"`
 }
 
 type TradePIRequest struct {

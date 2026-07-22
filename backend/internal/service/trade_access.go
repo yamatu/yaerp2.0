@@ -62,6 +62,26 @@ func (s *TradeService) loadTradeUserAccess(userID int64) (*tradeUserAccess, erro
 	}
 	manager := admin || codes["manager"]
 	legacyOwnerMode := !admin && len(positions) == 0
+	paymentRecordAccess := model.TradePaymentRecordAccessNone
+	if admin {
+		paymentRecordAccess = model.TradePaymentRecordAccessAll
+	} else {
+		if manager {
+			paymentRecordAccess = model.TradePaymentRecordAccessAll
+		} else if codes["sales"] || codes["quotation"] || codes["purchasing"] || legacyOwnerMode {
+			paymentRecordAccess = model.TradePaymentRecordAccessOwn
+		}
+		settings, settingsErr := s.repo.GetSettings()
+		if settingsErr != nil {
+			return nil, settingsErr
+		}
+		for _, permission := range settings.PaymentRecordPermissions {
+			if permission.UserID == userID {
+				paymentRecordAccess = normalizeTradePaymentRecordAccess(permission.Access)
+				break
+			}
+		}
+	}
 	canViewOrderProgress := admin || manager || len(positions) > 0
 	canManageCustomerData := admin || manager || codes["sales"] || legacyOwnerMode
 	canManageSupplierData := admin || manager || codes["sourcing"] || codes["quotation"] || codes["purchasing"]
@@ -82,7 +102,7 @@ func (s *TradeService) loadTradeUserAccess(userID int64) (*tradeUserAccess, erro
 			CanViewCustomers:   canManageCustomerData,
 			CanCreateCustomers: canManageCustomerData, CanCreateOrders: canManageCustomerData,
 			CanViewSuppliers: canManageSupplierData, CanManageSuppliers: canManageSupplierData,
-			ScopeLabel: scopeLabel,
+			PaymentRecordAccess: paymentRecordAccess, ScopeLabel: scopeLabel,
 		},
 		positionCodes: codes,
 		stageAccess:   stages,
@@ -144,6 +164,10 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		CanViewTimeline:        full || owner || access.profile.CanViewOrderProgress,
 		CanSyncWorkbook:        full,
 	}
+	result.CanViewPaymentRecords = access.profile.PaymentRecordAccess != model.TradePaymentRecordAccessNone
+	result.CanViewAllPaymentRecords = access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessAll
+	result.CanUploadPaymentProofs = result.CanViewPaymentRecords
+	result.CanManagePaymentStatus = result.CanViewAllPaymentRecords
 	switch {
 	case full:
 		result.ScopeLabel = "完整流程权限"
@@ -221,6 +245,50 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	return result, nil
 }
 
+func normalizeTradePaymentRecordAccess(value string) string {
+	switch value {
+	case model.TradePaymentRecordAccessAll:
+		return model.TradePaymentRecordAccessAll
+	case model.TradePaymentRecordAccessOwn:
+		return model.TradePaymentRecordAccessOwn
+	default:
+		return model.TradePaymentRecordAccessNone
+	}
+}
+
+func (s *TradeService) AuthorizePaymentAttachment(userID, attachmentID int64) (bool, bool, error) {
+	references, err := s.repo.ListPaymentProofReferencesByAttachment(attachmentID)
+	if err != nil {
+		return false, false, err
+	}
+	if len(references) == 0 {
+		return false, true, nil
+	}
+	access, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return true, false, err
+	}
+	if access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessNone {
+		return true, false, nil
+	}
+	for _, reference := range references {
+		order, orderErr := s.repo.GetOrder(reference.OrderID, userID, true)
+		if errors.Is(orderErr, sql.ErrNoRows) {
+			continue
+		}
+		if orderErr != nil {
+			return true, false, orderErr
+		}
+		if !s.canViewTradeOrder(userID, order, access) {
+			continue
+		}
+		if access.profile.PaymentRecordAccess == model.TradePaymentRecordAccessAll || reference.UploadedBy == userID {
+			return true, true, nil
+		}
+	}
+	return true, false, nil
+}
+
 func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, access *tradeUserAccess) error {
 	orderAccess, err := s.orderAccessForUser(userID, order, access)
 	if err != nil {
@@ -249,6 +317,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.ChannelID = nil
 		order.Notes = ""
 	}
+	redactTradePaymentRecords(userID, order.CustomerQuotes, orderAccess)
 	if !orderAccess.CanViewCustomerPricing {
 		order.TotalAmount = 0
 		order.QuotedGoodsAmount = 0
@@ -257,7 +326,13 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.QuoteDeadline = nil
 		order.PaymentMethod = ""
 		order.PaymentTerms = ""
-		order.CustomerQuotes = nil
+		if orderAccess.CanViewPaymentRecords {
+			order.CustomerQuotes = tradePaymentReviewQuotes(order.CustomerQuotes)
+		} else {
+			order.CustomerQuotes = nil
+		}
+		order.PaymentGalleryDirectoryID = nil
+	} else if !orderAccess.CanViewAllPaymentRecords {
 		order.PaymentGalleryDirectoryID = nil
 	}
 	if !orderAccess.CanViewProfit {
@@ -333,6 +408,49 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		}
 	}
 	return nil
+}
+
+func redactTradePaymentRecords(userID int64, quotes []model.TradeCustomerQuoteRound, access *model.TradeOrderAccess) {
+	for quoteIndex := range quotes {
+		quote := &quotes[quoteIndex]
+		if access == nil || !access.CanViewPaymentRecords {
+			quote.PaymentStatus = ""
+			quote.PaymentCurrency = ""
+			quote.PaidAmount = 0
+			quote.PaymentProofs = nil
+			continue
+		}
+		if access.CanViewAllPaymentRecords {
+			continue
+		}
+		quote.PaymentStatus = ""
+		quote.PaymentCurrency = ""
+		quote.PaidAmount = 0
+		visibleProofs := make([]model.TradePaymentProof, 0, len(quote.PaymentProofs))
+		for _, proof := range quote.PaymentProofs {
+			if proof.UploadedBy == userID {
+				visibleProofs = append(visibleProofs, proof)
+			}
+		}
+		quote.PaymentProofs = visibleProofs
+	}
+}
+
+func tradePaymentReviewQuotes(quotes []model.TradeCustomerQuoteRound) []model.TradeCustomerQuoteRound {
+	result := make([]model.TradeCustomerQuoteRound, 0, 1)
+	for _, quote := range quotes {
+		if quote.Status != "accepted" {
+			continue
+		}
+		result = append(result, model.TradeCustomerQuoteRound{
+			ID: quote.ID, OrderID: quote.OrderID, RoundNo: quote.RoundNo,
+			Currency: quote.Currency, Status: quote.Status,
+			PaymentStatus: quote.PaymentStatus, PaymentCurrency: quote.PaymentCurrency,
+			PaidAmount: quote.PaidAmount, PaymentProofs: quote.PaymentProofs,
+			CreatedAt: quote.CreatedAt, UpdatedAt: quote.UpdatedAt,
+		})
+	}
+	return result
 }
 
 func redactTradeTimelineDetails(events []model.TradeOrderStageEvent, currentStage string, canViewCurrentTask bool) {

@@ -1703,14 +1703,15 @@ func (r *TradeRepo) PositionUserIDs(positionID int64) ([]int64, error) {
 
 func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 	settings := &model.TradeSettings{
-		PaymentMethods: []string{},
+		PaymentMethods:           []string{},
+		PaymentRecordPermissions: []model.TradePaymentRecordPermission{},
 		PIProfile: model.TradePIProfile{
 			CompanyName:  "YAERP Trading Co., Ltd.",
 			AccountName:  "YAERP Trading Co., Ltd.",
 			DefaultNotes: "All banking charges outside the beneficiary bank are for the buyer's account.",
 		},
 	}
-	rows, err := r.db.Query(`SELECT setting_key,value FROM trade_settings WHERE setting_key IN ('payment_methods','pi_profile')`)
+	rows, err := r.db.Query(`SELECT setting_key,value FROM trade_settings WHERE setting_key IN ('payment_methods','payment_record_permissions','pi_profile')`)
 	if err != nil {
 		return nil, err
 	}
@@ -1724,6 +1725,10 @@ func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 		switch key {
 		case "payment_methods":
 			if err := json.Unmarshal(value, &settings.PaymentMethods); err != nil {
+				return nil, err
+			}
+		case "payment_record_permissions":
+			if err := json.Unmarshal(value, &settings.PaymentRecordPermissions); err != nil {
 				return nil, err
 			}
 		case "pi_profile":
@@ -1747,6 +1752,10 @@ func (r *TradeRepo) UpdateSettings(userID int64, settings *model.TradeSettings) 
 	if err != nil {
 		return err
 	}
+	paymentPermissionValue, err := json.Marshal(settings.PaymentRecordPermissions)
+	if err != nil {
+		return err
+	}
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
@@ -1757,6 +1766,7 @@ func (r *TradeRepo) UpdateSettings(userID int64, settings *model.TradeSettings) 
 		value []byte
 	}{
 		{key: "payment_methods", value: paymentValue},
+		{key: "payment_record_permissions", value: paymentPermissionValue},
 		{key: "pi_profile", value: profileValue},
 	} {
 		if _, err := tx.Exec(
@@ -1864,6 +1874,27 @@ func (r *TradeRepo) ListPaymentProofs(orderID int64) ([]model.TradePaymentProof,
 		}
 		if directoryID.Valid {
 			proof.GalleryDirectoryID = &directoryID.Int64
+		}
+		result = append(result, proof)
+	}
+	return result, rows.Err()
+}
+
+func (r *TradeRepo) ListPaymentProofReferencesByAttachment(attachmentID int64) ([]model.TradePaymentProof, error) {
+	rows, err := r.db.Query(
+		`SELECT order_id,uploaded_by
+		 FROM trade_customer_payment_proofs
+		 WHERE attachment_id=$1`, attachmentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]model.TradePaymentProof, 0)
+	for rows.Next() {
+		var proof model.TradePaymentProof
+		if err := rows.Scan(&proof.OrderID, &proof.UploadedBy); err != nil {
+			return nil, err
 		}
 		result = append(result, proof)
 	}

@@ -13,11 +13,20 @@ import (
 )
 
 type UploadHandler struct {
-	uploadService *service.UploadService
+	uploadService               *service.UploadService
+	paymentAttachmentAuthorizer PaymentAttachmentAuthorizer
 }
 
-func NewUploadHandler(uploadService *service.UploadService) *UploadHandler {
-	return &UploadHandler{uploadService: uploadService}
+type PaymentAttachmentAuthorizer interface {
+	AuthorizePaymentAttachment(userID, attachmentID int64) (protected, allowed bool, err error)
+}
+
+func NewUploadHandler(uploadService *service.UploadService, authorizers ...PaymentAttachmentAuthorizer) *UploadHandler {
+	handler := &UploadHandler{uploadService: uploadService}
+	if len(authorizers) > 0 {
+		handler.paymentAttachmentAuthorizer = authorizers[0]
+	}
+	return handler
 }
 
 func (h *UploadHandler) Upload(c *gin.Context) {
@@ -44,6 +53,17 @@ func (h *UploadHandler) GetFile(c *gin.Context) {
 	if err != nil {
 		response.BadRequest(c, "invalid file id")
 		return
+	}
+	if h.paymentAttachmentAuthorizer != nil {
+		protected, allowed, accessErr := h.paymentAttachmentAuthorizer.AuthorizePaymentAttachment(c.GetInt64("user_id"), id)
+		if accessErr != nil {
+			response.ServerError(c, accessErr.Error())
+			return
+		}
+		if protected && !allowed {
+			response.Forbidden(c, "没有查看该付款凭证的权限")
+			return
+		}
 	}
 
 	url, err := h.uploadService.GetFileURL(id)

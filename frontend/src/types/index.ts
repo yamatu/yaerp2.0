@@ -1382,7 +1382,15 @@ export interface TradePosition {
 
 export interface TradeSettings {
   payment_methods: string[];
+  payment_record_permissions: TradePaymentRecordPermission[];
   pi_profile: TradePIProfile;
+}
+
+export type TradePaymentRecordAccess = "none" | "own" | "all";
+
+export interface TradePaymentRecordPermission {
+  user_id: number;
+  access: TradePaymentRecordAccess;
 }
 
 export interface TradePIProfile {
@@ -1415,6 +1423,7 @@ export interface TradeAccessProfile {
   can_create_orders: boolean;
   can_view_suppliers: boolean;
   can_manage_suppliers: boolean;
+  payment_record_access: TradePaymentRecordAccess;
   scope_label: string;
 }
 
@@ -1433,6 +1442,10 @@ export interface TradeOrderAccess {
   can_view_timeline: boolean;
   can_sync_workbook: boolean;
   can_add_items: boolean;
+  can_view_payment_records: boolean;
+  can_view_all_payment_records: boolean;
+  can_upload_payment_proofs: boolean;
+  can_manage_payment_status: boolean;
   visible_sheet_names: string[];
   editable_sheet_names: string[];
 }

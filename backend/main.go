@@ -205,7 +205,7 @@ func main() {
 	sheetHandler := handler.NewSheetHandler(sheetService, hub)
 	sheetHistoryHandler := handler.NewSheetHistoryHandler(historyService, hub)
 	cellHandler := handler.NewCellHandler(sheetService, permService)
-	uploadHandler := handler.NewUploadHandler(uploadService)
+	uploadHandler := handler.NewUploadHandler(uploadService, tradeService)
 	channelHandler := handler.NewChannelHandler(channelService, uploadService, hub)
 	whatsAppHandler := handler.NewWhatsAppHandler(whatsAppService)
 	importHandler := handler.NewImportHandler(importService)
