@@ -696,6 +696,7 @@ export interface ChannelAIAskResult {
   changed_sheet_ids?: number[];
   resources_changed?: boolean;
   pending_operations?: AISpreadsheetOperation[];
+  pending_erp_plan?: AIERPPendingPlan;
 }
 
 export interface AIChatMessage {
@@ -720,7 +721,35 @@ export interface AIChatResponse {
   changed_sheet_ids?: number[];
   resources_changed?: boolean;
   pending_operations?: AISpreadsheetOperation[];
+  pending_erp_plan?: AIERPPendingPlan;
   tool_traces?: AIChatToolTrace[];
+}
+
+export interface AIERPActionPreview {
+  kind: string;
+  title: string;
+  description: string;
+  target_label?: string;
+  details?: string[];
+  customer_id?: number;
+  order_id?: number;
+}
+
+export interface AIERPPendingPlan {
+  plan_token: string;
+  summary: string;
+  expires_at: string;
+  action: AIERPActionPreview;
+  warnings?: string[];
+}
+
+export interface AIERPApplyResult {
+  action_kind: string;
+  message: string;
+  next_step?: string;
+  customer_id?: number;
+  order_id?: number;
+  resources_changed: boolean;
 }
 
 export interface AIConfigStatus {

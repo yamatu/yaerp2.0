@@ -757,7 +757,13 @@ func (r *TradeRepo) ListOrdersScoped(userID int64, canViewAll bool, stages []str
 		WHERE ($1 OR o.owner_id = $2 OR o.stage = ANY($3))
 		  AND ($4 = '' OR o.stage = $4)
 		  AND ($5 = 0 OR o.customer_id = $5)
-		  AND ($6 = '' OR CONCAT_WS(' ', o.order_no, o.title, c.name, c.company_name, o.destination_country, o.destination_port) ILIKE '%' || $6 || '%')
+		  AND ($6 = '' OR CONCAT_WS(' ', o.order_no, o.title, c.name, c.company_name, o.destination_country, o.destination_port) ILIKE '%' || $6 || '%'
+		       OR EXISTS (
+		           SELECT 1
+		           FROM trade_order_items search_item
+		           WHERE search_item.order_id = o.id
+		             AND CONCAT_WS(' ', search_item.sku, search_item.product_name, search_item.description, search_item.specification) ILIKE '%' || $6 || '%'
+		       ))
 		ORDER BY CASE WHEN o.stage IN ('completed', 'cancelled') THEN 1 ELSE 0 END,
 		         o.updated_at DESC, o.id DESC
 		LIMIT 500`

@@ -133,6 +133,22 @@ func (h *AIHandler) ApplySpreadsheetPlan(c *gin.Context) {
 	response.OKMsg(c, "AI plan applied")
 }
 
+func (h *AIHandler) ApplyERPPlan(c *gin.Context) {
+	var req service.ERPApplyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+
+	result, err := h.aiService.ApplyERPPlan(c.GetInt64("user_id"), req.PlanToken)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	response.OK(c, result)
+}
+
 func (h *AIHandler) ListAvailableAssistants(c *gin.Context) {
 	items, err := h.aiService.ListAIAssistants(false)
 	if err != nil {

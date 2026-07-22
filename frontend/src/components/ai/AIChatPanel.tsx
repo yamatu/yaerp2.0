@@ -2,14 +2,14 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
+import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useWorkbooks } from '@/hooks/useSheet'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
 import { notifyDataChanged, prepareDataMutation } from '@/lib/dataEvents'
-import type { AIAssistant, AIChatResponse, AIChatToolTrace, AISpreadsheetOperation, Workbook } from '@/types'
+import type { AIAssistant, AIChatResponse, AIChatToolTrace, AIERPApplyResult, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
 
 interface PersistedMessage {
   id: string
@@ -17,10 +17,13 @@ interface PersistedMessage {
   content: string
   createdAt: number
   pendingOperations?: AISpreadsheetOperation[]
+  pendingERPPlan?: AIERPPendingPlan
   toolTraces?: AIChatToolTrace[]
   touchedSheetIds?: number[]
   applyState?: 'idle' | 'applying' | 'applied' | 'failed'
   applyError?: string
+  erpApplyState?: 'idle' | 'applying' | 'applied' | 'failed'
+  erpApplyError?: string
 }
 
 interface AIChatPanelProps {
@@ -73,11 +76,23 @@ const AI_IDEA_BANK: AIIdea[] = [
   { label: '字段清理', icon: 'table', buildPrompt: (target) => `检查「${target}」的字段格式和命名，统一日期、金额、编号并找出脏数据` },
   { label: '客户画像', icon: 'sparkles', buildPrompt: (target) => `基于「${target}」按客户汇总交易、频次和金额，识别重点客户与流失风险` },
   { label: '管理摘要', icon: 'chart', buildPrompt: (target) => `把「${target}」整理成管理层可快速阅读的摘要，包含结论、图表建议和行动项` },
+  { label: '创建客户询价', icon: 'wand', buildPrompt: () => '帮我创建一条客户询价。先搜索并确认客户，再整理询价主题、币种和产品，生成 ERP 预备数据让我确认' },
+  { label: '匹配产品报价', icon: 'table', buildPrompt: () => '根据我提供的 SKU、产品名称或询价主题匹配 ERP 业务单，并把供应商报价整理成待确认方案，不要直接写入' },
+  { label: '检查流程下一步', icon: 'sparkles', buildPrompt: () => '读取我当前可处理的 ERP 业务单，说明所在环节、缺失数据和下一步操作；需要写入时先让我确认' },
 ]
 
 type ToolTraceRenderItem =
   | { kind: 'single'; trace: AIChatToolTrace; sourceIndex: number }
   | { kind: 'query-sheet-group'; traces: AIChatToolTrace[]; sourceIndex: number }
+  | { kind: 'erp-read-group'; traces: AIChatToolTrace[]; sourceIndex: number }
+
+const ERP_READ_TOOL_NAMES = new Set([
+  'get_erp_context',
+  'search_erp_customers',
+  'search_erp_orders',
+  'get_erp_order',
+  'search_erp_suppliers',
+])
 
 function normalizeSearchText(value: string | null | undefined) {
   return (value || '').normalize('NFKC').toLocaleLowerCase('zh-CN').trim()
@@ -96,17 +111,26 @@ function shuffleIdeas(seed: number) {
 
 function groupToolTraces(traces: AIChatToolTrace[]): ToolTraceRenderItem[] {
   const querySheetTraces = traces.filter((trace) => trace.name === 'query_sheet')
-  if (querySheetTraces.length <= 1) {
+  const erpReadTraces = traces.filter((trace) => ERP_READ_TOOL_NAMES.has(trace.name))
+  if (querySheetTraces.length <= 1 && erpReadTraces.length <= 1) {
     return traces.map((trace, sourceIndex) => ({ kind: 'single', trace, sourceIndex }))
   }
 
   const items: ToolTraceRenderItem[] = []
   let queryGroupAdded = false
+  let erpGroupAdded = false
   traces.forEach((trace, sourceIndex) => {
-    if (trace.name === 'query_sheet') {
+    if (trace.name === 'query_sheet' && querySheetTraces.length > 1) {
       if (!queryGroupAdded) {
         items.push({ kind: 'query-sheet-group', traces: querySheetTraces, sourceIndex })
         queryGroupAdded = true
+      }
+      return
+    }
+    if (ERP_READ_TOOL_NAMES.has(trace.name) && erpReadTraces.length > 1) {
+      if (!erpGroupAdded) {
+        items.push({ kind: 'erp-read-group', traces: erpReadTraces, sourceIndex })
+        erpGroupAdded = true
       }
       return
     }
@@ -124,8 +148,8 @@ function ideaIcon(icon: AIIdeaIcon) {
 
 function getThinkingProgress(elapsedSeconds: number) {
   if (elapsedSeconds < 3) return { label: '正在理解问题', detail: '分析你的需求和当前对话', progress: 18 + elapsedSeconds * 6 }
-  if (elapsedSeconds < 8) return { label: '正在读取上下文', detail: '检查表格范围、权限和相关数据', progress: 38 + (elapsedSeconds - 3) * 5 }
-  if (elapsedSeconds < 18) return { label: '正在分析并执行工具', detail: '计算数据或准备表格操作', progress: 63 + (elapsedSeconds - 8) * 2 }
+  if (elapsedSeconds < 8) return { label: '正在读取上下文', detail: '检查表格、ERP 范围、权限和相关数据', progress: 38 + (elapsedSeconds - 3) * 5 }
+  if (elapsedSeconds < 18) return { label: '正在分析并执行工具', detail: '匹配数据或准备待确认操作', progress: 63 + (elapsedSeconds - 8) * 2 }
   return { label: '正在整理回答', detail: '生成清晰的结论和操作结果', progress: Math.min(94, 83 + Math.floor((elapsedSeconds - 18) / 4)) }
 }
 
@@ -146,6 +170,18 @@ function toolTitle(name: string) {
   switch (name) {
     case 'get_user_context':
       return '访问范围'
+    case 'get_erp_context':
+      return 'ERP 权限与任务'
+    case 'search_erp_customers':
+      return '搜索 ERP 客户'
+    case 'search_erp_orders':
+      return '搜索 ERP 业务单'
+    case 'get_erp_order':
+      return '读取 ERP 业务单'
+    case 'search_erp_suppliers':
+      return '搜索 ERP 供应商'
+    case 'preview_erp_action':
+      return '准备 ERP 待确认操作'
     case 'query_sheet':
       return '读取工作表'
     case 'search_spreadsheets':
@@ -353,7 +389,13 @@ function ToolTraceCard({ trace }: { trace: AIChatToolTrace }) {
       <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
         <div className="flex min-w-0 items-center gap-2">
           <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${trace.status === 'success' ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
-            {trace.name === 'schedule_daily_report' ? <Clock3 className="h-4 w-4" /> : trace.name === 'preview_spreadsheet_plan' ? <Wand2 className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
+            {trace.name === 'schedule_daily_report'
+              ? <Clock3 className="h-4 w-4" />
+              : trace.name === 'preview_spreadsheet_plan'
+                ? <Wand2 className="h-4 w-4" />
+                : trace.name.includes('erp')
+                  ? <BriefcaseBusiness className="h-4 w-4" />
+                  : <Bot className="h-4 w-4" />}
           </div>
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-slate-900">{toolTitle(trace.name)}</div>
@@ -477,6 +519,37 @@ function QuerySheetTraceGroup({ traces }: { traces: AIChatToolTrace[] }) {
       {open && (
         <div className="space-y-2 border-t border-slate-200 bg-slate-50/60 p-2.5">
           {traces.map((trace, index) => <QuerySheetTraceItem key={`${trace.name}-${index}`} trace={trace} index={index} />)}
+        </div>
+      )}
+    </details>
+  )
+}
+
+function ERPReadTraceGroup({ traces }: { traces: AIChatToolTrace[] }) {
+  const [open, setOpen] = useState(false)
+  const failedCount = traces.filter((trace) => trace.status !== 'success').length
+  const orderReads = traces.filter((trace) => trace.name === 'search_erp_orders' || trace.name === 'get_erp_order').length
+  const directoryReads = traces.length - orderReads
+
+  return (
+    <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)} className="group/erp-traces overflow-hidden rounded-lg border border-slate-200 bg-white">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${failedCount === 0 ? 'bg-sky-50 text-sky-700' : 'bg-rose-50 text-rose-600'}`}>
+            <BriefcaseBusiness className="h-4 w-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-slate-900">读取 ERP 数据</div>
+            <div className={`line-clamp-2 text-xs ${failedCount === 0 ? 'text-sky-700' : 'text-rose-600'}`}>
+              已合并 {traces.length} 次权限内查询{orderReads > 0 ? ` · ${orderReads} 次业务单匹配` : ''}{directoryReads > 0 ? ` · ${directoryReads} 次客户/供应商/权限查询` : ''}{failedCount > 0 ? ` · ${failedCount} 次失败` : ''}
+            </div>
+          </div>
+        </div>
+        <ChevronRight className="h-4 w-4 shrink-0 text-slate-400 transition-transform group-open/erp-traces:rotate-90" />
+      </summary>
+      {open && (
+        <div className="space-y-2 border-t border-slate-200 bg-slate-50/60 p-2.5">
+          {traces.map((trace, index) => <ToolTraceCard key={`${trace.name}-${index}`} trace={trace} />)}
         </div>
       )}
     </details>
@@ -756,9 +829,11 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         content: res.data?.reply ?? '',
         createdAt: Date.now(),
         pendingOperations: res.data?.pending_operations,
+        pendingERPPlan: res.data?.pending_erp_plan,
         toolTraces: res.data?.tool_traces,
         touchedSheetIds: res.data?.touched_sheet_ids,
         applyState: 'idle',
+        erpApplyState: 'idle',
       }
       setMessages((prev) => [...prev, assistantMessage])
 
@@ -817,6 +892,50 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       setMessages((prev) => prev.map((message) => (
         message.id === messageId
           ? { ...message, applyState: 'failed', applyError: '写入失败，请稍后重试。' }
+          : message
+      )))
+    }
+  }, [])
+
+  const handleApplyERPPlan = useCallback(async (messageId: string, plan: AIERPPendingPlan) => {
+    setMessages((prev) => prev.map((message) => (
+      message.id === messageId
+        ? { ...message, erpApplyState: 'applying', erpApplyError: '' }
+        : message
+    )))
+
+    try {
+      await prepareDataMutation()
+      const res = await api.post<AIERPApplyResult>('/ai/erp/apply', { plan_token: plan.plan_token })
+      if (res.code !== 0 || !res.data) {
+        setMessages((prev) => prev.map((message) => (
+          message.id === messageId
+            ? { ...message, erpApplyState: 'failed', erpApplyError: res.message || 'ERP 操作失败，请重新生成方案。' }
+            : message
+        )))
+        return
+      }
+
+      const result = res.data
+      const followUp: PersistedMessage = {
+        id: makeId(),
+        role: 'assistant',
+        content: `**${result.message}**${result.next_step ? `\n\n${result.next_step}` : ''}`,
+        createdAt: Date.now(),
+      }
+      setMessages((prev) => [
+        ...prev.map((message) => (
+          message.id === messageId
+            ? { ...message, erpApplyState: 'applied' as const, erpApplyError: '' }
+            : message
+        )),
+        followUp,
+      ])
+      notifyDataChanged({ source: 'ai', sheetIds: [], resourcesChanged: true })
+    } catch (error) {
+      setMessages((prev) => prev.map((message) => (
+        message.id === messageId
+          ? { ...message, erpApplyState: 'failed', erpApplyError: error instanceof Error ? error.message : 'ERP 操作失败，请重新生成方案。' }
           : message
       )))
     }
@@ -993,9 +1112,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             <div className="text-sm font-semibold text-slate-900">你可以直接这样说</div>
             <div className="mt-3 grid gap-2 text-left text-xs leading-5 text-slate-500 sm:grid-cols-2">
               <div>“查询今天销售表里金额大于 10000 的记录”</div>
-              <div>“根据销售和成本表创建财务分析工作簿”</div>
+              <div>“根据客户、询价主题和 SKU 准备一条 ERP 询价”</div>
               <div>“把库存表数量加 50，先给我确认方案”</div>
-              <div>“用多个工作簿生成经营总结网页”</div>
+              <div>“检查我负责的订单还缺什么，再引导我进入下一步”</div>
             </div>
           </div>
         )}
@@ -1015,11 +1134,13 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                   : message.content}
               </div>
 
-              {message.role === 'assistant' && Array.isArray(message.toolTraces) && message.toolTraces.length > 0 && (
+              {message.role === 'assistant' && Array.isArray(message.toolTraces) && message.toolTraces.some((trace) => !(message.pendingERPPlan && trace.name === 'preview_erp_action' && trace.status === 'success')) && (
                 <div className="w-full space-y-2">
-                  {groupToolTraces(message.toolTraces).map((item) => item.kind === 'query-sheet-group'
+                  {groupToolTraces(message.toolTraces.filter((trace) => !(message.pendingERPPlan && trace.name === 'preview_erp_action' && trace.status === 'success'))).map((item) => item.kind === 'query-sheet-group'
                     ? <QuerySheetTraceGroup key={`${message.id}-query-sheet-group-${item.sourceIndex}`} traces={item.traces} />
-                    : <ToolTraceCard key={`${message.id}-trace-${item.sourceIndex}`} trace={item.trace} />)}
+                    : item.kind === 'erp-read-group'
+                      ? <ERPReadTraceGroup key={`${message.id}-erp-read-group-${item.sourceIndex}`} traces={item.traces} />
+                      : <ToolTraceCard key={`${message.id}-trace-${item.sourceIndex}`} trace={item.trace} />)}
                 </div>
               )}
 
@@ -1061,6 +1182,76 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                   {message.applyState === 'failed' && message.applyError && (
                     <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
                       {message.applyError}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {message.role === 'assistant' && message.pendingERPPlan && (
+                <div className="w-full rounded-[24px] border border-sky-200 bg-sky-50/80 p-4 shadow-sm">
+                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-sky-900">
+                    <BriefcaseBusiness className="h-4 w-4" />
+                    待确认 ERP 预备数据
+                  </div>
+                  <div className="rounded-2xl border border-sky-200 bg-white/95 px-4 py-4">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-slate-950">{message.pendingERPPlan.action.title}</div>
+                        {message.pendingERPPlan.action.target_label && (
+                          <div className="mt-1 text-xs font-medium text-sky-700">{message.pendingERPPlan.action.target_label}</div>
+                        )}
+                      </div>
+                      <span className="rounded-lg bg-sky-100 px-2 py-1 text-[10px] font-semibold text-sky-700">尚未写入</span>
+                    </div>
+                    <p className="mt-3 text-xs leading-6 text-slate-600">{message.pendingERPPlan.action.description}</p>
+                    {Array.isArray(message.pendingERPPlan.action.details) && message.pendingERPPlan.action.details.length > 0 && (
+                      <div className="mt-3 divide-y divide-slate-100 overflow-hidden rounded-xl border border-slate-200 bg-slate-50/70">
+                        {message.pendingERPPlan.action.details.map((detail, index) => (
+                          <div key={`${message.id}-erp-detail-${index}`} className="px-3 py-2 text-xs leading-5 text-slate-700">{detail}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {Array.isArray(message.pendingERPPlan.warnings) && message.pendingERPPlan.warnings.length > 0 && (
+                    <div className="mt-3 space-y-1 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      {message.pendingERPPlan.warnings.map((warning, index) => <div key={`${message.id}-erp-warning-${index}`}>{warning}</div>)}
+                    </div>
+                  )}
+                  <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2 text-xs leading-5 text-sky-800">
+                      <span>不确认不会写入；方案约 30 分钟后失效，执行时会再次校验当前员工权限和最新流程状态。</span>
+                      {message.pendingERPPlan.action.order_id && (
+                        <Link
+                          href={`/trade?order=${message.pendingERPPlan.action.order_id}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 font-semibold text-sky-700 underline decoration-sky-300 underline-offset-2 hover:text-sky-900"
+                        >
+                          打开 ERP 核对
+                          <ExternalLink className="h-3 w-3" />
+                        </Link>
+                      )}
+                    </div>
+                    {message.erpApplyState === 'applied' ? (
+                      <div className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-700">
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        已确认导入
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void handleApplyERPPlan(message.id, message.pendingERPPlan as AIERPPendingPlan)}
+                        disabled={message.erpApplyState === 'applying'}
+                        className="inline-flex items-center gap-2 rounded-full bg-sky-700 px-4 py-2 text-xs font-semibold text-white transition hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {message.erpApplyState === 'applying' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                        {message.erpApplyState === 'applying' ? '正在校验并导入...' : '确认导入 ERP'}
+                      </button>
+                    )}
+                  </div>
+                  {message.erpApplyState === 'failed' && message.erpApplyError && (
+                    <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                      {message.erpApplyError}
                     </div>
                   )}
                 </div>

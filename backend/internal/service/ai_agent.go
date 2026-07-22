@@ -30,6 +30,7 @@ type toolExecutionResult struct {
 	ResourcesChanged  bool
 	Summary           string
 	PendingOperations []SpreadsheetOperation
+	PendingERPPlan    *ERPPendingPlan
 }
 
 type openAIToolDefinition struct {
@@ -70,6 +71,12 @@ var formulaKeyArithmeticPattern = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}\s*
 func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 	return map[string]ToolFunc{
 		"get_user_context":         s.toolGetUserContext,
+		"get_erp_context":          s.toolGetERPContext,
+		"search_erp_customers":     s.toolSearchERPCustomers,
+		"search_erp_orders":        s.toolSearchERPOrders,
+		"get_erp_order":            s.toolGetERPOrder,
+		"search_erp_suppliers":     s.toolSearchERPSuppliers,
+		"preview_erp_action":       s.toolPreviewERPAction,
 		"query_sheet":              s.toolQuerySheet,
 		"search_spreadsheets":      s.toolSearchSpreadsheets,
 		"search_sheet_rows":        s.toolSearchSheetRows,
@@ -166,6 +173,7 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 	lastModel := assistant.Model
 	toolTraces := make([]ChatToolTrace, 0)
 	var pendingOperations []SpreadsheetOperation
+	var pendingERPPlan *ERPPendingPlan
 
 	for round := 0; round < 8; round++ {
 		resp, assistantMessage, err := s.callChatCompletionWithTools(assistant.Endpoint, assistant.APIKey, assistant.Model, conversation, toolDefs)
@@ -194,11 +202,22 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 				ChangedSheetIDs:   sortedTouchedSheetIDs(changedSheets),
 				ResourcesChanged:  resourcesChanged,
 				PendingOperations: pendingOperations,
+				PendingERPPlan:    pendingERPPlan,
 				ToolTraces:        toolTraces,
 			}, nil
 		}
 
 		for _, call := range toolCalls {
+			if call.Function.Name == "preview_erp_action" && pendingERPPlan != nil {
+				message := "本轮对话已经生成一个 ERP 待确认步骤；请先让员工确认、修改或放弃当前步骤，再准备下一步。"
+				toolTraces = append(toolTraces, ChatToolTrace{Name: call.Function.Name, Status: "error", Summary: message})
+				conversation = append(conversation, map[string]any{
+					"role":         "tool",
+					"tool_call_id": call.ID,
+					"content":      fmt.Sprintf(`{"error":%q}`, message),
+				})
+				continue
+			}
 			tool := s.tools[call.Function.Name]
 			if tool == nil {
 				toolTraces = append(toolTraces, ChatToolTrace{Name: call.Function.Name, Status: "error", Summary: "工具不存在"})
@@ -245,6 +264,9 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 			if len(result.PendingOperations) > 0 {
 				pendingOperations = result.PendingOperations
 			}
+			if result.PendingERPPlan != nil {
+				pendingERPPlan = result.PendingERPPlan
+			}
 			if call.Function.Name == "apply_spreadsheet_plan" {
 				pendingOperations = nil
 			}
@@ -277,6 +299,7 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 		ChangedSheetIDs:   sortedTouchedSheetIDs(changedSheets),
 		ResourcesChanged:  resourcesChanged,
 		PendingOperations: pendingOperations,
+		PendingERPPlan:    pendingERPPlan,
 		ToolTraces:        toolTraces,
 	}, nil
 }
@@ -427,6 +450,8 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
+					"如果用户询问客户、询价、SKU、供应商报价、对客报价或外贸流程，必须优先使用 get_erp_context、search_erp_customers、search_erp_orders、get_erp_order、search_erp_suppliers 读取真实 ERP 数据。ERP 工具返回的数据已经按当前员工权限遮罩；不得猜测被遮罩字段，也不得改用底层工作表工具绕过 ERP 权限。"+
+					"任何 ERP 新增、修改、报价录入或流程推进都必须调用 preview_erp_action 生成一项待确认操作，即使用户要求立即执行也不能直接写入。每次只准备一个明确步骤；客户、业务单、产品或供应商匹配不唯一时必须列出候选并询问，不能擅自选择。确认执行后，再根据最新阶段和 advance_blockers 指导下一步。"+
 					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；rows[*].row 一律表示 0-based 数据行索引（第一条数据行为 0，不是界面里显示的第 2 行），display_row 才是界面中的行号；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
 					"\n\n%s"+
 					"\n\n支持的列类型：text（文本）、number（数字）、currency（货币）、date（日期）、select（下拉选择）、checkbox（是/否复选框）、image（图片）、formula（公式）。"+
@@ -472,6 +497,43 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 				"limit": map[string]any{"type": "integer"},
 			},
 		}),
+		buildToolDefinition("get_erp_context", "Get the current employee's ERP access profile, workflow stages, dashboard counts, and recent visible orders.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"limit": map[string]any{"type": "integer", "description": "Recent visible order limit, 1-30."},
+			},
+		}),
+		buildToolDefinition("search_erp_customers", "Search customers visible to the current employee by name, company, code, phone, email, or WhatsApp identity.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string"},
+				"limit": map[string]any{"type": "integer"},
+			},
+		}),
+		buildToolDefinition("search_erp_orders", "Search visible ERP orders by order number, inquiry title, customer, destination, SKU, product name, or specification. Returns permission-redacted order and item data.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":       map[string]any{"type": "string"},
+				"stage":       map[string]any{"type": "string"},
+				"customer_id": map[string]any{"type": "integer"},
+				"limit":       map[string]any{"type": "integer"},
+			},
+		}),
+		buildToolDefinition("get_erp_order", "Read one visible ERP order with its permission-redacted items, quotes, current stage, blockers, and next-step capabilities.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"order_id":    map[string]any{"type": "integer"},
+				"order_query": map[string]any{"type": "string", "description": "Order number, inquiry title, customer, SKU, or product keyword when order_id is unknown."},
+			},
+		}),
+		buildToolDefinition("search_erp_suppliers", "Search suppliers visible to the current employee by code, name, company, contact, phone, or email.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string"},
+				"limit": map[string]any{"type": "integer"},
+			},
+		}),
+		buildToolDefinition("preview_erp_action", "Prepare exactly one permission-checked ERP mutation for employee confirmation. This tool never writes ERP data. Supported kinds: create_customer, update_customer, create_supplier, create_inquiry, add_inquiry_items, record_supplier_quotes, create_customer_quote, update_stage_data, advance_order.", erpActionToolSchema()),
 		buildToolDefinition("query_sheet", "Read a page of visible sheet rows and an optional full-sheet profile. Check has_more and next_start_row before concluding that the sheet has been fully read.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{

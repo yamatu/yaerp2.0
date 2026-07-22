@@ -101,6 +101,7 @@ type ChannelAIAskResult struct {
 	ChangedSheetIDs   []int64                `json:"changed_sheet_ids,omitempty"`
 	ResourcesChanged  bool                   `json:"resources_changed,omitempty"`
 	PendingOperations []SpreadsheetOperation `json:"pending_operations,omitempty"`
+	PendingERPPlan    *ERPPendingPlan        `json:"pending_erp_plan,omitempty"`
 }
 
 func NewChannelService(
@@ -478,6 +479,7 @@ func (s *ChannelService) AskAI(userID, channelID int64, req *model.ChannelAIAskR
 		ChangedSheetIDs:   aiResult.ChangedSheetIDs,
 		ResourcesChanged:  aiResult.ResourcesChanged,
 		PendingOperations: aiResult.PendingOperations,
+		PendingERPPlan:    aiResult.PendingERPPlan,
 	}, nil
 }
 

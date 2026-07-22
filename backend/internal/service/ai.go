@@ -28,6 +28,7 @@ type AIService struct {
 	uploadService     *UploadService
 	scheduleService   *AIScheduleService
 	automationService *AutomationService
+	tradeService      *TradeService
 	tools             map[string]ToolFunc
 }
 
@@ -39,7 +40,7 @@ const aiRequestTimeout = 180 * time.Second
 
 var bulkRowCountPattern = regexp.MustCompile(`(?i)(\d+)\s*(?:行|条|rows?)`)
 
-func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo, sheetService *SheetService, permService *PermissionService, uploadService *UploadService, scheduleService *AIScheduleService) *AIService {
+func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo, sheetService *SheetService, permService *PermissionService, uploadService *UploadService, scheduleService *AIScheduleService, tradeService *TradeService) *AIService {
 	service := &AIService{
 		cfg:             cfg,
 		db:              db,
@@ -48,6 +49,7 @@ func NewAIService(cfg *config.Config, db *sql.DB, sheetRepo *repo.SheetRepo, she
 		permService:     permService,
 		uploadService:   uploadService,
 		scheduleService: scheduleService,
+		tradeService:    tradeService,
 	}
 	service.tools = service.buildToolRegistry()
 	return service
@@ -88,6 +90,7 @@ type ChatResponse struct {
 	ChangedSheetIDs   []int64                `json:"changed_sheet_ids,omitempty"`
 	ResourcesChanged  bool                   `json:"resources_changed,omitempty"`
 	PendingOperations []SpreadsheetOperation `json:"pending_operations,omitempty"`
+	PendingERPPlan    *ERPPendingPlan        `json:"pending_erp_plan,omitempty"`
 	ToolTraces        []ChatToolTrace        `json:"tool_traces,omitempty"`
 }
 
