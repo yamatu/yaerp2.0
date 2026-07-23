@@ -299,6 +299,8 @@ func main() {
 		api.PUT("/trade/customer-delete-requests/:id/decision", tradeHandler.DecideCustomerDeleteRequest)
 		api.GET("/trade/suppliers", tradeHandler.ListSuppliers)
 		api.POST("/trade/suppliers", tradeHandler.CreateSupplier)
+		api.PUT("/trade/suppliers/:id", tradeHandler.UpdateSupplier)
+		api.DELETE("/trade/suppliers/:id", tradeHandler.DeleteSupplier)
 		api.GET("/trade/positions", tradeHandler.ListPositions)
 		api.PUT("/trade/positions/assignments", tradeHandler.UpdatePositionAssignments)
 		api.GET("/trade/settings", tradeHandler.GetSettings)

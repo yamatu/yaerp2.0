@@ -1032,6 +1032,12 @@ export default function TradeWorkspacePage() {
     newSupplierDraft(),
   );
   const [savingSupplier, setSavingSupplier] = useState(false);
+  const [editingSupplierID, setEditingSupplierID] = useState<number | null>(
+    null,
+  );
+  const [deletingSupplierID, setDeletingSupplierID] = useState<number | null>(
+    null,
+  );
 
   const [quoteModalOpen, setQuoteModalOpen] = useState(false);
   const [quoteDrafts, setQuoteDrafts] = useState<SupplierQuoteDraft[]>([
@@ -2165,16 +2171,24 @@ export default function TradeWorkspacePage() {
     setSavingSupplier(true);
     setError("");
     try {
-      const response = await api.post<TradeSupplier>(
-        "/trade/suppliers",
-        supplierDraft,
-      );
+      const isEditing = editingSupplierID !== null;
+      const endpoint = isEditing
+        ? `/trade/suppliers/${editingSupplierID}`
+        : "/trade/suppliers";
+      const response = isEditing
+        ? await api.put<TradeSupplier>(endpoint, supplierDraft)
+        : await api.post<TradeSupplier>(endpoint, supplierDraft);
       if (response.code !== 0 || !response.data)
-        throw new Error(response.message || "创建供应商失败");
+        throw new Error(
+          response.message || (isEditing ? "更新供应商失败" : "创建供应商失败"),
+        );
       setSupplierModalOpen(false);
-      setNotice(`供应商「${response.data.name}」已录入。`);
+      setEditingSupplierID(null);
+      setNotice(
+        `供应商「${response.data.name}」已${isEditing ? "更新" : "录入"}。`,
+      );
       await loadData(true);
-      if (quoteModalOpen)
+      if (!isEditing && quoteModalOpen)
         setQuoteDrafts((current) =>
           current.map((draft, index) =>
             index === activeQuoteDraftIndex
@@ -2188,10 +2202,68 @@ export default function TradeWorkspacePage() {
         );
     } catch (saveError) {
       setError(
-        saveError instanceof Error ? saveError.message : "创建供应商失败",
+        saveError instanceof Error
+          ? saveError.message
+          : editingSupplierID
+            ? "更新供应商失败"
+            : "创建供应商失败",
       );
     } finally {
       setSavingSupplier(false);
+    }
+  };
+
+  const closeSupplierModal = () => {
+    if (savingSupplier) return;
+    setSupplierModalOpen(false);
+    setEditingSupplierID(null);
+  };
+
+  const openNewSupplierModal = (paymentMethod = paymentOptions[0]) => {
+    setEditingSupplierID(null);
+    setSupplierDraft(newSupplierDraft(paymentMethod));
+    setSupplierModalOpen(true);
+  };
+
+  const openEditSupplierModal = (supplier: TradeSupplier) => {
+    setEditingSupplierID(supplier.id);
+    setSupplierDraft({
+      name: supplier.name || "",
+      company_name: supplier.company_name || "",
+      contact_name: supplier.contact_name || "",
+      phone: supplier.phone || "",
+      email: supplier.email || "",
+      whatsapp: supplier.whatsapp || "",
+      country: supplier.country || "",
+      default_currency: supplier.default_currency || "CNY",
+      payment_method: supplier.payment_method || paymentOptions[0] || "",
+      notes: supplier.notes || "",
+    });
+    setSupplierModalOpen(true);
+  };
+
+  const deleteSupplier = async (supplier: TradeSupplier) => {
+    if (
+      !window.confirm(
+        `确定删除供应商「${supplier.name}」吗？删除后无法恢复；已有历史报价的供应商不能直接删除。`,
+      )
+    ) {
+      return;
+    }
+    setDeletingSupplierID(supplier.id);
+    setError("");
+    try {
+      const response = await api.delete(`/trade/suppliers/${supplier.id}`);
+      if (response.code !== 0)
+        throw new Error(response.message || "删除供应商失败");
+      setNotice(`供应商「${supplier.name}」已删除。`);
+      await loadData(true);
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error ? deleteError.message : "删除供应商失败",
+      );
+    } finally {
+      setDeletingSupplierID(null);
     }
   };
 
@@ -3575,11 +3647,9 @@ export default function TradeWorkspacePage() {
                   tradeAccess?.can_manage_suppliers && (
                     <button
                       type="button"
-                      onClick={() => {
-                        setSupplierDraft(newSupplierDraft(paymentOptions[0]));
-                        setSupplierModalOpen(true);
-                      }}
+                      onClick={() => openNewSupplierModal(paymentOptions[0])}
                       className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white"
+                      title="新增供应商"
                     >
                       <Plus className="h-4 w-4" />
                       供应商
@@ -4473,13 +4543,14 @@ export default function TradeWorkspacePage() {
                       <th className="px-4 py-3">默认币种</th>
                       <th className="px-4 py-3">付款方式</th>
                       <th className="px-4 py-3">录入人</th>
+                      <th className="px-4 py-3">操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredSuppliers.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={7}
+                          colSpan={8}
                           className="h-48 text-center text-slate-400"
                         >
                           暂无供应商，先录入供应商后再进行比价。
@@ -4516,6 +4587,37 @@ export default function TradeWorkspacePage() {
                             {supplier.payment_method || "-"}
                           </td>
                           <td className="px-4 py-3">{supplier.owner_name}</td>
+                          <td className="px-4 py-3">
+                            {tradeAccess?.can_manage_suppliers ? (
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => openEditSupplierModal(supplier)}
+                                  className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium text-slate-600 hover:bg-slate-100"
+                                  title="编辑供应商信息"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                  编辑
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void deleteSupplier(supplier)}
+                                  disabled={deletingSupplierID === supplier.id}
+                                  className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-40"
+                                  title="删除供应商"
+                                >
+                                  {deletingSupplierID === supplier.id ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  )}
+                                  删除
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-slate-400">-</span>
+                            )}
+                          </td>
                         </tr>
                       ))
                     )}
@@ -5451,20 +5553,24 @@ export default function TradeWorkspacePage() {
             className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingSupplier)
-                setSupplierModalOpen(false);
+                closeSupplierModal();
             }}
           >
             <div className="w-full max-w-2xl rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
-                  <h2 className="font-semibold">录入供应商</h2>
+                  <h2 className="font-semibold">
+                    {editingSupplierID ? "编辑供应商" : "录入供应商"}
+                  </h2>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    供应商可在多个业务单的询价和采购环节复用。
+                    {editingSupplierID
+                      ? "修改后的供应商信息会同步到后续询价和采购记录。"
+                      : "供应商可在多个业务单的询价和采购环节复用。"}
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setSupplierModalOpen(false)}
+                  onClick={closeSupplierModal}
                   className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
                 >
                   <X className="h-4 w-4" />
@@ -5609,7 +5715,7 @@ export default function TradeWorkspacePage() {
               <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
                 <button
                   type="button"
-                  onClick={() => setSupplierModalOpen(false)}
+                  onClick={closeSupplierModal}
                   className="h-9 rounded-lg border border-slate-200 px-4 text-sm"
                 >
                   取消
@@ -5623,7 +5729,7 @@ export default function TradeWorkspacePage() {
                   {savingSupplier && (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   )}
-                  保存供应商
+                  {editingSupplierID ? "保存修改" : "保存供应商"}
                 </button>
               </div>
             </div>
@@ -5752,10 +5858,7 @@ export default function TradeWorkspacePage() {
                       />
                       <button
                         type="button"
-                        onClick={() => {
-                          setSupplierDraft(newSupplierDraft(paymentOptions[0]));
-                          setSupplierModalOpen(true);
-                        }}
+                        onClick={() => openNewSupplierModal(paymentOptions[0])}
                         className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200"
                         title="新增供应商"
                       >

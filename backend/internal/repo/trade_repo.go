@@ -1154,6 +1154,55 @@ func (r *TradeRepo) GetSupplier(supplierID int64) (*model.TradeSupplier, error) 
 	return &supplier, nil
 }
 
+func (r *TradeRepo) UpdateSupplier(supplier *model.TradeSupplier) error {
+	if supplier == nil || supplier.ID <= 0 {
+		return fmt.Errorf("invalid trade supplier")
+	}
+	result, err := r.db.Exec(
+		`UPDATE trade_suppliers SET
+		 name=$2,company_name=$3,contact_name=$4,phone=$5,email=$6,whatsapp=$7,
+		 country=$8,default_currency=$9,payment_method=$10,notes=$11,updated_at=NOW()
+		 WHERE id=$1`,
+		supplier.ID, supplier.Name, supplier.CompanyName, supplier.ContactName, supplier.Phone,
+		supplier.Email, supplier.WhatsApp, supplier.Country, supplier.DefaultCurrency,
+		supplier.PaymentMethod, supplier.Notes,
+	)
+	if err != nil {
+		return fmt.Errorf("update trade supplier: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (r *TradeRepo) DeleteSupplier(supplierID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin deleting trade supplier: %w", err)
+	}
+	defer tx.Rollback()
+
+	var quoteCount int64
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM trade_supplier_quotes WHERE supplier_id=$1`, supplierID,
+	).Scan(&quoteCount); err != nil {
+		return fmt.Errorf("check supplier history: %w", err)
+	}
+	if quoteCount > 0 {
+		return fmt.Errorf("供应商已关联 %d 条历史报价，不能直接删除；请编辑供应商信息或将其停用", quoteCount)
+	}
+
+	result, err := tx.Exec(`DELETE FROM trade_suppliers WHERE id=$1`, supplierID)
+	if err != nil {
+		return fmt.Errorf("delete trade supplier: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func scanTradeSupplierQuote(scanner tradeRowScanner) (*model.TradeSupplierQuote, error) {
 	var quote model.TradeSupplierQuote
 	var supplierID sql.NullInt64

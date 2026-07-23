@@ -1645,6 +1645,62 @@ func (s *TradeService) CreateSupplier(userID int64, request *model.CreateTradeSu
 	return supplier, nil
 }
 
+func (s *TradeService) UpdateSupplier(userID, supplierID int64, request *model.CreateTradeSupplierRequest) (*model.TradeSupplier, error) {
+	access, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !access.profile.CanManageSuppliers {
+		return nil, fmt.Errorf("当前岗位没有维护供应商的权限")
+	}
+	if supplierID <= 0 {
+		return nil, fmt.Errorf("供应商编号无效")
+	}
+	if request == nil || strings.TrimSpace(request.Name) == "" {
+		return nil, fmt.Errorf("供应商名称不能为空")
+	}
+
+	supplier, err := s.repo.GetSupplier(supplierID)
+	if err != nil {
+		return nil, err
+	}
+	currency := strings.ToUpper(strings.TrimSpace(request.DefaultCurrency))
+	if currency == "" {
+		currency = firstNonEmptyTrade(strings.ToUpper(strings.TrimSpace(supplier.DefaultCurrency)), "CNY")
+	}
+	supplier.Name = strings.TrimSpace(request.Name)
+	supplier.CompanyName = strings.TrimSpace(request.CompanyName)
+	if supplier.CompanyName == "" {
+		supplier.CompanyName = supplier.Name
+	}
+	supplier.ContactName = strings.TrimSpace(request.ContactName)
+	supplier.Phone = strings.TrimSpace(request.Phone)
+	supplier.Email = strings.TrimSpace(request.Email)
+	supplier.WhatsApp = strings.TrimSpace(request.WhatsApp)
+	supplier.Country = strings.TrimSpace(request.Country)
+	supplier.DefaultCurrency = currency
+	supplier.PaymentMethod = strings.TrimSpace(request.PaymentMethod)
+	supplier.Notes = strings.TrimSpace(request.Notes)
+	if err := s.repo.UpdateSupplier(supplier); err != nil {
+		return nil, err
+	}
+	return s.repo.GetSupplier(supplierID)
+}
+
+func (s *TradeService) DeleteSupplier(userID, supplierID int64) error {
+	access, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return err
+	}
+	if !access.profile.CanManageSuppliers {
+		return fmt.Errorf("当前岗位没有删除供应商的权限")
+	}
+	if supplierID <= 0 {
+		return fmt.Errorf("供应商编号无效")
+	}
+	return s.repo.DeleteSupplier(supplierID)
+}
+
 func defaultTradeSupplierQuoteCurrency(supplier *model.TradeSupplier) string {
 	if supplier == nil {
 		return "CNY"

@@ -415,6 +415,46 @@ func (h *TradeHandler) CreateSupplier(c *gin.Context) {
 	response.OK(c, supplier)
 }
 
+func (h *TradeHandler) UpdateSupplier(c *gin.Context) {
+	supplierID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的供应商编号")
+		return
+	}
+	var request model.CreateTradeSupplierRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	supplier, err := h.service.UpdateSupplier(c.GetInt64("user_id"), supplierID, &request)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "供应商不存在或已被删除")
+		return
+	}
+	if err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
+	response.OK(c, supplier)
+}
+
+func (h *TradeHandler) DeleteSupplier(c *gin.Context) {
+	supplierID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的供应商编号")
+		return
+	}
+	if err := h.service.DeleteSupplier(c.GetInt64("user_id"), supplierID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "供应商不存在或已被删除")
+			return
+		}
+		response.Forbidden(c, err.Error())
+		return
+	}
+	response.OKMsg(c, "供应商已删除")
+}
+
 func (h *TradeHandler) CreateSupplierQuote(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {
