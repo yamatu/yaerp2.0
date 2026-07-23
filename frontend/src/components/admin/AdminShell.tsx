@@ -9,6 +9,7 @@ import {
   Building2,
   Database,
   LayoutDashboard,
+  Mail,
   Shield,
   MessageCircle,
   Workflow,
@@ -28,6 +29,7 @@ const adminModules = [
   { label: '流程自动化', href: '/admin/automation', icon: Workflow },
   { label: 'AI 助手', href: '/admin/ai', icon: Bot },
   { label: 'WhatsApp', href: '/admin/whatsapp', icon: MessageCircle },
+  { label: '邮件服务', href: '/admin/mail', icon: Mail },
 ]
 
 interface AdminShellProps {

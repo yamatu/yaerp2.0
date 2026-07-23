@@ -21,6 +21,7 @@ import {
   Layers3,
   Images,
   LogOut,
+  Mail,
   MessageSquare,
   MessageCircle,
   PencilLine,
@@ -76,6 +77,15 @@ import type {
 interface WorkbookImportSource {
   filename?: string;
   attachment_id?: number | null;
+}
+
+interface HomeMailSummary {
+  configured: boolean;
+  enabled: boolean;
+  address?: string;
+  unread: number;
+  total?: number;
+  last_error?: string;
 }
 
 interface ExcelImportEntry {
@@ -239,7 +249,13 @@ export default function HomePage() {
     unread_system_notifications: 0,
     unread_notifications: 0,
   });
+  const [mailSummary, setMailSummary] = useState<HomeMailSummary>({
+    configured: false,
+    enabled: false,
+    unread: 0,
+  });
   const [channelNotificationOpen, setChannelNotificationOpen] = useState(false);
+  const [mailNotificationOpen, setMailNotificationOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [editingWorkbook, setEditingWorkbook] = useState<{
     id: number;
@@ -310,6 +326,8 @@ export default function HomePage() {
   const searchRef = useRef<HTMLDivElement>(null);
   const latestChannelMessageIdsRef = useRef<Map<number, number>>(new Map());
   const channelNotificationsInitializedRef = useRef(false);
+  const previousMailUnreadRef = useRef<number | null>(null);
+  const mailSummaryPollingRef = useRef(false);
   const notificationAudioContextRef = useRef<AudioContext | null>(null);
   const adminMode = isAdmin(profile);
   const workbookPageSize = 30;
@@ -413,6 +431,38 @@ export default function HomePage() {
       // Task badge should not block workbook operations.
     }
   }, [profile?.id]);
+
+  const loadMailSummary = useCallback(async () => {
+    if (!profile?.id || mailSummaryPollingRef.current) return;
+    mailSummaryPollingRef.current = true;
+    try {
+      const response = await api.get<HomeMailSummary>("/mail/summary");
+      if (response.code === 0 && response.data) {
+        const next = response.data;
+        const previous = previousMailUnreadRef.current;
+        previousMailUnreadRef.current = next.unread;
+        setMailSummary((current) =>
+          current.configured === next.configured &&
+          current.enabled === next.enabled &&
+          current.address === next.address &&
+          current.unread === next.unread &&
+          current.total === next.total &&
+          current.last_error === next.last_error
+            ? current
+            : next,
+        );
+        if (previous !== null && next.unread > previous) {
+          setMailNotificationOpen(true);
+          setChannelNotificationOpen(false);
+          void playHomeNotificationSound();
+        }
+      }
+    } catch {
+      // Mail status should not block workbook operations.
+    } finally {
+      mailSummaryPollingRef.current = false;
+    }
+  }, [playHomeNotificationSound, profile?.id]);
 
   const openChannelFromNotification = (channelId: number) => {
     if (profile?.id)
@@ -640,11 +690,18 @@ export default function HomePage() {
     if (!profile?.id) return;
     void loadChannelNotifications();
     void loadTaskSummary();
+    void loadMailSummary();
     const timer = window.setInterval(
       () => void loadChannelNotifications(),
       8000,
     );
     const taskTimer = window.setInterval(() => void loadTaskSummary(), 30000);
+    const mailTimer = window.setInterval(() => void loadMailSummary(), 12000);
+    const refreshMailWhenVisible = () => {
+      if (document.visibilityState === "visible") void loadMailSummary();
+    };
+    window.addEventListener("focus", refreshMailWhenVisible);
+    document.addEventListener("visibilitychange", refreshMailWhenVisible);
     wsClient.connect();
     const unsubscribe = wsClient.on(
       "task_notification",
@@ -653,19 +710,22 @@ export default function HomePage() {
     return () => {
       window.clearInterval(timer);
       window.clearInterval(taskTimer);
+      window.clearInterval(mailTimer);
+      window.removeEventListener("focus", refreshMailWhenVisible);
+      document.removeEventListener("visibilitychange", refreshMailWhenVisible);
       unsubscribe();
     };
-  }, [loadChannelNotifications, loadTaskSummary, profile?.id]);
+  }, [loadChannelNotifications, loadMailSummary, loadTaskSummary, profile?.id]);
 
   useEffect(() => {
     const baseTitle = "YaERP 2.0";
-    const totalUnread = totalChannelUnread + totalTaskUnread;
+    const totalUnread = totalChannelUnread + totalTaskUnread + mailSummary.unread;
     document.title =
       totalUnread > 0 ? `(${totalUnread}) ${baseTitle}` : baseTitle;
     return () => {
       document.title = baseTitle;
     };
-  }, [totalChannelUnread, totalTaskUnread]);
+  }, [mailSummary.unread, totalChannelUnread, totalTaskUnread]);
 
   useEffect(
     () => () => {
@@ -1387,9 +1447,10 @@ export default function HomePage() {
                 <div className="relative">
                   <button
                     type="button"
-                    onClick={() =>
-                      setChannelNotificationOpen((current) => !current)
-                    }
+                    onClick={() => {
+                      setMailNotificationOpen(false);
+                      setChannelNotificationOpen((current) => !current);
+                    }}
                     className="ui-tooltip relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-sky-700"
                     title="频道未读消息"
                     aria-label="频道未读消息"
@@ -1499,6 +1560,87 @@ export default function HomePage() {
                     </span>
                   )}
                 </button>
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setChannelNotificationOpen(false);
+                      setMailNotificationOpen((current) => !current);
+                    }}
+                    className="ui-tooltip relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-sky-50 hover:text-sky-700"
+                    title={mailSummary.configured ? "邮件提醒" : "绑定工作邮箱"}
+                    aria-label="邮件提醒"
+                    data-tooltip={mailSummary.configured ? "邮件提醒" : "绑定工作邮箱"}
+                  >
+                    <Mail className="h-4 w-4" />
+                    {mailSummary.unread > 0 && (
+                      <span className="absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full bg-sky-600 px-1 text-[10px] font-semibold leading-4 text-white">
+                        {mailSummary.unread > 99 ? "99+" : mailSummary.unread}
+                      </span>
+                    )}
+                  </button>
+                  {mailNotificationOpen && (
+                    <div className="fixed inset-x-3 top-20 z-50 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl sm:absolute sm:inset-x-auto sm:right-0 sm:top-11 sm:w-80">
+                      <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold text-slate-900">
+                            邮件提醒
+                          </div>
+                          <div className="mt-0.5 truncate text-xs text-slate-400">
+                            {mailSummary.address || "当前工作邮箱"}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setMailNotificationOpen(false)}
+                          className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+                          title="关闭邮件提醒"
+                          aria-label="关闭邮件提醒"
+                          data-tooltip="关闭"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="px-4 py-5">
+                        {!mailSummary.configured ? (
+                          <div className="text-sm text-slate-500">
+                            尚未绑定工作邮箱，进入邮件客户端完成配置。
+                          </div>
+                        ) : mailSummary.last_error ? (
+                          <div className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                            {mailSummary.last_error}
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-3">
+                            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-sky-50 text-sky-700">
+                              <Mail className="h-4 w-4" />
+                            </div>
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">
+                                {mailSummary.unread > 0
+                                  ? `${mailSummary.unread} 封未读邮件`
+                                  : "邮件已全部阅读"}
+                              </div>
+                              <div className="mt-0.5 text-xs text-slate-400">
+                                共 {mailSummary.total || 0} 封邮件
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMailNotificationOpen(false);
+                          router.push("/mail");
+                        }}
+                        className="flex h-10 w-full items-center justify-center border-t border-slate-200 text-sm font-medium text-sky-700 hover:bg-sky-50"
+                      >
+                        进入邮件
+                      </button>
+                    </div>
+                  )}
+                </div>
                 <button
                   type="button"
                   onClick={() => router.push("/trade")}

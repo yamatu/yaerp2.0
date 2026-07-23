@@ -82,6 +82,7 @@ func main() {
 	whatsAppRepo := repo.NewWhatsAppRepo(db)
 	scheduleRepo := repo.NewAIScheduleRepo(db)
 	tradeRepo := repo.NewTradeRepo(db)
+	mailRepo := repo.NewMailRepo(db)
 
 	// Services
 	authService := service.NewAuthService(userRepo, jwtUtil, rdb)
@@ -125,12 +126,16 @@ func main() {
 	go backupService.StartAutomaticBackups(context.Background())
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
 	aiService := service.NewAIService(cfg, db, sheetRepo, sheetService, permService, uploadService, scheduleService, tradeService)
+	mailService := service.NewMailService(mailRepo, permService, cfg.JWT.Secret)
+	mailService.SetAIService(aiService)
+	mailService.SetTradeService(tradeService)
 	aiService.SetAutomationService(automationService)
 	channelService.SetAIService(aiService)
 	scheduleService.SetReportGenerator(aiService.GenerateSheetReport)
 	if err := scheduleService.Start(); err != nil {
 		log.Fatalf("failed to start AI schedule service: %v", err)
 	}
+	go mailService.StartAutoForward(context.Background(), 2*time.Minute)
 
 	// WebSocket
 	hub := ws.NewHub()
@@ -219,6 +224,7 @@ func main() {
 	aiHandler := handler.NewAIHandler(aiService, hub)
 	automationHandler := handler.NewAutomationHandler(automationService)
 	tradeHandler := handler.NewTradeHandler(tradeService)
+	mailHandler := handler.NewMailHandler(mailService)
 
 	// Router
 	gin.SetMode(cfg.Server.Mode)
@@ -253,6 +259,30 @@ func main() {
 		api.PUT("/auth/avatar", userHandler.UpdateOwnAvatar)
 		api.GET("/users/shareable", userHandler.ListShareableUsers)
 		api.GET("/departments", departmentHandler.List)
+		api.GET("/mail/account", mailHandler.GetOwnAccount)
+		api.PUT("/mail/account", mailHandler.SaveOwnAccount)
+		api.POST("/mail/account/test", mailHandler.TestOwnAccount)
+		api.DELETE("/mail/account", mailHandler.DeleteOwnAccount)
+		api.GET("/mail/summary", mailHandler.Summary)
+		api.GET("/mail/folders", mailHandler.ListFolders)
+		api.POST("/mail/folders", mailHandler.CreateFolder)
+		api.PUT("/mail/folders/rename", mailHandler.RenameFolder)
+		api.DELETE("/mail/folders", mailHandler.DeleteFolder)
+		api.GET("/mail/messages", mailHandler.ListMessages)
+		api.POST("/mail/messages/batch", mailHandler.BatchMessages)
+		api.GET("/mail/correspondence", mailHandler.ListCorrespondence)
+		api.GET("/mail/messages/:uid", mailHandler.GetMessage)
+		api.PUT("/mail/messages/:uid/flags", mailHandler.UpdateFlags)
+		api.POST("/mail/messages/:uid/move", mailHandler.MoveMessage)
+		api.DELETE("/mail/messages/:uid", mailHandler.DeleteMessage)
+		api.GET("/mail/messages/:uid/attachments/:partId", mailHandler.DownloadAttachment)
+		api.POST("/mail/send", mailHandler.SendMessage)
+		api.GET("/mail/contacts", mailHandler.ListContacts)
+		api.POST("/mail/contacts", mailHandler.SaveContact)
+		api.PUT("/mail/contacts/:id", mailHandler.UpdateContact)
+		api.DELETE("/mail/contacts/:id", mailHandler.DeleteContact)
+		api.POST("/mail/translate", mailHandler.Translate)
+		api.POST("/mail/forward/run", mailHandler.RunForwarding)
 		api.GET("/trade/access", tradeHandler.AccessProfile)
 		api.GET("/trade/dashboard", tradeHandler.Dashboard)
 		api.GET("/trade/boss-dashboard", tradeHandler.BossDashboard)
@@ -537,6 +567,11 @@ func main() {
 			admin.PUT("/admin/whatsapp/accounts/:userId/preferences", whatsAppHandler.UpdateManagedPreferences)
 			admin.POST("/admin/whatsapp/accounts/:userId/:action", whatsAppHandler.ManagedAccountAction)
 			admin.GET("/admin/whatsapp/accounts/:userId/chats", whatsAppHandler.ListManagedChats)
+
+			// Poste.io mail client configuration (admin)
+			admin.GET("/admin/mail/settings", mailHandler.GetSettings)
+			admin.PUT("/admin/mail/settings", mailHandler.UpdateSettings)
+			admin.GET("/admin/mail/accounts", mailHandler.ListAccounts)
 		}
 	}
 

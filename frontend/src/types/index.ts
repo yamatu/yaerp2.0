@@ -1322,6 +1322,7 @@ export interface TradeCustomerQuoteRound {
   status: TradeCustomerQuoteStatus;
   goods_amount: number;
   exchange_rate_cny: number;
+  profit_margin_percent: number;
   freight_mode: "customer_forwarder" | "quoted";
   freight_amount: number;
   total_amount: number;
