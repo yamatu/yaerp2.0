@@ -101,6 +101,29 @@ func TestMailMessageSignatureOverride(t *testing.T) {
 	}
 }
 
+func TestMailSignatureRichHTMLSanitizer(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	signature, err := service.mailSignatureFromInput(7, 0, &model.MailSignatureInput{
+		Title:       "外贸签名",
+		HTMLContent: `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;border-collapse:collapse"><tbody><tr><td style="padding:0 16px 0 0;vertical-align:top"><strong style="font-size:18px;color:#0f172a">Janice</strong><br><img src="https://erp.example.com/api/files/1/content?signature=test" width="180" style="display:inline-block;max-width:100%;height:auto;margin:6px 0" onerror="alert(1)"></td></tr></tbody></table><script>alert(1)</script><a href="javascript:alert(1)">bad</a>`,
+		ApplyToNew:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := signature.HTMLContent
+	for _, expected := range []string{"<table", `role="presentation"`, "max-width: 600px", "font-size: 18px", "color: #0f172a", "<img", `width="180"`} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("safe rich signature markup %q was removed: %s", expected, content)
+		}
+	}
+	for _, forbidden := range []string{"<script", "onerror", "javascript:"} {
+		if strings.Contains(strings.ToLower(content), forbidden) {
+			t.Fatalf("unsafe signature markup %q was retained: %s", forbidden, content)
+		}
+	}
+}
+
 func TestMailFolderRoles(t *testing.T) {
 	tests := []struct {
 		name       string

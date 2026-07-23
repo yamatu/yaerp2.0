@@ -57,6 +57,7 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import { AuthGuard } from "@/components/auth/AuthGuard";
+import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
 import api from "@/lib/api";
 
 interface MailAccount {
@@ -1594,6 +1595,21 @@ export default function MailPage() {
     }
   };
 
+  const uploadSignatureImage = async (file: globalThis.File) => {
+    const uploadRes = await api.upload(file);
+    if (uploadRes.code !== 0 || !uploadRes.data?.id) {
+      throw new Error(uploadRes.message || "上传落款图片失败。");
+    }
+    const urlRes = await api.get<{ url: string }>(
+      `/files/${uploadRes.data.id}`,
+    );
+    if (urlRes.code !== 0 || !urlRes.data?.url) {
+      throw new Error(urlRes.message || "无法读取落款图片地址。");
+    }
+    if (typeof window === "undefined") return urlRes.data.url;
+    return new URL(urlRes.data.url, window.location.origin).toString();
+  };
+
   const translateText = async (source: string) => {
     if (!source.trim()) {
       setError("没有可翻译的内容。");
@@ -3052,24 +3068,25 @@ export default function MailPage() {
                   </label>
                 </div>
               </div>
-              <div className="mt-4 grid gap-4 xl:grid-cols-2">
-                <label>
+              <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
+                <div className="min-w-0">
                   <span className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600">
                     <Code2 className="h-3.5 w-3.5" />
-                    HTML 落款内容
+                    落款内容
                   </span>
-                  <textarea
+                  <MailSignatureEditor
                     value={signatureDraft.html_content}
-                    onChange={(event) =>
+                    onChange={(htmlContent) =>
                       setSignatureDraft((current) => ({
                         ...current,
-                        html_content: event.target.value,
+                        html_content: htmlContent,
                       }))
                     }
-                    placeholder={'<strong>Janice Chen</strong><br>Sales<br><a href="mailto:sales@example.com">sales@example.com</a>'}
-                    className="min-h-80 w-full resize-y rounded-lg border border-slate-200 p-3 font-mono text-sm leading-6 outline-none focus:border-sky-400"
+                    onUploadImage={uploadSignatureImage}
+                    displayName={account?.display_name || account?.username}
+                    emailAddress={account?.email_address}
                   />
-                </label>
+                </div>
                 <div>
                   <span className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600">
                     <Eye className="h-3.5 w-3.5" />
@@ -3082,7 +3099,7 @@ export default function MailPage() {
                       signatureDraft.html_content ||
                         '<span style="color:#94a3b8">在左侧输入落款内容后，这里会显示发送效果。</span>',
                     )}
-                    className="min-h-80 w-full rounded-lg border border-slate-200 bg-white"
+                    className="min-h-[466px] w-full rounded-lg border border-slate-200 bg-white"
                   />
                 </div>
               </div>

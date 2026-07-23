@@ -15,6 +15,7 @@ import (
 	"net"
 	stdmail "net/mail"
 	"net/smtp"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -68,14 +69,56 @@ func (s *MailService) SetAIService(aiSvc *AIService) { s.aiSvc = aiSvc }
 func (s *MailService) SetTradeService(tradeSvc *TradeService) { s.tradeSvc = tradeSvc }
 
 func NewMailService(mailRepo *repo.MailRepo, permSvc *PermissionService, encryptionSecret string) *MailService {
-	policy := bluemonday.UGCPolicy()
-	policy.AllowDataURIImages()
 	return &MailService{
 		repo:          mailRepo,
 		permSvc:       permSvc,
 		encryptionKey: sha256.Sum256([]byte(encryptionSecret + ":mail-account")),
-		htmlPolicy:    policy,
+		htmlPolicy:    newMailHTMLPolicy(),
 	}
+}
+
+func newMailHTMLPolicy() *bluemonday.Policy {
+	policy := bluemonday.UGCPolicy()
+	policy.AllowDataURIImages()
+
+	colorValue := regexp.MustCompile(`(?i)^(?:#[0-9a-f]{3,8}|rgba?\(\s*[0-9.]+%?(?:\s*,\s*[0-9.]+%?){2}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)|transparent|currentcolor|black|white|gray|grey|red|blue|green|orange|purple|navy|teal|maroon|silver)$`)
+	fontFamily := regexp.MustCompile(`^[\p{L}\p{N}\s,'"_-]{1,120}$`)
+	fontSize := regexp.MustCompile(`(?i)^(?:xx-small|x-small|small|medium|large|x-large|xx-large|smaller|larger|[0-9]{1,3}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))$`)
+	lengthValue := regexp.MustCompile(`(?i)^(?:0|auto|[0-9]{1,4}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))$`)
+	spacingValue := regexp.MustCompile(`(?i)^(?:0|auto|[0-9]{1,4}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))(?:\s+(?:0|auto|[0-9]{1,4}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))){0,3}$`)
+	lineHeight := regexp.MustCompile(`(?i)^(?:normal|[0-9](?:\.[0-9]{1,2})?|[0-9]{1,3}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))$`)
+	borderValue := regexp.MustCompile(`(?i)^(?:0|none|[0-9]{1,2}px\s+(?:solid|dashed|dotted)\s+(?:#[0-9a-f]{3,8}|rgba?\([^;]+\)|black|white|gray|grey|transparent))$`)
+
+	policy.AllowStyles("color", "background-color", "border-color").Matching(colorValue).Globally()
+	policy.AllowStyles("font-family").Matching(fontFamily).Globally()
+	policy.AllowStyles("font-size").Matching(fontSize).Globally()
+	policy.AllowStyles("font-weight").MatchingEnum("normal", "bold", "400", "500", "600", "700").Globally()
+	policy.AllowStyles("font-style").MatchingEnum("normal", "italic").Globally()
+	policy.AllowStyles("text-decoration").Matching(regexp.MustCompile(`(?i)^(?:none|underline|line-through|underline line-through)$`)).Globally()
+	policy.AllowStyles("text-align").MatchingEnum("left", "center", "right", "justify").Globally()
+	policy.AllowStyles("vertical-align").MatchingEnum("top", "middle", "bottom", "baseline").Globally()
+	policy.AllowStyles("line-height").Matching(lineHeight).Globally()
+	policy.AllowStyles("letter-spacing").Matching(lengthValue).Globally()
+	policy.AllowStyles("width", "min-width", "max-width", "height", "min-height", "max-height").Matching(lengthValue).Globally()
+	policy.AllowStyles("margin", "margin-top", "margin-right", "margin-bottom", "margin-left", "padding", "padding-top", "padding-right", "padding-bottom", "padding-left").Matching(spacingValue).Globally()
+	policy.AllowStyles("border", "border-top", "border-right", "border-bottom", "border-left").Matching(borderValue).Globally()
+	policy.AllowStyles("border-collapse").MatchingEnum("collapse", "separate").OnElements("table")
+	policy.AllowStyles("display").MatchingEnum("block", "inline", "inline-block", "table", "table-row", "table-cell").Globally()
+	policy.AllowStyles("white-space").MatchingEnum("normal", "nowrap", "pre", "pre-wrap", "pre-line").Globally()
+	policy.AllowStyles("word-break").MatchingEnum("normal", "break-all", "keep-all", "break-word").Globally()
+	policy.AllowStyles("float").MatchingEnum("none", "left", "right").Globally()
+	policy.AllowStyles("clear").MatchingEnum("none", "left", "right", "both").Globally()
+	policy.AllowStyles("object-fit").MatchingEnum("contain", "cover", "fill", "none", "scale-down").OnElements("img")
+
+	policy.AllowElements("font")
+	policy.AllowAttrs("color").Matching(colorValue).OnElements("font")
+	policy.AllowAttrs("face").Matching(fontFamily).OnElements("font")
+	policy.AllowAttrs("size").Matching(regexp.MustCompile(`^[1-7]$`)).OnElements("font")
+	policy.AllowAttrs("role").Matching(regexp.MustCompile(`(?i)^presentation$`)).OnElements("table")
+	policy.AllowAttrs("cellpadding", "cellspacing", "border").Matching(regexp.MustCompile(`^[0-9]{1,3}$`)).OnElements("table")
+	policy.AllowAttrs("target").Matching(regexp.MustCompile(`(?i)^_(?:blank|self)$`)).OnElements("a")
+
+	return policy
 }
 
 func (s *MailService) GetSettings(userID int64) (*model.MailServerSettings, error) {
