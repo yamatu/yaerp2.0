@@ -129,6 +129,73 @@ func (s *MailService) DeleteContact(userID, contactID int64) error {
 	return s.repo.DeleteContact(userID, contactID)
 }
 
+func (s *MailService) ListSignatures(userID int64) ([]model.MailSignature, error) {
+	return s.repo.ListSignatures(userID)
+}
+
+func (s *MailService) SaveSignature(userID int64, input *model.MailSignatureInput) (*model.MailSignature, error) {
+	count, err := s.repo.CountSignatures(userID)
+	if err != nil {
+		return nil, err
+	}
+	if count >= 10 {
+		return nil, fmt.Errorf("每个邮箱最多保存 10 个落款")
+	}
+	signature, err := s.mailSignatureFromInput(userID, 0, input)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.CreateSignature(signature); err != nil {
+		return nil, err
+	}
+	return signature, nil
+}
+
+func (s *MailService) UpdateSignature(userID, signatureID int64, input *model.MailSignatureInput) (*model.MailSignature, error) {
+	if signatureID <= 0 {
+		return nil, fmt.Errorf("邮件落款不存在")
+	}
+	signature, err := s.mailSignatureFromInput(userID, signatureID, input)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.UpdateSignature(signature); err != nil {
+		return nil, err
+	}
+	return signature, nil
+}
+
+func (s *MailService) DeleteSignature(userID, signatureID int64) error {
+	if signatureID <= 0 {
+		return fmt.Errorf("邮件落款不存在")
+	}
+	return s.repo.DeleteSignature(userID, signatureID)
+}
+
+func (s *MailService) mailSignatureFromInput(userID, signatureID int64, input *model.MailSignatureInput) (*model.MailSignature, error) {
+	if input == nil {
+		return nil, fmt.Errorf("邮件落款内容不能为空")
+	}
+	title := strings.TrimSpace(input.Title)
+	if title == "" {
+		return nil, fmt.Errorf("请填写落款标题")
+	}
+	if len([]rune(title)) > 100 {
+		return nil, fmt.Errorf("落款标题不能超过 100 个字符")
+	}
+	content := strings.TrimSpace(s.htmlPolicy.Sanitize(input.HTMLContent))
+	if content == "" {
+		return nil, fmt.Errorf("请填写落款内容")
+	}
+	if len(content) > 100000 {
+		return nil, fmt.Errorf("落款内容过长")
+	}
+	return &model.MailSignature{
+		ID: signatureID, UserID: userID, Title: title, HTMLContent: content,
+		ApplyToNew: input.ApplyToNew, ApplyToReply: input.ApplyToReply,
+	}, nil
+}
+
 func (s *MailService) ListCorrespondence(userID int64, email string, page, pageSize int) (*model.MailMessagePage, error) {
 	parsed, err := stdmail.ParseAddress(strings.TrimSpace(email))
 	if err != nil || !strings.Contains(parsed.Address, "@") {

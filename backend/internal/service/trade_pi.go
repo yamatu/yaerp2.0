@@ -53,6 +53,7 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 		return nil, err
 	}
 	profile := normalizeTradePIProfile(settings.PIProfile)
+	profile = applyTradePISellerProfile(profile, quote.PISellerProfile)
 	if profile.CompanyName == "" {
 		return nil, fmt.Errorf("请先在外贸设置中配置 PI 公司资料")
 	}
@@ -109,6 +110,19 @@ func (s *TradeService) BuildTradePIFile(userID, orderID int64, request *model.Tr
 		Total:    quote.TotalAmount,
 		Data:     pdfData,
 	}, nil
+}
+
+func applyTradePISellerProfile(profile model.TradePIProfile, seller *model.TradePISellerProfile) model.TradePIProfile {
+	if seller == nil {
+		return profile
+	}
+	profile.CompanyName = strings.TrimSpace(seller.CompanyName)
+	profile.Address = strings.TrimSpace(seller.Address)
+	profile.ContactName = strings.TrimSpace(seller.ContactName)
+	profile.Phone = strings.TrimSpace(seller.Phone)
+	profile.Email = strings.TrimSpace(seller.Email)
+	profile.TaxID = strings.TrimSpace(seller.TaxID)
+	return profile
 }
 
 func tradePIBankImageAttachmentID(profile *model.TradePIProfile, quote *model.TradeCustomerQuoteRound) *int64 {

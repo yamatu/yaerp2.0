@@ -321,6 +321,97 @@ func (r *MailRepo) DeleteContact(userID, contactID int64) error {
 	return nil
 }
 
+func (r *MailRepo) ListSignatures(userID int64) ([]model.MailSignature, error) {
+	rows, err := r.db.Query(
+		`SELECT id,user_id,title,html_content,apply_to_new,apply_to_reply,created_at,updated_at
+		   FROM mail_signatures WHERE user_id=$1 ORDER BY created_at,id`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]model.MailSignature, 0)
+	for rows.Next() {
+		var signature model.MailSignature
+		if err := rows.Scan(
+			&signature.ID, &signature.UserID, &signature.Title, &signature.HTMLContent,
+			&signature.ApplyToNew, &signature.ApplyToReply, &signature.CreatedAt, &signature.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, signature)
+	}
+	return result, rows.Err()
+}
+
+func (r *MailRepo) CountSignatures(userID int64) (int, error) {
+	var count int
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM mail_signatures WHERE user_id=$1`, userID).Scan(&count)
+	return count, err
+}
+
+func (r *MailRepo) CreateSignature(signature *model.MailSignature) error {
+	return r.saveSignature(signature, false)
+}
+
+func (r *MailRepo) UpdateSignature(signature *model.MailSignature) error {
+	return r.saveSignature(signature, true)
+}
+
+func (r *MailRepo) saveSignature(signature *model.MailSignature, update bool) error {
+	if signature == nil || signature.UserID <= 0 {
+		return fmt.Errorf("invalid mail signature")
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if signature.ApplyToNew {
+		if _, err := tx.Exec(`UPDATE mail_signatures SET apply_to_new=FALSE,updated_at=NOW() WHERE user_id=$1`, signature.UserID); err != nil {
+			return err
+		}
+	}
+	if signature.ApplyToReply {
+		if _, err := tx.Exec(`UPDATE mail_signatures SET apply_to_reply=FALSE,updated_at=NOW() WHERE user_id=$1`, signature.UserID); err != nil {
+			return err
+		}
+	}
+	if update {
+		err = tx.QueryRow(
+			`UPDATE mail_signatures
+			    SET title=$3,html_content=$4,apply_to_new=$5,apply_to_reply=$6,updated_at=NOW()
+			  WHERE id=$1 AND user_id=$2
+			 RETURNING created_at,updated_at`,
+			signature.ID, signature.UserID, signature.Title, signature.HTMLContent,
+			signature.ApplyToNew, signature.ApplyToReply,
+		).Scan(&signature.CreatedAt, &signature.UpdatedAt)
+	} else {
+		err = tx.QueryRow(
+			`INSERT INTO mail_signatures(user_id,title,html_content,apply_to_new,apply_to_reply,created_at,updated_at)
+			 VALUES($1,$2,$3,$4,$5,NOW(),NOW()) RETURNING id,created_at,updated_at`,
+			signature.UserID, signature.Title, signature.HTMLContent,
+			signature.ApplyToNew, signature.ApplyToReply,
+		).Scan(&signature.ID, &signature.CreatedAt, &signature.UpdatedAt)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *MailRepo) DeleteSignature(userID, signatureID int64) error {
+	result, err := r.db.Exec(`DELETE FROM mail_signatures WHERE id=$1 AND user_id=$2`, signatureID, userID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func scanMailContact(scanner mailScanner) (*model.MailContact, error) {
 	var contact model.MailContact
 	var customerID sql.NullInt64

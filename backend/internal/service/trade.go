@@ -2202,6 +2202,41 @@ func (s *TradeService) RemoveTradePIBankImage(userID, orderID, quoteID int64) (*
 	return s.GetOrder(userID, orderID)
 }
 
+func (s *TradeService) UpdateTradePISellerProfile(userID, orderID, quoteID int64, request *model.UpdateTradePISellerProfileRequest) (*model.TradeOrder, error) {
+	order, err := s.GetOrder(userID, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	if order.Access == nil || !order.Access.CanGeneratePI {
+		return nil, fmt.Errorf("没有修改当前 PI 卖方资料的权限")
+	}
+	if _, err := selectTradePIQuote(order.CustomerQuotes, &model.TradePIRequest{QuoteID: quoteID}); err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, fmt.Errorf("PI 卖方资料不能为空")
+	}
+	profile := normalizeTradePISellerProfile(request.Profile)
+	if profile.CompanyName == "" {
+		return nil, fmt.Errorf("卖方公司名称不能为空")
+	}
+	if err := s.repo.UpdateCustomerQuotePISellerProfile(orderID, quoteID, &profile); err != nil {
+		return nil, err
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+func normalizeTradePISellerProfile(profile model.TradePISellerProfile) model.TradePISellerProfile {
+	profile.CompanyName = strings.TrimSpace(profile.CompanyName)
+	profile.Address = strings.TrimSpace(profile.Address)
+	profile.ContactName = strings.TrimSpace(profile.ContactName)
+	profile.Phone = strings.TrimSpace(profile.Phone)
+	profile.Email = strings.TrimSpace(profile.Email)
+	profile.TaxID = strings.TrimSpace(profile.TaxID)
+	return profile
+}
+
 func (s *TradeService) DeleteCustomerPaymentProof(userID, orderID, proofID int64) error {
 	admin, err := s.isAdmin(userID)
 	if err != nil {

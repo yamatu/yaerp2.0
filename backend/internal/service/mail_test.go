@@ -71,6 +71,36 @@ func TestMailMessageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMailMessageSignatureOverride(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	session := &mailSession{
+		settings: &model.MailServerSettings{DefaultDomain: "example.com"},
+		account: &model.MailAccount{
+			EmailAddress: "sales@example.com", SignatureHTML: "<strong>Legacy signature</strong>",
+		},
+	}
+	override := "<strong>Selected signature</strong>"
+	input := &model.MailSendInput{Subject: "test", TextBody: "body", SignatureHTML: &override}
+	raw, _, _, err := service.buildOutgoingMessage(session, input, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := string(raw)
+	if !strings.Contains(message, "Selected signature") || strings.Contains(message, "Legacy signature") {
+		t.Fatalf("selected signature did not override legacy account signature: %s", message)
+	}
+
+	disabled := ""
+	input.SignatureHTML = &disabled
+	raw, _, _, err = service.buildOutgoingMessage(session, input, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "Legacy signature") {
+		t.Fatalf("explicitly disabled signature fell back to legacy signature: %s", raw)
+	}
+}
+
 func TestMailFolderRoles(t *testing.T) {
 	tests := []struct {
 		name       string

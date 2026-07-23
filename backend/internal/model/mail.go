@@ -175,6 +175,7 @@ type MailSendInput struct {
 	Priority           string   `json:"priority"`
 	RequestReadReceipt bool     `json:"request_read_receipt"`
 	AutoForwardedBy    string   `json:"-"`
+	SignatureHTML      *string  `json:"signature_html"`
 }
 
 type MailSendResult struct {
@@ -203,6 +204,24 @@ type MailContactInput struct {
 	Email           string `json:"email" binding:"required"`
 	Phone           string `json:"phone"`
 	Notes           string `json:"notes"`
+}
+
+type MailSignature struct {
+	ID           int64     `json:"id"`
+	UserID       int64     `json:"user_id"`
+	Title        string    `json:"title"`
+	HTMLContent  string    `json:"html_content"`
+	ApplyToNew   bool      `json:"apply_to_new"`
+	ApplyToReply bool      `json:"apply_to_reply"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type MailSignatureInput struct {
+	Title        string `json:"title" binding:"required"`
+	HTMLContent  string `json:"html_content"`
+	ApplyToNew   bool   `json:"apply_to_new"`
+	ApplyToReply bool   `json:"apply_to_reply"`
 }
 
 type MailTranslateInput struct {

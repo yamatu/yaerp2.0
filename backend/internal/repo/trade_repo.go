@@ -1381,6 +1381,7 @@ func (r *TradeRepo) SelectSupplierQuote(orderID, quoteID, userID int64) error {
 func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQuoteRound, error) {
 	var quote model.TradeCustomerQuoteRound
 	var itemsRaw []byte
+	var piSellerProfileRaw []byte
 	var piBankImageID sql.NullInt64
 	var sentAt sql.NullTime
 	if err := scanner.Scan(
@@ -1388,7 +1389,7 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 		&quote.GoodsAmount, &quote.ExchangeRateCNY, &quote.ProfitMarginPercent, &quote.FreightMode, &quote.FreightAmount,
 		&quote.TotalAmount, &quote.TotalAmountCNY, &itemsRaw, &quote.CustomerFeedback, &quote.Notes,
 		&quote.PaymentStatus, &quote.PaymentCurrency, &quote.PaidAmount,
-		&piBankImageID,
+		&piBankImageID, &piSellerProfileRaw,
 		&quote.CreatedBy, &quote.CreatedByName, &sentAt, &quote.CreatedAt, &quote.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -1405,6 +1406,13 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 	if piBankImageID.Valid {
 		quote.PIBankDetailsImageAttachmentID = &piBankImageID.Int64
 	}
+	if len(piSellerProfileRaw) > 0 && string(piSellerProfileRaw) != "{}" {
+		var profile model.TradePISellerProfile
+		if err := json.Unmarshal(piSellerProfileRaw, &profile); err != nil {
+			return nil, err
+		}
+		quote.PISellerProfile = &profile
+	}
 	return &quote, nil
 }
 
@@ -1412,7 +1420,7 @@ const tradeCustomerQuoteRoundSelect = `
 	SELECT q.id,q.order_id,q.round_no,q.currency,q.status,q.goods_amount,q.exchange_rate_cny,
 	       q.profit_margin_percent,q.freight_mode,q.freight_amount,q.total_amount,q.total_amount_cny,q.item_prices,
 	       q.customer_feedback,q.notes,q.payment_status,q.payment_currency,q.paid_amount,
-	       q.pi_bank_details_image_attachment_id,
+	       q.pi_bank_details_image_attachment_id,q.pi_seller_profile,
 	       q.created_by,COALESCE(u.username,''),q.sent_at,q.created_at,q.updated_at
 	FROM trade_customer_quote_rounds q
 	LEFT JOIN users u ON u.id=q.created_by`
@@ -1432,6 +1440,34 @@ func (r *TradeRepo) ListCustomerQuoteRounds(orderID int64) ([]model.TradeCustome
 		result = append(result, *quote)
 	}
 	return result, rows.Err()
+}
+
+func (r *TradeRepo) UpdateCustomerQuotePISellerProfile(orderID, quoteID int64, profile *model.TradePISellerProfile) error {
+	raw := []byte(`{}`)
+	var err error
+	if profile != nil {
+		raw, err = json.Marshal(profile)
+		if err != nil {
+			return fmt.Errorf("marshal PI seller profile: %w", err)
+		}
+	}
+	result, err := r.db.Exec(
+		`UPDATE trade_customer_quote_rounds
+		 SET pi_seller_profile=$3::jsonb,updated_at=NOW()
+		 WHERE id=$1 AND order_id=$2`,
+		quoteID, orderID, raw,
+	)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *TradeRepo) UpdateCustomerQuotePIBankImage(orderID, quoteID int64, attachmentID *int64) (*int64, error) {

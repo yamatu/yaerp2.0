@@ -347,6 +347,61 @@ func (h *MailHandler) DeleteContact(c *gin.Context) {
 	response.OKMsg(c, "mail contact deleted")
 }
 
+func (h *MailHandler) ListSignatures(c *gin.Context) {
+	signatures, err := h.service.ListSignatures(c.GetInt64("user_id"))
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, signatures)
+}
+
+func (h *MailHandler) SaveSignature(c *gin.Context) {
+	var input model.MailSignatureInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "invalid mail signature")
+		return
+	}
+	signature, err := h.service.SaveSignature(c.GetInt64("user_id"), &input)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, signature)
+}
+
+func (h *MailHandler) UpdateSignature(c *gin.Context) {
+	signatureID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || signatureID <= 0 {
+		response.BadRequest(c, "invalid mail signature")
+		return
+	}
+	var input model.MailSignatureInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "invalid mail signature")
+		return
+	}
+	signature, err := h.service.UpdateSignature(c.GetInt64("user_id"), signatureID, &input)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, signature)
+}
+
+func (h *MailHandler) DeleteSignature(c *gin.Context) {
+	signatureID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || signatureID <= 0 {
+		response.BadRequest(c, "invalid mail signature")
+		return
+	}
+	if err := h.service.DeleteSignature(c.GetInt64("user_id"), signatureID); err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OKMsg(c, "mail signature deleted")
+}
+
 func (h *MailHandler) Translate(c *gin.Context) {
 	var input model.MailTranslateInput
 	if err := c.ShouldBindJSON(&input); err != nil {

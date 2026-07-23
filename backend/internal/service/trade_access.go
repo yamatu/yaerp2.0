@@ -529,6 +529,7 @@ func redactTradePIBankImages(quotes []model.TradeCustomerQuoteRound, access *mod
 	for quoteIndex := range quotes {
 		quotes[quoteIndex].PIBankDetailsImageAttachmentID = nil
 		quotes[quoteIndex].PIBankDetailsImageURL = ""
+		quotes[quoteIndex].PISellerProfile = nil
 	}
 }
 

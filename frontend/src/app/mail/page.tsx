@@ -29,6 +29,7 @@ import {
   Menu,
   Paperclip,
   Pencil,
+  Plus,
   RefreshCw,
   Reply,
   ReplyAll,
@@ -171,6 +172,24 @@ interface MailContactInput {
   notes: string;
 }
 
+interface MailSignature {
+  id: number;
+  user_id: number;
+  title: string;
+  html_content: string;
+  apply_to_new: boolean;
+  apply_to_reply: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+interface MailSignatureInput {
+  title: string;
+  html_content: string;
+  apply_to_new: boolean;
+  apply_to_reply: boolean;
+}
+
 interface AIAssistant {
   id: number;
   name: string;
@@ -200,6 +219,8 @@ interface ComposeState {
   references: string[];
   priority: "normal" | "high" | "low";
   requestReadReceipt: boolean;
+  context: "new" | "reply" | "forward";
+  signatureID: "auto" | "none" | string;
 }
 
 interface MessageContextMenu {
@@ -243,6 +264,15 @@ const emptyCompose: ComposeState = {
   references: [],
   priority: "normal",
   requestReadReceipt: false,
+  context: "new",
+  signatureID: "auto",
+};
+
+const emptySignature: MailSignatureInput = {
+  title: "",
+  html_content: "",
+  apply_to_new: true,
+  apply_to_reply: true,
 };
 
 const translationLanguages = [
@@ -257,11 +287,6 @@ const translationLanguages = [
   ["ko", "韩语"],
   ["ar", "阿拉伯语"],
 ];
-
-function addressLabel(addresses: MailAddress[]) {
-  if (!addresses?.length) return "未知发件人";
-  return addresses.map((item) => item.name || item.address).join(", ");
-}
 
 function addressValues(addresses: MailAddress[]) {
   return addresses
@@ -410,6 +435,14 @@ export default function MailPage() {
   const [testingAccount, setTestingAccount] = useState(false);
   const [runningForward, setRunningForward] = useState(false);
   const [contacts, setContacts] = useState<MailContact[]>([]);
+  const [signatures, setSignatures] = useState<MailSignature[]>([]);
+  const [signaturesOpen, setSignaturesOpen] = useState(false);
+  const [signatureDraft, setSignatureDraft] =
+    useState<MailSignatureInput>(emptySignature);
+  const [editingSignatureID, setEditingSignatureID] = useState<number | null>(
+    null,
+  );
+  const [savingSignature, setSavingSignature] = useState(false);
   const [contactsOpen, setContactsOpen] = useState(false);
   const [contactQuery, setContactQuery] = useState("");
   const [contactSourceFilter, setContactSourceFilter] =
@@ -423,6 +456,7 @@ export default function MailPage() {
   const [savingContact, setSavingContact] = useState(false);
   const [correspondenceContact, setCorrespondenceContact] =
     useState<MailContact | null>(null);
+  const [senderCardOpen, setSenderCardOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<MessageContextMenu | null>(
     null,
   );
@@ -464,6 +498,29 @@ export default function MailPage() {
         (left.name || left.email).localeCompare(right.name || right.email),
       );
   }, [contactQuery, contactSourceFilter, contacts]);
+  const contactsByEmail = useMemo(
+    () =>
+      new Map(
+        contacts.map((contact) => [contact.email.trim().toLowerCase(), contact]),
+      ),
+    [contacts],
+  );
+  const selectedSenderAddress = selected?.from[0] || null;
+  const selectedSenderContact = selectedSenderAddress
+    ? contactsByEmail.get(selectedSenderAddress.address.toLowerCase()) || null
+    : null;
+  const mailAddressLabel = useCallback(
+    (addresses: MailAddress[]) => {
+      if (!addresses?.length) return "未知发件人";
+      return addresses
+        .map((address) => {
+          const contact = contactsByEmail.get(address.address.toLowerCase());
+          return contact?.name || address.name || address.address;
+        })
+        .join(", ");
+    },
+    [contactsByEmail],
+  );
   const selectedContacts = useMemo(
     () =>
       contacts.filter((contact) =>
@@ -490,14 +547,34 @@ export default function MailPage() {
   const allVisibleSelected =
     pageData.messages.length > 0 &&
     pageData.messages.every((message) => selectedKeys.has(messageKey(message)));
+  const activeSignature = useMemo(() => {
+    if (!compose || compose.signatureID === "none") return null;
+    if (compose.signatureID !== "auto") {
+      return (
+        signatures.find(
+          (signature) => String(signature.id) === compose.signatureID,
+        ) || null
+      );
+    }
+    const replyFlow = compose.context !== "new";
+    return (
+      signatures.find((signature) =>
+        replyFlow ? signature.apply_to_reply : signature.apply_to_new,
+      ) || null
+    );
+  }, [compose, signatures]);
+  const activeSignatureHTML =
+    compose?.signatureID === "none"
+      ? ""
+      : activeSignature?.html_content || account?.signature_html || "";
   const composePreview = useMemo(() => {
     if (!compose) return "";
     const body =
       compose.format === "html"
         ? compose.htmlBody
         : textToHTML(compose.textBody);
-    return `${body}${account?.signature_html ? `<br><br>${account.signature_html}` : ""}`;
-  }, [account?.signature_html, compose]);
+    return `${body}${activeSignatureHTML ? `<br><br>${activeSignatureHTML}` : ""}`;
+  }, [activeSignatureHTML, compose]);
   const displayedMailHTML = useMemo(() => {
     if (translation?.segments?.length) {
       return translation.segments
@@ -594,6 +671,12 @@ export default function MailPage() {
     if (!account) return;
     const res = await api.get<MailContact[]>("/mail/contacts");
     if (res.code === 0 && res.data) setContacts(res.data);
+  }, [account]);
+
+  const loadSignatures = useCallback(async () => {
+    if (!account) return;
+    const res = await api.get<MailSignature[]>("/mail/signatures");
+    if (res.code === 0 && res.data) setSignatures(res.data);
   }, [account]);
 
   const loadAssistants = useCallback(async () => {
@@ -762,11 +845,19 @@ export default function MailPage() {
   }, [loadAccount]);
   useEffect(() => {
     if (account)
-      void Promise.all([loadFolders(), loadContacts(), loadAssistants()]);
-  }, [account, loadAssistants, loadContacts, loadFolders]);
+      void Promise.all([
+        loadFolders(),
+        loadContacts(),
+        loadSignatures(),
+        loadAssistants(),
+      ]);
+  }, [account, loadAssistants, loadContacts, loadFolders, loadSignatures]);
   useEffect(() => {
     if (account) void loadMessages();
   }, [account, loadMessages]);
+  useEffect(() => {
+    setSenderCardOpen(false);
+  }, [selected?.folder, selected?.uid]);
   useEffect(() => {
     if (!account) return;
     void pollMailSummary();
@@ -1095,13 +1186,14 @@ export default function MailPage() {
   ) => {
     const ownAddress = account?.email_address.toLowerCase();
     const baseSubject = detail.subject.replace(/^(re|fwd):\s*/i, "");
-    const sender = addressLabel(detail.from);
+    const sender = mailAddressLabel(detail.from);
     const quotedText = `\n\n\n--- ${sender} 于 ${formatDate(detail.date, true)} 写道 ---\n${detail.text_body || ""}`;
     const originalHTML = detail.html_body || textToHTML(detail.text_body || "");
     const quotedHTML = `<p><br></p><blockquote style="margin:0;padding-left:14px;border-left:3px solid #cbd5e1"><div style="color:#64748b">${escapeHTML(sender)} 于 ${escapeHTML(formatDate(detail.date, true))} 写道：</div>${originalHTML}</blockquote>`;
     if (mode === "forward") {
       setCompose({
         ...emptyCompose,
+        context: "forward",
         subject: `Fwd: ${baseSubject}`,
         textBody: quotedText,
         htmlBody: quotedHTML,
@@ -1118,6 +1210,7 @@ export default function MailPage() {
       );
       setCompose({
         ...emptyCompose,
+        context: "new",
         to: addressValues(sentByMe ? detail.to : detail.from),
         cc: sentByMe ? addressValues(detail.cc || []) : "",
         subject: detail.subject,
@@ -1143,6 +1236,7 @@ export default function MailPage() {
           : [];
       setCompose({
         ...emptyCompose,
+        context: "reply",
         to: addressValues(replyTargets),
         cc: addressValues(all),
         subject: `Re: ${baseSubject}`,
@@ -1205,6 +1299,7 @@ export default function MailPage() {
           save_to_sent: true,
           priority: compose.priority,
           request_read_receipt: compose.requestReadReceipt,
+          signature_html: activeSignatureHTML,
         }),
       );
       composeFiles.forEach((file) => form.append("attachments", file));
@@ -1247,6 +1342,10 @@ export default function MailPage() {
   const openSaveSender = (message: MailMessageSummary) => {
     const sender = message.from[0];
     if (!sender) return;
+    openSaveAddress(sender);
+  };
+
+  const openSaveAddress = (sender: MailAddress) => {
     const existing = contacts.find(
       (contact) => contact.email.toLowerCase() === sender.address.toLowerCase(),
     );
@@ -1254,12 +1353,14 @@ export default function MailPage() {
       existing?.source === "saved" && existing.id > 0 ? existing.id : null,
     );
     setContactDraft({
+      trade_customer_id: existing?.trade_customer_id,
       name: existing?.name || sender.name || "",
       company: existing?.company || "",
       email: sender.address,
       phone: existing?.phone || "",
       notes: existing?.notes || "",
     });
+    setSenderCardOpen(false);
     setContactsOpen(true);
   };
 
@@ -1402,6 +1503,95 @@ export default function MailPage() {
     setComposeView("edit");
     setContactsOpen(false);
     setSelectedContactKeys(new Set());
+  };
+
+  const writeToAddress = (address: MailAddress) => {
+    const contact = contactsByEmail.get(address.address.toLowerCase());
+    setCompose({
+      ...emptyCompose,
+      to: contact?.name
+        ? `${contact.name} <${address.address}>`
+        : address.name
+          ? `${address.name} <${address.address}>`
+          : address.address,
+    });
+    setComposeFiles([]);
+    setComposeView("edit");
+    setSenderCardOpen(false);
+  };
+
+  const viewAddressCorrespondence = (address: MailAddress) => {
+    const contact = contactsByEmail.get(address.address.toLowerCase());
+    viewCorrespondence(
+      contact || {
+        id: 0,
+        user_id: account?.user_id || 0,
+        name: address.name || address.address,
+        company: "",
+        email: address.address,
+        source: "saved",
+      },
+    );
+    setSenderCardOpen(false);
+  };
+
+  const resetSignatureEditor = () => {
+    setEditingSignatureID(null);
+    setSignatureDraft({
+      ...emptySignature,
+      apply_to_new: !signatures.some((signature) => signature.apply_to_new),
+      apply_to_reply: !signatures.some(
+        (signature) => signature.apply_to_reply,
+      ),
+    });
+  };
+
+  const editSignature = (signature: MailSignature) => {
+    setEditingSignatureID(signature.id);
+    setSignatureDraft({
+      title: signature.title,
+      html_content: signature.html_content,
+      apply_to_new: signature.apply_to_new,
+      apply_to_reply: signature.apply_to_reply,
+    });
+  };
+
+  const saveSignature = async () => {
+    if (!signatureDraft.title.trim() || !signatureDraft.html_content.trim()) {
+      setError("请填写落款标题和内容。");
+      return;
+    }
+    setSavingSignature(true);
+    setError("");
+    const res = editingSignatureID
+      ? await api.put<MailSignature>(
+          `/mail/signatures/${editingSignatureID}`,
+          signatureDraft,
+        )
+      : await api.post<MailSignature>("/mail/signatures", signatureDraft);
+    if (res.code !== 0) setError(res.message || "保存邮件落款失败");
+    else {
+      setNotice(editingSignatureID ? "邮件落款已更新。" : "邮件落款已创建。");
+      await loadSignatures();
+      setEditingSignatureID(null);
+      setSignatureDraft({
+        ...emptySignature,
+        apply_to_new: false,
+        apply_to_reply: false,
+      });
+    }
+    setSavingSignature(false);
+  };
+
+  const deleteSignature = async (signature: MailSignature) => {
+    if (!window.confirm(`确定删除邮件落款“${signature.title}”？`)) return;
+    const res = await api.delete(`/mail/signatures/${signature.id}`);
+    if (res.code !== 0) setError(res.message || "删除邮件落款失败");
+    else {
+      if (editingSignatureID === signature.id) resetSignatureEditor();
+      await loadSignatures();
+      setNotice("邮件落款已删除。");
+    }
   };
 
   const translateText = async (source: string) => {
@@ -2106,7 +2296,7 @@ export default function MailPage() {
                         <span
                           className={`min-w-0 flex-1 truncate text-sm ${message.read ? "font-medium text-slate-700" : "font-semibold text-slate-950"}`}
                         >
-                          {addressLabel(message.from)}
+                          {mailAddressLabel(message.from)}
                         </span>
                         <span className="shrink-0 text-[11px] text-slate-400">
                           {formatDate(message.date)}
@@ -2330,32 +2520,121 @@ export default function MailPage() {
                       {selected.sender_avatar ? (
                         <img
                           src={selected.sender_avatar}
-                          alt={`${addressLabel(selected.from)} 的头像`}
+                          alt={`${mailAddressLabel(selected.from)} 的头像`}
                           className="h-full w-full object-cover"
                         />
                       ) : (
-                        addressLabel(selected.from).slice(0, 2).toUpperCase()
+                        mailAddressLabel(selected.from).slice(0, 2).toUpperCase()
                       )}
                     </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                    <div className="relative min-w-0 flex-1">
+                      <button
+                        type="button"
+                        onClick={() => setSenderCardOpen((current) => !current)}
+                        className="flex max-w-full flex-wrap items-baseline gap-x-2 gap-y-0.5 text-left hover:text-sky-700"
+                        title="查看发件人资料"
+                      >
                         <span className="text-sm font-semibold text-slate-800">
-                          {selected.from[0]?.name ||
-                            selected.from[0]?.address ||
-                            "未知发件人"}
+                          {selectedSenderAddress
+                            ? mailAddressLabel([selectedSenderAddress])
+                            : "未知发件人"}
                         </span>
-                        {selected.from[0]?.address &&
-                          selected.from[0].address !==
-                            selected.from[0]?.name && (
-                            <span className="break-all text-xs font-normal text-slate-500">
-                              {selected.from[0].address}
-                            </span>
-                          )}
-                      </div>
+                        {selectedSenderAddress?.address && (
+                          <span className="break-all text-xs font-normal text-slate-500">
+                            {selectedSenderAddress.address}
+                          </span>
+                        )}
+                      </button>
+                      {senderCardOpen && selectedSenderAddress && (
+                        <div
+                          className="absolute left-0 top-7 z-30 w-[min(340px,calc(100vw-40px))] overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <div className="flex items-start gap-3 border-b border-slate-100 p-4">
+                            <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-50 text-sm font-semibold text-sky-700">
+                              {selected.sender_avatar ? (
+                                <img
+                                  src={selected.sender_avatar}
+                                  alt="发件人头像"
+                                  className="h-full w-full object-cover"
+                                />
+                              ) : (
+                                mailAddressLabel([selectedSenderAddress])
+                                  .slice(0, 2)
+                                  .toUpperCase()
+                              )}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-sm font-semibold text-slate-900">
+                                {mailAddressLabel([selectedSenderAddress])}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void navigator.clipboard.writeText(
+                                    selectedSenderAddress.address,
+                                  )
+                                }
+                                className="mt-1 break-all text-left text-xs text-sky-700 hover:underline"
+                                title="复制邮箱地址"
+                              >
+                                {selectedSenderAddress.address}
+                              </button>
+                              {selectedSenderContact?.company && (
+                                <div className="mt-1 truncate text-xs text-slate-400">
+                                  {selectedSenderContact.company}
+                                </div>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setSenderCardOpen(false)}
+                              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100"
+                              title="关闭"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-3 divide-x divide-slate-100">
+                            <button
+                              type="button"
+                              onClick={() => writeToAddress(selectedSenderAddress)}
+                              className="flex h-11 items-center justify-center gap-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                            >
+                              <Send className="h-3.5 w-3.5" />
+                              写信
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                viewAddressCorrespondence(selectedSenderAddress)
+                              }
+                              className="flex h-11 items-center justify-center gap-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                            >
+                              <MailOpen className="h-3.5 w-3.5" />
+                              往来邮件
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openSaveAddress(selectedSenderAddress)}
+                              className="flex h-11 items-center justify-center gap-1.5 text-xs font-medium text-sky-700 hover:bg-sky-50"
+                            >
+                              {selectedSenderContact?.source === "saved" ? (
+                                <Pencil className="h-3.5 w-3.5" />
+                              ) : (
+                                <UserPlus className="h-3.5 w-3.5" />
+                              )}
+                              {selectedSenderContact?.source === "saved"
+                                ? "编辑备注"
+                                : "加联系人"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
                       <div className="mt-0.5 break-all text-xs text-slate-500">
-                        发给 {addressLabel(selected.to)}
+                        发给 {mailAddressLabel(selected.to)}
                         {selected.cc?.length
-                          ? `，抄送 ${addressLabel(selected.cc)}`
+                          ? `，抄送 ${mailAddressLabel(selected.cc)}`
                           : ""}
                       </div>
                     </div>
@@ -2596,6 +2875,12 @@ export default function MailPage() {
               value={accountInput}
               onChange={setAccountInput}
               existing
+              signatureCount={signatures.length}
+              onManageSignatures={() => {
+                setSettingsOpen(false);
+                resetSignatureEditor();
+                setSignaturesOpen(true);
+              }}
             />
             {(error || notice) && (
               <StatusMessage error={error} notice={notice} />
@@ -2643,6 +2928,209 @@ export default function MailPage() {
               >
                 <Save className="h-4 w-4" />
                 保存
+              </button>
+            </div>
+          </div>
+        </ModalShell>
+      )}
+
+      {signaturesOpen && (
+        <ModalShell
+          title="邮件落款"
+          subtitle="为新邮件、回复和转发设置不同的 HTML 落款"
+          onClose={() => setSignaturesOpen(false)}
+          maxWidth="max-w-6xl"
+        >
+          <div className="grid min-h-0 flex-1 lg:grid-cols-[280px_minmax(0,1fr)]">
+            <aside className="border-b border-slate-200 bg-slate-50 p-3 lg:border-b-0 lg:border-r">
+              <div className="flex items-center justify-between gap-2 px-1 pb-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-800">
+                    已保存 {signatures.length} / 10
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-400">
+                    默认项在写信时自动选择
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={resetSignatureEditor}
+                  disabled={signatures.length >= 10}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-sky-600 px-2.5 text-xs font-semibold text-white disabled:opacity-40"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  新建
+                </button>
+              </div>
+              <div className="flex max-h-52 gap-2 overflow-x-auto lg:max-h-[65dvh] lg:flex-col lg:overflow-y-auto lg:overflow-x-hidden">
+                {signatures.length === 0 ? (
+                  <div className="flex min-h-28 w-full flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 px-4 text-center text-xs text-slate-400">
+                    <FileText className="mb-2 h-5 w-5" />
+                    尚未创建落款
+                  </div>
+                ) : (
+                  signatures.map((signature) => (
+                    <button
+                      key={signature.id}
+                      type="button"
+                      onClick={() => editSignature(signature)}
+                      className={`min-w-52 rounded-lg border p-3 text-left transition lg:min-w-0 ${editingSignatureID === signature.id ? "border-sky-300 bg-white shadow-sm" : "border-slate-200 bg-white/70 hover:border-slate-300"}`}
+                    >
+                      <div className="truncate text-sm font-semibold text-slate-800">
+                        {signature.title}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {signature.apply_to_new && (
+                          <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700">
+                            新邮件
+                          </span>
+                        )}
+                        {signature.apply_to_reply && (
+                          <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">
+                            回复/转发
+                          </span>
+                        )}
+                        {!signature.apply_to_new &&
+                          !signature.apply_to_reply && (
+                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                              手动选择
+                            </span>
+                          )}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            </aside>
+            <section className="min-h-0 overflow-y-auto p-4 sm:p-5">
+              <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                <label>
+                  <span className="mb-1.5 block text-xs font-medium text-slate-600">
+                    落款标题
+                  </span>
+                  <input
+                    value={signatureDraft.title}
+                    onChange={(event) =>
+                      setSignatureDraft((current) => ({
+                        ...current,
+                        title: event.target.value,
+                      }))
+                    }
+                    placeholder="例如：外贸业务签名"
+                    maxLength={100}
+                    className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+                  />
+                </label>
+                <div className="flex h-10 items-center gap-4 rounded-lg border border-slate-200 px-3 text-xs text-slate-600">
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={signatureDraft.apply_to_new}
+                      onChange={(event) =>
+                        setSignatureDraft((current) => ({
+                          ...current,
+                          apply_to_new: event.target.checked,
+                        }))
+                      }
+                      className="h-4 w-4 accent-sky-600"
+                    />
+                    新邮件
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={signatureDraft.apply_to_reply}
+                      onChange={(event) =>
+                        setSignatureDraft((current) => ({
+                          ...current,
+                          apply_to_reply: event.target.checked,
+                        }))
+                      }
+                      className="h-4 w-4 accent-sky-600"
+                    />
+                    回复/转发
+                  </label>
+                </div>
+              </div>
+              <div className="mt-4 grid gap-4 xl:grid-cols-2">
+                <label>
+                  <span className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600">
+                    <Code2 className="h-3.5 w-3.5" />
+                    HTML 落款内容
+                  </span>
+                  <textarea
+                    value={signatureDraft.html_content}
+                    onChange={(event) =>
+                      setSignatureDraft((current) => ({
+                        ...current,
+                        html_content: event.target.value,
+                      }))
+                    }
+                    placeholder={'<strong>Janice Chen</strong><br>Sales<br><a href="mailto:sales@example.com">sales@example.com</a>'}
+                    className="min-h-80 w-full resize-y rounded-lg border border-slate-200 p-3 font-mono text-sm leading-6 outline-none focus:border-sky-400"
+                  />
+                </label>
+                <div>
+                  <span className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-600">
+                    <Eye className="h-3.5 w-3.5" />
+                    实时预览
+                  </span>
+                  <iframe
+                    title="邮件落款预览"
+                    sandbox=""
+                    srcDoc={iframeDocument(
+                      signatureDraft.html_content ||
+                        '<span style="color:#94a3b8">在左侧输入落款内容后，这里会显示发送效果。</span>',
+                    )}
+                    className="min-h-80 w-full rounded-lg border border-slate-200 bg-white"
+                  />
+                </div>
+              </div>
+              {(error || notice) && (
+                <div className="mt-4">
+                  <StatusMessage error={error} notice={notice} compact />
+                </div>
+              )}
+            </section>
+          </div>
+          <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-4 py-3 sm:px-5">
+            <div>
+              {editingSignatureID && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const signature = signatures.find(
+                      (item) => item.id === editingSignatureID,
+                    );
+                    if (signature) void deleteSignature(signature);
+                  }}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  删除落款
+                </button>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setSignaturesOpen(false)}
+                className="h-9 rounded-lg border border-slate-200 px-3 text-sm text-slate-600"
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveSignature()}
+                disabled={savingSignature || (!editingSignatureID && signatures.length >= 10)}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
+              >
+                {savingSignature ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="h-4 w-4" />
+                )}
+                {editingSignatureID ? "保存修改" : "创建落款"}
               </button>
             </div>
           </div>
@@ -3201,6 +3689,29 @@ export default function MailPage() {
                   <option value="high">高优先级</option>
                   <option value="low">低优先级</option>
                 </select>
+                <label className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600">
+                  <FileText className="h-3.5 w-3.5 text-slate-400" />
+                  <select
+                    value={compose.signatureID}
+                    onChange={(event) =>
+                      setCompose((current) =>
+                        current
+                          ? { ...current, signatureID: event.target.value }
+                          : current,
+                      )
+                    }
+                    className="max-w-36 bg-transparent outline-none"
+                    title="选择邮件落款"
+                  >
+                    <option value="auto">自动落款</option>
+                    <option value="none">不使用落款</option>
+                    {signatures.map((signature) => (
+                      <option key={signature.id} value={String(signature.id)}>
+                        {signature.title}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label className="inline-flex h-8 items-center gap-2 text-xs text-slate-500">
                   <input
                     type="checkbox"
@@ -3310,9 +3821,9 @@ export default function MailPage() {
                 }}
               />
               <span className="min-w-0 flex-1 truncate text-xs text-slate-400">
-                {account.signature_html
-                  ? "发送时会附加已预览的 HTML 签名"
-                  : "未设置邮箱签名"}
+                {activeSignatureHTML
+                  ? `发送时附加：${activeSignature?.title || "兼容签名"}`
+                  : "本次邮件不使用落款"}
               </span>
               <button
                 type="button"
@@ -3439,10 +3950,14 @@ function AccountForm({
   value,
   onChange,
   existing,
+  signatureCount = 0,
+  onManageSignatures,
 }: {
   value: MailAccountInput;
   onChange: (value: MailAccountInput) => void;
   existing: boolean;
+  signatureCount?: number;
+  onManageSignatures?: () => void;
 }) {
   return (
     <div className="grid gap-4 p-4 sm:grid-cols-2 sm:p-6">
@@ -3500,34 +4015,25 @@ function AccountForm({
           className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
         />
       </label>
-      <div className="grid gap-3 sm:col-span-2 sm:grid-cols-2">
-        <label>
-          <span className="mb-1.5 block text-xs font-medium text-slate-600">
-            HTML 邮件签名
-          </span>
-          <textarea
-            value={value.signature_html}
-            onChange={(event) =>
-              onChange({ ...value, signature_html: event.target.value })
-            }
-            placeholder="例如：&lt;strong&gt;姓名&lt;/strong&gt;&lt;br&gt;公司与联系方式"
-            className="min-h-36 w-full rounded-lg border border-slate-200 px-3 py-2 font-mono text-sm leading-6 outline-none focus:border-sky-400"
-          />
-        </label>
+      <div className="flex flex-col gap-3 border-y border-slate-200 py-4 sm:col-span-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <span className="mb-1.5 block text-xs font-medium text-slate-600">
-            签名预览
-          </span>
-          <iframe
-            title="HTML 签名预览"
-            sandbox=""
-            srcDoc={iframeDocument(
-              value.signature_html ||
-                '<span style="color:#94a3b8">尚未填写签名</span>',
-            )}
-            className="min-h-36 w-full rounded-lg border border-slate-200 bg-white"
-          />
+          <div className="text-sm font-semibold text-slate-800">邮件落款</div>
+          <div className="mt-1 text-xs leading-5 text-slate-500">
+            {existing
+              ? `已保存 ${signatureCount} 个落款，可分别应用于新邮件和回复/转发。`
+              : "完成邮箱绑定后，可创建多个 HTML 落款并预览发送效果。"}
+          </div>
         </div>
+        {onManageSignatures && (
+          <button
+            type="button"
+            onClick={onManageSignatures}
+            className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-lg border border-sky-200 bg-white px-3 text-sm font-medium text-sky-700 hover:bg-sky-50"
+          >
+            <Pencil className="h-4 w-4" />
+            管理落款
+          </button>
+        )}
       </div>
       <div className="rounded-lg border border-sky-100 bg-sky-50 p-3 sm:col-span-2">
         <label className="flex items-center justify-between gap-3">

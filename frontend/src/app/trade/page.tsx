@@ -88,6 +88,7 @@ import type {
   TradePaymentProof,
   TradePaymentRecordAccess,
   TradePIProfile,
+  TradePISellerProfile,
   TradePosition,
   TradeSettings,
   TradeStage,
@@ -245,6 +246,17 @@ interface TradePIDraft {
   delivery_terms: string;
   delivery_time: string;
   notes: string;
+}
+
+function tradePISellerProfile(profile: TradePIProfile): TradePISellerProfile {
+  return {
+    company_name: profile.company_name,
+    address: profile.address,
+    contact_name: profile.contact_name,
+    phone: profile.phone,
+    email: profile.email,
+    tax_id: profile.tax_id,
+  };
 }
 
 interface UploadedAttachment {
@@ -1127,6 +1139,11 @@ export default function TradeWorkspacePage() {
   const [piModalOpen, setPIModalOpen] = useState(false);
   const [piDraft, setPIDraft] = useState<TradePIDraft | null>(null);
   const [piPreviewURL, setPIPreviewURL] = useState("");
+  const [piSellerEditorOpen, setPISellerEditorOpen] = useState(false);
+  const [piSellerDraft, setPISellerDraft] = useState<TradePISellerProfile>(() =>
+    tradePISellerProfile(defaultTradePIProfile()),
+  );
+  const [savingPISeller, setSavingPISeller] = useState(false);
   const [uploadingPIQuoteBankImage, setUploadingPIQuoteBankImage] =
     useState(false);
   const piQuoteBankImageInputRef = useRef<HTMLInputElement>(null);
@@ -1629,6 +1646,8 @@ export default function TradeWorkspacePage() {
   const selectedPIUsesQuoteBankImage = Boolean(
     selectedPIQuote?.pi_bank_details_image_attachment_id,
   );
+  const selectedPISellerProfile =
+    selectedPIQuote?.pi_seller_profile || tradePISellerProfile(settings.pi_profile);
 
   const openCustomerModal = (mode: "manual" | "whatsapp" = "manual") => {
     setEditingCustomer(null);
@@ -2249,6 +2268,7 @@ export default function TradeWorkspacePage() {
       notes: "",
     });
     setPIPreviewURL("");
+    setPISellerEditorOpen(false);
     setPIModalOpen(true);
     setError("");
   };
@@ -2257,11 +2277,47 @@ export default function TradeWorkspacePage() {
     setPIModalOpen(false);
     setPIDraft(null);
     setPIPreviewURL("");
+    setPISellerEditorOpen(false);
   };
 
   const updatePIDraft = (patch: Partial<TradePIDraft>) => {
     setPIDraft((current) => (current ? { ...current, ...patch } : current));
     setPIPreviewURL("");
+  };
+
+  const openPISellerEditor = () => {
+    setPISellerDraft({ ...selectedPISellerProfile });
+    setPISellerEditorOpen(true);
+  };
+
+  const savePISellerProfile = async () => {
+    if (!detailOrder || !selectedPIQuote) return;
+    if (!piSellerDraft.company_name.trim()) {
+      setError("卖方公司名称不能为空。");
+      return;
+    }
+    setSavingPISeller(true);
+    setError("");
+    try {
+      const response = await api.put<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/customer-quotes/${selectedPIQuote.id}/pi-seller-profile`,
+        { profile: piSellerDraft },
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "保存本次 PI 卖方资料失败");
+      setDetailOrder(response.data);
+      setPIPreviewURL("");
+      setPISellerEditorOpen(false);
+      setNotice(`第 ${selectedPIQuote.round_no} 轮 PI 卖方资料已保存。`);
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "保存本次 PI 卖方资料失败",
+      );
+    } finally {
+      setSavingPISeller(false);
+    }
   };
 
   const uploadPIQuoteBankImage = async (file?: File) => {
@@ -8817,24 +8873,89 @@ export default function TradeWorkspacePage() {
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="truncate text-xs font-semibold text-slate-700">
-                          {settings.pi_profile.company_name}
+                          {selectedPISellerProfile.company_name}
                         </div>
                         <div className="mt-1 text-[11px] leading-5 text-slate-400">
-                          第 {selectedPIQuote.round_no} 轮报价独立保存收款图片
+                          第 {selectedPIQuote.round_no} 轮独立保存卖方资料和收款图片
                         </div>
                       </div>
                       <button
                         type="button"
-                        onClick={() => {
-                          closePIModal();
-                          setSettingsTab("pi");
-                          setSettingsOpen(true);
-                        }}
+                        onClick={openPISellerEditor}
                         className="shrink-0 text-xs font-semibold text-indigo-700"
                       >
-                        编辑抬头
+                        编辑本次资料
                       </button>
                     </div>
+                    {piSellerEditorOpen && (
+                      <div className="mt-3 border-t border-slate-200 pt-3">
+                        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1">
+                          {[
+                            ["company_name", "公司名称", "Seller company"],
+                            ["contact_name", "联系人", "Sales representative"],
+                            ["phone", "电话", "+86 ..."],
+                            ["email", "邮箱", "sales@example.com"],
+                            ["tax_id", "税号 / 注册号", "Registration No."],
+                          ].map(([key, label, placeholder]) => (
+                            <label key={key} className="block">
+                              <span className="mb-1 block text-[11px] font-medium text-slate-500">
+                                {label}
+                              </span>
+                              <input
+                                value={piSellerDraft[key as keyof TradePISellerProfile]}
+                                onChange={(event) =>
+                                  setPISellerDraft((current) => ({
+                                    ...current,
+                                    [key]: event.target.value,
+                                  }))
+                                }
+                                placeholder={placeholder}
+                                className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-xs outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+                              />
+                            </label>
+                          ))}
+                          <label className="block sm:col-span-2 lg:col-span-1">
+                            <span className="mb-1 block text-[11px] font-medium text-slate-500">
+                              公司地址
+                            </span>
+                            <textarea
+                              value={piSellerDraft.address}
+                              onChange={(event) =>
+                                setPISellerDraft((current) => ({
+                                  ...current,
+                                  address: event.target.value,
+                                }))
+                              }
+                              placeholder="Seller address"
+                              className="min-h-16 w-full resize-y rounded-md border border-slate-200 bg-white px-2.5 py-2 text-xs leading-5 outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+                            />
+                          </label>
+                        </div>
+                        <div className="mt-3 flex justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setPISellerEditorOpen(false)}
+                            disabled={savingPISeller}
+                            className="h-8 rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void savePISellerProfile()}
+                            disabled={savingPISeller}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-md bg-indigo-600 px-3 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+                          >
+                            {savingPISeller ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Save className="h-3.5 w-3.5" />
+                            )}
+                            保存本次资料
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     <button
                       type="button"
                       onClick={() => piQuoteBankImageInputRef.current?.click()}
@@ -8961,13 +9082,13 @@ export default function TradeWorkspacePage() {
                           {[
                             [
                               "Company:",
-                              settings.pi_profile.company_name,
+                              selectedPISellerProfile.company_name,
                               "Company:",
                               detailOrder.customer_company || detailOrder.customer_name,
                             ],
                             [
                               "Add:",
-                              settings.pi_profile.address,
+                              selectedPISellerProfile.address,
                               "Add:",
                               formatTradeDestination(
                                 detailOrder.customer?.country,
@@ -8978,19 +9099,19 @@ export default function TradeWorkspacePage() {
                             ],
                             [
                               "Contact:",
-                              settings.pi_profile.contact_name,
+                              selectedPISellerProfile.contact_name,
                               "Contact:",
                               detailOrder.customer?.contact_name || detailOrder.customer_name,
                             ],
                             [
                               "Tel:",
-                              settings.pi_profile.phone,
+                              selectedPISellerProfile.phone,
                               "Tel:",
                               detailOrder.customer?.phone,
                             ],
                             [
                               "Email:",
-                              settings.pi_profile.email,
+                              selectedPISellerProfile.email,
                               "Email:",
                               detailOrder.customer?.email,
                             ],
@@ -9158,7 +9279,7 @@ export default function TradeWorkspacePage() {
                           <tr>
                             <td className="border border-black bg-yellow-50 px-2 py-2 text-center font-bold">Seller Rep. Signature<br />卖方代表签字</td>
                             <td className="h-14 border border-black px-2 text-center align-bottom font-semibold">
-                              {settings.pi_profile.contact_name || settings.pi_profile.company_name}
+                              {selectedPISellerProfile.contact_name || selectedPISellerProfile.company_name}
                               <span className="ml-10">Buyer Rep. Signature / 买方代表签字: ____________________</span>
                             </td>
                           </tr>

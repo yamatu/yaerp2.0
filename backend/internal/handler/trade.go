@@ -674,6 +674,30 @@ func (h *TradeHandler) RemovePIBankImage(c *gin.Context) {
 	response.OK(c, order)
 }
 
+func (h *TradeHandler) UpdatePISellerProfile(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	quoteID, err := strconv.ParseInt(c.Param("quoteId"), 10, 64)
+	if err != nil || quoteID <= 0 {
+		response.BadRequest(c, "无效的对客报价编号")
+		return
+	}
+	var request model.UpdateTradePISellerProfileRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdateTradePISellerProfile(c.GetInt64("user_id"), orderID, quoteID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) ListPositions(c *gin.Context) {
 	positions, err := h.service.ListPositions(c.GetInt64("user_id"))
 	if err != nil {

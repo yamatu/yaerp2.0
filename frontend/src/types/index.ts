@@ -1336,11 +1336,21 @@ export interface TradeCustomerQuoteRound {
   payment_proofs?: TradePaymentProof[];
   pi_bank_details_image_attachment_id?: number;
   pi_bank_details_image_url?: string;
+  pi_seller_profile?: TradePISellerProfile;
   created_by: number;
   created_by_name: string;
   sent_at?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface TradePISellerProfile {
+  company_name: string;
+  address: string;
+  contact_name: string;
+  phone: string;
+  email: string;
+  tax_id: string;
 }
 
 export interface TradeShipment {

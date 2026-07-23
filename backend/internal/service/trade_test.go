@@ -277,6 +277,25 @@ func TestTradePIBankImagePrefersQuoteRoundOverride(t *testing.T) {
 	}
 }
 
+func TestTradePISellerProfileOverridesOnlySellerIdentity(t *testing.T) {
+	imageID := int64(42)
+	profile := model.TradePIProfile{
+		CompanyName: "Default Seller", Address: "Default address", ContactName: "Default contact",
+		Phone: "10086", Email: "default@example.com", TaxID: "DEFAULT-TAX",
+		BankName: "Default Bank", AccountNumber: "123", BankDetailsImageAttachmentID: &imageID,
+	}
+	result := applyTradePISellerProfile(profile, &model.TradePISellerProfile{
+		CompanyName: "Quote Seller", Address: "Quote address", ContactName: "Quote contact",
+		Phone: "20000", Email: "quote@example.com", TaxID: "QUOTE-TAX",
+	})
+	if result.CompanyName != "Quote Seller" || result.Email != "quote@example.com" || result.TaxID != "QUOTE-TAX" {
+		t.Fatalf("quote seller profile was not applied: %#v", result)
+	}
+	if result.BankName != profile.BankName || result.AccountNumber != profile.AccountNumber || result.BankDetailsImageAttachmentID != profile.BankDetailsImageAttachmentID {
+		t.Fatalf("seller override changed bank details: %#v", result)
+	}
+}
+
 func TestMergeTradeDestinationRemovesBlankAndDuplicateValues(t *testing.T) {
 	if actual := mergeTradeDestination("Brazil", " Santos ", "brazil", ""); actual != "Brazil · Santos" {
 		t.Fatalf("mergeTradeDestination() = %q", actual)

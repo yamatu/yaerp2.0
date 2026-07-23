@@ -185,6 +185,7 @@ type TradeCustomerQuoteRound struct {
 	PaymentProofs                  []TradePaymentProof      `json:"payment_proofs,omitempty"`
 	PIBankDetailsImageAttachmentID *int64                   `json:"pi_bank_details_image_attachment_id,omitempty"`
 	PIBankDetailsImageURL          string                   `json:"pi_bank_details_image_url,omitempty"`
+	PISellerProfile                *TradePISellerProfile    `json:"pi_seller_profile,omitempty"`
 	CreatedBy                      int64                    `json:"created_by"`
 	CreatedByName                  string                   `json:"created_by_name"`
 	SentAt                         *time.Time               `json:"sent_at,omitempty"`
@@ -313,6 +314,15 @@ type TradePIProfile struct {
 	BankDetailsImageAttachmentID *int64 `json:"bank_details_image_attachment_id,omitempty"`
 	BankDetailsImageURL          string `json:"bank_details_image_url,omitempty"`
 	DefaultNotes                 string `json:"default_notes"`
+}
+
+type TradePISellerProfile struct {
+	CompanyName string `json:"company_name"`
+	Address     string `json:"address"`
+	ContactName string `json:"contact_name"`
+	Phone       string `json:"phone"`
+	Email       string `json:"email"`
+	TaxID       string `json:"tax_id"`
 }
 
 type TradeAccessProfile struct {
@@ -815,6 +825,10 @@ type TradePIRequest struct {
 	DeliveryTerms string `json:"delivery_terms"`
 	DeliveryTime  string `json:"delivery_time"`
 	Notes         string `json:"notes"`
+}
+
+type UpdateTradePISellerProfileRequest struct {
+	Profile TradePISellerProfile `json:"profile" binding:"required"`
 }
 
 type UpdateTradeLabelSettingsRequest struct {

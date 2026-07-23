@@ -540,7 +540,11 @@ func (s *MailService) buildOutgoingMessage(session *mailSession, input *model.Ma
 	}
 	textBody := strings.TrimSpace(input.TextBody)
 	htmlBody := strings.TrimSpace(input.HTMLBody)
-	if signature := strings.TrimSpace(session.account.SignatureHTML); signature != "" {
+	signatureHTML := session.account.SignatureHTML
+	if input.SignatureHTML != nil {
+		signatureHTML = s.htmlPolicy.Sanitize(*input.SignatureHTML)
+	}
+	if signature := strings.TrimSpace(signatureHTML); signature != "" {
 		if htmlBody == "" && textBody != "" {
 			htmlBody = strings.ReplaceAll(html.EscapeString(textBody), "\n", "<br>")
 		}
