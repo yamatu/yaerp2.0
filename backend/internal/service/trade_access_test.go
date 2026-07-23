@@ -99,8 +99,14 @@ func TestTradeSupplierAccessScopeRequiresMatchingCurrentStage(t *testing.T) {
 	}
 
 	canView, canViewPricing = tradeSupplierAccessScope(false, model.TradeStageQuotation, codes)
+	if !canView || canViewPricing {
+		t.Fatal("the quotation role may identify the supplier but must not receive purchase costs")
+	}
+
+	codes["purchasing"] = true
+	canView, canViewPricing = tradeSupplierAccessScope(false, model.TradeStageQuotation, codes)
 	if !canView || !canViewPricing {
-		t.Fatal("the active quotation role needs supplier pricing to prepare the customer quote")
+		t.Fatal("an employee who also holds the purchasing position may use costs for automatic quotation")
 	}
 
 	canView, canViewPricing = tradeSupplierAccessScope(true, model.TradeStageCompleted, map[string]bool{})

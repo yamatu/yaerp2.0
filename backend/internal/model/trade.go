@@ -171,6 +171,7 @@ type TradeCustomerQuoteRound struct {
 	Status                         string                   `json:"status"`
 	GoodsAmount                    float64                  `json:"goods_amount"`
 	ExchangeRateCNY                float64                  `json:"exchange_rate_cny"`
+	ProfitMarginPercent            float64                  `json:"profit_margin_percent"`
 	FreightMode                    string                   `json:"freight_mode"`
 	FreightAmount                  float64                  `json:"freight_amount"`
 	TotalAmount                    float64                  `json:"total_amount"`
@@ -744,14 +745,15 @@ type TradeCustomerQuoteItemInput struct {
 }
 
 type CreateTradeCustomerQuoteRequest struct {
-	Currency         string                        `json:"currency"`
-	ExchangeRateCNY  float64                       `json:"exchange_rate_cny"`
-	FreightMode      string                        `json:"freight_mode"`
-	FreightAmount    float64                       `json:"freight_amount"`
-	Status           string                        `json:"status"`
-	CustomerFeedback string                        `json:"customer_feedback"`
-	Notes            string                        `json:"notes"`
-	Items            []TradeCustomerQuoteItemInput `json:"items" binding:"required,min=1,dive"`
+	Currency            string                        `json:"currency"`
+	ExchangeRateCNY     float64                       `json:"exchange_rate_cny"`
+	ProfitMarginPercent float64                       `json:"profit_margin_percent"`
+	FreightMode         string                        `json:"freight_mode"`
+	FreightAmount       float64                       `json:"freight_amount"`
+	Status              string                        `json:"status"`
+	CustomerFeedback    string                        `json:"customer_feedback"`
+	Notes               string                        `json:"notes"`
+	Items               []TradeCustomerQuoteItemInput `json:"items" binding:"required,min=1,dive"`
 }
 
 type UpdateTradeCustomerQuoteStatusRequest struct {

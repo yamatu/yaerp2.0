@@ -1624,7 +1624,7 @@ func (s *TradeService) CreateSupplier(userID int64, request *model.CreateTradeSu
 	}
 	currency := strings.ToUpper(strings.TrimSpace(request.DefaultCurrency))
 	if currency == "" {
-		currency = "USD"
+		currency = "CNY"
 	}
 	supplier := &model.TradeSupplier{
 		OwnerID: userID, Name: strings.TrimSpace(request.Name), CompanyName: strings.TrimSpace(request.CompanyName),
@@ -1645,6 +1645,19 @@ func (s *TradeService) CreateSupplier(userID int64, request *model.CreateTradeSu
 	return supplier, nil
 }
 
+func defaultTradeSupplierQuoteCurrency(supplier *model.TradeSupplier) string {
+	if supplier == nil {
+		return "CNY"
+	}
+	country := strings.ToLower(strings.TrimSpace(supplier.Country))
+	domestic := country == "" || country == "cn" || country == "china" || country == "prc" ||
+		strings.Contains(country, "中国") || strings.Contains(country, "大陆")
+	if domestic {
+		return "CNY"
+	}
+	return strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(supplier.DefaultCurrency), "CNY"))
+}
+
 func (s *TradeService) CreateSupplierQuote(userID, orderID int64, request *model.UpsertTradeSupplierQuoteRequest) (*model.TradeOrder, error) {
 	order, err := s.repo.GetOrder(orderID, userID, true)
 	if err != nil {
@@ -1663,7 +1676,8 @@ func (s *TradeService) CreateSupplierQuote(userID, orderID int64, request *model
 	if request == nil || request.OrderItemID <= 0 || request.SupplierID <= 0 {
 		return nil, fmt.Errorf("请选择产品和供应商")
 	}
-	if _, err := s.repo.GetSupplier(request.SupplierID); err != nil {
+	supplier, err := s.repo.GetSupplier(request.SupplierID)
+	if err != nil {
 		return nil, fmt.Errorf("供应商不存在")
 	}
 	validUntil, err := parseTradeDate(request.ValidUntil)
@@ -1672,7 +1686,7 @@ func (s *TradeService) CreateSupplierQuote(userID, orderID int64, request *model
 	}
 	request.Currency = strings.ToUpper(strings.TrimSpace(request.Currency))
 	if request.Currency == "" {
-		request.Currency = order.Currency
+		request.Currency = defaultTradeSupplierQuoteCurrency(supplier)
 	}
 	request.Notes = strings.TrimSpace(request.Notes)
 	if _, err := s.repo.CreateSupplierQuote(orderID, userID, request, validUntil); err != nil {
@@ -1712,7 +1726,8 @@ func (s *TradeService) BatchCreateSupplierQuotes(userID, orderID int64, request 
 		if quote.UnitPrice < 0 || quote.MOQ < 0 || quote.LeadTimeDays < 0 {
 			return nil, fmt.Errorf("第 %d 条报价的价格、MOQ 或交期不能小于零", index+1)
 		}
-		if _, err := s.repo.GetSupplier(quote.SupplierID); err != nil {
+		supplier, err := s.repo.GetSupplier(quote.SupplierID)
+		if err != nil {
 			return nil, fmt.Errorf("第 %d 条报价的供应商不存在", index+1)
 		}
 		validUntil, err := parseTradeDate(quote.ValidUntil)
@@ -1720,7 +1735,7 @@ func (s *TradeService) BatchCreateSupplierQuotes(userID, orderID int64, request 
 			return nil, fmt.Errorf("第 %d 条报价有效期格式无效", index+1)
 		}
 		validUntils[index] = validUntil
-		quote.Currency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(quote.Currency), order.Currency, "USD"))
+		quote.Currency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(quote.Currency), defaultTradeSupplierQuoteCurrency(supplier)))
 		quote.Notes = strings.TrimSpace(quote.Notes)
 	}
 	if err := s.repo.CreateSupplierQuotes(orderID, userID, request.Quotes, validUntils); err != nil {
@@ -1748,14 +1763,15 @@ func (s *TradeService) UpdateSupplierQuote(userID, orderID, quoteID int64, reque
 	if request == nil || request.OrderItemID <= 0 || request.SupplierID <= 0 {
 		return nil, fmt.Errorf("请选择产品和供应商")
 	}
-	if _, err := s.repo.GetSupplier(request.SupplierID); err != nil {
+	supplier, err := s.repo.GetSupplier(request.SupplierID)
+	if err != nil {
 		return nil, fmt.Errorf("供应商不存在")
 	}
 	validUntil, err := parseTradeDate(request.ValidUntil)
 	if err != nil {
 		return nil, fmt.Errorf("报价有效期格式无效")
 	}
-	request.Currency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(request.Currency), order.Currency, "USD"))
+	request.Currency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(request.Currency), defaultTradeSupplierQuoteCurrency(supplier)))
 	request.Notes = strings.TrimSpace(request.Notes)
 	if err := s.repo.UpdateSupplierQuote(orderID, quoteID, request, validUntil); err != nil {
 		return nil, err
@@ -1829,7 +1845,25 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	if order.Stage != model.TradeStageQuotation {
 		return nil, fmt.Errorf("当前业务单不在对客报价与议价阶段")
 	}
-	if request == nil || len(request.Items) == 0 {
+	if request == nil {
+		return nil, fmt.Errorf("请填写本轮每项产品的对客报价")
+	}
+	userAccess, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	orderAccess, err := s.orderAccessForUser(userID, order, userAccess)
+	if err != nil {
+		return nil, err
+	}
+	profitMarginPercent := 0.0
+	if orderAccess.CanViewSupplierPricing {
+		profitMarginPercent = nonNegativeTradeValue(request.ProfitMarginPercent)
+		if profitMarginPercent > 1000 {
+			return nil, fmt.Errorf("成本加价率不能超过 1000%%")
+		}
+	}
+	if len(request.Items) == 0 {
 		return nil, fmt.Errorf("请填写本轮每项产品的对客报价")
 	}
 	status := strings.ToLower(strings.TrimSpace(request.Status))
@@ -1897,7 +1931,8 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	totalAmount := goodsAmount + freightAmount
 	round := &model.TradeCustomerQuoteRound{
 		OrderID: orderID, Currency: currency, Status: status, GoodsAmount: goodsAmount,
-		ExchangeRateCNY: exchangeRateCNY, FreightMode: freightMode, FreightAmount: freightAmount,
+		ExchangeRateCNY: exchangeRateCNY, ProfitMarginPercent: profitMarginPercent,
+		FreightMode: freightMode, FreightAmount: freightAmount,
 		TotalAmount: totalAmount, TotalAmountCNY: totalAmount * exchangeRateCNY,
 		Items: quoteItems, CustomerFeedback: strings.TrimSpace(request.CustomerFeedback),
 		Notes: strings.TrimSpace(request.Notes), CreatedBy: userID,

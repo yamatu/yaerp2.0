@@ -86,14 +86,15 @@ type erpCustomerQuoteItemDraft struct {
 }
 
 type erpCustomerQuoteDraft struct {
-	Currency         string                      `json:"currency"`
-	ExchangeRateCNY  float64                     `json:"exchange_rate_cny"`
-	FreightMode      string                      `json:"freight_mode"`
-	FreightAmount    float64                     `json:"freight_amount"`
-	Status           string                      `json:"status"`
-	CustomerFeedback string                      `json:"customer_feedback"`
-	Notes            string                      `json:"notes"`
-	Items            []erpCustomerQuoteItemDraft `json:"items"`
+	Currency            string                      `json:"currency"`
+	ExchangeRateCNY     float64                     `json:"exchange_rate_cny"`
+	ProfitMarginPercent float64                     `json:"profit_margin_percent"`
+	FreightMode         string                      `json:"freight_mode"`
+	FreightAmount       float64                     `json:"freight_amount"`
+	Status              string                      `json:"status"`
+	CustomerFeedback    string                      `json:"customer_feedback"`
+	Notes               string                      `json:"notes"`
+	Items               []erpCustomerQuoteItemDraft `json:"items"`
 }
 
 func (s *AIService) toolGetERPContext(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -595,7 +596,8 @@ func (s *AIService) prepareERPCreateCustomerQuote(userID int64, raw map[string]a
 	}
 	request := model.CreateTradeCustomerQuoteRequest{
 		Currency:        strings.ToUpper(firstNonEmptyTrade(draft.Currency, order.Currency, "USD")),
-		ExchangeRateCNY: draft.ExchangeRateCNY, FreightMode: draft.FreightMode,
+		ExchangeRateCNY: draft.ExchangeRateCNY, ProfitMarginPercent: draft.ProfitMarginPercent,
+		FreightMode:   draft.FreightMode,
 		FreightAmount: draft.FreightAmount, Status: firstNonEmptyTrade(draft.Status, "draft"),
 		CustomerFeedback: strings.TrimSpace(draft.CustomerFeedback), Notes: strings.TrimSpace(draft.Notes),
 		Items: make([]model.TradeCustomerQuoteItemInput, 0, len(draft.Items)),
@@ -1452,7 +1454,8 @@ func erpActionToolSchema() map[string]any {
 			"description": "Customer quote fields for create_customer_quote.",
 			"properties": map[string]any{
 				"currency": map[string]any{"type": "string"}, "exchange_rate_cny": map[string]any{"type": "number"},
-				"freight_mode": map[string]any{"type": "string"}, "freight_amount": map[string]any{"type": "number"},
+				"profit_margin_percent": map[string]any{"type": "number", "description": "Optional cost markup percentage; applied only when the current employee may view purchase costs."},
+				"freight_mode":          map[string]any{"type": "string"}, "freight_amount": map[string]any{"type": "number"},
 				"status":            map[string]any{"type": "string", "description": "draft or sent; prefer draft when user has not explicitly approved sending."},
 				"customer_feedback": map[string]any{"type": "string"}, "notes": map[string]any{"type": "string"},
 				"items": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{

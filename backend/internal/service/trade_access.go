@@ -148,16 +148,20 @@ func tradeSupplierAccessScope(full bool, stage string, codes map[string]bool) (b
 	if full {
 		return true, true
 	}
-	allowed := false
+	canView := false
+	canViewPricing := false
 	switch stage {
 	case model.TradeStageSupplierQuote:
-		allowed = codes["sourcing"]
+		canView = codes["sourcing"] || codes["purchasing"]
+		canViewPricing = canView
 	case model.TradeStageQuotation:
-		allowed = codes["quotation"]
+		canView = codes["quotation"] || codes["purchasing"]
+		canViewPricing = codes["purchasing"]
 	case model.TradeStagePurchase:
-		allowed = codes["purchasing"]
+		canView = codes["purchasing"]
+		canViewPricing = canView
 	}
-	return allowed, allowed
+	return canView, canViewPricing
 }
 
 func tradePaymentRecordScope(full, owner, currentTask bool, configuredAccess string) (bool, bool, bool, bool) {
@@ -389,6 +393,11 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	}
 	redactTradePaymentRecords(userID, order.CustomerQuotes, orderAccess)
 	redactTradePIBankImages(order.CustomerQuotes, orderAccess)
+	if !orderAccess.CanViewSupplierPricing {
+		for index := range order.CustomerQuotes {
+			order.CustomerQuotes[index].ProfitMarginPercent = 0
+		}
+	}
 	if !orderAccess.CanViewCustomerPricing {
 		order.TotalAmount = 0
 		order.QuotedGoodsAmount = 0

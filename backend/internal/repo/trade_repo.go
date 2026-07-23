@@ -1385,7 +1385,7 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 	var sentAt sql.NullTime
 	if err := scanner.Scan(
 		&quote.ID, &quote.OrderID, &quote.RoundNo, &quote.Currency, &quote.Status,
-		&quote.GoodsAmount, &quote.ExchangeRateCNY, &quote.FreightMode, &quote.FreightAmount,
+		&quote.GoodsAmount, &quote.ExchangeRateCNY, &quote.ProfitMarginPercent, &quote.FreightMode, &quote.FreightAmount,
 		&quote.TotalAmount, &quote.TotalAmountCNY, &itemsRaw, &quote.CustomerFeedback, &quote.Notes,
 		&quote.PaymentStatus, &quote.PaymentCurrency, &quote.PaidAmount,
 		&piBankImageID,
@@ -1410,7 +1410,7 @@ func scanTradeCustomerQuoteRound(scanner tradeRowScanner) (*model.TradeCustomerQ
 
 const tradeCustomerQuoteRoundSelect = `
 	SELECT q.id,q.order_id,q.round_no,q.currency,q.status,q.goods_amount,q.exchange_rate_cny,
-	       q.freight_mode,q.freight_amount,q.total_amount,q.total_amount_cny,q.item_prices,
+	       q.profit_margin_percent,q.freight_mode,q.freight_amount,q.total_amount,q.total_amount_cny,q.item_prices,
 	       q.customer_feedback,q.notes,q.payment_status,q.payment_currency,q.paid_amount,
 	       q.pi_bank_details_image_attachment_id,
 	       q.created_by,COALESCE(u.username,''),q.sent_at,q.created_at,q.updated_at
@@ -1518,13 +1518,13 @@ func (r *TradeRepo) CreateCustomerQuoteRound(round *model.TradeCustomerQuoteRoun
 	var sentAt sql.NullTime
 	if err := tx.QueryRow(
 		`INSERT INTO trade_customer_quote_rounds(order_id,round_no,currency,status,goods_amount,exchange_rate_cny,
-		 freight_mode,freight_amount,total_amount,total_amount_cny,item_prices,customer_feedback,notes,created_by,
+		 profit_margin_percent,freight_mode,freight_amount,total_amount,total_amount_cny,item_prices,customer_feedback,notes,created_by,
 		 sent_at,created_at,updated_at)
-		 VALUES($1,$2,$3,$4::varchar(24),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+		 VALUES($1,$2,$3,$4::varchar(24),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
 		        CASE WHEN $4::varchar(24) IN ('sent','accepted') THEN NOW() ELSE NULL END,NOW(),NOW())
 		 RETURNING id,sent_at,created_at,updated_at`,
 		round.OrderID, round.RoundNo, round.Currency, round.Status, round.GoodsAmount, round.ExchangeRateCNY,
-		round.FreightMode, round.FreightAmount, round.TotalAmount, round.TotalAmountCNY, itemsRaw,
+		round.ProfitMarginPercent, round.FreightMode, round.FreightAmount, round.TotalAmount, round.TotalAmountCNY, itemsRaw,
 		round.CustomerFeedback, round.Notes, round.CreatedBy,
 	).Scan(&round.ID, &sentAt, &round.CreatedAt, &round.UpdatedAt); err != nil {
 		return err

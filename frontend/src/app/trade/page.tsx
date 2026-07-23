@@ -8,6 +8,7 @@ import {
   BarChart3,
   Boxes,
   BriefcaseBusiness,
+  Calculator,
   CalendarDays,
   Check,
   ChevronDown,
@@ -17,6 +18,7 @@ import {
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
+  Copy,
   Download,
   Eye,
   FileText,
@@ -188,6 +190,7 @@ interface CustomerQuoteItemDraft {
 interface CustomerQuoteDraft {
   currency: string;
   exchange_rate_cny: string;
+  profit_margin_percent: string;
   freight_mode: "customer_forwarder" | "quoted";
   freight_amount: string;
   status: "draft" | "sent";
@@ -516,10 +519,24 @@ function newSupplierDraft(paymentMethod = "T/T 电汇"): SupplierDraft {
     email: "",
     whatsapp: "",
     country: "",
-    default_currency: "USD",
+    default_currency: "CNY",
     payment_method: paymentMethod,
     notes: "",
   };
+}
+
+const DEFAULT_CUSTOMER_QUOTE_MARGIN_PERCENT = 15;
+
+function defaultSupplierQuoteCurrency(supplier?: TradeSupplier) {
+  if (!supplier) return "CNY";
+  const country = supplier.country.trim().toLowerCase();
+  const domestic =
+    !country ||
+    ["cn", "china", "prc"].includes(country) ||
+    country.includes("中国") ||
+    country.includes("大陆");
+  if (domestic) return "CNY";
+  return supplier.default_currency?.trim().toUpperCase() || "CNY";
 }
 
 function newSupplierQuoteDraft(
@@ -527,10 +544,11 @@ function newSupplierQuoteDraft(
   suppliers: TradeSupplier[] = [],
 ): SupplierQuoteDraft {
   const today = new Date().toISOString().slice(0, 10);
+  const supplier = suppliers[0];
   return {
     order_item_id: order?.items?.[0]?.id || 0,
-    supplier_id: suppliers[0]?.id || 0,
-    currency: order?.currency || suppliers[0]?.default_currency || "USD",
+    supplier_id: supplier?.id || 0,
+    currency: defaultSupplierQuoteCurrency(supplier),
     unit_price: "",
     moq: "",
     lead_time_days: "3",
@@ -539,20 +557,89 @@ function newSupplierQuoteDraft(
   };
 }
 
+function customerQuoteCostRateCNY(
+  item: TradeOrderItem,
+  quoteCurrency: string,
+  quoteRateCNY: number,
+) {
+  const purchaseCurrency = item.purchase_currency.trim().toUpperCase();
+  if (purchaseCurrency === "CNY") return 1;
+  if (purchaseCurrency && purchaseCurrency === quoteCurrency.toUpperCase())
+    return quoteRateCNY;
+  const configuredRate = Number(item.workflow_data?.cost_exchange_rate || 0);
+  return configuredRate > 0 ? configuredRate : 0;
+}
+
+function customerQuoteSuggestedPrice(
+  item: TradeOrderItem,
+  quoteCurrency: string,
+  quoteRateCNY: number,
+  marginPercent: number,
+) {
+  const effectiveQuoteRate = quoteCurrency.toUpperCase() === "CNY" ? 1 : quoteRateCNY;
+  if (item.purchase_price <= 0 || effectiveQuoteRate <= 0) return 0;
+  const costRateCNY = customerQuoteCostRateCNY(
+    item,
+    quoteCurrency,
+    effectiveQuoteRate,
+  );
+  if (costRateCNY <= 0) return 0;
+  const suggested =
+    ((item.purchase_price * costRateCNY) / effectiveQuoteRate) *
+    (1 + Math.max(0, marginPercent) / 100);
+  return Math.ceil((suggested - Number.EPSILON) * 100) / 100;
+}
+
+function applyCustomerQuoteMargin(
+  draft: CustomerQuoteDraft,
+  order: TradeOrder,
+): CustomerQuoteDraft {
+  const quoteRateCNY = Number(draft.exchange_rate_cny || 0);
+  const marginPercent = Number(draft.profit_margin_percent || 0);
+  return {
+    ...draft,
+    items: draft.items.map((draftItem) => {
+      const orderItem = (order.items || []).find(
+        (item) => item.id === draftItem.order_item_id,
+      );
+      if (!orderItem) return draftItem;
+      const suggested = customerQuoteSuggestedPrice(
+        orderItem,
+        draft.currency,
+        quoteRateCNY,
+        marginPercent,
+      );
+      return suggested > 0
+        ? { ...draftItem, unit_price: String(suggested) }
+        : draftItem;
+    }),
+  };
+}
+
 function newCustomerQuoteDraft(
   order: TradeOrder,
   source?: TradeCustomerQuoteRound,
+  canUsePurchasePricing = false,
 ): CustomerQuoteDraft {
-  return {
-    currency: source?.currency || order.currency || "USD",
-    exchange_rate_cny:
+  const currency = source?.currency || order.currency || "USD";
+  const exchangeRateCNY =
       (source?.exchange_rate_cny || 0) > 0
         ? String(source?.exchange_rate_cny)
         : order.quote_exchange_rate_cny > 0
           ? String(order.quote_exchange_rate_cny)
-          : (source?.currency || order.currency) === "CNY"
+          : currency === "CNY"
             ? "1"
-            : "",
+            : "";
+  const draft: CustomerQuoteDraft = {
+    currency,
+    exchange_rate_cny: exchangeRateCNY,
+    profit_margin_percent: String(
+      source
+        ? source.profit_margin_percent || 0
+        : canUsePurchasePricing
+          ? DEFAULT_CUSTOMER_QUOTE_MARGIN_PERCENT
+          : 0,
+    ),
     freight_mode:
       source?.freight_mode || order.freight_mode || "customer_forwarder",
     freight_amount:
@@ -566,8 +653,7 @@ function newCustomerQuoteDraft(
       const sourceItem = source?.items.find(
         (candidate) => candidate.order_item_id === item.id,
       );
-      const suggestedPrice =
-        sourceItem?.unit_price || item.quoted_price || item.purchase_price || 0;
+      const suggestedPrice = sourceItem?.unit_price || 0;
       return {
         order_item_id: item.id,
         line_no: item.line_no,
@@ -579,6 +665,9 @@ function newCustomerQuoteDraft(
       };
     }),
   };
+  return !source && canUsePurchasePricing
+    ? applyCustomerQuoteMargin(draft, order)
+    : draft;
 }
 
 const customerQuoteStatusLabels: Record<TradeCustomerQuoteStatus, string> = {
@@ -2073,8 +2162,7 @@ export default function TradeWorkspacePage() {
               ? {
                   ...draft,
                   supplier_id: response.data!.id,
-                  currency:
-                    response.data!.default_currency || draft.currency,
+                  currency: defaultSupplierQuoteCurrency(response.data!),
                 }
               : draft,
           ),
@@ -2554,9 +2642,39 @@ export default function TradeWorkspacePage() {
     }
   };
 
+  const copyOrderModel = async (model: string) => {
+    const value = model.trim();
+    if (!value) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand("copy");
+        textarea.remove();
+        if (!copied) throw new Error("copy failed");
+      }
+      setNotice(`已复制型号：${value}`);
+      setError("");
+    } catch {
+      setError("复制型号失败，请检查浏览器剪贴板权限。");
+    }
+  };
+
   const openCustomerQuoteModal = (source?: TradeCustomerQuoteRound) => {
     if (!detailOrder) return;
-    setCustomerQuoteDraft(newCustomerQuoteDraft(detailOrder, source));
+    setCustomerQuoteDraft(
+      newCustomerQuoteDraft(
+        detailOrder,
+        source,
+        Boolean(detailOrder.access?.can_view_supplier_pricing),
+      ),
+    );
     setCustomerQuoteModalOpen(true);
     setError("");
   };
@@ -2579,6 +2697,13 @@ export default function TradeWorkspacePage() {
     );
   };
 
+  const recalculateCustomerQuotePrices = () => {
+    if (!detailOrder || !detailOrder.access?.can_view_supplier_pricing) return;
+    setCustomerQuoteDraft((current) =>
+      current ? applyCustomerQuoteMargin(current, detailOrder) : current,
+    );
+  };
+
   const saveCustomerQuoteRound = async () => {
     if (!detailOrder || !customerQuoteDraft) return;
     if (
@@ -2590,6 +2715,16 @@ export default function TradeWorkspacePage() {
       return;
     }
     const exchangeRateCNY = Number(customerQuoteDraft.exchange_rate_cny || 0);
+    const profitMarginPercent = Number(
+      customerQuoteDraft.profit_margin_percent || 0,
+    );
+    if (
+      detailOrder.access?.can_view_supplier_pricing &&
+      (profitMarginPercent < 0 || profitMarginPercent > 1000)
+    ) {
+      setError("成本加价率需要填写 0 到 1000 之间的数值。");
+      return;
+    }
     if (
       customerQuoteDraft.currency.toUpperCase() !== "CNY" &&
       exchangeRateCNY <= 0
@@ -2615,6 +2750,7 @@ export default function TradeWorkspacePage() {
             customerQuoteDraft.currency.toUpperCase() === "CNY"
               ? 1
               : exchangeRateCNY,
+          profit_margin_percent: profitMarginPercent,
           freight_mode: customerQuoteDraft.freight_mode,
           freight_amount:
             customerQuoteDraft.freight_mode === "quoted"
@@ -3470,25 +3606,39 @@ export default function TradeWorkspacePage() {
                               className="border-t border-slate-100 hover:bg-slate-50/70"
                             >
                               <td className="px-4 py-3">
-                                <button
-                                  type="button"
-                                  onClick={() => void openOrderDetail(order)}
-                                  className="text-left"
-                                >
-                                  <div className="flex items-center gap-2">
-                                    <span className="font-semibold text-slate-900">
-                                      {order.order_no}
-                                    </span>
-                                    <span
-                                      className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${priorityClass(order.priority)}`}
+                                <div className="flex items-end gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => void openOrderDetail(order)}
+                                    className="min-w-0 text-left"
+                                  >
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-semibold text-slate-900">
+                                        {order.order_no}
+                                      </span>
+                                      <span
+                                        className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${priorityClass(order.priority)}`}
+                                      >
+                                        {PRIORITY_LABELS[order.priority]}
+                                      </span>
+                                    </div>
+                                    <div
+                                      className="mt-1 max-w-72 truncate text-sm font-semibold text-slate-700"
+                                      title={order.title}
                                     >
-                                      {PRIORITY_LABELS[order.priority]}
-                                    </span>
-                                  </div>
-                                  <div className="mt-0.5 max-w-64 truncate text-xs text-slate-500">
-                                    {order.title}
-                                  </div>
-                                </button>
+                                      {order.title}
+                                    </div>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void copyOrderModel(order.title)}
+                                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-sky-700"
+                                    title="复制型号"
+                                    aria-label={`复制型号 ${order.title}`}
+                                  >
+                                    <Copy className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
                               </td>
                               <td className="px-4 py-3">
                                 <div className="font-medium">
@@ -5540,10 +5690,7 @@ export default function TradeWorkspacePage() {
                           setQuoteDraft((current) => ({
                             ...current,
                             supplier_id: supplierID,
-                            currency:
-                              supplier.default_currency ||
-                              current.currency ||
-                              detailOrder.currency,
+                            currency: defaultSupplierQuoteCurrency(supplier),
                           }))
                         }
                       />
@@ -5704,28 +5851,44 @@ export default function TradeWorkspacePage() {
                 </button>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto p-4">
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <div
+                  className={`grid gap-3 sm:grid-cols-2 ${detailOrder.access?.can_view_supplier_pricing ? "lg:grid-cols-5" : "lg:grid-cols-4"}`}
+                >
                   <label className="text-sm font-medium">
                     报价币种
                     <input
                       list="trade-currency-options"
                       value={customerQuoteDraft.currency}
-                      onChange={(event) =>
-                        setCustomerQuoteDraft((current) =>
-                          current
-                            ? {
-                                ...current,
-                                currency: event.target.value.toUpperCase(),
-                                exchange_rate_cny:
-                                  event.target.value.toUpperCase() === "CNY"
-                                    ? "1"
-                                    : current.currency === "CNY"
-                                      ? ""
-                                      : current.exchange_rate_cny,
-                              }
-                            : current,
-                        )
-                      }
+                      onChange={(event) => {
+                        const currency = event.target.value.toUpperCase();
+                        setCustomerQuoteDraft((current) => {
+                          if (!current) return current;
+                          const canAutoPrice = Boolean(
+                            detailOrder.access?.can_view_supplier_pricing,
+                          );
+                          const currencyChanged = currency !== current.currency;
+                          const next = {
+                            ...current,
+                            currency,
+                            exchange_rate_cny:
+                              currency === "CNY"
+                                ? "1"
+                                : currencyChanged
+                                  ? ""
+                                  : current.exchange_rate_cny,
+                            items:
+                              canAutoPrice && currencyChanged
+                                ? current.items.map((item) => ({
+                                    ...item,
+                                    unit_price: "",
+                                  }))
+                                : current.items,
+                          };
+                          return canAutoPrice
+                            ? applyCustomerQuoteMargin(next, detailOrder)
+                            : next;
+                        });
+                      }}
                       className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 uppercase outline-none"
                     />
                   </label>
@@ -5741,20 +5904,56 @@ export default function TradeWorkspacePage() {
                           ? "1"
                           : customerQuoteDraft.exchange_rate_cny
                       }
-                      onChange={(event) =>
-                        setCustomerQuoteDraft((current) =>
-                          current
-                            ? {
-                                ...current,
-                                exchange_rate_cny: event.target.value,
-                              }
-                            : current,
-                        )
-                      }
+                      onChange={(event) => {
+                        const exchangeRate = event.target.value;
+                        setCustomerQuoteDraft((current) => {
+                          if (!current) return current;
+                          const next = {
+                            ...current,
+                            exchange_rate_cny: exchangeRate,
+                          };
+                          return detailOrder.access
+                            ?.can_view_supplier_pricing
+                            ? applyCustomerQuoteMargin(next, detailOrder)
+                            : next;
+                        });
+                      }}
                       className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none disabled:bg-slate-100"
                       placeholder={`1 ${customerQuoteDraft.currency} = ? CNY`}
                     />
                   </label>
+                  {detailOrder.access?.can_view_supplier_pricing && (
+                    <label className="text-sm font-medium">
+                      成本加价率
+                      <div className="relative mt-1.5">
+                        <input
+                          type="number"
+                          min="0"
+                          max="1000"
+                          step="0.1"
+                          value={customerQuoteDraft.profit_margin_percent}
+                          onChange={(event) => {
+                            const margin = event.target.value;
+                            setCustomerQuoteDraft((current) =>
+                              current
+                                ? applyCustomerQuoteMargin(
+                                    {
+                                      ...current,
+                                      profit_margin_percent: margin,
+                                    },
+                                    detailOrder,
+                                  )
+                                : current,
+                            );
+                          }}
+                          className="h-10 w-full rounded-lg border border-slate-200 px-3 pr-8 outline-none focus:border-sky-400"
+                        />
+                        <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-slate-400">
+                          %
+                        </span>
+                      </div>
+                    </label>
+                  )}
                   <label className="text-sm font-medium">
                     运费方式
                     <select
@@ -5803,6 +6002,28 @@ export default function TradeWorkspacePage() {
                     </select>
                   </label>
                 </div>
+                {detailOrder.access?.can_view_supplier_pricing ? (
+                  <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-2">
+                    <div className="flex min-w-0 items-center gap-2 text-xs font-medium text-emerald-800">
+                      <Calculator className="h-4 w-4 shrink-0" />
+                      <span className="truncate">
+                        成本自动定价 · 加价 {customerQuoteDraft.profit_margin_percent || 0}%
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={recalculateCustomerQuotePrices}
+                      className="h-8 shrink-0 rounded-lg border border-emerald-200 bg-white px-3 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
+                    >
+                      重新计算
+                    </button>
+                  </div>
+                ) : (
+                  <div className="mt-3 flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-600">
+                    <ShieldCheck className="h-4 w-4 shrink-0" />
+                    手工报价 · 采购成本已按权限隐藏
+                  </div>
+                )}
                 {customerQuoteDraft.freight_mode === "quoted" && (
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
                     <label className="text-sm font-medium">
@@ -5832,13 +6053,16 @@ export default function TradeWorkspacePage() {
                   </div>
                 )}
                 <div className="mt-4 overflow-x-auto rounded-lg border border-slate-200">
-                  <table className="w-full min-w-[720px] text-sm">
+                  <table className="w-full min-w-[800px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs text-slate-500">
                       <tr>
                         <th className="px-3 py-2">产品</th>
                         <th className="px-3 py-2 text-right">数量</th>
                         {detailOrder.access?.can_view_supplier_pricing && (
                           <th className="px-3 py-2 text-right">采购参考价</th>
+                        )}
+                        {detailOrder.access?.can_view_supplier_pricing && (
+                          <th className="px-3 py-2 text-right">加价率</th>
                         )}
                         <th className="px-3 py-2 text-right">本轮对客单价</th>
                         <th className="px-3 py-2 text-right">金额</th>
@@ -5875,6 +6099,16 @@ export default function TradeWorkspacePage() {
                                 )}
                               </td>
                             )}
+                            {detailOrder.access?.can_view_supplier_pricing && (
+                              <td className="px-3 py-2 text-right text-xs font-semibold text-emerald-700">
+                                {formatPercent(
+                                  Number(
+                                    customerQuoteDraft.profit_margin_percent ||
+                                      0,
+                                  ),
+                                )}
+                              </td>
+                            )}
                             <td className="px-3 py-2 text-right">
                               <input
                                 type="number"
@@ -5906,7 +6140,7 @@ export default function TradeWorkspacePage() {
                         <td
                           colSpan={
                             detailOrder.access?.can_view_supplier_pricing
-                              ? 4
+                              ? 5
                               : 3
                           }
                           className="px-3 py-2 text-right text-xs font-semibold text-slate-500"
@@ -5924,7 +6158,7 @@ export default function TradeWorkspacePage() {
                         <td
                           colSpan={
                             detailOrder.access?.can_view_supplier_pricing
-                              ? 4
+                              ? 5
                               : 3
                           }
                           className="px-3 py-2 text-right text-xs font-semibold text-slate-500"
@@ -5945,7 +6179,7 @@ export default function TradeWorkspacePage() {
                         <td
                           colSpan={
                             detailOrder.access?.can_view_supplier_pricing
-                              ? 4
+                              ? 5
                               : 3
                           }
                           className="px-3 py-2 text-right text-xs font-semibold text-slate-600"
@@ -5963,7 +6197,7 @@ export default function TradeWorkspacePage() {
                         <td
                           colSpan={
                             detailOrder.access?.can_view_supplier_pricing
-                              ? 4
+                              ? 5
                               : 3
                           }
                           className="px-3 py-2 text-right text-xs font-semibold text-slate-500"
@@ -7486,6 +7720,13 @@ export default function TradeWorkspacePage() {
                                               ? "含我方运费"
                                               : "客户自有货代"}
                                           </span>
+                                          {detailOrder.access
+                                            ?.can_view_supplier_pricing &&
+                                            quote.profit_margin_percent > 0 && (
+                                              <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                                                成本加价 {formatPercent(quote.profit_margin_percent)}
+                                              </span>
+                                            )}
                                         </div>
                                         <div className="mt-1 text-xs text-slate-400">
                                           {quote.created_by_name || "系统"} ·{" "}

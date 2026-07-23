@@ -486,3 +486,20 @@ func TestTradeOrderAdvanceBlockers(t *testing.T) {
 		t.Fatalf("shipment with actual freight should have no blockers, got %#v", blockers)
 	}
 }
+
+func TestDefaultTradeSupplierQuoteCurrencyUsesCNYForDomesticSuppliers(t *testing.T) {
+	for _, supplier := range []*model.TradeSupplier{
+		nil,
+		{Country: "", DefaultCurrency: "USD"},
+		{Country: "中国", DefaultCurrency: "USD"},
+		{Country: "China", DefaultCurrency: "USD"},
+	} {
+		if actual := defaultTradeSupplierQuoteCurrency(supplier); actual != "CNY" {
+			t.Fatalf("domestic supplier currency = %q, want CNY", actual)
+		}
+	}
+	foreign := &model.TradeSupplier{Country: "Germany", DefaultCurrency: "EUR"}
+	if actual := defaultTradeSupplierQuoteCurrency(foreign); actual != "EUR" {
+		t.Fatalf("foreign supplier currency = %q, want EUR", actual)
+	}
+}
