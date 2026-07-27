@@ -226,7 +226,7 @@ func TestDecodeMailHeaderValue(t *testing.T) {
 
 func TestExtractMailSenderAvatar(t *testing.T) {
 	htmlValue := `<div><a>Yamatu</a><br><a>yamatu@qq.com</a></div><p><img src="cid:qq-avatar" alt="profile"></p><p>邮件正文</p>`
-	cleaned, avatar, contentID := extractMailSenderAvatar(htmlValue, "yamatu@qq.com", map[string]string{
+	cleaned, avatar, contentID := extractMailSenderAvatar(htmlValue, "Yamatu", "yamatu@qq.com", map[string]string{
 		"qq-avatar": "data:image/png;base64,YXZhdGFy",
 	})
 	if avatar != "data:image/png;base64,YXZhdGFy" || contentID != "qq-avatar" {
@@ -237,13 +237,13 @@ func TestExtractMailSenderAvatar(t *testing.T) {
 	}
 
 	ordinary := `<p>产品图片</p><img src="https://example.com/product.png">`
-	cleaned, avatar, _ = extractMailSenderAvatar(ordinary, "yamatu@qq.com", nil)
+	cleaned, avatar, _ = extractMailSenderAvatar(ordinary, "Yamatu", "yamatu@qq.com", nil)
 	if avatar != "" || cleaned != ordinary {
 		t.Fatalf("ordinary body image was incorrectly extracted: avatar=%q html=%q", avatar, cleaned)
 	}
 
 	tableSignature := `<table><tr><td><img src="cid:table-avatar"></td><td><a>Yamatu</a><br><a>yamatu@qq.com</a></td></tr></table><p>正文</p>`
-	cleaned, avatar, contentID = extractMailSenderAvatar(tableSignature, "yamatu@qq.com", map[string]string{
+	cleaned, avatar, contentID = extractMailSenderAvatar(tableSignature, "Yamatu", "yamatu@qq.com", map[string]string{
 		"table-avatar": "data:image/png;base64,dGFibGU=",
 	})
 	if avatar == "" || contentID != "table-avatar" || strings.Contains(cleaned, "table-avatar") || strings.Contains(cleaned, "yamatu@qq.com") {
@@ -251,11 +251,39 @@ func TestExtractMailSenderAvatar(t *testing.T) {
 	}
 
 	inlineSignature := `<p>正文保留</p><div class="signature"><img src="cid:inline-avatar"><a>Yamatu</a><a>yamatu@qq.com</a></div>`
-	cleaned, avatar, contentID = extractMailSenderAvatar(inlineSignature, "yamatu@qq.com", map[string]string{
+	cleaned, avatar, contentID = extractMailSenderAvatar(inlineSignature, "Yamatu", "yamatu@qq.com", map[string]string{
 		"inline-avatar": "data:image/png;base64,aW5saW5l",
 	})
 	if avatar == "" || contentID != "inline-avatar" || strings.Contains(cleaned, "yamatu@qq.com") || !strings.Contains(cleaned, "正文保留") {
 		t.Fatalf("inline signature was not removed: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+
+	brandHeader := `<table><tr><td><img src="cid:facebook-logo" alt="Facebook logo" width="80" height="80"></td></tr></table><h2>验证你的邮箱</h2>`
+	cleaned, avatar, contentID = extractMailSenderAvatar(brandHeader, "Facebook", "security@facebookmail.com", map[string]string{
+		"facebook-logo": "data:image/png;base64,ZmFjZWJvb2s=",
+	})
+	if avatar == "" || contentID != "facebook-logo" || strings.Contains(cleaned, "facebook-logo") || !strings.Contains(cleaned, "验证你的邮箱") {
+		t.Fatalf("sender brand logo was not extracted: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+
+	trackingAndLogo := `<img src="https://www.facebook.com/email_open_log_pic.php?mid=1" width="1" height="1"><img src="cid:visible-brand" width="32" height="32"><h2>验证码</h2>`
+	cleaned, avatar, contentID = extractMailSenderAvatar(trackingAndLogo, "Facebook", "security@facebookmail.com", map[string]string{
+		"visible-brand": "data:image/png;base64,dmlzaWJsZQ==",
+	})
+	if avatar != "data:image/png;base64,dmlzaWJsZQ==" || contentID != "visible-brand" || strings.Contains(cleaned, "email_open_log") || strings.Contains(cleaned, "visible-brand") {
+		t.Fatalf("visible brand logo did not win over tracking pixel: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+}
+
+func TestForceMailExternalLinksNewTab(t *testing.T) {
+	htmlValue := forceMailExternalLinksNewTab(`<p><a href="https://example.com/verify" target="_self">验证</a><a href="mailto:sales@example.com">写信</a></p>`)
+	for _, expected := range []string{`href="https://example.com/verify"`, `target="_blank"`, `rel="noopener noreferrer"`} {
+		if !strings.Contains(htmlValue, expected) {
+			t.Fatalf("external mail link is missing %q: %s", expected, htmlValue)
+		}
+	}
+	if strings.Contains(htmlValue, `href="mailto:sales@example.com" target="_blank"`) {
+		t.Fatalf("mailto link was forced into a browser tab: %s", htmlValue)
 	}
 }
 

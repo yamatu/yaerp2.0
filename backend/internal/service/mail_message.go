@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
@@ -499,12 +500,14 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 			inlineData[contentID] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(content)
 		}
 	}
+	senderName := ""
 	senderEmail := ""
 	if len(result.From) > 0 {
+		senderName = result.From[0].Name
 		senderEmail = result.From[0].Address
 	}
 	var avatarContentID string
-	result.HTMLBody, result.SenderAvatar, avatarContentID = extractMailSenderAvatar(result.HTMLBody, senderEmail, inlineData)
+	result.HTMLBody, result.SenderAvatar, avatarContentID = extractMailSenderAvatar(result.HTMLBody, senderName, senderEmail, inlineData)
 	if avatarContentID != "" {
 		filtered := result.Attachments[:0]
 		for _, attachment := range result.Attachments {
@@ -519,7 +522,7 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 		result.HTMLBody = strings.ReplaceAll(result.HTMLBody, "cid:"+contentID, dataURI)
 		result.HTMLBody = strings.ReplaceAll(result.HTMLBody, "CID:"+contentID, dataURI)
 	}
-	result.HTMLBody = s.htmlPolicy.Sanitize(result.HTMLBody)
+	result.HTMLBody = forceMailExternalLinksNewTab(s.htmlPolicy.Sanitize(result.HTMLBody))
 	if result.TextBody == "" && result.HTMLBody != "" {
 		result.TextBody = bluemondayText(result.HTMLBody)
 	}
@@ -636,7 +639,7 @@ func decodeMailHeaderValue(value string) string {
 	return strings.TrimSpace(decoded)
 }
 
-func extractMailSenderAvatar(htmlValue, senderEmail string, inlineData map[string]string) (string, string, string) {
+func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineData map[string]string) (string, string, string) {
 	if strings.TrimSpace(htmlValue) == "" {
 		return htmlValue, "", ""
 	}
@@ -650,13 +653,16 @@ func extractMailSenderAvatar(htmlValue, senderEmail string, inlineData map[strin
 	}
 
 	needle := strings.ToLower(strings.TrimSpace(senderEmail))
+	senderImageHints := mailSenderImageHints(senderName, senderEmail)
 	var visibleText strings.Builder
 	var candidate *htmlparser.Node
+	candidateScore := 0
+	trackingImages := make([]*htmlparser.Node, 0)
 	avatarURL := ""
 	avatarContentID := ""
 	var walk func(*htmlparser.Node)
 	walk = func(node *htmlparser.Node) {
-		if node == nil || candidate != nil {
+		if node == nil {
 			return
 		}
 		if node.Type == htmlparser.TextNode {
@@ -667,6 +673,10 @@ func extractMailSenderAvatar(htmlValue, senderEmail string, inlineData map[strin
 			source := mailHTMLAttribute(node, "src")
 			resolvedURL, contentID := resolveMailImageSource(source, inlineData)
 			if resolvedURL != "" {
+				if mailHTMLImageIsTracking(node, source) {
+					trackingImages = append(trackingImages, node)
+					return
+				}
 				text := visibleText.String()
 				if len(text) > 600 {
 					text = text[len(text)-600:]
@@ -677,27 +687,52 @@ func extractMailSenderAvatar(htmlValue, senderEmail string, inlineData map[strin
 				}, " "))
 				nearSender := needle != "" && strings.Contains(strings.ToLower(text), needle)
 				insideSenderSignature := needle != "" && mailHTMLAncestorContainsText(node, context, needle)
-				avatarHint := strings.Contains(attributes, "avatar") || strings.Contains(attributes, "profile") ||
+				explicitAvatarHint := strings.Contains(attributes, "avatar") || strings.Contains(attributes, "profile") ||
 					strings.Contains(attributes, "head") || strings.Contains(attributes, "face") || strings.Contains(attributes, "qqmail") ||
 					strings.Contains(attributes, "qlogo") || strings.Contains(attributes, "qpic")
-				if nearSender || insideSenderSignature || avatarHint {
+				brandHint := strings.Contains(attributes, "logo") || strings.Contains(attributes, "brand") ||
+					mailImageMatchesSender(attributes, senderImageHints)
+				nearMessageStart := len([]rune(strings.TrimSpace(visibleText.String()))) <= 1200
+				score := 0
+				switch {
+				case explicitAvatarHint:
+					score = 100
+				case nearSender || insideSenderSignature:
+					score = 90
+				case nearMessageStart && brandHint:
+					score = 80
+				case nearMessageStart && mailHTMLImageIsSmallSquare(node):
+					score = 60
+				}
+				if score > candidateScore {
 					candidate = node
+					candidateScore = score
 					avatarURL = resolvedURL
 					avatarContentID = contentID
-					return
 				}
 			}
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
 			walk(child)
-			if candidate != nil {
-				return
-			}
 		}
 	}
 	walk(context)
-	if candidate == nil || candidate.Parent == nil {
-		return htmlValue, "", ""
+	for _, tracker := range trackingImages {
+		if tracker.Parent == nil {
+			continue
+		}
+		parent := tracker.Parent
+		parent.RemoveChild(tracker)
+		removeEmptyMailHTMLAncestors(parent, context)
+	}
+	if candidate == nil {
+		if len(trackingImages) == 0 {
+			return htmlValue, "", ""
+		}
+		return renderMailHTMLChildren(context, htmlValue), "", ""
+	}
+	if candidate.Parent == nil {
+		return renderMailHTMLChildren(context, htmlValue), "", ""
 	}
 	identityNode := mailHTMLSenderIdentityNode(candidate, context, needle)
 	if identityNode != nil && identityNode.Parent != nil {
@@ -713,6 +748,127 @@ func extractMailSenderAvatar(htmlValue, senderEmail string, inlineData map[strin
 	parent.RemoveChild(candidate)
 	removeEmptyMailHTMLAncestors(parent, context)
 	return renderMailHTMLChildren(context, htmlValue), avatarURL, avatarContentID
+}
+
+func mailSenderImageHints(senderName, senderEmail string) []string {
+	ignored := map[string]struct{}{
+		"account": {}, "admin": {}, "company": {}, "contact": {}, "email": {}, "info": {}, "limited": {},
+		"mail": {}, "message": {}, "net": {}, "noreply": {}, "notification": {}, "notifications": {},
+		"org": {}, "reply": {}, "sales": {}, "security": {}, "service": {}, "support": {}, "team": {},
+	}
+	seen := make(map[string]struct{})
+	hints := make([]string, 0, 8)
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if len([]rune(value)) < 4 {
+			return
+		}
+		if _, skip := ignored[value]; skip {
+			return
+		}
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		hints = append(hints, value)
+	}
+	collect := func(value string) {
+		for _, token := range strings.FieldsFunc(value, func(char rune) bool {
+			return !unicode.IsLetter(char) && !unicode.IsDigit(char)
+		}) {
+			add(token)
+			lower := strings.ToLower(token)
+			if strings.HasSuffix(lower, "mail") && len([]rune(lower)) > 8 {
+				add(strings.TrimSuffix(lower, "mail"))
+			}
+		}
+	}
+	collect(senderName)
+	collect(senderEmail)
+	return hints
+}
+
+func mailImageMatchesSender(attributes string, hints []string) bool {
+	for _, hint := range hints {
+		if strings.Contains(attributes, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func mailHTMLImageIsTracking(node *htmlparser.Node, source string) bool {
+	lowerSource := strings.ToLower(strings.TrimSpace(source))
+	for _, hint := range []string{"email_open_log", "open_log_pic", "tracking_pixel", "track.gif", "spacer.gif", "pixel.gif"} {
+		if strings.Contains(lowerSource, hint) {
+			return true
+		}
+	}
+	width, widthOK := mailHTMLImageDimension(node, "width")
+	height, heightOK := mailHTMLImageDimension(node, "height")
+	return widthOK && heightOK && width <= 2 && height <= 2
+}
+
+func mailHTMLImageIsSmallSquare(node *htmlparser.Node) bool {
+	width, widthOK := mailHTMLImageDimension(node, "width")
+	height, heightOK := mailHTMLImageDimension(node, "height")
+	if !widthOK || !heightOK || width < 16 || height < 16 || width > 256 || height > 256 {
+		return false
+	}
+	ratio := width / height
+	return ratio >= 0.6 && ratio <= 1.67
+}
+
+func mailHTMLImageDimension(node *htmlparser.Node, key string) (float64, bool) {
+	value := strings.ToLower(strings.TrimSpace(mailHTMLAttribute(node, key)))
+	value = strings.TrimSpace(strings.TrimSuffix(value, "px"))
+	if value == "" || strings.Contains(value, "%") {
+		return 0, false
+	}
+	dimension, err := strconv.ParseFloat(value, 64)
+	return dimension, err == nil && dimension > 0
+}
+
+func forceMailExternalLinksNewTab(htmlValue string) string {
+	if strings.TrimSpace(htmlValue) == "" {
+		return htmlValue
+	}
+	context := &htmlparser.Node{Type: htmlparser.ElementNode, Data: "div", DataAtom: atom.Div}
+	nodes, err := htmlparser.ParseFragment(strings.NewReader(htmlValue), context)
+	if err != nil {
+		return htmlValue
+	}
+	for _, node := range nodes {
+		context.AppendChild(node)
+	}
+	var walk func(*htmlparser.Node)
+	walk = func(node *htmlparser.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type == htmlparser.ElementNode && strings.EqualFold(node.Data, "a") {
+			href := strings.ToLower(strings.TrimSpace(mailHTMLAttribute(node, "href")))
+			if strings.HasPrefix(href, "https://") || strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "//") {
+				setMailHTMLAttribute(node, "target", "_blank")
+				setMailHTMLAttribute(node, "rel", "noopener noreferrer")
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(context)
+	return renderMailHTMLChildren(context, htmlValue)
+}
+
+func setMailHTMLAttribute(node *htmlparser.Node, key, value string) {
+	for index := range node.Attr {
+		if strings.EqualFold(node.Attr[index].Key, key) {
+			node.Attr[index].Val = value
+			return
+		}
+	}
+	node.Attr = append(node.Attr, htmlparser.Attribute{Key: key, Val: value})
 }
 
 func renderMailHTMLChildren(root *htmlparser.Node, fallback string) string {

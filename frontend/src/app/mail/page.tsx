@@ -387,8 +387,10 @@ function htmlToText(value: string) {
 }
 
 function iframeDocument(html: string) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}img{display:block;max-width:min(100%,420px)!important;max-height:420px!important;width:auto!important;height:auto!important;object-fit:contain;margin:8px 0}table{max-width:100%;border-collapse:collapse}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body>${html}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><base target="_blank"><style>html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}table{max-width:100%;border-collapse:collapse}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body>${html}</body></html>`;
 }
+
+const mailFrameSandbox = "allow-popups allow-popups-to-escape-sandbox";
 
 export default function MailPage() {
   const router = useRouter();
@@ -2743,7 +2745,7 @@ export default function MailPage() {
                   <div className="py-5">
                     <iframe
                       title="邮件正文"
-                      sandbox=""
+                      sandbox={mailFrameSandbox}
                       srcDoc={iframeDocument(displayedMailHTML)}
                       className="min-h-[55dvh] w-full border-0"
                     />
@@ -3094,7 +3096,7 @@ export default function MailPage() {
                   </span>
                   <iframe
                     title="邮件落款预览"
-                    sandbox=""
+                    sandbox={mailFrameSandbox}
                     srcDoc={iframeDocument(
                       signatureDraft.html_content ||
                         '<span style="color:#94a3b8">在左侧输入落款内容后，这里会显示发送效果。</span>',
@@ -3751,7 +3753,7 @@ export default function MailPage() {
               {composeView === "preview" ? (
                 <iframe
                   title="邮件发送预览"
-                  sandbox=""
+                  sandbox={mailFrameSandbox}
                   srcDoc={iframeDocument(composePreview)}
                   className="mt-3 min-h-[48dvh] w-full rounded-lg border border-slate-200"
                 />
