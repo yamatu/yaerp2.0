@@ -872,6 +872,21 @@ function stageItemStatus(stage: TradeStage, item: TradeOrderItem) {
   }
 }
 
+function resolveInspectionItemID(
+  order: Pick<TradeOrder, "items">,
+  selectedItemID: number | "" | null,
+): number | "" {
+  const items = order.items || [];
+  if (selectedItemID === "") return "";
+  if (
+    selectedItemID !== null &&
+    items.some((item) => item.id === selectedItemID)
+  ) {
+    return selectedItemID;
+  }
+  return items[0]?.id || "";
+}
+
 function stageDefinition(stage: TradeStage) {
   return STAGES.find((item) => item.key === stage);
 }
@@ -1110,7 +1125,9 @@ export default function TradeWorkspacePage() {
   const [flowing, setFlowing] = useState(false);
   const [advanceNote, setAdvanceNote] = useState("");
   const [syncingWorkbook, setSyncingWorkbook] = useState(false);
-  const [inspectionItemID, setInspectionItemID] = useState<number | "">("");
+  const [inspectionItemID, setInspectionItemID] = useState<
+    number | "" | null
+  >(null);
   const [inspectionNote, setInspectionNote] = useState("");
   const [inspectionFiles, setInspectionFiles] = useState<File[]>([]);
   const [uploadingInspection, setUploadingInspection] = useState(false);
@@ -1314,8 +1331,9 @@ export default function TradeWorkspacePage() {
         setDetailOrder(response.data);
         setDetailViewStage(response.data.stage as Exclude<TradeStage, "cancelled">);
         detailOrderIDRef.current = response.data.id;
-        if (!inspectionItemID && response.data.items?.length)
-          setInspectionItemID(response.data.items[0].id);
+        setInspectionItemID((current) =>
+          resolveInspectionItemID(response.data!, current),
+        );
       } catch (detailError) {
         setDetailOrder(null);
         detailOrderIDRef.current = null;
@@ -1328,7 +1346,7 @@ export default function TradeWorkspacePage() {
         if (showLoader) setDetailLoading(false);
       }
     },
-    [inspectionItemID],
+    [],
   );
 
   useEffect(() => {
@@ -2272,6 +2290,7 @@ export default function TradeWorkspacePage() {
     setDetailViewStage(order.stage as Exclude<TradeStage, "cancelled">);
     detailOrderIDRef.current = order.id;
     setAdvanceNote("");
+    setInspectionItemID(null);
     setInspectionFiles([]);
     setInspectionNote("");
     setTimelineExpanded(false);
@@ -2290,6 +2309,7 @@ export default function TradeWorkspacePage() {
   const closeOrderDetail = () => {
     setDetailOrder(null);
     detailOrderIDRef.current = null;
+    setInspectionItemID(null);
     setTimelineExpanded(false);
     persistWorkspaceState();
   };
@@ -3080,14 +3100,20 @@ export default function TradeWorkspacePage() {
   const uploadInspectionPhotos = async () => {
     if (!detailOrder || inspectionFiles.length === 0)
       return setError("请选择至少一张质检图片。");
+    const effectiveItemID = resolveInspectionItemID(
+      detailOrder,
+      inspectionItemID,
+    );
+    if (effectiveItemID !== inspectionItemID)
+      setInspectionItemID(effectiveItemID);
     setUploadingInspection(true);
     setError("");
     try {
       for (const file of inspectionFiles) {
         const body = new FormData();
         body.append("file", file);
-        if (inspectionItemID)
-          body.append("order_item_id", String(inspectionItemID));
+        if (effectiveItemID)
+          body.append("order_item_id", String(effectiveItemID));
         body.append("note", inspectionNote.trim());
         const response = await api.form<TradeInspectionPhoto>(
           `/trade/orders/${detailOrder.id}/inspection-photos`,
@@ -3112,6 +3138,13 @@ export default function TradeWorkspacePage() {
   };
 
   const openInspectionGalleryPicker = async () => {
+    if (!detailOrder) return;
+    const effectiveItemID = resolveInspectionItemID(
+      detailOrder,
+      inspectionItemID,
+    );
+    if (effectiveItemID !== inspectionItemID)
+      setInspectionItemID(effectiveItemID);
     setGalleryPickerOpen(true);
     setGallerySelectedIDs([]);
     setGalleryLoading(true);
@@ -3137,13 +3170,19 @@ export default function TradeWorkspacePage() {
 
   const linkInspectionGalleryImages = async () => {
     if (!detailOrder || gallerySelectedIDs.length === 0) return;
+    const effectiveItemID = resolveInspectionItemID(
+      detailOrder,
+      inspectionItemID,
+    );
+    if (effectiveItemID !== inspectionItemID)
+      setInspectionItemID(effectiveItemID);
     setLinkingGalleryImages(true);
     setError("");
     try {
       const response = await api.post<TradeOrder>(
         `/trade/orders/${detailOrder.id}/inspection-photos/link`,
         {
-          order_item_id: inspectionItemID || undefined,
+          order_item_id: effectiveItemID || undefined,
           attachment_ids: gallerySelectedIDs,
           note: inspectionNote.trim(),
         },
@@ -8560,7 +8599,7 @@ export default function TradeWorkspacePage() {
                             detailOrder.stage === "inspection" && (
                               <div className="mt-3 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[180px_1fr_auto_auto]">
                                 <select
-                                  value={inspectionItemID}
+                                  value={inspectionItemID ?? ""}
                                   onChange={(event) =>
                                     setInspectionItemID(
                                       event.target.value
