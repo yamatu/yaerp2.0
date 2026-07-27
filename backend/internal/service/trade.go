@@ -166,6 +166,14 @@ func (s *TradeService) BossDashboard(userID int64) (*model.TradeBossDashboard, e
 	if err != nil {
 		return nil, err
 	}
+	return buildTradeBossDashboard(orders, items, time.Now()), nil
+}
+
+func buildTradeBossDashboard(
+	orders []model.TradeOrder,
+	items []model.TradeOrderItem,
+	now time.Time,
+) *model.TradeBossDashboard {
 	itemsByOrder := make(map[int64][]model.TradeOrderItem)
 	for _, item := range items {
 		itemsByOrder[item.OrderID] = append(itemsByOrder[item.OrderID], item)
@@ -180,7 +188,7 @@ func (s *TradeService) BossDashboard(userID int64) (*model.TradeBossDashboard, e
 		LossOrderList:   []model.TradeBossOrderSummary{},
 	}
 	currencies := make(map[string]*model.TradeBossCurrencySummary)
-	completeSummaries := make([]model.TradeBossOrderSummary, 0, len(orders))
+	finalizedSummaries := make([]model.TradeBossOrderSummary, 0, len(orders))
 	for _, order := range orders {
 		profit := buildTradeProfitSummary(&order, itemsByOrder[order.ID])
 		if order.Stage == model.TradeStageCompleted {
@@ -188,16 +196,43 @@ func (s *TradeService) BossDashboard(userID int64) (*model.TradeBossDashboard, e
 		} else if order.Stage != model.TradeStageCancelled {
 			dashboard.ActiveOrders++
 		}
-		if !profit.CostComplete {
-			dashboard.IncompleteCostOrders++
-		} else {
-			if profit.ProfitAmount < 0 {
-				dashboard.LossOrders++
-			} else if profit.ProfitAmount > 0 {
-				dashboard.ProfitableOrders++
-			}
-		}
 		currency := strings.ToUpper(firstNonEmptyTrade(profit.Currency, "未设置"))
+		summary := model.TradeBossOrderSummary{
+			ID: order.ID, OrderNo: order.OrderNo, Title: order.Title,
+			CustomerName: order.CustomerName, OwnerName: order.OwnerName, Stage: order.Stage,
+			Currency: currency, Revenue: profit.Revenue, GoodsRevenue: profit.GoodsRevenue,
+			FreightRevenue: profit.FreightRevenue, TotalCost: profit.TotalCost,
+			ActualFreightCost: profit.ActualFreightCost, FreightProfit: profit.FreightProfit,
+			ProfitAmount: profit.ProfitAmount, ProfitMargin: profit.ProfitMargin,
+			RevenueCNY: profit.RevenueCNY, TotalCostCNY: profit.TotalCostCNY,
+			ProfitAmountCNY: profit.ProfitAmountCNY, FreightProfitCNY: profit.FreightProfitCNY,
+			CostComplete: profit.CostComplete, CNYComplete: profit.CNYComplete,
+			Finalized: profit.Finalized, Warnings: profit.Warnings, UpdatedAt: order.UpdatedAt,
+		}
+		if order.Stage != model.TradeStageCompleted {
+			continue
+		}
+		if len(dashboard.RecentOrders) < 30 {
+			dashboard.RecentOrders = append(dashboard.RecentOrders, summary)
+		}
+		if !profit.Finalized {
+			dashboard.IncompleteCostOrders++
+			continue
+		}
+
+		dashboard.CNYCompleteOrders++
+		dashboard.RevenueCNY += profit.RevenueCNY
+		dashboard.TotalCostCNY += profit.TotalCostCNY
+		dashboard.ProfitAmountCNY += profit.ProfitAmountCNY
+		dashboard.FreightRevenueCNY += profit.FreightRevenueCNY
+		dashboard.FreightCostCNY += profit.FreightCostCNY
+		dashboard.FreightProfitCNY += profit.FreightProfitCNY
+		if profit.ProfitAmountCNY < 0 {
+			dashboard.LossOrders++
+		} else if profit.ProfitAmountCNY > 0 {
+			dashboard.ProfitableOrders++
+		}
+
 		currencySummary := currencies[currency]
 		if currencySummary == nil {
 			currencySummary = &model.TradeBossCurrencySummary{Currency: currency}
@@ -213,34 +248,7 @@ func (s *TradeService) BossDashboard(userID int64) (*model.TradeBossDashboard, e
 		currencySummary.TotalCost += profit.TotalCost
 		currencySummary.FreightProfit += profit.FreightProfit
 		currencySummary.ProfitAmount += profit.ProfitAmount
-		if profit.CNYComplete {
-			dashboard.CNYCompleteOrders++
-			dashboard.RevenueCNY += profit.RevenueCNY
-			dashboard.TotalCostCNY += profit.TotalCostCNY
-			dashboard.ProfitAmountCNY += profit.ProfitAmountCNY
-			dashboard.FreightRevenueCNY += profit.FreightRevenueCNY
-			dashboard.FreightCostCNY += profit.FreightCostCNY
-			dashboard.FreightProfitCNY += profit.FreightProfitCNY
-		}
-
-		summary := model.TradeBossOrderSummary{
-			ID: order.ID, OrderNo: order.OrderNo, Title: order.Title,
-			CustomerName: order.CustomerName, OwnerName: order.OwnerName, Stage: order.Stage,
-			Currency: currency, Revenue: profit.Revenue, GoodsRevenue: profit.GoodsRevenue,
-			FreightRevenue: profit.FreightRevenue, TotalCost: profit.TotalCost,
-			ActualFreightCost: profit.ActualFreightCost, FreightProfit: profit.FreightProfit,
-			ProfitAmount: profit.ProfitAmount, ProfitMargin: profit.ProfitMargin,
-			RevenueCNY: profit.RevenueCNY, TotalCostCNY: profit.TotalCostCNY,
-			ProfitAmountCNY: profit.ProfitAmountCNY, FreightProfitCNY: profit.FreightProfitCNY,
-			CostComplete: profit.CostComplete, CNYComplete: profit.CNYComplete,
-			Warnings: profit.Warnings, UpdatedAt: order.UpdatedAt,
-		}
-		if len(dashboard.RecentOrders) < 30 {
-			dashboard.RecentOrders = append(dashboard.RecentOrders, summary)
-		}
-		if profit.CostComplete {
-			completeSummaries = append(completeSummaries, summary)
-		}
+		finalizedSummaries = append(finalizedSummaries, summary)
 	}
 	for _, summary := range currencies {
 		if summary.Revenue != 0 {
@@ -251,24 +259,24 @@ func (s *TradeService) BossDashboard(userID int64) (*model.TradeBossDashboard, e
 	sort.Slice(dashboard.Currencies, func(i, j int) bool {
 		return dashboard.Currencies[i].Currency < dashboard.Currencies[j].Currency
 	})
-	sort.Slice(completeSummaries, func(i, j int) bool {
-		return completeSummaries[i].ProfitAmount > completeSummaries[j].ProfitAmount
+	sort.Slice(finalizedSummaries, func(i, j int) bool {
+		return finalizedSummaries[i].ProfitAmountCNY > finalizedSummaries[j].ProfitAmountCNY
 	})
-	for _, summary := range completeSummaries {
-		if summary.ProfitAmount > 0 && len(dashboard.TopProfitOrders) < 10 {
+	for _, summary := range finalizedSummaries {
+		if summary.ProfitAmountCNY > 0 && len(dashboard.TopProfitOrders) < 10 {
 			dashboard.TopProfitOrders = append(dashboard.TopProfitOrders, summary)
 		}
 	}
-	sort.Slice(completeSummaries, func(i, j int) bool {
-		return completeSummaries[i].ProfitAmount < completeSummaries[j].ProfitAmount
+	sort.Slice(finalizedSummaries, func(i, j int) bool {
+		return finalizedSummaries[i].ProfitAmountCNY < finalizedSummaries[j].ProfitAmountCNY
 	})
-	for _, summary := range completeSummaries {
-		if summary.ProfitAmount < 0 && len(dashboard.LossOrderList) < 10 {
+	for _, summary := range finalizedSummaries {
+		if summary.ProfitAmountCNY < 0 && len(dashboard.LossOrderList) < 10 {
 			dashboard.LossOrderList = append(dashboard.LossOrderList, summary)
 		}
 	}
-	dashboard.Monthly = buildTradeMonthlyProfit(orders, itemsByOrder, time.Now())
-	return dashboard, nil
+	dashboard.Monthly = buildTradeMonthlyProfit(orders, itemsByOrder, now)
+	return dashboard
 }
 
 func buildTradeMonthlyProfit(
@@ -1378,16 +1386,16 @@ func tradeStageAtOrAfter(stage, target string) bool {
 }
 
 func tradeProfitExchangeRate(orderCurrency string, quoteRateCNY float64, item *model.TradeOrderItem) float64 {
-	rate := tradeWorkflowFloat(item, "cost_exchange_rate")
-	if rate > 0 {
-		return rate
-	}
 	if item == nil {
 		return 1
 	}
 	purchaseCurrency := strings.ToUpper(firstNonEmptyTrade(item.PurchaseCurrency, orderCurrency))
 	if strings.EqualFold(purchaseCurrency, orderCurrency) {
 		return 1
+	}
+	rate := tradeWorkflowFloat(item, "cost_exchange_rate")
+	if rate > 0 {
+		return rate
 	}
 	if purchaseCurrency == "CNY" && quoteRateCNY > 0 {
 		return 1 / quoteRateCNY

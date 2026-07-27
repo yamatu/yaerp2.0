@@ -104,6 +104,22 @@ func TestBuildTradeProfitSummaryInfersCNYCostRateFromQuoteRate(t *testing.T) {
 	}
 }
 
+func TestBuildTradeProfitSummaryIgnoresStaleRateForSameCurrency(t *testing.T) {
+	order := &model.TradeOrder{
+		Stage: model.TradeStageCompleted, Currency: "CNY", TotalAmount: 1000,
+		QuoteExchangeRateCNY: 1,
+	}
+	item := model.TradeOrderItem{
+		ID: 1, LineNo: 1, Quantity: 10, QuotedPrice: 100,
+		PurchaseCurrency: "CNY", PurchasePrice: 60,
+		WorkflowData: map[string]any{"cost_exchange_rate": 0.14},
+	}
+	profit := buildTradeProfitSummary(order, []model.TradeOrderItem{item})
+	if !profit.Finalized || profit.ProductCost != 600 || profit.ProfitAmount != 400 {
+		t.Fatalf("same-currency costs must ignore stale conversion rates: %#v", profit)
+	}
+}
+
 func TestBuildTradeProfitSummaryRequiresUnknownCrossCurrencyRate(t *testing.T) {
 	order := &model.TradeOrder{Stage: model.TradeStageCompleted, Currency: "USD", TotalAmount: 1000, QuoteExchangeRateCNY: 7}
 	item := model.TradeOrderItem{ID: 1, LineNo: 1, Quantity: 10, QuotedPrice: 100, PurchaseCurrency: "EUR", PurchasePrice: 60}
@@ -204,6 +220,72 @@ func TestBuildTradeMonthlyProfit(t *testing.T) {
 	previous := monthly[len(monthly)-2]
 	if previous.Month != "2026-06" || previous.CompletedOrders != 1 || previous.IncompleteOrders != 1 || previous.FinalizedOrders != 0 {
 		t.Fatalf("unexpected previous month: %#v", previous)
+	}
+}
+
+func TestBuildTradeBossDashboardOnlyAggregatesFinalizedCompletedOrders(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.Local)
+	orders := []model.TradeOrder{
+		{
+			ID: 1, OrderNo: "USD-COMPLETE", Stage: model.TradeStageCompleted,
+			StageUpdatedAt: now, UpdatedAt: now, Currency: "USD", TotalAmount: 100,
+			QuoteExchangeRateCNY: 7, FreightMode: "customer_forwarder",
+		},
+		{
+			ID: 2, OrderNo: "CNY-COMPLETE", Stage: model.TradeStageCompleted,
+			StageUpdatedAt: now, UpdatedAt: now.Add(-time.Minute), Currency: "CNY", TotalAmount: 1000,
+			QuoteExchangeRateCNY: 1, FreightMode: "customer_forwarder",
+		},
+		{
+			ID: 3, OrderNo: "USD-ACTIVE", Stage: model.TradeStagePurchase,
+			StageUpdatedAt: now, UpdatedAt: now.Add(-2 * time.Minute), Currency: "USD", TotalAmount: 100000,
+			QuoteExchangeRateCNY: 7, FreightMode: "customer_forwarder",
+		},
+		{
+			ID: 4, OrderNo: "EUR-INCOMPLETE", Stage: model.TradeStageCompleted,
+			StageUpdatedAt: now, UpdatedAt: now.Add(-3 * time.Minute), Currency: "EUR", TotalAmount: 100,
+			FreightMode: "customer_forwarder",
+		},
+		{
+			ID: 5, OrderNo: "CANCELLED", Stage: model.TradeStageCancelled,
+			StageUpdatedAt: now, UpdatedAt: now.Add(-4 * time.Minute), Currency: "CNY", TotalAmount: 99999,
+			QuoteExchangeRateCNY: 1, FreightMode: "customer_forwarder",
+		},
+	}
+	items := []model.TradeOrderItem{
+		{OrderID: 1, ID: 11, LineNo: 1, Quantity: 1, QuotedPrice: 100, PurchaseCurrency: "CNY", PurchasePrice: 420},
+		{OrderID: 2, ID: 21, LineNo: 1, Quantity: 1, QuotedPrice: 1000, PurchaseCurrency: "CNY", PurchasePrice: 600},
+		{OrderID: 3, ID: 31, LineNo: 1, Quantity: 1, QuotedPrice: 100000, PurchaseCurrency: "USD", PurchasePrice: 1},
+		{OrderID: 4, ID: 41, LineNo: 1, Quantity: 1, QuotedPrice: 100, PurchaseCurrency: "EUR", PurchasePrice: 60},
+		{OrderID: 5, ID: 51, LineNo: 1, Quantity: 1, QuotedPrice: 99999, PurchaseCurrency: "CNY", PurchasePrice: 1},
+	}
+
+	dashboard := buildTradeBossDashboard(orders, items, now)
+	if dashboard.TotalOrders != 5 || dashboard.ActiveOrders != 1 || dashboard.CompletedOrders != 3 {
+		t.Fatalf("unexpected order counts: %#v", dashboard)
+	}
+	if dashboard.ProfitableOrders != 2 || dashboard.LossOrders != 0 || dashboard.IncompleteCostOrders != 1 {
+		t.Fatalf("only finalized completed orders should be classified: %#v", dashboard)
+	}
+	if dashboard.CNYCompleteOrders != 2 || math.Abs(dashboard.RevenueCNY-1700) > 0.0001 ||
+		math.Abs(dashboard.TotalCostCNY-1020) > 0.0001 || math.Abs(dashboard.ProfitAmountCNY-680) > 0.0001 {
+		t.Fatalf("unexpected CNY aggregation: %#v", dashboard)
+	}
+	if len(dashboard.Currencies) != 2 || dashboard.Currencies[0].Currency != "CNY" ||
+		dashboard.Currencies[0].OrderCount != 1 || dashboard.Currencies[1].Currency != "USD" ||
+		dashboard.Currencies[1].OrderCount != 1 {
+		t.Fatalf("currency summaries must only contain finalized completed orders: %#v", dashboard.Currencies)
+	}
+	if len(dashboard.RecentOrders) != 3 || dashboard.RecentOrders[2].Finalized {
+		t.Fatalf("recent profit rows should contain completed orders and mark incomplete rows: %#v", dashboard.RecentOrders)
+	}
+	if len(dashboard.TopProfitOrders) != 2 || dashboard.TopProfitOrders[0].ID != 2 || dashboard.TopProfitOrders[1].ID != 1 {
+		t.Fatalf("profit ranking must use CNY values across currencies: %#v", dashboard.TopProfitOrders)
+	}
+	currentMonth := dashboard.Monthly[len(dashboard.Monthly)-1]
+	if currentMonth.CompletedOrders != 3 || currentMonth.FinalizedOrders != 2 || currentMonth.IncompleteOrders != 1 ||
+		math.Abs(currentMonth.ProfitAmountCNY-680) > 0.0001 {
+		t.Fatalf("monthly totals must match the completed-order accounting scope: %#v", currentMonth)
 	}
 }
 

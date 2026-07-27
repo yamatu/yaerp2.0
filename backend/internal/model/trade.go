@@ -531,6 +531,7 @@ type TradeBossOrderSummary struct {
 	FreightProfitCNY  float64   `json:"freight_profit_cny"`
 	CostComplete      bool      `json:"cost_complete"`
 	CNYComplete       bool      `json:"cny_complete"`
+	Finalized         bool      `json:"finalized"`
 	Warnings          []string  `json:"warnings"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }

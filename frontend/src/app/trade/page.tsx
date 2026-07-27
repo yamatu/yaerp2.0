@@ -3917,9 +3917,9 @@ export default function TradeWorkspacePage() {
                         ["全部订单", bossDashboard.total_orders],
                         ["进行中", bossDashboard.active_orders],
                         ["已完成", bossDashboard.completed_orders],
-                        ["盈利订单", bossDashboard.profitable_orders],
-                        ["亏损订单", bossDashboard.loss_orders],
-                        ["成本待补", bossDashboard.incomplete_cost_orders],
+                        ["已完成盈利", bossDashboard.profitable_orders],
+                        ["已完成亏损", bossDashboard.loss_orders],
+                        ["完成待核算", bossDashboard.incomplete_cost_orders],
                       ].map(([label, value], index) => (
                         <div
                           key={String(label)}
@@ -4102,8 +4102,8 @@ export default function TradeWorkspacePage() {
                           人民币经营汇总
                         </h3>
                         <p className="mt-0.5 text-xs text-slate-400">
-                          仅统计已配置报价汇率的订单，共{" "}
-                          {bossDashboard.cny_complete_orders} 单。
+                          仅统计已完成且成本、汇率完整的订单，共{" "}
+                          {bossDashboard.cny_complete_orders} 单；按各订单报价汇率统一折算人民币。
                         </p>
                       </div>
                       <div className="grid gap-px bg-slate-200 sm:grid-cols-2 xl:grid-cols-5">
@@ -4135,7 +4135,7 @@ export default function TradeWorkspacePage() {
                           分币种经营汇总
                         </h3>
                         <p className="mt-0.5 text-xs text-slate-400">
-                          不同币种独立汇总，不进行未经配置的跨币种合并。
+                          仅包含已完成且可核算订单；原币分别展示，不直接混加。
                         </p>
                       </div>
                       <div className="overflow-x-auto">
@@ -4236,10 +4236,10 @@ export default function TradeWorkspacePage() {
                       <section className="overflow-hidden rounded-lg border border-slate-200 bg-white">
                         <div className="border-b border-slate-200 px-4 py-3">
                           <h3 className="text-sm font-semibold">
-                            最近订单利润
+                            最近完成订单利润
                           </h3>
                           <p className="mt-0.5 text-xs text-slate-400">
-                            成本待补的订单显示为暂估，补齐采购价和换算率后自动重算。
+                            未完成订单不计入利润；完成后缺少成本或汇率的订单显示为待核算。
                           </p>
                         </div>
                         <div className="overflow-x-auto">
@@ -4312,19 +4312,19 @@ export default function TradeWorkspacePage() {
                                       order.currency,
                                       order.profit_amount,
                                     )}
-                                    {!order.cost_complete && (
+                                    {!order.finalized && (
                                       <div className="mt-0.5 text-[10px] font-medium text-amber-600">
-                                        暂估
+                                        待核算
                                       </div>
                                     )}
                                   </td>
                                   <td className="px-4 py-3 text-right font-semibold tabular-nums text-slate-700">
-                                    {order.cny_complete
+                                    {order.finalized
                                       ? formatFinancialMoney(
                                           "CNY",
                                           order.profit_amount_cny,
                                         )
-                                      : "汇率待补"}
+                                      : "待核算"}
                                   </td>
                                   <td className="px-4 py-3 text-right font-semibold tabular-nums">
                                     {formatPercent(order.profit_margin)}
@@ -4344,7 +4344,7 @@ export default function TradeWorkspacePage() {
                           <div className="divide-y divide-slate-100">
                             {bossDashboard.top_profit_orders.length === 0 ? (
                               <div className="px-4 py-8 text-center text-xs text-slate-400">
-                                暂无成本完整的盈利订单
+                                暂无已完成且核算完整的盈利订单
                               </div>
                             ) : (
                               bossDashboard.top_profit_orders
@@ -4364,10 +4364,20 @@ export default function TradeWorkspacePage() {
                                         {order.customer_name}
                                       </span>
                                     </span>
-                                    <span className="shrink-0 text-sm font-semibold text-emerald-700">
-                                      {formatFinancialMoney(
-                                        order.currency,
-                                        order.profit_amount,
+                                    <span className="shrink-0 text-right">
+                                      <span className="block text-sm font-semibold text-emerald-700">
+                                        {formatFinancialMoney(
+                                          "CNY",
+                                          order.profit_amount_cny,
+                                        )}
+                                      </span>
+                                      {order.currency !== "CNY" && (
+                                        <span className="mt-0.5 block text-[10px] text-slate-400">
+                                          {formatFinancialMoney(
+                                            order.currency,
+                                            order.profit_amount,
+                                          )}
+                                        </span>
                                       )}
                                     </span>
                                   </button>
@@ -4382,7 +4392,7 @@ export default function TradeWorkspacePage() {
                           <div className="divide-y divide-slate-100">
                             {bossDashboard.loss_orders_list.length === 0 ? (
                               <div className="px-4 py-8 text-center text-xs text-slate-400">
-                                暂无成本完整的亏损订单
+                                暂无已完成且核算完整的亏损订单
                               </div>
                             ) : (
                               bossDashboard.loss_orders_list
@@ -4402,10 +4412,20 @@ export default function TradeWorkspacePage() {
                                         {order.customer_name}
                                       </span>
                                     </span>
-                                    <span className="shrink-0 text-sm font-semibold text-rose-700">
-                                      {formatFinancialMoney(
-                                        order.currency,
-                                        order.profit_amount,
+                                    <span className="shrink-0 text-right">
+                                      <span className="block text-sm font-semibold text-rose-700">
+                                        {formatFinancialMoney(
+                                          "CNY",
+                                          order.profit_amount_cny,
+                                        )}
+                                      </span>
+                                      {order.currency !== "CNY" && (
+                                        <span className="mt-0.5 block text-[10px] text-slate-400">
+                                          {formatFinancialMoney(
+                                            order.currency,
+                                            order.profit_amount,
+                                          )}
+                                        </span>
                                       )}
                                     </span>
                                   </button>

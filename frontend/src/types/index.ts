@@ -1601,6 +1601,7 @@ export interface TradeBossOrderSummary {
   freight_profit_cny: number;
   cost_complete: boolean;
   cny_complete: boolean;
+  finalized: boolean;
   warnings: string[];
   updated_at: string;
 }
