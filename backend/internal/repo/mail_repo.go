@@ -62,56 +62,185 @@ func (r *MailRepo) UpdateSettings(userID int64, settings *model.MailServerSettin
 }
 
 func (r *MailRepo) GetAccount(userID int64) (*model.MailAccount, error) {
-	return scanMailAccount(r.db.QueryRow(mailAccountSelectSQL()+` WHERE account.user_id = $1`, userID))
+	return scanMailAccount(r.db.QueryRow(
+		mailAccountSelectSQL()+` WHERE account.user_id = $1 ORDER BY account.is_default DESC, account.id LIMIT 1`,
+		userID,
+	))
+}
+
+func (r *MailRepo) GetAccountByID(userID, accountID int64) (*model.MailAccount, error) {
+	return scanMailAccount(r.db.QueryRow(
+		mailAccountSelectSQL()+` WHERE account.user_id = $1 AND account.id = $2`,
+		userID, accountID,
+	))
+}
+
+func (r *MailRepo) ListOwnAccounts(userID int64) ([]model.MailAccount, error) {
+	rows, err := r.db.Query(
+		mailAccountSelectSQL()+` WHERE account.user_id = $1 ORDER BY account.is_default DESC, account.id`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	accounts := make([]model.MailAccount, 0)
+	for rows.Next() {
+		account, scanErr := scanMailAccount(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		accounts = append(accounts, *account)
+	}
+	return accounts, rows.Err()
 }
 
 func (r *MailRepo) UpsertAccount(account *model.MailAccount) error {
+	return r.SaveAccount(account)
+}
+
+func (r *MailRepo) SaveAccount(account *model.MailAccount) error {
 	if account == nil || account.UserID <= 0 {
 		return fmt.Errorf("invalid mail account")
 	}
-	return r.db.QueryRow(
-		`INSERT INTO mail_accounts (
-		     user_id, email_address, display_name, username, password_encrypted,
-		     signature_html, enabled, auto_forward_enabled, auto_forward_to, forward_attachments,
-		     forward_uid_validity, forward_last_uid,
-		     last_verified_at, last_error, created_at, updated_at
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),NOW())
-		 ON CONFLICT (user_id) DO UPDATE SET
-		     email_address=EXCLUDED.email_address,
-		     display_name=EXCLUDED.display_name,
-		     username=EXCLUDED.username,
-		     password_encrypted=EXCLUDED.password_encrypted,
-		     signature_html=EXCLUDED.signature_html,
-		     enabled=EXCLUDED.enabled,
-		     auto_forward_enabled=EXCLUDED.auto_forward_enabled,
-		     auto_forward_to=EXCLUDED.auto_forward_to,
-		     forward_attachments=EXCLUDED.forward_attachments,
-		     forward_uid_validity=EXCLUDED.forward_uid_validity,
-		     forward_last_uid=EXCLUDED.forward_last_uid,
-		     last_verified_at=EXCLUDED.last_verified_at,
-		     last_error=EXCLUDED.last_error,
-		     updated_at=NOW()
-		 RETURNING id, created_at, updated_at`,
-		account.UserID, account.EmailAddress, account.DisplayName, account.LoginUsername,
-		account.PasswordEncrypted, account.SignatureHTML, account.Enabled,
-		account.AutoForwardEnabled, pq.Array(account.AutoForwardTo), account.ForwardAttachments,
-		account.ForwardUIDValidity, account.ForwardLastUID,
-		account.LastVerifiedAt, account.LastError,
-	).Scan(&account.ID, &account.CreatedAt, &account.UpdatedAt)
+	// PostgreSQL treats pq.Array(nil) as SQL NULL. The forwarding column is
+	// intentionally NOT NULL, so providers without forwarding support (such as
+	// AliMail) must persist an empty array instead.
+	account.AutoForwardTo = nonNilMailAddresses(account.AutoForwardTo)
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if !account.IsDefault {
+		var defaultCount int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM mail_accounts WHERE user_id=$1 AND is_default`, account.UserID).Scan(&defaultCount); err != nil {
+			return err
+		}
+		account.IsDefault = defaultCount == 0
+	}
+	if account.IsDefault {
+		if _, err := tx.Exec(`UPDATE mail_accounts SET is_default=FALSE, updated_at=NOW() WHERE user_id=$1 AND ($2=0 OR id<>$2)`, account.UserID, account.ID); err != nil {
+			return err
+		}
+	}
+	if account.ID > 0 {
+		err = tx.QueryRow(
+			`UPDATE mail_accounts SET
+			     provider=$3, email_address=$4, display_name=$5, username=$6,
+			     password_encrypted=$7, api_base_url=$8, client_id=$9,
+			     client_secret_encrypted=$10, is_default=$11,
+			     signature_html=$12, enabled=$13,
+			     auto_forward_enabled=$14, auto_forward_to=$15, forward_attachments=$16,
+			     forward_uid_validity=$17, forward_last_uid=$18,
+			     last_verified_at=$19, last_error=$20, updated_at=NOW()
+			 WHERE id=$1 AND user_id=$2
+			 RETURNING created_at,updated_at`,
+			account.ID, account.UserID, account.Provider, account.EmailAddress, account.DisplayName,
+			account.LoginUsername, account.PasswordEncrypted, account.APIBaseURL, account.ClientID,
+			account.ClientSecretEncrypted, account.IsDefault, account.SignatureHTML, account.Enabled,
+			account.AutoForwardEnabled, pq.Array(account.AutoForwardTo), account.ForwardAttachments,
+			account.ForwardUIDValidity, account.ForwardLastUID, account.LastVerifiedAt, account.LastError,
+		).Scan(&account.CreatedAt, &account.UpdatedAt)
+	} else {
+		err = tx.QueryRow(
+			`INSERT INTO mail_accounts (
+			     user_id,provider,email_address,display_name,username,password_encrypted,
+			     api_base_url,client_id,client_secret_encrypted,is_default,
+			     signature_html,enabled,auto_forward_enabled,auto_forward_to,forward_attachments,
+			     forward_uid_validity,forward_last_uid,last_verified_at,last_error,created_at,updated_at
+			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW())
+			 RETURNING id,created_at,updated_at`,
+			account.UserID, account.Provider, account.EmailAddress, account.DisplayName,
+			account.LoginUsername, account.PasswordEncrypted, account.APIBaseURL, account.ClientID,
+			account.ClientSecretEncrypted, account.IsDefault, account.SignatureHTML, account.Enabled,
+			account.AutoForwardEnabled, pq.Array(account.AutoForwardTo), account.ForwardAttachments,
+			account.ForwardUIDValidity, account.ForwardLastUID, account.LastVerifiedAt, account.LastError,
+		).Scan(&account.ID, &account.CreatedAt, &account.UpdatedAt)
+	}
+	if err != nil {
+		return err
+	}
+	if !account.Enabled && account.IsDefault {
+		var replacementID int64
+		replacementErr := tx.QueryRow(
+			`SELECT id FROM mail_accounts
+			  WHERE user_id=$1 AND id<>$2 AND enabled
+			  ORDER BY id LIMIT 1`,
+			account.UserID, account.ID,
+		).Scan(&replacementID)
+		if replacementErr == nil {
+			if _, err := tx.Exec(`UPDATE mail_accounts SET is_default=FALSE,updated_at=NOW() WHERE id=$1`, account.ID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE mail_accounts SET is_default=TRUE,updated_at=NOW() WHERE id=$1`, replacementID); err != nil {
+				return err
+			}
+			account.IsDefault = false
+		} else if !errors.Is(replacementErr, sql.ErrNoRows) {
+			return replacementErr
+		}
+	}
+	return tx.Commit()
 }
 
-func (r *MailRepo) DeleteAccount(userID int64) error {
-	result, err := r.db.Exec(`DELETE FROM mail_accounts WHERE user_id = $1`, userID)
+func nonNilMailAddresses(addresses []string) []string {
+	if addresses == nil {
+		return []string{}
+	}
+	return addresses
+}
+
+func (r *MailRepo) SetDefaultAccount(userID, accountID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM mail_accounts WHERE id=$1 AND user_id=$2 AND enabled)`, accountID, userID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.Exec(`UPDATE mail_accounts SET is_default=(id=$2),updated_at=NOW() WHERE user_id=$1`, userID, accountID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *MailRepo) DeleteAccount(userID, accountID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if accountID <= 0 {
+		if err := tx.QueryRow(`SELECT id FROM mail_accounts WHERE user_id=$1 ORDER BY is_default DESC,id LIMIT 1`, userID).Scan(&accountID); err != nil {
+			return err
+		}
+	}
+	var wasDefault bool
+	if err := tx.QueryRow(`SELECT is_default FROM mail_accounts WHERE id=$1 AND user_id=$2`, accountID, userID).Scan(&wasDefault); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM mail_accounts WHERE id=$1 AND user_id=$2`, accountID, userID)
 	if err != nil {
 		return err
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	if wasDefault {
+		if _, err := tx.Exec(`UPDATE mail_accounts SET is_default=TRUE,updated_at=NOW() WHERE id=(SELECT id FROM mail_accounts WHERE user_id=$1 ORDER BY id LIMIT 1)`, userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
-func (r *MailRepo) UpdateAccountStatus(userID int64, verified bool, syncAt bool, lastError string) error {
+func (r *MailRepo) UpdateAccountStatus(accountID int64, verified bool, syncAt bool, lastError string) error {
 	lastError = strings.TrimSpace(lastError)
 	if len(lastError) > 1000 {
 		lastError = lastError[:1000]
@@ -122,14 +251,14 @@ func (r *MailRepo) UpdateAccountStatus(userID int64, verified bool, syncAt bool,
 		        last_sync_at = CASE WHEN $3 THEN NOW() ELSE last_sync_at END,
 		        last_error = $4,
 		        updated_at = NOW()
-		  WHERE user_id = $1`,
-		userID, verified, syncAt, lastError,
+		  WHERE id = $1`,
+		accountID, verified, syncAt, lastError,
 	)
 	return err
 }
 
 func (r *MailRepo) ListAccounts() ([]model.MailAccount, error) {
-	rows, err := r.db.Query(mailAccountSelectSQL() + ` WHERE account.id IS NOT NULL ORDER BY usr.username`)
+	rows, err := r.db.Query(mailAccountSelectSQL() + ` WHERE account.id IS NOT NULL ORDER BY usr.username, account.is_default DESC, account.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +277,7 @@ func (r *MailRepo) ListAccounts() ([]model.MailAccount, error) {
 func (r *MailRepo) ListForwardingAccounts() ([]model.MailAccount, error) {
 	rows, err := r.db.Query(mailAccountSelectSQL() + `
 		WHERE account.id IS NOT NULL
+		  AND account.provider = 'imap'
 		  AND account.enabled = TRUE
 		  AND account.auto_forward_enabled = TRUE
 		  AND cardinality(account.auto_forward_to) > 0
@@ -194,8 +324,10 @@ type mailScanner interface{ Scan(...any) error }
 
 func mailAccountSelectSQL() string {
 	return `SELECT account.id, usr.id, usr.username, usr.email,
-	              account.email_address, account.display_name, account.username,
-	              account.password_encrypted, account.signature_html, account.enabled,
+	              account.provider, account.email_address, account.display_name, account.username,
+	              account.password_encrypted, account.api_base_url, account.client_id,
+	              account.client_secret_encrypted, account.is_default,
+	              account.signature_html, account.enabled,
 	              account.auto_forward_enabled, account.auto_forward_to, account.forward_attachments,
 	              account.forward_uid_validity, account.forward_last_uid,
 	              account.last_verified_at, account.last_sync_at, account.last_error,
@@ -207,14 +339,16 @@ func mailAccountSelectSQL() string {
 func scanMailAccount(scanner mailScanner) (*model.MailAccount, error) {
 	var account model.MailAccount
 	var id sql.NullInt64
-	var emailAddress, displayName, loginUsername, encryptedPassword, signature, lastError sql.NullString
-	var enabled sql.NullBool
+	var provider, emailAddress, displayName, loginUsername, encryptedPassword sql.NullString
+	var apiBaseURL, clientID, encryptedClientSecret, signature, lastError sql.NullString
+	var isDefault, enabled sql.NullBool
 	var autoForwardEnabled, forwardAttachments sql.NullBool
 	var forwardUIDValidity, forwardLastUID sql.NullInt64
 	var verifiedAt, syncAt, createdAt, updatedAt sql.NullTime
 	err := scanner.Scan(
 		&id, &account.UserID, &account.Username, &account.UserEmail,
-		&emailAddress, &displayName, &loginUsername, &encryptedPassword, &signature, &enabled,
+		&provider, &emailAddress, &displayName, &loginUsername, &encryptedPassword,
+		&apiBaseURL, &clientID, &encryptedClientSecret, &isDefault, &signature, &enabled,
 		&autoForwardEnabled, pq.Array(&account.AutoForwardTo), &forwardAttachments,
 		&forwardUIDValidity, &forwardLastUID,
 		&verifiedAt, &syncAt, &lastError, &createdAt, &updatedAt,
@@ -226,11 +360,25 @@ func scanMailAccount(scanner mailScanner) (*model.MailAccount, error) {
 		return nil, sql.ErrNoRows
 	}
 	account.ID = id.Int64
+	account.Provider = provider.String
+	if account.Provider == "" {
+		account.Provider = "imap"
+	}
+	if account.Provider == "alimail" {
+		account.ProviderLabel = "阿里邮箱"
+	} else {
+		account.ProviderLabel = "Poste.io / IMAP"
+	}
 	account.EmailAddress = emailAddress.String
 	account.DisplayName = displayName.String
 	account.LoginUsername = loginUsername.String
 	account.PasswordEncrypted = encryptedPassword.String
 	account.PasswordConfigured = strings.TrimSpace(encryptedPassword.String) != ""
+	account.APIBaseURL = apiBaseURL.String
+	account.ClientID = clientID.String
+	account.ClientSecretEncrypted = encryptedClientSecret.String
+	account.ClientSecretConfigured = strings.TrimSpace(encryptedClientSecret.String) != ""
+	account.IsDefault = isDefault.Bool
 	account.SignatureHTML = signature.String
 	account.Enabled = enabled.Bool
 	account.AutoForwardEnabled = autoForwardEnabled.Bool
@@ -253,6 +401,37 @@ func scanMailAccount(scanner mailScanner) (*model.MailAccount, error) {
 		account.LastSyncAt = &value
 	}
 	return &account, nil
+}
+
+func (r *MailRepo) ResolveRemoteMessageUID(accountID int64, remoteID, folderID string) (uint32, error) {
+	remoteID = strings.TrimSpace(remoteID)
+	if accountID <= 0 || remoteID == "" {
+		return 0, fmt.Errorf("invalid remote mail reference")
+	}
+	var uid int64
+	err := r.db.QueryRow(
+		`INSERT INTO mail_remote_message_refs(account_id,remote_id,folder_id,created_at,updated_at)
+		 VALUES($1,$2,$3,NOW(),NOW())
+		 ON CONFLICT(account_id,remote_id) DO UPDATE SET folder_id=EXCLUDED.folder_id,updated_at=NOW()
+		 RETURNING uid`,
+		accountID, remoteID, strings.TrimSpace(folderID),
+	).Scan(&uid)
+	if err != nil {
+		return 0, err
+	}
+	if uid <= 0 || uid > int64(^uint32(0)) {
+		return 0, fmt.Errorf("remote mail reference limit exceeded")
+	}
+	return uint32(uid), nil
+}
+
+func (r *MailRepo) GetRemoteMessageRef(accountID int64, uid uint32) (string, string, error) {
+	var remoteID, folderID string
+	err := r.db.QueryRow(
+		`SELECT remote_id,folder_id FROM mail_remote_message_refs WHERE account_id=$1 AND uid=$2`,
+		accountID, uid,
+	).Scan(&remoteID, &folderID)
+	return remoteID, folderID, err
 }
 
 func (r *MailRepo) ListContacts(userID int64, query string) ([]model.MailContact, error) {

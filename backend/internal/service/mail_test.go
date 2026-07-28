@@ -142,6 +142,78 @@ func TestMailFolderRoles(t *testing.T) {
 	}
 }
 
+func TestAliMailProviderHelpers(t *testing.T) {
+	for _, value := range []string{
+		"https://alimail-cn.aliyuncs.com",
+		"https://alimail-personal.aliyuncs.com/",
+		"https://alimail-sg.aliyuncs.com",
+	} {
+		if _, err := normalizeAliMailBaseURL(value); err != nil {
+			t.Fatalf("supported AliMail base URL %q was rejected: %v", value, err)
+		}
+	}
+	if _, err := normalizeAliMailBaseURL("https://example.com"); err == nil {
+		t.Fatal("untrusted AliMail API base URL was accepted")
+	}
+
+	roles := []struct {
+		name        string
+		wantRole    string
+		wantDisplay string
+	}{
+		{name: "收件箱", wantRole: "inbox", wantDisplay: "收件箱"},
+		{name: "Sent Items", wantRole: "sent", wantDisplay: "已发送"},
+		{name: "draft", wantRole: "drafts", wantDisplay: "草稿箱"},
+		{name: "deleted", wantRole: "trash", wantDisplay: "已删除"},
+		{name: "spam", wantRole: "junk", wantDisplay: "垃圾邮件"},
+		{name: "客户项目", wantRole: "folder", wantDisplay: "客户项目"},
+	}
+	for _, test := range roles {
+		role := aliMailFolderRole(aliMailFolder{DisplayName: test.name})
+		if role != test.wantRole {
+			t.Errorf("aliMailFolderRole(%q) = %q, want %q", test.name, role, test.wantRole)
+		}
+		if got := mailFolderDisplayNameByRole(role, test.name); got != test.wantDisplay {
+			t.Errorf("mail folder display name for %q = %q, want %q", test.name, got, test.wantDisplay)
+		}
+	}
+	if got := aliMailFolderAliasRole("INBOX"); got != "inbox" {
+		t.Fatalf("aliMailFolderAliasRole(INBOX) = %q, want inbox", got)
+	}
+}
+
+func TestAliMailSearchQuery(t *testing.T) {
+	if got := aliMailSearchQuery("inbox-id", MailMessageListOptions{}); got != "" {
+		t.Fatalf("folder-only query should use the list API, got %q", got)
+	}
+	query := aliMailSearchQuery("inbox-id", MailMessageListOptions{
+		Query:       `quote "A"`,
+		Filter:      "attachment",
+		UnreadOnly:  true,
+		Participant: "buyer@example.com",
+	})
+	for _, expected := range []string{
+		`folderId:"inbox-id"`,
+		`isRead:false`,
+		`hasAttachments:true`,
+		`fromEmail:"buyer@example.com"`,
+		`quote ""A""`,
+	} {
+		if !strings.Contains(query, expected) {
+			t.Fatalf("AliMail query is missing %q: %s", expected, query)
+		}
+	}
+}
+
+func TestMailAccountInputIsEmpty(t *testing.T) {
+	if !mailAccountInputIsEmpty(nil) || !mailAccountInputIsEmpty(&model.MailAccountInput{}) {
+		t.Fatal("empty account input was not recognized")
+	}
+	if mailAccountInputIsEmpty(&model.MailAccountInput{EmailAddress: "sales@example.com"}) {
+		t.Fatal("new account input was treated as an existing-account test")
+	}
+}
+
 func TestValidateMailSettings(t *testing.T) {
 	settings := &model.MailServerSettings{
 		IMAPHost: "mail.example.com", IMAPPort: 993, IMAPSecurity: "tls",

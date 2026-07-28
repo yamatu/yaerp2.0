@@ -38,11 +38,14 @@ func (s *MailService) StartAutoForward(ctx context.Context, interval time.Durati
 }
 
 func (s *MailService) RunForwardingNow(userID int64) error {
-	settings, err := s.activeSettings()
+	account, err := s.repo.GetAccount(userID)
 	if err != nil {
 		return err
 	}
-	account, err := s.repo.GetAccount(userID)
+	if account.Provider != "imap" {
+		return fmt.Errorf("阿里邮箱 OpenAPI 账号不使用后台 IMAP 自动转发")
+	}
+	settings, err := s.activeSettings()
 	if err != nil {
 		return err
 	}
@@ -66,7 +69,7 @@ func (s *MailService) processForwardingAccounts() error {
 	}
 	for index := range accounts {
 		if err := s.processForwardingAccount(settings, &accounts[index]); err != nil {
-			s.recordFailure(accounts[index].UserID, fmt.Errorf("自动转发失败: %w", err))
+			_ = s.repo.UpdateAccountStatus(accounts[index].ID, false, false, "自动转发失败: "+cleanMailError(err))
 		}
 	}
 	return nil
@@ -134,7 +137,7 @@ func (s *MailService) processForwardingAccount(settings *model.MailServerSetting
 		account.ForwardLastUID = uid
 	}
 	if len(pending) > 0 {
-		_ = s.repo.UpdateAccountStatus(account.UserID, false, true, "")
+		_ = s.repo.UpdateAccountStatus(account.ID, false, true, "")
 	}
 	return nil
 }
@@ -143,7 +146,7 @@ func (s *MailService) recordForwardFailure(account *model.MailAccount, uidValidi
 	message := cleanMailError(forwardErr)
 	_ = s.repo.RecordForwardEvent(account.ID, imap.InboxName, uidValidity, uid, messageID, account.AutoForwardTo, "failed", message)
 	_ = s.repo.UpdateForwardCursor(account.ID, uidValidity, uid)
-	_ = s.repo.UpdateAccountStatus(account.UserID, false, false, "自动转发失败: "+message)
+	_ = s.repo.UpdateAccountStatus(account.ID, false, false, "自动转发失败: "+message)
 	account.ForwardLastUID = uid
 }
 

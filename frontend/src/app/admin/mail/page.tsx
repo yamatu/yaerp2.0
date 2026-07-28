@@ -39,10 +39,14 @@ interface MailAccount {
   user_id: number;
   username: string;
   user_email: string;
+  provider: "imap" | "alimail";
+  provider_label: string;
   email_address: string;
   display_name: string;
   enabled: boolean;
   password_configured: boolean;
+  client_secret_configured: boolean;
+  is_default: boolean;
   last_verified_at?: string;
   last_sync_at?: string;
   last_error?: string;
@@ -122,7 +126,7 @@ export default function AdminMailPage() {
       if (res.code !== 0 || !res.data)
         throw new Error(res.message || "保存失败");
       setSettings(res.data);
-      setNotice("邮件服务器配置已保存。员工现在可以绑定各自的 poste.io 邮箱。");
+      setNotice("邮件服务器配置已保存。IMAP 邮箱将使用此连接配置，阿里邮箱继续使用各账号的 OpenAPI 授权。");
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "保存失败");
     } finally {
@@ -149,7 +153,7 @@ export default function AdminMailPage() {
   return (
     <AdminShell
       title="邮件服务"
-      description="配置 poste.io IMAP / SMTP，并查看员工邮箱绑定状态"
+      description="配置标准 IMAP / SMTP，并查看 Poste.io 与阿里邮箱多账号绑定状态"
     >
       <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
         <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
@@ -379,7 +383,8 @@ export default function AdminMailPage() {
               邮件网络代理
             </div>
             <div className="mt-1 text-xs text-slate-500">
-              IMAP 和 SMTP 会统一通过该 SOCKS5 代理连接；员工无需单独配置。
+              IMAP、SMTP 和阿里邮箱 HTTPS OpenAPI 会统一通过该 SOCKS5
+              代理连接；员工无需单独配置。
             </div>
           </div>
           <label>
@@ -549,7 +554,8 @@ export default function AdminMailPage() {
                     {account.email_address}
                   </div>
                   <div className="mt-0.5 truncate text-xs text-slate-400">
-                    {account.display_name || "未设置发件人名称"}
+                    {account.display_name || "未设置发件人名称"} · {account.provider_label}
+                    {account.is_default ? " · 当前账号" : ""}
                   </div>
                   {account.auto_forward_enabled && (
                     <div className="mt-1 truncate text-[11px] text-sky-600">

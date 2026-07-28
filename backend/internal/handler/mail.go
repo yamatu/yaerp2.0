@@ -66,6 +66,75 @@ func (h *MailHandler) GetOwnAccount(c *gin.Context) {
 	response.OK(c, account)
 }
 
+func (h *MailHandler) ListOwnAccounts(c *gin.Context) {
+	accounts, err := h.service.ListOwnAccounts(c.GetInt64("user_id"))
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, accounts)
+}
+
+func (h *MailHandler) CreateOwnAccount(c *gin.Context) {
+	var input model.MailAccountInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	account, err := h.service.CreateOwnAccount(c.GetInt64("user_id"), &input)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, account)
+}
+
+func (h *MailHandler) UpdateOwnAccount(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid mail account")
+		return
+	}
+	var input model.MailAccountInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	account, err := h.service.UpdateOwnAccount(c.GetInt64("user_id"), accountID, &input)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, account)
+}
+
+func (h *MailHandler) ActivateOwnAccount(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid mail account")
+		return
+	}
+	account, err := h.service.ActivateOwnAccount(c.GetInt64("user_id"), accountID)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, account)
+}
+
+func (h *MailHandler) DeleteOwnAccountByID(c *gin.Context) {
+	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		response.BadRequest(c, "invalid mail account")
+		return
+	}
+	if err := h.service.DeleteOwnAccountByID(c.GetInt64("user_id"), accountID); err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OKMsg(c, "mail account removed")
+}
+
 func (h *MailHandler) SaveOwnAccount(c *gin.Context) {
 	var input model.MailAccountInput
 	if err := c.ShouldBindJSON(&input); err != nil {

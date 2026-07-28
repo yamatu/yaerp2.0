@@ -64,6 +64,13 @@ var mailHeaderWordDecoder = &mime.WordDecoder{
 }
 
 func (s *MailService) ListMessages(userID int64, folder string, page, pageSize int, options MailMessageListOptions) (*model.MailMessagePage, error) {
+	account, accountErr := s.repo.GetAccount(userID)
+	if accountErr != nil {
+		return nil, accountErr
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailListMessages(account, folder, page, pageSize, options)
+	}
 	folder, err := validateMailFolderName(folder)
 	if err != nil {
 		return nil, err
@@ -191,7 +198,7 @@ func (s *MailService) ListMessages(userID int64, folder string, page, pageSize i
 			}
 			result.Messages = append(result.Messages, all[offset:end]...)
 		}
-		_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+		_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 		return result, nil
 	}
 	total := len(uids)
@@ -225,7 +232,7 @@ func (s *MailService) ListMessages(userID int64, folder string, page, pageSize i
 			result.Messages = append(result.Messages, summary)
 		}
 	}
-	_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+	_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	return result, nil
 }
 
@@ -295,6 +302,13 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 	if uid == 0 {
 		return nil, fmt.Errorf("无效的邮件标识")
 	}
+	account, accountErr := s.repo.GetAccount(userID)
+	if accountErr != nil {
+		return nil, accountErr
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailGetMessage(account, folder, uid)
+	}
 	folder, err := validateMailFolderName(folder)
 	if err != nil {
 		return nil, err
@@ -354,13 +368,20 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 			detail.Read = true
 		}
 	}
-	_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+	_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	return detail, nil
 }
 
 func (s *MailService) DownloadAttachment(userID int64, folder string, uid uint32, partID string) (string, string, []byte, error) {
 	if uid == 0 {
 		return "", "", nil, fmt.Errorf("无效的邮件标识")
+	}
+	account, accountErr := s.repo.GetAccount(userID)
+	if accountErr != nil {
+		return "", "", nil, accountErr
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailDownloadAttachment(account, uid, partID)
 	}
 	folder, err := validateMailFolderName(folder)
 	if err != nil {

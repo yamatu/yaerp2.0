@@ -17,6 +17,8 @@ func (s *MailService) ListContacts(userID int64, query string) ([]model.MailCont
 	byEmail := make(map[string]int, len(contacts))
 	for index := range contacts {
 		contacts[index].Email = strings.ToLower(strings.TrimSpace(contacts[index].Email))
+		contacts[index].Source = "saved"
+		contacts[index].Sources = []string{"saved"}
 		byEmail[contacts[index].Email] = index
 	}
 	if s.tradeSvc != nil {
@@ -30,6 +32,7 @@ func (s *MailService) ListContacts(userID int64, query string) ([]model.MailCont
 				continue
 			}
 			if index, exists := byEmail[email]; exists {
+				contacts[index].Sources = appendMailContactSource(contacts[index].Sources, "erp")
 				if contacts[index].TradeCustomerID == nil {
 					customerID := customer.ID
 					contacts[index].TradeCustomerID = &customerID
@@ -41,8 +44,57 @@ func (s *MailService) ListContacts(userID int64, query string) ([]model.MailCont
 				ID: -customer.ID, UserID: userID, TradeCustomerID: &customerID,
 				Name:    firstNonEmptyMail(customer.ContactName, customer.Name),
 				Company: customer.CompanyName, Email: email, Phone: customer.Phone,
-				Notes: customer.Notes, Source: "erp",
+				Notes: customer.Notes, Source: "erp", Sources: []string{"erp"},
 			})
+			byEmail[email] = len(contacts) - 1
+		}
+	}
+	accounts, accountErr := s.repo.ListOwnAccounts(userID)
+	if accountErr != nil {
+		return nil, accountErr
+	}
+	mailServiceEnabled := true
+	if settings, settingsErr := s.repo.GetSettings(); settingsErr == nil {
+		mailServiceEnabled = settings.Enabled
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	for index := range accounts {
+		account := &accounts[index]
+		if account.Provider != "alimail" || !account.Enabled || !mailServiceEnabled {
+			continue
+		}
+		remoteContacts, remoteErr := s.aliMailSharedContactsCached(account)
+		if remoteErr != nil {
+			_ = s.repo.UpdateAccountStatus(account.ID, false, false, "公共通讯录读取失败: "+cleanMailError(remoteErr))
+			continue
+		}
+		for _, contact := range remoteContacts {
+			email := strings.ToLower(strings.TrimSpace(contact.Email))
+			if email == "" {
+				continue
+			}
+			if query != "" && !strings.Contains(strings.ToLower(strings.Join([]string{contact.Name, contact.Company, email, contact.Phone, contact.Notes}, " ")), query) {
+				continue
+			}
+			if existingIndex, exists := byEmail[email]; exists {
+				existing := &contacts[existingIndex]
+				existing.Sources = appendMailContactSource(existing.Sources, "alimail")
+				if existing.Name == "" || existing.Name == existing.Email {
+					existing.Name = contact.Name
+				}
+				if existing.Company == "" {
+					existing.Company = contact.Company
+				}
+				if existing.Phone == "" {
+					existing.Phone = contact.Phone
+				}
+				if existing.SourceAccountID == nil {
+					existing.SourceAccountID = contact.SourceAccountID
+					existing.ExternalID = contact.ExternalID
+				}
+				continue
+			}
+			contacts = append(contacts, contact)
 			byEmail[email] = len(contacts) - 1
 		}
 	}
@@ -52,6 +104,15 @@ func (s *MailService) ListContacts(userID int64, query string) ([]model.MailCont
 		return left < right
 	})
 	return contacts, nil
+}
+
+func appendMailContactSource(values []string, source string) []string {
+	for _, value := range values {
+		if value == source {
+			return values
+		}
+	}
+	return append(values, source)
 }
 
 func (s *MailService) SaveContact(userID int64, input *model.MailContactInput) (*model.MailContact, error) {

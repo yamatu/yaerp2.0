@@ -25,34 +25,47 @@ type MailServerSettings struct {
 }
 
 type MailAccount struct {
-	ID                 int64      `json:"id"`
-	UserID             int64      `json:"user_id"`
-	Username           string     `json:"username"`
-	UserEmail          string     `json:"user_email"`
-	EmailAddress       string     `json:"email_address"`
-	DisplayName        string     `json:"display_name"`
-	LoginUsername      string     `json:"login_username"`
-	PasswordEncrypted  string     `json:"-"`
-	PasswordConfigured bool       `json:"password_configured"`
-	SignatureHTML      string     `json:"signature_html"`
-	Enabled            bool       `json:"enabled"`
-	AutoForwardEnabled bool       `json:"auto_forward_enabled"`
-	AutoForwardTo      []string   `json:"auto_forward_to"`
-	ForwardAttachments bool       `json:"forward_attachments"`
-	ForwardUIDValidity uint32     `json:"-"`
-	ForwardLastUID     uint32     `json:"-"`
-	LastVerifiedAt     *time.Time `json:"last_verified_at,omitempty"`
-	LastSyncAt         *time.Time `json:"last_sync_at,omitempty"`
-	LastError          string     `json:"last_error,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                     int64      `json:"id"`
+	UserID                 int64      `json:"user_id"`
+	Username               string     `json:"username"`
+	UserEmail              string     `json:"user_email"`
+	Provider               string     `json:"provider"`
+	ProviderLabel          string     `json:"provider_label"`
+	EmailAddress           string     `json:"email_address"`
+	DisplayName            string     `json:"display_name"`
+	LoginUsername          string     `json:"login_username"`
+	PasswordEncrypted      string     `json:"-"`
+	PasswordConfigured     bool       `json:"password_configured"`
+	APIBaseURL             string     `json:"api_base_url,omitempty"`
+	ClientID               string     `json:"client_id,omitempty"`
+	ClientSecretEncrypted  string     `json:"-"`
+	ClientSecretConfigured bool       `json:"client_secret_configured"`
+	IsDefault              bool       `json:"is_default"`
+	SignatureHTML          string     `json:"signature_html"`
+	Enabled                bool       `json:"enabled"`
+	AutoForwardEnabled     bool       `json:"auto_forward_enabled"`
+	AutoForwardTo          []string   `json:"auto_forward_to"`
+	ForwardAttachments     bool       `json:"forward_attachments"`
+	ForwardUIDValidity     uint32     `json:"-"`
+	ForwardLastUID         uint32     `json:"-"`
+	LastVerifiedAt         *time.Time `json:"last_verified_at,omitempty"`
+	LastSyncAt             *time.Time `json:"last_sync_at,omitempty"`
+	LastError              string     `json:"last_error,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
 type MailAccountInput struct {
+	ID                 int64    `json:"id"`
+	Provider           string   `json:"provider"`
 	EmailAddress       string   `json:"email_address" binding:"required"`
 	DisplayName        string   `json:"display_name"`
 	LoginUsername      string   `json:"login_username"`
 	Password           string   `json:"password"`
+	APIBaseURL         string   `json:"api_base_url"`
+	ClientID           string   `json:"client_id"`
+	ClientSecret       string   `json:"client_secret"`
+	IsDefault          bool     `json:"is_default"`
 	SignatureHTML      string   `json:"signature_html"`
 	Enabled            bool     `json:"enabled"`
 	AutoForwardEnabled bool     `json:"auto_forward_enabled"`
@@ -63,6 +76,8 @@ type MailAccountInput struct {
 type MailConnectionTest struct {
 	IMAPConnected bool   `json:"imap_connected"`
 	SMTPConnected bool   `json:"smtp_connected"`
+	APIConnected  bool   `json:"api_connected"`
+	Provider      string `json:"provider"`
 	Message       string `json:"message"`
 }
 
@@ -193,6 +208,9 @@ type MailContact struct {
 	Phone           string    `json:"phone,omitempty"`
 	Notes           string    `json:"notes,omitempty"`
 	Source          string    `json:"source"`
+	Sources         []string  `json:"sources,omitempty"`
+	SourceAccountID *int64    `json:"source_account_id,omitempty"`
+	ExternalID      string    `json:"external_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }

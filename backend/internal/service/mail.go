@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -56,6 +57,10 @@ type MailService struct {
 	tradeSvc      *TradeService
 	encryptionKey [32]byte
 	htmlPolicy    *bluemonday.Policy
+	aliTokenMu    sync.Mutex
+	aliTokens     map[int64]aliMailToken
+	aliContactMu  sync.Mutex
+	aliContacts   map[int64]aliMailContactCache
 }
 
 type mailSession struct {
@@ -74,6 +79,8 @@ func NewMailService(mailRepo *repo.MailRepo, permSvc *PermissionService, encrypt
 		permSvc:       permSvc,
 		encryptionKey: sha256.Sum256([]byte(encryptionSecret + ":mail-account")),
 		htmlPolicy:    newMailHTMLPolicy(),
+		aliTokens:     make(map[int64]aliMailToken),
+		aliContacts:   make(map[int64]aliMailContactCache),
 	}
 }
 
@@ -195,59 +202,116 @@ func (s *MailService) GetOwnAccount(userID int64) (*model.MailAccount, error) {
 	return account, err
 }
 
+func (s *MailService) ListOwnAccounts(userID int64) ([]model.MailAccount, error) {
+	return s.repo.ListOwnAccounts(userID)
+}
+
 func (s *MailService) SaveOwnAccount(userID int64, input *model.MailAccountInput) (*model.MailAccount, error) {
-	settings, err := s.activeSettings()
+	accountID := int64(0)
+	if current, err := s.repo.GetAccount(userID); err == nil {
+		accountID = current.ID
+	} else if !repo.IsMailAccountMissing(err) {
+		return nil, err
+	}
+	return s.saveOwnAccount(userID, accountID, input)
+}
+
+func (s *MailService) CreateOwnAccount(userID int64, input *model.MailAccountInput) (*model.MailAccount, error) {
+	return s.saveOwnAccount(userID, 0, input)
+}
+
+func (s *MailService) UpdateOwnAccount(userID, accountID int64, input *model.MailAccountInput) (*model.MailAccount, error) {
+	if accountID <= 0 {
+		return nil, fmt.Errorf("邮箱账号不存在")
+	}
+	return s.saveOwnAccount(userID, accountID, input)
+}
+
+func (s *MailService) saveOwnAccount(userID, accountID int64, input *model.MailAccountInput) (*model.MailAccount, error) {
+	account, secret, err := s.accountFromInput(userID, accountID, input)
 	if err != nil {
 		return nil, err
 	}
-	account, password, err := s.accountFromInput(userID, input)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.verifyConnections(settings, account, password); err != nil {
-		return nil, err
-	}
-	encrypted, err := s.encryptSecret(password)
-	if err != nil {
+	if err := s.verifyMailAccount(account, secret); err != nil {
 		return nil, err
 	}
 	now := time.Now()
-	account.PasswordEncrypted = encrypted
-	account.PasswordConfigured = true
 	account.LastVerifiedAt = &now
 	account.LastError = ""
-	if account.AutoForwardEnabled && account.ForwardUIDValidity == 0 {
-		uidValidity, lastUID, cursorErr := s.currentInboxCursor(settings, account, password)
-		if cursorErr != nil {
-			return nil, fmt.Errorf("自动转发初始化失败: %w", cursorErr)
+	if account.Provider == "alimail" {
+		encrypted, encryptErr := s.encryptSecret(secret)
+		if encryptErr != nil {
+			return nil, encryptErr
 		}
-		account.ForwardUIDValidity = uidValidity
-		account.ForwardLastUID = lastUID
+		account.ClientSecretEncrypted = encrypted
+		account.ClientSecretConfigured = true
+		account.PasswordEncrypted = ""
+		account.PasswordConfigured = false
+	} else {
+		encrypted, encryptErr := s.encryptSecret(secret)
+		if encryptErr != nil {
+			return nil, encryptErr
+		}
+		account.PasswordEncrypted = encrypted
+		account.PasswordConfigured = true
+		account.ClientSecretEncrypted = ""
+		account.ClientSecretConfigured = false
+		settings, settingsErr := s.activeSettings()
+		if settingsErr != nil {
+			return nil, settingsErr
+		}
+		if account.AutoForwardEnabled && account.ForwardUIDValidity == 0 {
+			uidValidity, lastUID, cursorErr := s.currentInboxCursor(settings, account, secret)
+			if cursorErr != nil {
+				return nil, fmt.Errorf("自动转发初始化失败: %w", cursorErr)
+			}
+			account.ForwardUIDValidity = uidValidity
+			account.ForwardLastUID = lastUID
+		}
 	}
-	if err := s.repo.UpsertAccount(account); err != nil {
+	if err := s.repo.SaveAccount(account); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "idx_mail_accounts_user_provider_address") {
+			return nil, fmt.Errorf("该邮箱已经绑定，无需重复添加")
+		}
 		return nil, err
 	}
-	return s.repo.GetAccount(userID)
+	s.invalidateAliMailToken(account.ID)
+	return s.repo.GetAccountByID(userID, account.ID)
 }
 
 func (s *MailService) TestOwnAccount(userID int64, input *model.MailAccountInput) (*model.MailConnectionTest, error) {
+	accountID := int64(0)
+	if input != nil {
+		accountID = input.ID
+	}
+	if accountID == 0 && mailAccountInputIsEmpty(input) {
+		if current, err := s.repo.GetAccount(userID); err == nil {
+			accountID = current.ID
+		}
+	}
+	account, secret, err := s.accountFromInput(userID, accountID, input)
+	if err != nil {
+		return nil, err
+	}
+	if account.Provider == "alimail" {
+		if err := s.verifyAliMailAccount(account, secret); err != nil {
+			return &model.MailConnectionTest{Provider: "alimail", Message: cleanMailError(err)}, err
+		}
+		return &model.MailConnectionTest{APIConnected: true, Provider: "alimail", Message: "阿里邮箱 OpenAPI 认证与邮箱访问均正常"}, nil
+	}
 	settings, err := s.activeSettings()
 	if err != nil {
 		return nil, err
 	}
-	account, password, err := s.accountFromInput(userID, input)
-	if err != nil {
-		return nil, err
-	}
-	result := &model.MailConnectionTest{}
-	imapConn, err := s.connectIMAP(settings, account.LoginUsername, password)
+	result := &model.MailConnectionTest{Provider: "imap"}
+	imapConn, err := s.connectIMAP(settings, account.LoginUsername, secret)
 	if err != nil {
 		result.Message = "IMAP 连接失败: " + cleanMailError(err)
 		return result, fmt.Errorf("%s", result.Message)
 	}
 	result.IMAPConnected = true
 	_ = imapConn.Logout()
-	smtpConn, err := s.connectSMTP(settings, account.LoginUsername, password)
+	smtpConn, err := s.connectSMTP(settings, account.LoginUsername, secret)
 	if err != nil {
 		result.Message = "SMTP 连接失败: " + cleanMailError(err)
 		return result, fmt.Errorf("%s", result.Message)
@@ -258,23 +322,68 @@ func (s *MailService) TestOwnAccount(userID int64, input *model.MailAccountInput
 	return result, nil
 }
 
+func mailAccountInputIsEmpty(input *model.MailAccountInput) bool {
+	if input == nil {
+		return true
+	}
+	return strings.TrimSpace(input.Provider) == "" &&
+		strings.TrimSpace(input.EmailAddress) == "" &&
+		strings.TrimSpace(input.LoginUsername) == "" &&
+		strings.TrimSpace(input.Password) == "" &&
+		strings.TrimSpace(input.ClientID) == "" &&
+		strings.TrimSpace(input.ClientSecret) == ""
+}
+
 func (s *MailService) DeleteOwnAccount(userID int64) error {
-	err := s.repo.DeleteAccount(userID)
+	account, _ := s.repo.GetAccount(userID)
+	err := s.repo.DeleteAccount(userID, 0)
+	if account != nil {
+		s.invalidateAliMailToken(account.ID)
+	}
 	if repo.IsMailAccountMissing(err) {
 		return nil
 	}
 	return err
 }
 
+func (s *MailService) DeleteOwnAccountByID(userID, accountID int64) error {
+	if accountID <= 0 {
+		return fmt.Errorf("邮箱账号不存在")
+	}
+	err := s.repo.DeleteAccount(userID, accountID)
+	s.invalidateAliMailToken(accountID)
+	if repo.IsMailAccountMissing(err) {
+		return nil
+	}
+	return err
+}
+
+func (s *MailService) ActivateOwnAccount(userID, accountID int64) (*model.MailAccount, error) {
+	if err := s.repo.SetDefaultAccount(userID, accountID); err != nil {
+		if repo.IsMailAccountMissing(err) {
+			return nil, fmt.Errorf("邮箱账号不存在或已停用")
+		}
+		return nil, err
+	}
+	return s.repo.GetAccount(userID)
+}
+
 func (s *MailService) Summary(userID int64) (*model.MailSummary, error) {
-	settings, err := s.repo.GetSettings()
+	account, err := s.repo.GetAccount(userID)
+	if repo.IsMailAccountMissing(err) {
+		settings, settingsErr := s.repo.GetSettings()
+		if settingsErr != nil {
+			return nil, settingsErr
+		}
+		return &model.MailSummary{Configured: false, Enabled: settings.Enabled}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	account, err := s.repo.GetAccount(userID)
-	if repo.IsMailAccountMissing(err) {
-		return &model.MailSummary{Configured: false, Enabled: settings.Enabled}, nil
+	if account.Provider == "alimail" {
+		return s.aliMailSummary(account)
 	}
+	settings, err := s.repo.GetSettings()
 	if err != nil {
 		return nil, err
 	}
@@ -288,25 +397,35 @@ func (s *MailService) Summary(userID int64) (*model.MailSummary, error) {
 	}
 	conn, err := s.connectIMAP(settings, account.LoginUsername, password)
 	if err != nil {
-		_ = s.repo.UpdateAccountStatus(userID, false, false, cleanMailError(err))
+		_ = s.repo.UpdateAccountStatus(account.ID, false, false, cleanMailError(err))
 		result.LastError = cleanMailError(err)
 		return result, nil
 	}
 	defer conn.Logout()
 	status, err := conn.Status(imap.InboxName, []imap.StatusItem{imap.StatusMessages, imap.StatusUnseen})
 	if err != nil {
-		_ = s.repo.UpdateAccountStatus(userID, false, false, cleanMailError(err))
+		_ = s.repo.UpdateAccountStatus(account.ID, false, false, cleanMailError(err))
 		result.LastError = cleanMailError(err)
 		return result, nil
 	}
 	result.Total = status.Messages
 	result.Unread = status.Unseen
 	result.LastError = ""
-	_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+	_ = s.repo.UpdateAccountStatus(account.ID, false, true, "")
 	return result, nil
 }
 
 func (s *MailService) ListFolders(userID int64) ([]model.MailFolder, error) {
+	account, err := s.repo.GetAccount(userID)
+	if repo.IsMailAccountMissing(err) {
+		return nil, ErrMailAccountNotConfigured
+	}
+	if err != nil {
+		return nil, err
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailFolders(account)
+	}
 	session, err := s.sessionForUser(userID)
 	if err != nil {
 		return nil, err
@@ -322,12 +441,19 @@ func (s *MailService) ListFolders(userID int64) ([]model.MailFolder, error) {
 		s.recordFailure(userID, err)
 		return nil, err
 	}
-	_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+	_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	return folders, nil
 }
 
 func (s *MailService) CreateFolder(userID int64, name string) error {
-	name, err := validateMailFolderName(name)
+	account, err := s.repo.GetAccount(userID)
+	if err != nil {
+		return err
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailCreateFolder(account, name)
+	}
+	name, err = validateMailFolderName(name)
 	if err != nil {
 		return err
 	}
@@ -335,6 +461,13 @@ func (s *MailService) CreateFolder(userID int64, name string) error {
 }
 
 func (s *MailService) RenameFolder(userID int64, from, to string) error {
+	account, accountErr := s.repo.GetAccount(userID)
+	if accountErr != nil {
+		return accountErr
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailRenameFolder(account, from, to)
+	}
 	from, err := validateMailFolderName(from)
 	if err != nil {
 		return err
@@ -350,6 +483,13 @@ func (s *MailService) RenameFolder(userID int64, from, to string) error {
 }
 
 func (s *MailService) DeleteFolder(userID int64, name string) error {
+	account, accountErr := s.repo.GetAccount(userID)
+	if accountErr != nil {
+		return accountErr
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailDeleteFolder(account, name)
+	}
 	name, err := validateMailFolderName(name)
 	if err != nil {
 		return err
@@ -363,6 +503,29 @@ func (s *MailService) DeleteFolder(userID int64, name string) error {
 func (s *MailService) UpdateFlags(userID int64, uid uint32, input *model.MailFlagInput) error {
 	if uid == 0 || input == nil {
 		return fmt.Errorf("无效的邮件标识")
+	}
+	account, err := s.repo.GetAccount(userID)
+	if err != nil {
+		return err
+	}
+	if account.Provider == "alimail" {
+		if input.Read != nil {
+			action := "unread"
+			if *input.Read {
+				action = "read"
+			}
+			if err := s.aliMailBatch(account, []uint32{uid}, action, ""); err != nil {
+				return err
+			}
+		}
+		if input.Starred != nil {
+			action := "unstar"
+			if *input.Starred {
+				action = "star"
+			}
+			return s.aliMailBatch(account, []uint32{uid}, action, "")
+		}
+		return nil
 	}
 	folder, err := validateMailFolderName(input.Folder)
 	if err != nil {
@@ -389,6 +552,13 @@ func (s *MailService) MoveMessage(userID int64, uid uint32, input *model.MailMov
 	if uid == 0 || input == nil {
 		return fmt.Errorf("无效的邮件标识")
 	}
+	account, err := s.repo.GetAccount(userID)
+	if err != nil {
+		return err
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailBatch(account, []uint32{uid}, "move", input.Destination)
+	}
 	folder, err := validateMailFolderName(input.Folder)
 	if err != nil {
 		return err
@@ -411,6 +581,13 @@ func (s *MailService) DeleteMessage(userID int64, uid uint32, folder string) err
 func (s *MailService) BatchMessages(userID int64, input *model.MailBatchInput) error {
 	if input == nil || len(input.UIDs) == 0 || len(input.UIDs) > 500 {
 		return fmt.Errorf("请选择 1 到 500 封邮件")
+	}
+	account, err := s.repo.GetAccount(userID)
+	if err != nil {
+		return err
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailBatch(account, input.UIDs, input.Action, input.Destination)
 	}
 	folder, err := validateMailFolderName(input.Folder)
 	if err != nil {
@@ -463,6 +640,16 @@ func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, atta
 	if input == nil {
 		return nil, fmt.Errorf("邮件内容不能为空")
 	}
+	account, err := s.repo.GetAccount(userID)
+	if repo.IsMailAccountMissing(err) {
+		return nil, ErrMailAccountNotConfigured
+	}
+	if err != nil {
+		return nil, err
+	}
+	if account.Provider == "alimail" {
+		return s.aliMailSendMessage(account, input, attachments)
+	}
 	session, err := s.sessionForUser(userID)
 	if err != nil {
 		return nil, err
@@ -513,12 +700,12 @@ func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, atta
 	_ = smtpConn.Quit()
 	if input.SaveToSent {
 		if err := s.appendSentMessage(session, raw, sentAt); err != nil {
-			_ = s.repo.UpdateAccountStatus(userID, false, true, "邮件已发送，但未能保存到已发送文件夹: "+cleanMailError(err))
+			_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "邮件已发送，但未能保存到已发送文件夹: "+cleanMailError(err))
 		} else {
-			_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+			_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 		}
 	} else {
-		_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+		_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	}
 	return &model.MailSendResult{MessageID: messageID, SentAt: sentAt}, nil
 }
@@ -647,10 +834,6 @@ func (s *MailService) buildOutgoingMessage(session *mailSession, input *model.Ma
 }
 
 func (s *MailService) sessionForUser(userID int64) (*mailSession, error) {
-	settings, err := s.activeSettings()
-	if err != nil {
-		return nil, err
-	}
 	account, err := s.repo.GetAccount(userID)
 	if repo.IsMailAccountMissing(err) {
 		return nil, ErrMailAccountNotConfigured
@@ -660,6 +843,13 @@ func (s *MailService) sessionForUser(userID int64) (*mailSession, error) {
 	}
 	if !account.Enabled {
 		return nil, fmt.Errorf("当前邮箱账号已停用")
+	}
+	if account.Provider != "imap" {
+		return nil, fmt.Errorf("当前邮箱不使用 IMAP/SMTP")
+	}
+	settings, err := s.activeSettings()
+	if err != nil {
+		return nil, err
 	}
 	password, err := s.decryptSecret(account.PasswordEncrypted)
 	if err != nil {
@@ -682,13 +872,24 @@ func (s *MailService) activeSettings() (*model.MailServerSettings, error) {
 	return settings, nil
 }
 
-func (s *MailService) accountFromInput(userID int64, input *model.MailAccountInput) (*model.MailAccount, string, error) {
+func (s *MailService) accountFromInput(userID, accountID int64, input *model.MailAccountInput) (*model.MailAccount, string, error) {
 	if input == nil {
 		input = &model.MailAccountInput{}
 	}
-	existing, err := s.repo.GetAccount(userID)
-	if err != nil && !repo.IsMailAccountMissing(err) {
-		return nil, "", err
+	var existing *model.MailAccount
+	var err error
+	if accountID > 0 {
+		existing, err = s.repo.GetAccountByID(userID, accountID)
+		if err != nil {
+			if repo.IsMailAccountMissing(err) {
+				return nil, "", fmt.Errorf("邮箱账号不存在")
+			}
+			return nil, "", err
+		}
+	}
+	provider := normalizeMailProvider(input.Provider)
+	if strings.TrimSpace(input.Provider) == "" && existing != nil {
+		provider = existing.Provider
 	}
 	emailAddress := strings.TrimSpace(strings.ToLower(input.EmailAddress))
 	if emailAddress == "" && existing != nil {
@@ -699,6 +900,53 @@ func (s *MailService) accountFromInput(userID int64, input *model.MailAccountInp
 		return nil, "", fmt.Errorf("请输入有效的邮箱地址")
 	}
 	emailAddress = strings.ToLower(parsed.Address)
+	enabled := input.Enabled
+	if existing == nil && !input.Enabled {
+		enabled = true
+	}
+	isDefault := input.IsDefault
+	if existing != nil && !input.IsDefault {
+		isDefault = existing.IsDefault
+	}
+	account := &model.MailAccount{
+		ID: accountID, UserID: userID, Provider: provider,
+		EmailAddress: emailAddress, DisplayName: strings.TrimSpace(input.DisplayName),
+		SignatureHTML: s.htmlPolicy.Sanitize(input.SignatureHTML), Enabled: enabled,
+		IsDefault: isDefault,
+	}
+	if account.DisplayName == "" && existing != nil {
+		account.DisplayName = existing.DisplayName
+	}
+	if account.SignatureHTML == "" && existing != nil && strings.TrimSpace(input.SignatureHTML) == "" {
+		account.SignatureHTML = existing.SignatureHTML
+	}
+	if provider == "alimail" {
+		account.APIBaseURL, err = normalizeAliMailBaseURL(firstNonEmptyMail(input.APIBaseURL, valueOrEmpty(existing, func(value *model.MailAccount) string { return value.APIBaseURL })))
+		if err != nil {
+			return nil, "", err
+		}
+		account.ClientID = strings.TrimSpace(input.ClientID)
+		if account.ClientID == "" && existing != nil {
+			account.ClientID = existing.ClientID
+		}
+		if account.ClientID == "" {
+			return nil, "", fmt.Errorf("请输入阿里邮箱应用 Client ID")
+		}
+		secret := input.ClientSecret
+		if secret == "" && existing != nil && strings.TrimSpace(existing.ClientSecretEncrypted) != "" {
+			secret, err = s.decryptSecret(existing.ClientSecretEncrypted)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		if secret == "" {
+			return nil, "", fmt.Errorf("请输入阿里邮箱应用 Client Secret")
+		}
+		account.LoginUsername = ""
+		account.ForwardAttachments = true
+		return account, secret, nil
+	}
+
 	loginUsername := strings.TrimSpace(input.LoginUsername)
 	if loginUsername == "" {
 		loginUsername = emailAddress
@@ -713,15 +961,9 @@ func (s *MailService) accountFromInput(userID int64, input *model.MailAccountInp
 	if password == "" {
 		return nil, "", fmt.Errorf("请输入邮箱密码")
 	}
-	enabled := input.Enabled
-	if existing == nil && !input.Enabled {
-		enabled = true
-	}
-	account := &model.MailAccount{
-		UserID: userID, EmailAddress: emailAddress, DisplayName: strings.TrimSpace(input.DisplayName),
-		LoginUsername: loginUsername, SignatureHTML: s.htmlPolicy.Sanitize(input.SignatureHTML), Enabled: enabled,
-		AutoForwardEnabled: input.AutoForwardEnabled, ForwardAttachments: input.ForwardAttachments,
-	}
+	account.LoginUsername = loginUsername
+	account.AutoForwardEnabled = input.AutoForwardEnabled
+	account.ForwardAttachments = input.ForwardAttachments
 	if existing != nil {
 		account.ForwardUIDValidity = existing.ForwardUIDValidity
 		account.ForwardLastUID = existing.ForwardLastUID
@@ -738,6 +980,33 @@ func (s *MailService) accountFromInput(userID int64, input *model.MailAccountInp
 		account.ForwardLastUID = 0
 	}
 	return account, password, nil
+}
+
+func normalizeMailProvider(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "alimail", "aliyun", "aliyunmail":
+		return "alimail"
+	default:
+		return "imap"
+	}
+}
+
+func valueOrEmpty(account *model.MailAccount, getter func(*model.MailAccount) string) string {
+	if account == nil {
+		return ""
+	}
+	return getter(account)
+}
+
+func (s *MailService) verifyMailAccount(account *model.MailAccount, secret string) error {
+	if account.Provider == "alimail" {
+		return s.verifyAliMailAccount(account, secret)
+	}
+	settings, err := s.activeSettings()
+	if err != nil {
+		return err
+	}
+	return s.verifyConnections(settings, account, secret)
 }
 
 func (s *MailService) verifyConnections(settings *model.MailServerSettings, account *model.MailAccount, password string) error {
@@ -779,7 +1048,7 @@ func (s *MailService) withIMAP(userID int64, fn func(*imapclient.Client) error) 
 		s.recordFailure(userID, err)
 		return err
 	}
-	_ = s.repo.UpdateAccountStatus(userID, false, true, "")
+	_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	return nil
 }
 
@@ -793,7 +1062,9 @@ func (s *MailService) withSelectedMailbox(userID int64, folder string, readOnly 
 }
 
 func (s *MailService) recordFailure(userID int64, err error) {
-	_ = s.repo.UpdateAccountStatus(userID, false, false, cleanMailError(err))
+	if account, accountErr := s.repo.GetAccount(userID); accountErr == nil {
+		_ = s.repo.UpdateAccountStatus(account.ID, false, false, cleanMailError(err))
+	}
 }
 
 func (s *MailService) connectIMAP(settings *model.MailServerSettings, username, password string) (*imapclient.Client, error) {
@@ -1166,7 +1437,11 @@ func mailFolderRole(name string, attributes []string) string {
 }
 
 func mailFolderDisplayName(name string, attributes []string) string {
-	switch mailFolderRole(name, attributes) {
+	return mailFolderDisplayNameByRole(mailFolderRole(name, attributes), name)
+}
+
+func mailFolderDisplayNameByRole(role, fallback string) string {
+	switch role {
 	case "inbox":
 		return "收件箱"
 	case "sent":
@@ -1184,7 +1459,7 @@ func mailFolderDisplayName(name string, attributes []string) string {
 	case "flagged":
 		return "已加星标"
 	default:
-		return name
+		return fallback
 	}
 }
 

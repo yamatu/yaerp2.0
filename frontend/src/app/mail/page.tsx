@@ -64,10 +64,16 @@ interface MailAccount {
   id: number;
   user_id: number;
   username: string;
+  provider: "imap" | "alimail";
+  provider_label: string;
   email_address: string;
   display_name: string;
   login_username: string;
   password_configured: boolean;
+  api_base_url?: string;
+  client_id?: string;
+  client_secret_configured: boolean;
+  is_default: boolean;
   signature_html: string;
   enabled: boolean;
   auto_forward_enabled: boolean;
@@ -79,10 +85,16 @@ interface MailAccount {
 }
 
 interface MailAccountInput {
+  id?: number;
+  provider: "imap" | "alimail";
   email_address: string;
   display_name: string;
   login_username: string;
   password: string;
+  api_base_url: string;
+  client_id: string;
+  client_secret: string;
+  is_default: boolean;
   signature_html: string;
   enabled: boolean;
   auto_forward_enabled: boolean;
@@ -161,7 +173,10 @@ interface MailContact {
   email: string;
   phone?: string;
   notes?: string;
-  source: "saved" | "erp";
+  source: "saved" | "erp" | "alimail";
+  sources?: Array<"saved" | "erp" | "alimail">;
+  source_account_id?: number;
+  external_id?: string;
 }
 
 interface MailContactInput {
@@ -233,13 +248,18 @@ interface MessageContextMenu {
 type MailFilterMode = "all" | "unread" | "attachment" | "contacts";
 type MailSortMode = "date" | "size";
 type MailSortOrder = "asc" | "desc";
-type ContactSourceFilter = "all" | "erp" | "saved";
+type ContactSourceFilter = "all" | "erp" | "saved" | "alimail";
 
 const emptyAccountInput: MailAccountInput = {
+  provider: "imap",
   email_address: "",
   display_name: "",
   login_username: "",
   password: "",
+  api_base_url: "https://alimail-cn.aliyuncs.com",
+  client_id: "",
+  client_secret: "",
+  is_default: true,
   signature_html: "",
   enabled: true,
   auto_forward_enabled: false,
@@ -326,6 +346,43 @@ function contactKey(contact: MailContact) {
   return `${contact.source}:${contact.id}:${contact.email.toLowerCase()}`;
 }
 
+function accountToInput(account: MailAccount): MailAccountInput {
+  return {
+    id: account.id,
+    provider: account.provider || "imap",
+    email_address: account.email_address,
+    display_name: account.display_name,
+    login_username: account.login_username || "",
+    password: "",
+    api_base_url:
+      account.api_base_url || "https://alimail-cn.aliyuncs.com",
+    client_id: account.client_id || "",
+    client_secret: "",
+    is_default: account.is_default,
+    signature_html: account.signature_html || "",
+    enabled: account.enabled,
+    auto_forward_enabled: account.auto_forward_enabled,
+    auto_forward_to: account.auto_forward_to || [],
+    forward_attachments: account.forward_attachments,
+  };
+}
+
+function contactSources(contact: MailContact) {
+  return contact.sources?.length ? contact.sources : [contact.source];
+}
+
+function contactSourceLabel(contact: MailContact) {
+  return contactSources(contact)
+    .map((source) =>
+      source === "erp"
+        ? "ERP 客户"
+        : source === "alimail"
+          ? "阿里邮箱"
+          : "个人联系人",
+    )
+    .join(" · ");
+}
+
 function formatDate(value: string, full = false) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -402,13 +459,15 @@ export default function MailPage() {
   const [account, setAccount] = useState<MailAccount | null | undefined>(
     undefined,
   );
+  const [accounts, setAccounts] = useState<MailAccount[]>([]);
+  const [editingAccountID, setEditingAccountID] = useState<number | null>(null);
   const [accountInput, setAccountInput] =
     useState<MailAccountInput>(emptyAccountInput);
   const [summary, setSummary] = useState<MailSummary | null>(null);
   const [folders, setFolders] = useState<MailFolder[]>([]);
-  const [selectedFolder, setSelectedFolder] = useState("INBOX");
+  const [selectedFolder, setSelectedFolder] = useState("");
   const [pageData, setPageData] = useState<MailMessagePage>({
-    folder: "INBOX",
+    folder: "",
     messages: [],
     page: 1,
     page_size: 30,
@@ -486,7 +545,7 @@ export default function MailPage() {
       .filter((contact) => {
         if (
           contactSourceFilter !== "all" &&
-          contact.source !== contactSourceFilter
+          !contactSources(contact).includes(contactSourceFilter)
         )
           return false;
         if (!query) return true;
@@ -539,8 +598,14 @@ export default function MailPage() {
   const contactCounts = useMemo(
     () => ({
       all: contacts.length,
-      erp: contacts.filter((contact) => contact.source === "erp").length,
-      saved: contacts.filter((contact) => contact.source === "saved").length,
+      erp: contacts.filter((contact) => contactSources(contact).includes("erp"))
+        .length,
+      saved: contacts.filter((contact) =>
+        contactSources(contact).includes("saved"),
+      ).length,
+      alimail: contacts.filter((contact) =>
+        contactSources(contact).includes("alimail"),
+      ).length,
     }),
     [contacts],
   );
@@ -594,10 +659,12 @@ export default function MailPage() {
   const loadAccount = useCallback(async () => {
     setError("");
     try {
-      const accountRes = await api.get<MailAccount | null>("/mail/account");
+      const accountRes = await api.get<MailAccount[]>("/mail/accounts");
       if (accountRes.code !== 0)
         throw new Error(accountRes.message || "无法读取邮箱账号");
-      const value = accountRes.data || null;
+      const values = accountRes.data || [];
+      const value = values.find((item) => item.is_default) || values[0] || null;
+      setAccounts(values);
       setAccount(value);
       setSummary(
         value
@@ -612,22 +679,12 @@ export default function MailPage() {
           : null,
       );
       setAccountInput(
-        value
-          ? {
-              email_address: value.email_address,
-              display_name: value.display_name,
-              login_username: value.login_username,
-              password: "",
-              signature_html: value.signature_html,
-              enabled: value.enabled,
-              auto_forward_enabled: value.auto_forward_enabled,
-              auto_forward_to: value.auto_forward_to || [],
-              forward_attachments: value.forward_attachments,
-            }
-          : emptyAccountInput,
+        value ? accountToInput(value) : { ...emptyAccountInput },
       );
+      setEditingAccountID(value?.id || null);
     } catch (loadError) {
       setAccount(null);
+      setAccounts([]);
       setError(
         loadError instanceof Error ? loadError.message : "无法读取邮箱账号",
       );
@@ -641,8 +698,9 @@ export default function MailPage() {
       const res = await api.get<MailFolder[]>("/mail/folders");
       if (res.code !== 0 || !res.data)
         throw new Error(res.message || "无法读取邮件文件夹");
-      setFolders(res.data);
-      const inbox = res.data.find((folder) => folder.role === "inbox");
+      const values = res.data;
+      setFolders(values);
+      const inbox = values.find((folder) => folder.role === "inbox");
       if (inbox) {
         setSummary((current) =>
           current
@@ -650,17 +708,22 @@ export default function MailPage() {
             : current,
         );
       }
-      if (
-        !res.data.some(
-          (folder) => folder.name === selectedFolder && folder.selectable,
-        )
-      ) {
-        const inbox =
-          res.data.find(
+      setSelectedFolder((current) => {
+        if (
+          values.some(
+            (folder) => folder.name === current && folder.selectable,
+          )
+        ) {
+          return current;
+        }
+        return (
+          values.find(
             (folder) => folder.role === "inbox" && folder.selectable,
-          ) || res.data.find((folder) => folder.selectable);
-        if (inbox) setSelectedFolder(inbox.name);
-      }
+          )?.name ||
+          values.find((folder) => folder.selectable)?.name ||
+          ""
+        );
+      });
     } catch (loadError) {
       setError(
         loadError instanceof Error ? loadError.message : "无法读取邮件文件夹",
@@ -668,7 +731,7 @@ export default function MailPage() {
     } finally {
       setLoadingFolders(false);
     }
-  }, [account, selectedFolder]);
+  }, [account]);
 
   const loadContacts = useCallback(async () => {
     if (!account) return;
@@ -973,13 +1036,25 @@ export default function MailPage() {
     setError("");
     setNotice("");
     try {
-      const res = await api.put<MailAccount>("/mail/account", accountInput);
+      const payload = { ...accountInput, id: editingAccountID || undefined };
+      const res = editingAccountID
+        ? await api.put<MailAccount>(
+            `/mail/accounts/${editingAccountID}`,
+            payload,
+          )
+        : await api.post<MailAccount>("/mail/accounts", payload);
       if (res.code !== 0 || !res.data)
         throw new Error(res.message || "邮箱绑定失败");
       setAccount(res.data);
-      setAccountInput((current) => ({ ...current, password: "" }));
+      setAccountInput((current) => ({
+        ...current,
+        password: "",
+        client_secret: "",
+      }));
       setSettingsOpen(false);
-      setNotice("邮箱设置已验证并保存。");
+      setNotice(
+        `${res.data.provider_label || "邮箱"}设置已验证并保存。`,
+      );
       await loadAccount();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "邮箱绑定失败");
@@ -994,11 +1069,11 @@ export default function MailPage() {
     setNotice("");
     try {
       const res = await api.post<{ message: string }>(
-        "/mail/account/test",
-        accountInput,
+        "/mail/accounts/test",
+        { ...accountInput, id: editingAccountID || undefined },
       );
       if (res.code !== 0) throw new Error(res.message || "连接测试失败");
-      setNotice(res.data?.message || "IMAP 与 SMTP 连接正常。");
+      setNotice(res.data?.message || "邮箱连接正常。");
     } catch (testError) {
       setError(testError instanceof Error ? testError.message : "连接测试失败");
     } finally {
@@ -1016,24 +1091,66 @@ export default function MailPage() {
   };
 
   const removeAccount = async () => {
-    if (!window.confirm("确定解除当前邮箱绑定？邮件仍保留在 poste.io 服务器。"))
+    if (!editingAccountID) return;
+    const target = accounts.find((item) => item.id === editingAccountID);
+    if (
+      !window.confirm(
+        `确定解除“${target?.email_address || "当前邮箱"}”的绑定？服务器中的邮件不会被删除。`,
+      )
+    )
       return;
-    const res = await api.delete("/mail/account");
+    const res = await api.delete(`/mail/accounts/${editingAccountID}`);
     if (res.code !== 0) {
       setError(res.message || "解除绑定失败");
       return;
     }
-    setAccount(null);
     setSettingsOpen(false);
     setFolders([]);
+    setSelectedFolder("");
     setPageData({
-      folder: "INBOX",
+      folder: "",
       messages: [],
       page: 1,
       page_size: 30,
       total: 0,
       has_more: false,
     });
+    await loadAccount();
+  };
+
+  const editAccount = (value: MailAccount) => {
+    setEditingAccountID(value.id);
+    setAccountInput(accountToInput(value));
+    setSettingsOpen(true);
+  };
+
+  const addAccount = () => {
+    setEditingAccountID(null);
+    setAccountInput({ ...emptyAccountInput, is_default: true });
+    setSettingsOpen(true);
+  };
+
+  const activateAccount = async (accountID: number) => {
+    if (account?.id === accountID) return;
+    setError("");
+    setNotice("");
+    const res = await api.post<MailAccount>(
+      `/mail/accounts/${accountID}/activate`,
+      {},
+    );
+    if (res.code !== 0 || !res.data) {
+      setError(res.message || "切换邮箱失败");
+      return;
+    }
+    setSelected(null);
+    setSelectedFolder("");
+    setPage(1);
+    setSearchDraft("");
+    setSearchQuery("");
+    setCorrespondenceContact(null);
+    previousInboxUnreadRef.current = null;
+    await loadAccount();
+    setNotice(`已切换到 ${res.data.email_address}`);
   };
 
   const createFolder = async () => {
@@ -1079,7 +1196,7 @@ export default function MailPage() {
       setError(res.message || "删除文件夹失败");
       return;
     }
-    setSelectedFolder("INBOX");
+    setSelectedFolder("");
     await loadFolders();
   };
 
@@ -1707,10 +1824,10 @@ export default function MailPage() {
               </div>
               <div>
                 <h1 className="text-lg font-semibold text-slate-950">
-                  绑定工作邮箱
+                  添加工作邮箱
                 </h1>
                 <p className="mt-0.5 text-sm text-slate-500">
-                  使用你的 poste.io 邮箱收发邮件
+                  可绑定 Poste.io / IMAP 或阿里邮箱 OpenAPI
                 </p>
               </div>
             </div>
@@ -1722,7 +1839,7 @@ export default function MailPage() {
             <div className="flex flex-col gap-3 border-t border-slate-200 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
               <div className="flex items-start gap-2 text-xs text-slate-500">
                 <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-                密码使用服务器密钥加密保存，管理员无法查看你的邮件和密码。
+                邮箱密码或应用密钥使用服务器密钥加密保存，管理员无法查看你的邮件和凭据。
               </div>
               <div className="flex gap-2">
                 <button
@@ -1758,7 +1875,10 @@ export default function MailPage() {
 
   return (
     <AuthGuard>
-      <div className="h-screen overflow-hidden bg-slate-100 text-slate-800">
+      <div
+        className="notranslate h-screen overflow-hidden bg-slate-100 text-slate-800"
+        translate="no"
+      >
         <header className="flex h-16 items-center gap-2 border-b border-slate-200 bg-white px-3 sm:px-4">
           <button
             type="button"
@@ -1773,16 +1893,41 @@ export default function MailPage() {
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-600 text-white">
             <Mail className="h-4 w-4" />
           </div>
-          <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-slate-950">
-              {account.display_name || account.email_address}
-            </div>
+          <div className="min-w-0 max-w-[260px]">
+            <label className="sr-only" htmlFor="active-mail-account">
+              当前邮箱账号
+            </label>
+            <select
+              id="active-mail-account"
+              value={account.id}
+              onChange={(event) => void activateAccount(Number(event.target.value))}
+              className="block h-6 max-w-full truncate bg-transparent pr-5 text-sm font-semibold text-slate-950 outline-none"
+              title="切换当前邮箱账号"
+            >
+              {accounts.map((item) => (
+                <option key={item.id} value={item.id} disabled={!item.enabled}>
+                  {item.display_name || item.email_address} · {item.provider_label}
+                  {!item.enabled ? "（已停用）" : ""}
+                </option>
+              ))}
+            </select>
             <div className="truncate text-[11px] text-slate-400">
               {account.email_address}
+              {` · ${account.provider_label}`}
               {summary ? ` · ${summary.unread} 封未读` : ""}
             </div>
           </div>
           <div className="ml-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={addAccount}
+              className="ui-tooltip flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
+              title="添加另一个邮箱"
+              aria-label="添加另一个邮箱"
+              data-tooltip="添加另一个邮箱"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
             <button
               type="button"
               onClick={() => {
@@ -1832,7 +1977,7 @@ export default function MailPage() {
             </button>
             <button
               type="button"
-              onClick={() => setSettingsOpen(true)}
+              onClick={() => editAccount(account)}
               className="ui-tooltip flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
               title="邮箱设置"
               aria-label="邮箱设置"
@@ -2744,6 +2889,7 @@ export default function MailPage() {
                   )}
                   <div className="py-5">
                     <iframe
+                      key={messageKey(selected)}
                       title="邮件正文"
                       sandbox={mailFrameSandbox}
                       srcDoc={iframeDocument(displayedMailHTML)}
@@ -2883,16 +3029,50 @@ export default function MailPage() {
 
       {settingsOpen && (
         <ModalShell
-          title="邮箱设置"
-          subtitle="发件资料、HTML 签名和自动转发"
+          title={editingAccountID ? "邮箱设置" : "添加邮箱"}
+          subtitle="同一员工可同时绑定多个邮箱，并随时切换当前账号"
           onClose={() => setSettingsOpen(false)}
           maxWidth="max-w-3xl"
         >
           <div className="min-h-0 overflow-y-auto">
+            {accounts.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 sm:px-6">
+                {accounts.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => {
+                      setEditingAccountID(item.id);
+                      setAccountInput(accountToInput(item));
+                    }}
+                    className={`inline-flex h-9 min-w-0 items-center gap-2 rounded-lg border px-3 text-xs ${editingAccountID === item.id ? "border-sky-300 bg-white font-semibold text-sky-700" : "border-slate-200 bg-white text-slate-600"}`}
+                    title={`编辑 ${item.email_address}`}
+                  >
+                    <Mail className="h-3.5 w-3.5 shrink-0" />
+                    <span className="max-w-44 truncate">{item.email_address}</span>
+                    <span className="text-[10px] text-slate-400">
+                      {item.provider_label}
+                    </span>
+                    {item.is_default && <Check className="h-3.5 w-3.5" />}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingAccountID(null);
+                    setAccountInput({ ...emptyAccountInput, is_default: true });
+                  }}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-dashed border-slate-300 px-3 text-xs font-medium text-slate-600"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  添加邮箱
+                </button>
+              </div>
+            )}
             <AccountForm
               value={accountInput}
               onChange={setAccountInput}
-              existing
+              existing={Boolean(editingAccountID)}
               signatureCount={signatures.length}
               onManageSignatures={() => {
                 setSettingsOpen(false);
@@ -2905,16 +3085,22 @@ export default function MailPage() {
             )}
           </div>
           <div className="flex flex-col gap-3 border-t border-slate-200 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-            <button
-              type="button"
-              onClick={() => void removeAccount()}
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600"
-            >
-              <Trash2 className="h-4 w-4" />
-              解除绑定
-            </button>
+            {editingAccountID ? (
+              <button
+                type="button"
+                onClick={() => void removeAccount()}
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600"
+              >
+                <Trash2 className="h-4 w-4" />
+                解除绑定
+              </button>
+            ) : (
+              <span />
+            )}
             <div className="flex flex-wrap justify-end gap-2">
-              {accountInput.auto_forward_enabled && (
+              {accountInput.provider === "imap" &&
+                accountInput.auto_forward_enabled &&
+                editingAccountID && (
                 <button
                   type="button"
                   onClick={() => void runForwarding()}
@@ -2928,7 +3114,7 @@ export default function MailPage() {
                   )}
                   立即检查转发
                 </button>
-              )}
+                )}
               <button
                 type="button"
                 onClick={() => void testAccount()}
@@ -2945,7 +3131,7 @@ export default function MailPage() {
                 className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50"
               >
                 <Save className="h-4 w-4" />
-                保存
+                {editingAccountID ? "保存" : "验证并添加"}
               </button>
             </div>
           </div>
@@ -3176,6 +3362,7 @@ export default function MailPage() {
                   ["all", "全部联系人", contactCounts.all],
                   ["erp", "ERP 客户", contactCounts.erp],
                   ["saved", "个人联系人", contactCounts.saved],
+                  ["alimail", "阿里邮箱", contactCounts.alimail],
                 ] as Array<[ContactSourceFilter, string, number]>
               ).map(([value, label, count]) => (
                 <button
@@ -3195,7 +3382,7 @@ export default function MailPage() {
                 </button>
               ))}
               <div className="mt-auto hidden rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-700 lg:block">
-                ERP 客户由业务系统同步，只能查看往来和写邮件；个人联系人可编辑或删除。
+                ERP 客户和阿里邮箱公共通讯录为只读来源；个人联系人由当前员工跨邮箱共享，可编辑或删除。
               </div>
             </aside>
 
@@ -3208,7 +3395,9 @@ export default function MailPage() {
                         ? "全部联系人"
                         : contactSourceFilter === "erp"
                           ? "ERP 客户"
-                          : "个人联系人"}
+                          : contactSourceFilter === "alimail"
+                            ? "阿里邮箱通讯录"
+                            : "个人联系人"}
                     </div>
                     <div className="mt-0.5 text-xs text-slate-400">
                       当前显示 {filteredContacts.length} 位联系人
@@ -3324,7 +3513,7 @@ export default function MailPage() {
                             className="flex min-w-0 items-center gap-2.5 text-left"
                           >
                             <span
-                              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${contact.source === "erp" ? "bg-emerald-50 text-emerald-700" : "bg-sky-50 text-sky-700"}`}
+                              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${contactSources(contact).includes("erp") ? "bg-emerald-50 text-emerald-700" : contactSources(contact).includes("alimail") ? "bg-amber-50 text-amber-700" : "bg-sky-50 text-sky-700"}`}
                             >
                               {(contact.name || contact.email)
                                 .slice(0, 2)
@@ -3354,11 +3543,9 @@ export default function MailPage() {
                               {contact.company || "未填写公司"}
                             </div>
                             <span
-                              className={`mt-1 inline-flex rounded px-1.5 py-0.5 text-[10px] ${contact.source === "erp" ? "bg-emerald-50 text-emerald-700" : "bg-sky-50 text-sky-700"}`}
+                              className={`mt-1 inline-flex rounded px-1.5 py-0.5 text-[10px] ${contactSources(contact).includes("erp") ? "bg-emerald-50 text-emerald-700" : contactSources(contact).includes("alimail") ? "bg-amber-50 text-amber-700" : "bg-sky-50 text-sky-700"}`}
                             >
-                              {contact.source === "erp"
-                                ? "ERP 客户"
-                                : "个人联系人"}
+                              {contactSourceLabel(contact)}
                             </span>
                           </div>
                           <div className="flex justify-end gap-1">
@@ -3380,7 +3567,8 @@ export default function MailPage() {
                             >
                               <Send className="h-4 w-4" />
                             </button>
-                            {contact.source === "saved" && contact.id > 0 && (
+                            {contactSources(contact).includes("saved") &&
+                              contact.id > 0 && (
                               <>
                                 <button
                                   type="button"
@@ -3401,7 +3589,7 @@ export default function MailPage() {
                                   <Trash2 className="h-4 w-4" />
                                 </button>
                               </>
-                            )}
+                              )}
                           </div>
                         </div>
                       );
@@ -3423,7 +3611,7 @@ export default function MailPage() {
                 )}
               </div>
               <p className="mb-4 text-xs leading-5 text-slate-400">
-                个人联系人仅当前邮箱账号可见。ERP 客户请在业务系统中维护。
+                个人联系人由当前员工的所有邮箱共同使用。ERP 客户和阿里邮箱联系人请在对应来源中维护。
               </p>
               <div className="grid gap-3">
                 <label>
@@ -3980,6 +4168,36 @@ function AccountForm({
 }) {
   return (
     <div className="grid gap-4 p-4 sm:grid-cols-2 sm:p-6">
+      <label className="sm:col-span-2">
+        <span className="mb-1.5 block text-xs font-medium text-slate-600">
+          邮箱系统
+        </span>
+        <select
+          value={value.provider}
+          disabled={existing}
+          onChange={(event) =>
+            onChange({
+              ...value,
+              provider: event.target.value as "imap" | "alimail",
+              auto_forward_enabled:
+                event.target.value === "imap"
+                  ? value.auto_forward_enabled
+                  : false,
+            })
+          }
+          className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 disabled:bg-slate-50"
+        >
+          <option value="imap">Poste.io / 标准 IMAP + SMTP</option>
+          <option value="alimail">阿里邮箱 OpenAPI</option>
+        </select>
+        <span className="mt-1 block text-xs text-slate-400">
+          {existing
+            ? "邮箱系统创建后不可转换，如需更换请添加新账号。"
+            : value.provider === "alimail"
+              ? "使用企业应用 Client ID / Secret 授权，不保存邮箱登录密码。"
+              : "使用管理员后台配置的统一 IMAP、SMTP 和 SOCKS5 代理。"}
+        </span>
+      </label>
       <label>
         <span className="mb-1.5 block text-xs font-medium text-slate-600">
           邮箱地址
@@ -4007,33 +4225,94 @@ function AccountForm({
           className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
         />
       </label>
-      <label>
-        <span className="mb-1.5 block text-xs font-medium text-slate-600">
-          登录用户名
-        </span>
-        <input
-          value={value.login_username}
-          onChange={(event) =>
-            onChange({ ...value, login_username: event.target.value })
-          }
-          placeholder="默认使用完整邮箱地址"
-          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
-        />
-      </label>
-      <label>
-        <span className="mb-1.5 block text-xs font-medium text-slate-600">
-          邮箱密码
-        </span>
-        <input
-          type="password"
-          value={value.password}
-          onChange={(event) =>
-            onChange({ ...value, password: event.target.value })
-          }
-          placeholder={existing ? "留空则不修改密码" : "Poste.io 邮箱密码"}
-          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
-        />
-      </label>
+      {value.provider === "imap" ? (
+        <>
+          <label>
+            <span className="mb-1.5 block text-xs font-medium text-slate-600">
+              登录用户名
+            </span>
+            <input
+              value={value.login_username}
+              onChange={(event) =>
+                onChange({ ...value, login_username: event.target.value })
+              }
+              placeholder="默认使用完整邮箱地址"
+              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+            />
+          </label>
+          <label>
+            <span className="mb-1.5 block text-xs font-medium text-slate-600">
+              邮箱密码
+            </span>
+            <input
+              type="password"
+              value={value.password}
+              onChange={(event) =>
+                onChange({ ...value, password: event.target.value })
+              }
+              placeholder={
+                existing ? "留空则不修改密码" : "Poste.io 邮箱密码"
+              }
+              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+            />
+          </label>
+        </>
+      ) : (
+        <>
+          <label>
+            <span className="mb-1.5 block text-xs font-medium text-slate-600">
+              OpenAPI 区域
+            </span>
+            <select
+              value={value.api_base_url}
+              onChange={(event) =>
+                onChange({ ...value, api_base_url: event.target.value })
+              }
+              className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400"
+            >
+              <option value="https://alimail-cn.aliyuncs.com">
+                中国站企业邮箱
+              </option>
+              <option value="https://alimail-personal.aliyuncs.com">
+                中国站个人邮箱
+              </option>
+              <option value="https://alimail-sg.aliyuncs.com">
+                国际站（新加坡）
+              </option>
+            </select>
+          </label>
+          <label>
+            <span className="mb-1.5 block text-xs font-medium text-slate-600">
+              应用 Client ID
+            </span>
+            <input
+              value={value.client_id}
+              onChange={(event) =>
+                onChange({ ...value, client_id: event.target.value })
+              }
+              placeholder="阿里邮箱域管理后台创建的应用 ID"
+              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+            />
+          </label>
+          <label className="sm:col-span-2">
+            <span className="mb-1.5 block text-xs font-medium text-slate-600">
+              应用 Client Secret
+            </span>
+            <input
+              type="password"
+              value={value.client_secret}
+              onChange={(event) =>
+                onChange({ ...value, client_secret: event.target.value })
+              }
+              placeholder={existing ? "留空则不修改应用密钥" : "应用 Secret"}
+              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+            />
+            <span className="mt-1 block text-xs leading-5 text-slate-400">
+              应用至少需要 Mail.ReadWrite.All、Mail.Send.All；同步公共通讯录还需要 SharedContact.Read.All。
+            </span>
+          </label>
+        </>
+      )}
       <div className="flex flex-col gap-3 border-y border-slate-200 py-4 sm:col-span-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <div className="text-sm font-semibold text-slate-800">邮件落款</div>
@@ -4054,62 +4333,85 @@ function AccountForm({
           </button>
         )}
       </div>
-      <div className="rounded-lg border border-sky-100 bg-sky-50 p-3 sm:col-span-2">
-        <label className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-medium text-sky-900">
-              自动转发新收件
+      {value.provider === "imap" && (
+        <div className="rounded-lg border border-sky-100 bg-sky-50 p-3 sm:col-span-2">
+          <label className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-medium text-sky-900">
+                自动转发新收件
+              </div>
+              <div className="mt-0.5 text-xs text-sky-700">
+                后台定时检查收件箱，并转发到多个提醒邮箱。
+              </div>
             </div>
-            <div className="mt-0.5 text-xs text-sky-700">
-              后台定时检查收件箱，并转发到多个提醒邮箱。
+            <input
+              type="checkbox"
+              checked={value.auto_forward_enabled}
+              onChange={(event) =>
+                onChange({
+                  ...value,
+                  auto_forward_enabled: event.target.checked,
+                })
+              }
+              className="h-4 w-4 accent-sky-600"
+            />
+          </label>
+          {value.auto_forward_enabled && (
+            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <label>
+                <span className="mb-1 block text-xs font-medium text-sky-800">
+                  转发邮箱，每行一个
+                </span>
+                <textarea
+                  value={value.auto_forward_to.join("\n")}
+                  onChange={(event) =>
+                    onChange({
+                      ...value,
+                      auto_forward_to: event.target.value
+                        .split(/[;,]+/)
+                        .map((item) => item.trim()),
+                    })
+                  }
+                  placeholder={"notify@example.com\nmanager@example.com"}
+                  className="min-h-24 w-full rounded-lg border border-sky-200 bg-white px-3 py-2 text-sm outline-none"
+                />
+              </label>
+              <label className="flex items-center gap-2 self-end rounded-lg border border-sky-200 bg-white p-3 text-xs text-sky-800">
+                <input
+                  type="checkbox"
+                  checked={value.forward_attachments}
+                  onChange={(event) =>
+                    onChange({
+                      ...value,
+                      forward_attachments: event.target.checked,
+                    })
+                  }
+                  className="h-3.5 w-3.5 accent-sky-600"
+                />
+                同时转发附件
+              </label>
             </div>
+          )}
+        </div>
+      )}
+      <label className="flex items-center gap-3 rounded-lg border border-slate-200 p-3 sm:col-span-2">
+        <input
+          type="checkbox"
+          checked={value.is_default}
+          onChange={(event) =>
+            onChange({ ...value, is_default: event.target.checked })
+          }
+          className="h-4 w-4 accent-sky-600"
+        />
+        <div>
+          <div className="text-sm font-medium text-slate-800">
+            保存后设为当前邮箱
           </div>
-          <input
-            type="checkbox"
-            checked={value.auto_forward_enabled}
-            onChange={(event) =>
-              onChange({ ...value, auto_forward_enabled: event.target.checked })
-            }
-            className="h-4 w-4 accent-sky-600"
-          />
-        </label>
-        {value.auto_forward_enabled && (
-          <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
-            <label>
-              <span className="mb-1 block text-xs font-medium text-sky-800">
-                转发邮箱，每行一个
-              </span>
-              <textarea
-                value={value.auto_forward_to.join("\n")}
-                onChange={(event) =>
-                  onChange({
-                    ...value,
-                    auto_forward_to: event.target.value
-                      .split(/[;,]+/)
-                      .map((item) => item.trim()),
-                  })
-                }
-                placeholder={"notify@example.com\nmanager@example.com"}
-                className="min-h-24 w-full rounded-lg border border-sky-200 bg-white px-3 py-2 text-sm outline-none"
-              />
-            </label>
-            <label className="flex items-center gap-2 self-end rounded-lg border border-sky-200 bg-white p-3 text-xs text-sky-800">
-              <input
-                type="checkbox"
-                checked={value.forward_attachments}
-                onChange={(event) =>
-                  onChange({
-                    ...value,
-                    forward_attachments: event.target.checked,
-                  })
-                }
-                className="h-3.5 w-3.5 accent-sky-600"
-              />
-              同时转发附件
-            </label>
+          <div className="mt-0.5 text-xs text-slate-500">
+            邮件列表、发件和通知将使用这个账号，其他已绑定邮箱仍会保留。
           </div>
-        )}
-      </div>
+        </div>
+      </label>
       <label className="flex items-center gap-3 rounded-lg border border-slate-200 p-3 sm:col-span-2">
         <input
           type="checkbox"
