@@ -112,6 +112,9 @@ func (r *MailRepo) SaveAccount(account *model.MailAccount) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := lockMailAccountOwner(tx, account.UserID); err != nil {
+		return err
+	}
 	if !account.IsDefault {
 		var defaultCount int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM mail_accounts WHERE user_id=$1 AND is_default`, account.UserID).Scan(&defaultCount); err != nil {
@@ -191,20 +194,51 @@ func nonNilMailAddresses(addresses []string) []string {
 	return addresses
 }
 
+func lockMailAccountOwner(tx *sql.Tx, userID int64) error {
+	var lockedUserID int64
+	return tx.QueryRow(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&lockedUserID)
+}
+
+type mailAccountExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func switchDefaultMailAccount(execer mailAccountExecer, userID, accountID int64) error {
+	if _, err := execer.Exec(
+		`UPDATE mail_accounts SET is_default=FALSE,updated_at=NOW()
+		  WHERE user_id=$1 AND is_default`,
+		userID,
+	); err != nil {
+		return err
+	}
+	result, err := execer.Exec(
+		`UPDATE mail_accounts SET is_default=TRUE,updated_at=NOW()
+		  WHERE id=$1 AND user_id=$2 AND enabled`,
+		accountID, userID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *MailRepo) SetDefaultAccount(userID, accountID int64) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var exists bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM mail_accounts WHERE id=$1 AND user_id=$2 AND enabled)`, accountID, userID).Scan(&exists); err != nil {
+	if err := lockMailAccountOwner(tx, userID); err != nil {
 		return err
 	}
-	if !exists {
-		return sql.ErrNoRows
-	}
-	if _, err := tx.Exec(`UPDATE mail_accounts SET is_default=(id=$2),updated_at=NOW() WHERE user_id=$1`, userID, accountID); err != nil {
+	if err := switchDefaultMailAccount(tx, userID, accountID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -216,6 +250,9 @@ func (r *MailRepo) DeleteAccount(userID, accountID int64) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := lockMailAccountOwner(tx, userID); err != nil {
+		return err
+	}
 	if accountID <= 0 {
 		if err := tx.QueryRow(`SELECT id FROM mail_accounts WHERE user_id=$1 ORDER BY is_default DESC,id LIMIT 1`, userID).Scan(&accountID); err != nil {
 			return err
