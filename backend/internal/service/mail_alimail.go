@@ -28,6 +28,7 @@ const (
 	aliMailDefaultBaseURL = "https://alimail-cn.aliyuncs.com"
 	aliMailPageSize       = 100
 	aliMailUploadChunk    = 5 << 20
+	aliMailListSelect     = "internetMessageId,subject,from,toRecipients,ccRecipients,folderId,hasAttachments,isRead,sentDateTime,receivedDateTime,tags,size"
 )
 
 var aliMailBaseURLs = map[string]struct{}{
@@ -56,6 +57,29 @@ type aliMailBody struct {
 	HTML string `json:"bodyHtml"`
 }
 
+type aliMailInt64 int64
+
+func (value *aliMailInt64) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" || raw == `""` {
+		*value = 0
+		return nil
+	}
+	if strings.HasPrefix(raw, `"`) {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		raw = strings.TrimSpace(text)
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid AliMail integer %q: %w", raw, err)
+	}
+	*value = aliMailInt64(parsed)
+	return nil
+}
+
 type aliMailMessage struct {
 	InternetMessageID      string             `json:"internetMessageId"`
 	Subject                string             `json:"subject"`
@@ -77,7 +101,7 @@ type aliMailMessage struct {
 	SentDateTime           time.Time          `json:"sentDateTime"`
 	ReceivedDateTime       time.Time          `json:"receivedDateTime"`
 	Tags                   []string           `json:"tags"`
-	Size                   int64              `json:"size"`
+	Size                   aliMailInt64       `json:"size"`
 }
 
 type aliMailFolder struct {
@@ -558,7 +582,7 @@ func (s *MailService) aliMailListMessages(account *model.MailAccount, folder str
 				NextCursor string           `json:"nextCursor"`
 			}
 			endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/messages/query"
-			query := url.Values{"$select": {"internetMessageId,toRecipients,ccRecipients,receivedDateTime,tags"}}
+			query := url.Values{"$select": {aliMailListSelect}}
 			payload := map[string]any{"query": queryText, "cursor": cursor, "size": pageSize}
 			if err := s.aliMailDo(account, http.MethodPost, endpoint, query, payload, &response); err != nil {
 				return nil, err
@@ -575,7 +599,7 @@ func (s *MailService) aliMailListMessages(account *model.MailAccount, folder str
 			query := url.Values{
 				"size":        {strconv.Itoa(pageSize)},
 				"isAscending": {strconv.FormatBool(strings.EqualFold(options.SortOrder, "asc"))},
-				"$select":     {"internetMessageId,toRecipients,ccRecipients,receivedDateTime,tags"},
+				"$select":     {aliMailListSelect},
 			}
 			if cursor != "" {
 				query.Set("cursor", cursor)
@@ -667,7 +691,7 @@ func (s *MailService) aliMailMessageSummary(account *model.MailAccount, fallback
 	if date.IsZero() {
 		date = message.SentDateTime
 	}
-	size := clampMailUint32(message.Size)
+	size := clampMailUint32(int64(message.Size))
 	return model.MailMessageSummary{
 		UID: uid, Folder: folder, MessageID: message.InternetMessageID,
 		Subject: firstNonEmptyMail(message.Subject, "（无主题）"),
@@ -708,7 +732,7 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 		Message aliMailMessage `json:"message"`
 	}
 	endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/messages/" + url.PathEscape(remoteID)
-	query := url.Values{"$select": {"internetMessageId,toRecipients,ccRecipients,bccRecipients,sender,replyTo,body,internetMessageHeaders,receivedDateTime,tags,isReadReceiptRequested"}}
+	query := url.Values{"$select": {aliMailListSelect + ",bccRecipients,sender,replyTo,body,internetMessageHeaders,isReadReceiptRequested"}}
 	if err := s.aliMailDo(account, http.MethodGet, endpoint, query, nil, &response); err != nil {
 		return nil, err
 	}

@@ -572,8 +572,8 @@ export default function MailPage() {
     ? contactsByEmail.get(selectedSenderAddress.address.toLowerCase()) || null
     : null;
   const mailAddressLabel = useCallback(
-    (addresses: MailAddress[]) => {
-      if (!addresses?.length) return "未知发件人";
+    (addresses: MailAddress[], fallback = "未知发件人") => {
+      if (!addresses?.length) return fallback;
       return addresses
         .map((address) => {
           const contact = contactsByEmail.get(address.address.toLowerCase());
@@ -2459,7 +2459,9 @@ export default function MailPage() {
                         <span
                           className={`min-w-0 flex-1 truncate text-sm ${message.read ? "font-medium text-slate-700" : "font-semibold text-slate-950"}`}
                         >
-                          {mailAddressLabel(message.from)}
+                          {selectedFolderMeta?.role === "sent"
+                            ? mailAddressLabel(message.to, "未知收件人")
+                            : mailAddressLabel(message.from)}
                         </span>
                         <span className="shrink-0 text-[11px] text-slate-400">
                           {formatDate(message.date)}

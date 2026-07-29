@@ -205,6 +205,36 @@ func TestAliMailSearchQuery(t *testing.T) {
 	}
 }
 
+func TestAliMailListSelectIncludesSummaryFields(t *testing.T) {
+	for _, field := range []string{
+		"subject", "from", "toRecipients", "hasAttachments", "isRead", "sentDateTime", "size",
+	} {
+		if !strings.Contains(","+aliMailListSelect+",", ","+field+",") {
+			t.Fatalf("AliMail list select is missing %q: %s", field, aliMailListSelect)
+		}
+	}
+}
+
+func TestAliMailInt64AcceptsNumberAndString(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want int64
+	}{
+		{raw: `1024`, want: 1024},
+		{raw: `"2048"`, want: 2048},
+		{raw: `""`, want: 0},
+		{raw: `null`, want: 0},
+	} {
+		var value aliMailInt64
+		if err := json.Unmarshal([]byte(test.raw), &value); err != nil {
+			t.Fatalf("failed to decode %s: %v", test.raw, err)
+		}
+		if int64(value) != test.want {
+			t.Fatalf("decoded %s as %d, want %d", test.raw, value, test.want)
+		}
+	}
+}
+
 func TestMailAccountInputIsEmpty(t *testing.T) {
 	if !mailAccountInputIsEmpty(nil) || !mailAccountInputIsEmpty(&model.MailAccountInput{}) {
 		t.Fatal("empty account input was not recognized")
