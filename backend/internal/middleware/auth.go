@@ -37,18 +37,23 @@ func AuthMiddleware(jwtUtil *jwtpkg.JWTUtil, rdb *redis.Client) gin.HandlerFunc 
 			return
 		}
 
-		// Check whether the token has been blacklisted (e.g. after logout).
-		exists, err := rdb.Exists(c.Request.Context(), jwtpkg.BlacklistKey(tokenString), "token:blacklist:"+tokenString).Result()
-		if err != nil {
+		// Fetch both revocation signals in one network round trip. This middleware
+		// runs on every authenticated request, so pipelining materially reduces
+		// Redis connection pressure under concurrency.
+		pipe := rdb.Pipeline()
+		revokedToken := pipe.Exists(c.Request.Context(), jwtpkg.BlacklistKey(tokenString), "token:blacklist:"+tokenString)
+		revokedBeforeCommand := pipe.Get(c.Request.Context(), jwtpkg.UserRevokedBeforeKey(claims.UserID))
+		_, err = pipe.Exec(c.Request.Context())
+		if err != nil && !errors.Is(err, redis.Nil) {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check token status"})
 			return
 		}
-		if exists > 0 {
+		if revokedToken.Err() != nil || revokedToken.Val() > 0 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "token has been revoked"})
 			return
 		}
 
-		revokedBefore, err := rdb.Get(c.Request.Context(), jwtpkg.UserRevokedBeforeKey(claims.UserID)).Int64()
+		revokedBefore, err := revokedBeforeCommand.Int64()
 		if err != nil && !errors.Is(err, redis.Nil) {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check account session status"})
 			return

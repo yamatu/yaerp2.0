@@ -207,11 +207,73 @@ func TestAliMailSearchQuery(t *testing.T) {
 
 func TestAliMailListSelectIncludesSummaryFields(t *testing.T) {
 	for _, field := range []string{
-		"subject", "from", "toRecipients", "hasAttachments", "isRead", "sentDateTime", "size",
+		"subject", "from", "sender", "toRecipients", "hasAttachments", "isRead", "sentDateTime", "size",
 	} {
 		if !strings.Contains(","+aliMailListSelect+",", ","+field+",") {
 			t.Fatalf("AliMail list select is missing %q: %s", field, aliMailListSelect)
 		}
+	}
+}
+
+func TestAliMailMessageFromFallbacks(t *testing.T) {
+	tests := []struct {
+		name    string
+		message aliMailMessage
+		want    string
+	}{
+		{
+			name: "from", message: aliMailMessage{
+				From:   aliMailRecipient{Name: "Owner", Email: "owner@example.com"},
+				Sender: aliMailRecipient{Name: "Sender", Email: "sender@example.com"},
+			}, want: "owner@example.com",
+		},
+		{
+			name: "sender", message: aliMailMessage{
+				Sender: aliMailRecipient{Name: "Sender", Email: "sender@example.com"},
+			}, want: "sender@example.com",
+		},
+		{
+			name: "header", message: aliMailMessage{
+				InternetMessageHeaders: map[string]string{"fRoM": "Header Sender <header@example.com>"},
+			}, want: "header@example.com",
+		},
+	}
+	for _, test := range tests {
+		addresses := aliMailMessageFrom(test.message)
+		if len(addresses) != 1 || addresses[0].Address != test.want {
+			t.Fatalf("%s fallback = %#v, want %s", test.name, addresses, test.want)
+		}
+	}
+}
+
+func TestNormalizeBulkRecipients(t *testing.T) {
+	recipients, err := normalizeBulkRecipients([]string{
+		`"Doe, Jane" <JANE@example.com>; buyer@example.com`,
+		"jane@example.com；Second <second@example.com>",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recipients) != 3 {
+		t.Fatalf("unexpected recipients: %#v", recipients)
+	}
+	if recipients[0].Name != "Doe, Jane" || recipients[0].Email != "jane@example.com" {
+		t.Fatalf("quoted recipient was not normalized: %#v", recipients[0])
+	}
+	if _, err := normalizeBulkRecipients([]string{"only@example.com"}); err == nil {
+		t.Fatal("single-recipient bulk job was accepted")
+	}
+}
+
+func TestPersonalizeBulkMessage(t *testing.T) {
+	message := personalizeBulkMessage(model.MailSendInput{
+		Subject: "Hello {{name}}", TextBody: "Account: {{email}}", CC: []string{"hidden@example.com"},
+	}, model.MailBulkRecipient{Name: "Jane", Email: "jane@example.com"})
+	if message.Subject != "Hello Jane" || message.TextBody != "Account: jane@example.com" {
+		t.Fatalf("unexpected personalized message: %#v", message)
+	}
+	if len(message.To) != 1 || len(message.CC) != 0 || !strings.Contains(message.To[0], "jane@example.com") {
+		t.Fatalf("bulk recipient isolation failed: %#v", message)
 	}
 }
 

@@ -49,9 +49,19 @@ func main() {
 
 	// Redis
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
-		Password: cfg.Redis.Password,
+		Addr:            fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
+		Password:        cfg.Redis.Password,
+		PoolSize:        cfg.Redis.PoolSize,
+		MinIdleConns:    cfg.Redis.MinIdleConns,
+		ConnMaxIdleTime: 5 * time.Minute,
+		DialTimeout:     5 * time.Second,
+		ReadTimeout:     3 * time.Second,
+		WriteTimeout:    3 * time.Second,
 	})
+	defer rdb.Close()
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
 	log.Println("Redis connected")
 
 	// MinIO
@@ -127,6 +137,7 @@ func main() {
 	scheduleService := service.NewAIScheduleService(scheduleRepo)
 	aiService := service.NewAIService(cfg, db, sheetRepo, sheetService, permService, uploadService, scheduleService, tradeService)
 	mailService := service.NewMailService(mailRepo, permService, cfg.JWT.Secret)
+	mailService.SetRedisClient(rdb)
 	mailService.SetAIService(aiService)
 	mailService.SetTradeService(tradeService)
 	aiService.SetAutomationService(automationService)
@@ -136,6 +147,9 @@ func main() {
 		log.Fatalf("failed to start AI schedule service: %v", err)
 	}
 	go mailService.StartAutoForward(context.Background(), 2*time.Minute)
+	if err := mailService.StartBulkWorkers(context.Background()); err != nil {
+		log.Fatalf("failed to start bulk mail workers: %v", err)
+	}
 
 	// WebSocket
 	hub := ws.NewHub()
@@ -283,6 +297,10 @@ func main() {
 		api.DELETE("/mail/messages/:uid", mailHandler.DeleteMessage)
 		api.GET("/mail/messages/:uid/attachments/:partId", mailHandler.DownloadAttachment)
 		api.POST("/mail/send", mailHandler.SendMessage)
+		api.POST("/mail/bulk", mailHandler.SendBulkMessage)
+		api.GET("/mail/bulk/jobs", mailHandler.ListBulkJobs)
+		api.GET("/mail/bulk/jobs/:id", mailHandler.GetBulkJob)
+		api.POST("/mail/bulk/jobs/:id/cancel", mailHandler.CancelBulkJob)
 		api.GET("/mail/contacts", mailHandler.ListContacts)
 		api.POST("/mail/contacts", mailHandler.SaveContact)
 		api.PUT("/mail/contacts/:id", mailHandler.UpdateContact)

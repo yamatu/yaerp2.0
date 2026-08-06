@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -494,29 +495,103 @@ func (h *MailHandler) RunForwarding(c *gin.Context) {
 }
 
 func (h *MailHandler) SendMessage(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMailSendRequestBytes)
-	if err := c.Request.ParseMultipartForm(8 << 20); err != nil {
-		response.BadRequest(c, "邮件或附件过大")
+	payload, attachments, err := readMailSendRequest(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
 		return
 	}
 	var input model.MailSendInput
-	if err := json.Unmarshal([]byte(c.PostForm("payload")), &input); err != nil {
+	if err := json.Unmarshal(payload, &input); err != nil {
 		response.BadRequest(c, "invalid mail payload")
 		return
+	}
+	result, err := h.service.SendMessage(c.GetInt64("user_id"), &input, attachments)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
+func (h *MailHandler) SendBulkMessage(c *gin.Context) {
+	payload, attachments, err := readMailSendRequest(c)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	var input model.MailBulkSendInput
+	if err := json.Unmarshal(payload, &input); err != nil {
+		response.BadRequest(c, "invalid bulk mail payload")
+		return
+	}
+	job, err := h.service.CreateBulkJob(c.GetInt64("user_id"), &input, attachments)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, job)
+}
+
+func (h *MailHandler) ListBulkJobs(c *gin.Context) {
+	jobs, err := h.service.ListBulkJobs(c.GetInt64("user_id"))
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, jobs)
+}
+
+func (h *MailHandler) GetBulkJob(c *gin.Context) {
+	jobID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || jobID <= 0 {
+		response.BadRequest(c, "invalid bulk mail job id")
+		return
+	}
+	job, err := h.service.GetBulkJob(c.GetInt64("user_id"), jobID)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, job)
+}
+
+func (h *MailHandler) CancelBulkJob(c *gin.Context) {
+	jobID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || jobID <= 0 {
+		response.BadRequest(c, "invalid bulk mail job id")
+		return
+	}
+	job, err := h.service.CancelBulkJob(c.GetInt64("user_id"), jobID)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, job)
+}
+
+func readMailSendRequest(c *gin.Context) ([]byte, []service.MailOutgoingAttachment, error) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMailSendRequestBytes)
+	if err := c.Request.ParseMultipartForm(8 << 20); err != nil {
+		return nil, nil, fmt.Errorf("邮件或附件过大")
+	}
+	if c.Request.MultipartForm != nil {
+		defer c.Request.MultipartForm.RemoveAll()
+	}
+	payload := []byte(c.PostForm("payload"))
+	if len(payload) == 0 {
+		return nil, nil, fmt.Errorf("invalid mail payload")
 	}
 	attachments := make([]service.MailOutgoingAttachment, 0)
 	if c.Request.MultipartForm != nil {
 		for _, header := range c.Request.MultipartForm.File["attachments"] {
 			file, err := header.Open()
 			if err != nil {
-				response.BadRequest(c, "附件读取失败")
-				return
+				return nil, nil, fmt.Errorf("附件读取失败")
 			}
 			data, readErr := io.ReadAll(io.LimitReader(file, maxMailSendRequestBytes+1))
 			_ = file.Close()
 			if readErr != nil || len(data) > maxMailSendRequestBytes {
-				response.BadRequest(c, "附件读取失败或文件过大")
-				return
+				return nil, nil, fmt.Errorf("附件读取失败或文件过大")
 			}
 			contentType := header.Header.Get("Content-Type")
 			if contentType == "" {
@@ -525,12 +600,7 @@ func (h *MailHandler) SendMessage(c *gin.Context) {
 			attachments = append(attachments, service.MailOutgoingAttachment{Filename: header.Filename, ContentType: contentType, Data: data})
 		}
 	}
-	result, err := h.service.SendMessage(c.GetInt64("user_id"), &input, attachments)
-	if err != nil {
-		handleMailError(c, err)
-		return
-	}
-	response.OK(c, result)
+	return payload, attachments, nil
 }
 
 func mailUID(c *gin.Context) (uint32, bool) {

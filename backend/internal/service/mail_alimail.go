@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/microcosm-cc/bluemonday"
+	"github.com/redis/go-redis/v9"
 
 	"yaerp/internal/model"
 	"yaerp/internal/repo"
@@ -28,7 +30,9 @@ const (
 	aliMailDefaultBaseURL = "https://alimail-cn.aliyuncs.com"
 	aliMailPageSize       = 100
 	aliMailUploadChunk    = 5 << 20
-	aliMailListSelect     = "internetMessageId,subject,from,toRecipients,ccRecipients,folderId,hasAttachments,isRead,sentDateTime,receivedDateTime,tags,size"
+	aliMailListSelect     = "internetMessageId,subject,from,sender,toRecipients,ccRecipients,folderId,hasAttachments,isRead,sentDateTime,receivedDateTime,tags,size"
+	aliMailRatePerSecond  = 32
+	aliMailRateBurst      = 8
 )
 
 var aliMailBaseURLs = map[string]struct{}{
@@ -41,6 +45,44 @@ type aliMailToken struct {
 	AccessToken string
 	ExpiresAt   time.Time
 }
+
+type aliMailTokenCall struct {
+	done  chan struct{}
+	token aliMailToken
+	err   error
+}
+
+type aliMailRequestError struct {
+	status     int
+	retryAfter time.Duration
+	err        error
+}
+
+func (err *aliMailRequestError) Error() string { return err.err.Error() }
+func (err *aliMailRequestError) Unwrap() error { return err.err }
+
+var aliMailRateLimitScript = redis.NewScript(`
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local state = redis.call('HMGET', KEYS[1], 'tokens', 'updated')
+local tokens = tonumber(state[1])
+local updated = tonumber(state[2])
+if tokens == nil then tokens = capacity end
+if updated == nil then updated = now end
+local elapsed = math.max(0, now - updated) / 1000
+tokens = math.min(capacity, tokens + elapsed * rate)
+if tokens >= 1 then
+  tokens = tokens - 1
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'updated', now)
+  redis.call('PEXPIRE', KEYS[1], 2000)
+  return 0
+end
+local wait = math.ceil((1 - tokens) * 1000 / rate)
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'updated', now)
+redis.call('PEXPIRE', KEYS[1], 2000)
+return wait
+`)
 
 type aliMailContactCache struct {
 	Contacts  []model.MailContact
@@ -166,16 +208,31 @@ func (s *MailService) invalidateAliMailToken(accountID int64) {
 }
 
 func (s *MailService) aliMailHTTPClient() (*http.Client, error) {
+	settings := &model.MailServerSettings{ProxyType: "none"}
+	if s.repo != nil {
+		if current, err := s.repo.GetSettings(); err == nil && current != nil {
+			settings = current
+		}
+	}
+	cacheKey := strings.Join([]string{
+		normalizeMailProxyType(settings.ProxyType), settings.ProxyHost,
+		strconv.Itoa(settings.ProxyPort), settings.ProxyUsername, settings.ProxyPasswordEncrypted,
+	}, "|")
+	s.aliHTTPMu.Lock()
+	if client := s.aliHTTPClient[cacheKey]; client != nil {
+		s.aliHTTPMu.Unlock()
+		return client, nil
+	}
+	s.aliHTTPMu.Unlock()
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          40,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   40,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
-	settings, err := s.repo.GetSettings()
-	if err == nil && normalizeMailProxyType(settings.ProxyType) != "none" {
+	if normalizeMailProxyType(settings.ProxyType) != "none" {
 		dialer, dialErr := s.mailDialer(settings)
 		if dialErr != nil {
 			return nil, dialErr
@@ -185,7 +242,27 @@ func (s *MailService) aliMailHTTPClient() (*http.Client, error) {
 			return dialer.Dial(network, address)
 		}
 	}
-	return &http.Client{Transport: transport, Timeout: 45 * time.Second}, nil
+	client := &http.Client{Transport: transport, Timeout: 45 * time.Second}
+	s.aliHTTPMu.Lock()
+	if existing := s.aliHTTPClient[cacheKey]; existing != nil {
+		s.aliHTTPMu.Unlock()
+		transport.CloseIdleConnections()
+		return existing, nil
+	}
+	s.aliHTTPClient[cacheKey] = client
+	s.aliHTTPMu.Unlock()
+	return client, nil
+}
+
+func (s *MailService) resetAliMailHTTPClients() {
+	s.aliHTTPMu.Lock()
+	defer s.aliHTTPMu.Unlock()
+	for _, client := range s.aliHTTPClient {
+		if transport, ok := client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	s.aliHTTPClient = make(map[string]*http.Client)
 }
 
 func (s *MailService) aliMailAcquireToken(account *model.MailAccount, secret string) (aliMailToken, error) {
@@ -238,19 +315,35 @@ func (s *MailService) aliMailAccessToken(account *model.MailAccount) (string, er
 		s.aliTokenMu.Unlock()
 		return cached.AccessToken, nil
 	}
+	if call := s.aliTokenCalls[account.ID]; call != nil {
+		s.aliTokenMu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return "", call.err
+		}
+		return call.token.AccessToken, nil
+	}
+	call := &aliMailTokenCall{done: make(chan struct{})}
+	s.aliTokenCalls[account.ID] = call
 	s.aliTokenMu.Unlock()
 	secret, err := s.decryptSecret(account.ClientSecretEncrypted)
 	if err != nil {
-		return "", fmt.Errorf("阿里邮箱应用密钥无法读取: %w", err)
+		err = fmt.Errorf("阿里邮箱应用密钥无法读取: %w", err)
+	} else {
+		call.token, err = s.aliMailAcquireToken(account, secret)
 	}
-	token, err := s.aliMailAcquireToken(account, secret)
+	s.aliTokenMu.Lock()
+	call.err = err
+	if err == nil {
+		s.aliTokens[account.ID] = call.token
+	}
+	delete(s.aliTokenCalls, account.ID)
+	close(call.done)
+	s.aliTokenMu.Unlock()
 	if err != nil {
 		return "", err
 	}
-	s.aliTokenMu.Lock()
-	s.aliTokens[account.ID] = token
-	s.aliTokenMu.Unlock()
-	return token.AccessToken, nil
+	return call.token.AccessToken, nil
 }
 
 func (s *MailService) aliMailDo(account *model.MailAccount, method, endpoint string, query url.Values, payload, result any) error {
@@ -265,10 +358,39 @@ func (s *MailService) aliMailDo(account *model.MailAccount, method, endpoint str
 	if err != nil {
 		return err
 	}
-	return s.aliMailDoWithToken(account, token, method, endpoint, query, payload, result)
+	for attempt := 0; attempt < 4; attempt++ {
+		err = s.aliMailDoWithToken(account, token, method, endpoint, query, payload, result)
+		if err == nil {
+			return nil
+		}
+		var requestErr *aliMailRequestError
+		if !errors.As(err, &requestErr) {
+			return err
+		}
+		if requestErr.status == http.StatusUnauthorized && attempt == 0 {
+			s.invalidateAliMailToken(account.ID)
+			token, err = s.aliMailAccessToken(account)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if requestErr.status != http.StatusTooManyRequests || attempt == 3 {
+			return err
+		}
+		delay := requestErr.retryAfter
+		if delay <= 0 {
+			delay = time.Duration(attempt+1) * 250 * time.Millisecond
+		}
+		time.Sleep(delay)
+	}
+	return err
 }
 
 func (s *MailService) aliMailDoWithToken(account *model.MailAccount, token, method, endpoint string, query url.Values, payload, result any) error {
+	if err := s.waitAliMailRateLimit(account); err != nil {
+		return err
+	}
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -307,10 +429,10 @@ func (s *MailService) aliMailDoWithToken(account *model.MailAccount, token, meth
 		return fmt.Errorf("阿里邮箱响应超过 64MB 限制")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if response.StatusCode == http.StatusUnauthorized {
-			s.invalidateAliMailToken(account.ID)
+		return &aliMailRequestError{
+			status: response.StatusCode, retryAfter: aliMailRetryAfter(response.Header.Get("Retry-After")),
+			err: aliMailHTTPError(response.StatusCode, responseBody),
 		}
-		return aliMailHTTPError(response.StatusCode, responseBody)
 	}
 	if result == nil || len(bytes.TrimSpace(responseBody)) == 0 {
 		return nil
@@ -319,6 +441,62 @@ func (s *MailService) aliMailDoWithToken(account *model.MailAccount, token, meth
 		return fmt.Errorf("阿里邮箱响应无法解析: %w", err)
 	}
 	return nil
+}
+
+func (s *MailService) waitAliMailRateLimit(account *model.MailAccount) error {
+	if s.rdb != nil {
+		host := "default"
+		if parsed, err := url.Parse(account.APIBaseURL); err == nil && parsed.Hostname() != "" {
+			host = parsed.Hostname()
+		}
+		key := "alimail:rate:v1:" + host
+		deadline := time.Now().Add(45 * time.Second)
+		for {
+			wait, err := aliMailRateLimitScript.Run(
+				context.Background(), s.rdb, []string{key},
+				aliMailRateBurst, aliMailRatePerSecond, time.Now().UnixMilli(),
+			).Int64()
+			if err != nil {
+				break
+			}
+			if wait <= 0 {
+				return nil
+			}
+			if time.Now().Add(time.Duration(wait) * time.Millisecond).After(deadline) {
+				return fmt.Errorf("等待阿里邮箱 API 限流超时")
+			}
+			time.Sleep(time.Duration(wait) * time.Millisecond)
+		}
+	}
+	interval := time.Second / aliMailRatePerSecond
+	s.aliRateMu.Lock()
+	now := time.Now()
+	if s.aliRateNext.Before(now) {
+		s.aliRateNext = now
+	}
+	wait := time.Until(s.aliRateNext)
+	s.aliRateNext = s.aliRateNext.Add(interval)
+	s.aliRateMu.Unlock()
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+	return nil
+}
+
+func aliMailRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(date); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func aliMailHTTPError(status int, body []byte) error {
@@ -695,10 +873,42 @@ func (s *MailService) aliMailMessageSummary(account *model.MailAccount, fallback
 	return model.MailMessageSummary{
 		UID: uid, Folder: folder, MessageID: message.InternetMessageID,
 		Subject: firstNonEmptyMail(message.Subject, "（无主题）"),
-		From:    aliMailAddresses([]aliMailRecipient{message.From}), To: aliMailAddresses(message.To),
+		From:    aliMailMessageFrom(message), To: aliMailAddresses(message.To),
 		Date: date, Size: size, Read: message.IsRead, Starred: aliMailMessageStarred(message.Tags),
 		HasAttachment: message.HasAttachments,
 	}, nil
+}
+
+func aliMailMessageFrom(message aliMailMessage) []model.MailAddress {
+	for _, candidate := range []aliMailRecipient{message.From, message.Sender} {
+		if addresses := aliMailAddresses([]aliMailRecipient{candidate}); len(addresses) > 0 {
+			return addresses
+		}
+	}
+	header := aliMailHeaderValue(message.InternetMessageHeaders, "From")
+	parsed, err := stdmail.ParseAddressList(header)
+	if err != nil {
+		return []model.MailAddress{}
+	}
+	result := make([]model.MailAddress, 0, len(parsed))
+	for _, address := range parsed {
+		if address == nil || strings.TrimSpace(address.Address) == "" {
+			continue
+		}
+		result = append(result, model.MailAddress{
+			Name: strings.TrimSpace(address.Name), Address: strings.ToLower(strings.TrimSpace(address.Address)),
+		})
+	}
+	return result
+}
+
+func aliMailHeaderValue(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func aliMailAddresses(values []aliMailRecipient) []model.MailAddress {
@@ -732,7 +942,7 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 		Message aliMailMessage `json:"message"`
 	}
 	endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/messages/" + url.PathEscape(remoteID)
-	query := url.Values{"$select": {aliMailListSelect + ",bccRecipients,sender,replyTo,body,internetMessageHeaders,isReadReceiptRequested"}}
+	query := url.Values{"$select": {aliMailListSelect + ",bccRecipients,replyTo,body,internetMessageHeaders,isReadReceiptRequested"}}
 	if err := s.aliMailDo(account, http.MethodGet, endpoint, query, nil, &response); err != nil {
 		return nil, err
 	}
@@ -753,8 +963,8 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 		CC:                 aliMailAddresses(response.Message.CC), BCC: aliMailAddresses(response.Message.BCC),
 		ReplyTo: aliMailAddresses(response.Message.ReplyTo), TextBody: response.Message.Body.Text,
 		HTMLBody: s.htmlPolicy.Sanitize(response.Message.Body.HTML), Attachments: attachments,
-		InReplyTo:  response.Message.InternetMessageHeaders["In-Reply-To"],
-		References: parseAliMailReferences(response.Message.InternetMessageHeaders["References"]),
+		InReplyTo:  aliMailHeaderValue(response.Message.InternetMessageHeaders, "In-Reply-To"),
+		References: parseAliMailReferences(aliMailHeaderValue(response.Message.InternetMessageHeaders, "References")),
 	}
 	if detail.HTMLBody == "" && detail.TextBody == "" {
 		detail.TextBody = response.Message.Summary

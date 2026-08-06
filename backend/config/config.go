@@ -27,9 +27,11 @@ type PostgresConfig struct {
 }
 
 type RedisConfig struct {
-	Host     string
-	Port     int
-	Password string
+	Host         string
+	Port         int
+	Password     string
+	PoolSize     int
+	MinIdleConns int
 }
 
 type MinIOConfig struct {
@@ -89,9 +91,11 @@ func Load() *Config {
 			Password: getEnv("POSTGRES_PASSWORD", "yaerp_secret_2024"),
 		},
 		Redis: RedisConfig{
-			Host:     getEnv("REDIS_HOST", "localhost"),
-			Port:     getEnvInt("REDIS_PORT", 6379),
-			Password: getEnv("REDIS_PASSWORD", "redis_secret_2024"),
+			Host:         getEnv("REDIS_HOST", "localhost"),
+			Port:         getEnvInt("REDIS_PORT", 6379),
+			Password:     getEnv("REDIS_PASSWORD", "redis_secret_2024"),
+			PoolSize:     getPositiveEnvInt("REDIS_POOL_SIZE", 64),
+			MinIdleConns: getPositiveEnvInt("REDIS_MIN_IDLE_CONNS", 8),
 		},
 		MinIO: MinIOConfig{
 			Endpoint:       getEnv("MINIO_ENDPOINT", "localhost:9000"),

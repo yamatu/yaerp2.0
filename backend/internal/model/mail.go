@@ -198,6 +198,47 @@ type MailSendResult struct {
 	SentAt    time.Time `json:"sent_at"`
 }
 
+type MailBulkSendInput struct {
+	Recipients []string      `json:"recipients"`
+	Message    MailSendInput `json:"message"`
+}
+
+type MailBulkJob struct {
+	ID          int64               `json:"id"`
+	UserID      int64               `json:"user_id"`
+	AccountID   int64               `json:"account_id"`
+	Status      string              `json:"status"`
+	Subject     string              `json:"subject"`
+	TotalCount  int                 `json:"total_count"`
+	SentCount   int                 `json:"sent_count"`
+	FailedCount int                 `json:"failed_count"`
+	LastError   string              `json:"last_error,omitempty"`
+	CreatedAt   time.Time           `json:"created_at"`
+	StartedAt   *time.Time          `json:"started_at,omitempty"`
+	FinishedAt  *time.Time          `json:"finished_at,omitempty"`
+	UpdatedAt   time.Time           `json:"updated_at"`
+	Recipients  []MailBulkRecipient `json:"recipients,omitempty"`
+}
+
+type MailBulkRecipient struct {
+	ID           int64      `json:"id"`
+	JobID        int64      `json:"job_id"`
+	Name         string     `json:"name,omitempty"`
+	Email        string     `json:"email"`
+	Status       string     `json:"status"`
+	MessageID    string     `json:"message_id,omitempty"`
+	ErrorMessage string     `json:"error_message,omitempty"`
+	SentAt       *time.Time `json:"sent_at,omitempty"`
+}
+
+type MailBulkAttachment struct {
+	ID          int64  `json:"id"`
+	JobID       int64  `json:"job_id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Data        []byte `json:"-"`
+}
+
 type MailContact struct {
 	ID              int64     `json:"id"`
 	UserID          int64     `json:"user_id"`

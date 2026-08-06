@@ -13,6 +13,7 @@ import (
 	"html"
 	"io"
 	"net"
+	"net/http"
 	stdmail "net/mail"
 	"net/smtp"
 	"regexp"
@@ -25,6 +26,7 @@ import (
 	imapclient "github.com/emersion/go-imap/client"
 	gomail "github.com/emersion/go-message/mail"
 	"github.com/microcosm-cc/bluemonday"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/net/proxy"
 
 	"yaerp/internal/model"
@@ -59,8 +61,15 @@ type MailService struct {
 	htmlPolicy    *bluemonday.Policy
 	aliTokenMu    sync.Mutex
 	aliTokens     map[int64]aliMailToken
+	aliTokenCalls map[int64]*aliMailTokenCall
 	aliContactMu  sync.Mutex
 	aliContacts   map[int64]aliMailContactCache
+	aliHTTPMu     sync.Mutex
+	aliHTTPClient map[string]*http.Client
+	aliRateMu     sync.Mutex
+	aliRateNext   time.Time
+	rdb           *redis.Client
+	bulkSendSem   chan struct{}
 }
 
 type mailSession struct {
@@ -80,9 +89,14 @@ func NewMailService(mailRepo *repo.MailRepo, permSvc *PermissionService, encrypt
 		encryptionKey: sha256.Sum256([]byte(encryptionSecret + ":mail-account")),
 		htmlPolicy:    newMailHTMLPolicy(),
 		aliTokens:     make(map[int64]aliMailToken),
+		aliTokenCalls: make(map[int64]*aliMailTokenCall),
 		aliContacts:   make(map[int64]aliMailContactCache),
+		aliHTTPClient: make(map[string]*http.Client),
+		bulkSendSem:   make(chan struct{}, 4),
 	}
 }
+
+func (s *MailService) SetRedisClient(rdb *redis.Client) { s.rdb = rdb }
 
 func newMailHTMLPolicy() *bluemonday.Policy {
 	policy := bluemonday.UGCPolicy()
@@ -184,6 +198,7 @@ func (s *MailService) UpdateSettings(userID int64, input *model.MailServerSettin
 	if err := s.repo.UpdateSettings(userID, &settings); err != nil {
 		return nil, err
 	}
+	s.resetAliMailHTTPClients()
 	return s.repo.GetSettings()
 }
 
@@ -647,10 +662,23 @@ func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, atta
 	if err != nil {
 		return nil, err
 	}
+	return s.sendMessageForAccount(account, input, attachments)
+}
+
+func (s *MailService) sendMessageForAccount(account *model.MailAccount, input *model.MailSendInput, attachments []MailOutgoingAttachment) (*model.MailSendResult, error) {
+	if account == nil || input == nil {
+		return nil, fmt.Errorf("邮件内容不能为空")
+	}
+	if !account.Enabled {
+		return nil, fmt.Errorf("当前邮箱账号已停用")
+	}
+	// Bulk workers share attachment bytes between recipients. Clone the slice so
+	// filename normalization never mutates another sender goroutine's view.
+	attachments = append([]MailOutgoingAttachment(nil), attachments...)
 	if account.Provider == "alimail" {
 		return s.aliMailSendMessage(account, input, attachments)
 	}
-	session, err := s.sessionForUser(userID)
+	session, err := s.sessionForAccount(account)
 	if err != nil {
 		return nil, err
 	}
@@ -688,13 +716,13 @@ func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, atta
 	}
 	smtpConn, err := s.connectSMTP(session.settings, session.account.LoginUsername, session.password)
 	if err != nil {
-		s.recordFailure(userID, err)
+		s.recordFailure(account.UserID, err)
 		return nil, err
 	}
 	recipients := append(append(toEnvelope, ccEnvelope...), bccEnvelope...)
 	if err := sendSMTPMessage(smtpConn, session.account.EmailAddress, recipients, raw); err != nil {
 		_ = smtpConn.Close()
-		s.recordFailure(userID, err)
+		s.recordFailure(account.UserID, err)
 		return nil, err
 	}
 	_ = smtpConn.Quit()
@@ -840,6 +868,13 @@ func (s *MailService) sessionForUser(userID int64) (*mailSession, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	return s.sessionForAccount(account)
+}
+
+func (s *MailService) sessionForAccount(account *model.MailAccount) (*mailSession, error) {
+	if account == nil {
+		return nil, ErrMailAccountNotConfigured
 	}
 	if !account.Enabled {
 		return nil, fmt.Errorf("当前邮箱账号已停用")

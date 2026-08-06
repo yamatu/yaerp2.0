@@ -471,6 +471,396 @@ func (r *MailRepo) GetRemoteMessageRef(accountID int64, uid uint32) (string, str
 	return remoteID, folderID, err
 }
 
+func (r *MailRepo) CreateBulkJob(userID, accountID int64, subject string, payload []byte, recipients []model.MailBulkRecipient, attachments []model.MailBulkAttachment) (*model.MailBulkJob, error) {
+	if userID <= 0 || accountID <= 0 || len(payload) == 0 || len(recipients) == 0 || len(recipients) > 1000 {
+		return nil, fmt.Errorf("invalid bulk mail job")
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	job := &model.MailBulkJob{}
+	err = tx.QueryRow(
+		`INSERT INTO mail_bulk_jobs(user_id,account_id,status,subject,payload,total_count,created_at,updated_at)
+		 SELECT $1,$2,'queued',$3,$4::jsonb,$5,NOW(),NOW()
+		   FROM mail_accounts
+		  WHERE id=$2 AND user_id=$1 AND enabled
+		 RETURNING id,user_id,account_id,status,subject,total_count,sent_count,failed_count,
+		           last_error,created_at,started_at,finished_at,updated_at`,
+		userID, accountID, strings.TrimSpace(subject), payload, len(recipients),
+	).Scan(
+		&job.ID, &job.UserID, &job.AccountID, &job.Status, &job.Subject,
+		&job.TotalCount, &job.SentCount, &job.FailedCount, &job.LastError,
+		&job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	recipientStmt, err := tx.Prepare(pq.CopyIn("mail_bulk_recipients", "job_id", "name", "email", "status"))
+	if err != nil {
+		return nil, err
+	}
+	for _, recipient := range recipients {
+		if _, err := recipientStmt.Exec(job.ID, strings.TrimSpace(recipient.Name), strings.ToLower(strings.TrimSpace(recipient.Email)), "pending"); err != nil {
+			_ = recipientStmt.Close()
+			return nil, err
+		}
+	}
+	if _, err := recipientStmt.Exec(); err != nil {
+		_ = recipientStmt.Close()
+		return nil, err
+	}
+	if err := recipientStmt.Close(); err != nil {
+		return nil, err
+	}
+	if len(attachments) > 0 {
+		attachmentStmt, err := tx.Prepare(pq.CopyIn("mail_bulk_attachments", "job_id", "filename", "content_type", "data"))
+		if err != nil {
+			return nil, err
+		}
+		for _, attachment := range attachments {
+			if _, err := attachmentStmt.Exec(job.ID, attachment.Filename, attachment.ContentType, attachment.Data); err != nil {
+				_ = attachmentStmt.Close()
+				return nil, err
+			}
+		}
+		if _, err := attachmentStmt.Exec(); err != nil {
+			_ = attachmentStmt.Close()
+			return nil, err
+		}
+		if err := attachmentStmt.Close(); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+func (r *MailRepo) ListBulkJobs(userID int64, limit int) ([]model.MailBulkJob, error) {
+	if limit < 1 || limit > 100 {
+		limit = 30
+	}
+	rows, err := r.db.Query(
+		`SELECT id,user_id,account_id,status,subject,total_count,sent_count,failed_count,
+		        last_error,created_at,started_at,finished_at,updated_at
+		   FROM mail_bulk_jobs WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2`,
+		userID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]model.MailBulkJob, 0)
+	for rows.Next() {
+		job, scanErr := scanMailBulkJob(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, *job)
+	}
+	return result, rows.Err()
+}
+
+func (r *MailRepo) GetBulkJob(userID, jobID int64) (*model.MailBulkJob, error) {
+	job, err := scanMailBulkJob(r.db.QueryRow(
+		`SELECT id,user_id,account_id,status,subject,total_count,sent_count,failed_count,
+		        last_error,created_at,started_at,finished_at,updated_at
+		   FROM mail_bulk_jobs WHERE id=$1 AND user_id=$2`,
+		jobID, userID,
+	))
+	if err != nil {
+		return nil, err
+	}
+	recipients, err := r.ListBulkRecipients(job.ID)
+	if err != nil {
+		return nil, err
+	}
+	job.Recipients = recipients
+	return job, nil
+}
+
+func (r *MailRepo) ClaimBulkJob(jobID int64) (*model.MailBulkJob, []byte, bool, error) {
+	job := &model.MailBulkJob{}
+	var payload []byte
+	err := r.db.QueryRow(
+		`UPDATE mail_bulk_jobs
+		    SET status='running',started_at=COALESCE(started_at,NOW()),updated_at=NOW()
+		  WHERE id=$1 AND status='queued'
+		 RETURNING id,user_id,account_id,status,subject,total_count,sent_count,failed_count,
+		           last_error,created_at,started_at,finished_at,updated_at,payload`,
+		jobID,
+	).Scan(
+		&job.ID, &job.UserID, &job.AccountID, &job.Status, &job.Subject,
+		&job.TotalCount, &job.SentCount, &job.FailedCount, &job.LastError,
+		&job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.UpdatedAt, &payload,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, false, nil
+	}
+	return job, payload, err == nil, err
+}
+
+func (r *MailRepo) ListBulkRecipients(jobID int64) ([]model.MailBulkRecipient, error) {
+	rows, err := r.db.Query(
+		`SELECT id,job_id,name,email,status,message_id,error_message,sent_at
+		   FROM mail_bulk_recipients WHERE job_id=$1 ORDER BY id`,
+		jobID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]model.MailBulkRecipient, 0)
+	for rows.Next() {
+		var recipient model.MailBulkRecipient
+		if err := rows.Scan(
+			&recipient.ID, &recipient.JobID, &recipient.Name, &recipient.Email,
+			&recipient.Status, &recipient.MessageID, &recipient.ErrorMessage, &recipient.SentAt,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, recipient)
+	}
+	return result, rows.Err()
+}
+
+func (r *MailRepo) ListBulkAttachments(jobID int64) ([]model.MailBulkAttachment, error) {
+	rows, err := r.db.Query(
+		`SELECT id,job_id,filename,content_type,data FROM mail_bulk_attachments WHERE job_id=$1 ORDER BY id`,
+		jobID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]model.MailBulkAttachment, 0)
+	for rows.Next() {
+		var attachment model.MailBulkAttachment
+		if err := rows.Scan(&attachment.ID, &attachment.JobID, &attachment.Filename, &attachment.ContentType, &attachment.Data); err != nil {
+			return nil, err
+		}
+		result = append(result, attachment)
+	}
+	return result, rows.Err()
+}
+
+func (r *MailRepo) MarkBulkRecipientSending(recipientID int64) (bool, error) {
+	result, err := r.db.Exec(
+		`WITH marked AS (
+		     UPDATE mail_bulk_recipients AS recipient
+		        SET status='sending',updated_at=NOW()
+		      WHERE recipient.id=$1 AND recipient.status='pending'
+		        AND EXISTS (
+		            SELECT 1 FROM mail_bulk_jobs AS job
+		             WHERE job.id=recipient.job_id AND job.status='running'
+		        )
+		  RETURNING recipient.job_id
+		 )
+		 UPDATE mail_bulk_jobs AS job SET updated_at=NOW()
+		   FROM marked WHERE job.id=marked.job_id`,
+		recipientID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
+}
+
+func (r *MailRepo) CompleteBulkRecipient(recipientID int64, status, messageID, errorMessage string) error {
+	if status != "sent" && status != "failed" {
+		return fmt.Errorf("invalid bulk recipient status")
+	}
+	_, err := r.db.Exec(
+		`WITH completed AS (
+		     UPDATE mail_bulk_recipients
+		        SET status=$2,message_id=$3,error_message=$4,
+		            sent_at=CASE WHEN $2='sent' THEN NOW() ELSE NULL END,updated_at=NOW()
+		      WHERE id=$1 AND status='sending'
+		  RETURNING job_id
+		 )
+		 UPDATE mail_bulk_jobs AS job
+		    SET sent_count=sent_count + CASE WHEN $2='sent' THEN 1 ELSE 0 END,
+		        failed_count=failed_count + CASE WHEN $2='failed' THEN 1 ELSE 0 END,
+		        last_error=CASE WHEN $2='failed' THEN $4 ELSE last_error END,
+		        updated_at=NOW()
+		   FROM completed WHERE job.id=completed.job_id`,
+		recipientID, status, strings.TrimSpace(messageID), strings.TrimSpace(errorMessage),
+	)
+	return err
+}
+
+func (r *MailRepo) FinishBulkJob(jobID int64) error {
+	_, err := r.db.Exec(
+		`WITH counts AS (
+		     SELECT job_id,
+		            COUNT(*) FILTER (WHERE status='sent')::INTEGER AS sent_count,
+		            COUNT(*) FILTER (WHERE status='failed')::INTEGER AS failed_count,
+		            COUNT(*) FILTER (WHERE status IN ('pending','sending'))::INTEGER AS active_count
+		       FROM mail_bulk_recipients WHERE job_id=$1 GROUP BY job_id
+		 )
+		 UPDATE mail_bulk_jobs AS job
+		    SET sent_count=counts.sent_count,failed_count=counts.failed_count,
+		        status=CASE
+		            WHEN job.status='cancelled' THEN 'cancelled'
+		            WHEN counts.active_count > 0 THEN job.status
+		            WHEN counts.failed_count=0 THEN 'completed'
+		            WHEN counts.sent_count=0 THEN 'failed'
+		            ELSE 'partial'
+		        END,
+		        finished_at=CASE WHEN counts.active_count=0 OR job.status='cancelled' THEN NOW() ELSE finished_at END,
+		        updated_at=NOW()
+		   FROM counts WHERE job.id=counts.job_id`,
+		jobID,
+	)
+	return err
+}
+
+func (r *MailRepo) FailBulkJob(jobID int64, errorMessage string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(
+		`UPDATE mail_bulk_recipients
+		    SET status='failed',error_message=$2,updated_at=NOW()
+		  WHERE job_id=$1 AND status IN ('pending','sending')`,
+		jobID, strings.TrimSpace(errorMessage),
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE mail_bulk_jobs AS job
+		    SET sent_count=(SELECT COUNT(*)::INTEGER FROM mail_bulk_recipients WHERE job_id=job.id AND status='sent'),
+		        failed_count=(SELECT COUNT(*)::INTEGER FROM mail_bulk_recipients WHERE job_id=job.id AND status='failed'),
+		        status=CASE
+		            WHEN job.status='cancelled' THEN 'cancelled'
+		            WHEN EXISTS (SELECT 1 FROM mail_bulk_recipients WHERE job_id=job.id AND status='sent') THEN 'partial'
+		            ELSE 'failed'
+		        END,
+		        last_error=$2,finished_at=NOW(),updated_at=NOW()
+		  WHERE job.id=$1`,
+		jobID, strings.TrimSpace(errorMessage),
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *MailRepo) CancelBulkJob(userID, jobID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.Exec(
+		`UPDATE mail_bulk_jobs
+		    SET status='cancelled',finished_at=NOW(),updated_at=NOW()
+		  WHERE id=$1 AND user_id=$2 AND status IN ('queued','running')`,
+		jobID, userID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.Exec(
+		`UPDATE mail_bulk_recipients SET status='cancelled',updated_at=NOW()
+		  WHERE job_id=$1 AND status='pending'`,
+		jobID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *MailRepo) RecoverStaleBulkJobs(staleBefore time.Time) ([]int64, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(
+		`UPDATE mail_bulk_recipients AS recipient
+		    SET status='failed',error_message='服务中断，发送结果未知，已停止自动重试',updated_at=NOW()
+		  WHERE recipient.status='sending'
+		    AND EXISTS (
+		        SELECT 1 FROM mail_bulk_jobs AS job
+		         WHERE job.id=recipient.job_id AND job.status='running' AND job.updated_at < $1
+		    )`,
+		staleBefore,
+	); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(
+		`UPDATE mail_bulk_jobs AS job
+		    SET status='queued',
+		        sent_count=(SELECT COUNT(*)::INTEGER FROM mail_bulk_recipients WHERE job_id=job.id AND status='sent'),
+		        failed_count=(SELECT COUNT(*)::INTEGER FROM mail_bulk_recipients WHERE job_id=job.id AND status='failed'),
+		        updated_at=NOW()
+		  WHERE job.status='running' AND job.updated_at < $1
+		 RETURNING job.id`,
+		staleBefore,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (r *MailRepo) ListQueuedBulkJobIDs(limit int) ([]int64, error) {
+	if limit < 1 || limit > 5000 {
+		limit = 1000
+	}
+	rows, err := r.db.Query(`SELECT id FROM mail_bulk_jobs WHERE status='queued' ORDER BY created_at,id LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func scanMailBulkJob(scanner mailScanner) (*model.MailBulkJob, error) {
+	job := &model.MailBulkJob{}
+	err := scanner.Scan(
+		&job.ID, &job.UserID, &job.AccountID, &job.Status, &job.Subject,
+		&job.TotalCount, &job.SentCount, &job.FailedCount, &job.LastError,
+		&job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.UpdatedAt,
+	)
+	return job, err
+}
+
 func (r *MailRepo) ListContacts(userID int64, query string) ([]model.MailContact, error) {
 	rows, err := r.db.Query(
 		`SELECT id,user_id,trade_customer_id,name,company,email,phone,notes,created_at,updated_at

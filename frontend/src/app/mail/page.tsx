@@ -5,6 +5,7 @@ import {
   Archive,
   ArrowLeft,
   ArrowUpDown,
+  Ban,
   BookUser,
   CalendarDays,
   Check,
@@ -23,6 +24,7 @@ import {
   Inbox,
   Languages,
   Loader2,
+  ListChecks,
   ListFilter,
   Mail,
   MailOpen,
@@ -42,6 +44,7 @@ import {
   Trash2,
   Type,
   UserPlus,
+  Users,
   X,
 } from "lucide-react";
 import {
@@ -223,7 +226,28 @@ interface AITranslationResult {
   }>;
 }
 
+interface MailBulkJob {
+  id: number;
+  account_id: number;
+  status:
+    | "queued"
+    | "running"
+    | "completed"
+    | "partial"
+    | "failed"
+    | "cancelled";
+  subject: string;
+  total_count: number;
+  sent_count: number;
+  failed_count: number;
+  last_error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
 interface ComposeState {
+  bulk: boolean;
   to: string;
   cc: string;
   bcc: string;
@@ -274,6 +298,7 @@ const emptyContact: MailContactInput = {
   notes: "",
 };
 const emptyCompose: ComposeState = {
+  bulk: false,
   to: "",
   cc: "",
   bcc: "",
@@ -322,6 +347,25 @@ function splitAddresses(value: string) {
     .split(/[;\n]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function bulkJobStatusLabel(status: MailBulkJob["status"]) {
+  return {
+    queued: "等待发送",
+    running: "发送中",
+    completed: "已完成",
+    partial: "部分失败",
+    failed: "发送失败",
+    cancelled: "已取消",
+  }[status];
+}
+
+function bulkJobStatusClass(status: MailBulkJob["status"]) {
+  if (status === "completed") return "bg-emerald-50 text-emerald-700";
+  if (status === "running") return "bg-sky-50 text-sky-700";
+  if (status === "queued") return "bg-amber-50 text-amber-700";
+  if (status === "cancelled") return "bg-slate-100 text-slate-500";
+  return "bg-rose-50 text-rose-700";
 }
 
 function appendAddress(value: string, contact: MailContact) {
@@ -493,6 +537,12 @@ export default function MailPage() {
   const [composeView, setComposeView] = useState<"edit" | "preview">("edit");
   const [composeFiles, setComposeFiles] = useState<globalThis.File[]>([]);
   const [sending, setSending] = useState(false);
+  const [bulkJobs, setBulkJobs] = useState<MailBulkJob[]>([]);
+  const [bulkJobsOpen, setBulkJobsOpen] = useState(false);
+  const [loadingBulkJobs, setLoadingBulkJobs] = useState(false);
+  const [cancellingBulkJobID, setCancellingBulkJobID] = useState<number | null>(
+    null,
+  );
   const [savingAccount, setSavingAccount] = useState(false);
   const [testingAccount, setTestingAccount] = useState(false);
   const [runningForward, setRunningForward] = useState(false);
@@ -643,6 +693,9 @@ export default function MailPage() {
         : textToHTML(compose.textBody);
     return `${body}${activeSignatureHTML ? `<br><br>${activeSignatureHTML}` : ""}`;
   }, [activeSignatureHTML, compose]);
+  const hasActiveBulkJobs = bulkJobs.some(
+    (job) => job.status === "queued" || job.status === "running",
+  );
   const displayedMailHTML = useMemo(() => {
     if (translation?.segments?.length) {
       return translation.segments
@@ -688,6 +741,22 @@ export default function MailPage() {
       setError(
         loadError instanceof Error ? loadError.message : "无法读取邮箱账号",
       );
+    }
+  }, []);
+
+  const loadBulkJobs = useCallback(async () => {
+    setLoadingBulkJobs(true);
+    try {
+      const res = await api.get<MailBulkJob[]>("/mail/bulk/jobs");
+      if (res.code !== 0)
+        throw new Error(res.message || "无法读取群发任务");
+      setBulkJobs(res.data || []);
+    } catch (loadError) {
+      setError(
+        loadError instanceof Error ? loadError.message : "无法读取群发任务",
+      );
+    } finally {
+      setLoadingBulkJobs(false);
     }
   }, []);
 
@@ -916,14 +985,27 @@ export default function MailPage() {
         loadContacts(),
         loadSignatures(),
         loadAssistants(),
+        loadBulkJobs(),
       ]);
-  }, [account, loadAssistants, loadContacts, loadFolders, loadSignatures]);
+  }, [
+    account,
+    loadAssistants,
+    loadBulkJobs,
+    loadContacts,
+    loadFolders,
+    loadSignatures,
+  ]);
   useEffect(() => {
     if (account) void loadMessages();
   }, [account, loadMessages]);
   useEffect(() => {
     setSenderCardOpen(false);
   }, [selected?.folder, selected?.uid]);
+  useEffect(() => {
+    if (!account || !hasActiveBulkJobs) return;
+    const timer = window.setInterval(() => void loadBulkJobs(), 2000);
+    return () => window.clearInterval(timer);
+  }, [account, hasActiveBulkJobs, loadBulkJobs]);
   useEffect(() => {
     if (!account) return;
     void pollMailSummary();
@@ -1392,8 +1474,13 @@ export default function MailPage() {
   };
 
   const sendMessage = async () => {
-    if (!compose || !splitAddresses(compose.to).length) {
+    const recipients = splitAddresses(compose?.to || "");
+    if (!compose || !recipients.length) {
       setError("请填写收件人。");
+      return;
+    }
+    if (compose.bulk && recipients.length < 2) {
+      setError("群发邮件至少需要 2 位不同的收件人。");
       return;
     }
     setSending(true);
@@ -1405,29 +1492,41 @@ export default function MailPage() {
         compose.format === "html"
           ? htmlToText(compose.htmlBody)
           : compose.textBody;
+      const message = {
+        to: compose.bulk ? [] : recipients,
+        cc: compose.bulk ? [] : splitAddresses(compose.cc),
+        bcc: compose.bulk ? [] : splitAddresses(compose.bcc),
+        subject: compose.subject,
+        text_body: textBody,
+        html_body: htmlBody,
+        in_reply_to: compose.bulk ? "" : compose.inReplyTo,
+        references: compose.bulk ? [] : compose.references,
+        save_to_sent: true,
+        priority: compose.priority,
+        request_read_receipt: compose.requestReadReceipt,
+        signature_html: activeSignatureHTML,
+      };
       form.append(
         "payload",
-        JSON.stringify({
-          to: splitAddresses(compose.to),
-          cc: splitAddresses(compose.cc),
-          bcc: splitAddresses(compose.bcc),
-          subject: compose.subject,
-          text_body: textBody,
-          html_body: htmlBody,
-          in_reply_to: compose.inReplyTo,
-          references: compose.references,
-          save_to_sent: true,
-          priority: compose.priority,
-          request_read_receipt: compose.requestReadReceipt,
-          signature_html: activeSignatureHTML,
-        }),
+        JSON.stringify(
+          compose.bulk ? { recipients, message } : message,
+        ),
       );
       composeFiles.forEach((file) => form.append("attachments", file));
-      const res = await api.form<{ message_id: string }>("/mail/send", form);
+      const res = await api.form<MailBulkJob | { message_id: string }>(
+        compose.bulk ? "/mail/bulk" : "/mail/send",
+        form,
+      );
       if (res.code !== 0) throw new Error(res.message || "发送失败");
+      const wasBulk = compose.bulk;
       setCompose(null);
       setComposeFiles([]);
-      setNotice("邮件已发送。");
+      setNotice(wasBulk ? "群发任务已进入发送队列。" : "邮件已发送。");
+      if (wasBulk) {
+        setBulkJobsOpen(true);
+        await loadBulkJobs();
+        return;
+      }
       await Promise.all([
         loadFolders(),
         selectedFolderMeta?.role === "sent"
@@ -1438,6 +1537,26 @@ export default function MailPage() {
       setError(sendError instanceof Error ? sendError.message : "发送失败");
     } finally {
       setSending(false);
+    }
+  };
+
+  const cancelBulkJob = async (job: MailBulkJob) => {
+    setCancellingBulkJobID(job.id);
+    setError("");
+    try {
+      const res = await api.post<MailBulkJob>(
+        `/mail/bulk/jobs/${job.id}/cancel`,
+        {},
+      );
+      if (res.code !== 0) throw new Error(res.message || "取消群发任务失败");
+      await loadBulkJobs();
+      setNotice("群发任务已取消。");
+    } catch (cancelError) {
+      setError(
+        cancelError instanceof Error ? cancelError.message : "取消群发任务失败",
+      );
+    } finally {
+      setCancellingBulkJobID(null);
     }
   };
 
@@ -1942,6 +2061,36 @@ export default function MailPage() {
             >
               <Pencil className="h-4 w-4" />
               <span className="hidden sm:inline">写邮件</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCompose({ ...emptyCompose, bulk: true });
+                setComposeFiles([]);
+                setComposeView("edit");
+              }}
+              className="ui-tooltip hidden h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 sm:flex"
+              title="新建群发邮件"
+              aria-label="新建群发邮件"
+              data-tooltip="新建群发邮件"
+            >
+              <Users className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setBulkJobsOpen(true);
+                void loadBulkJobs();
+              }}
+              className="ui-tooltip relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
+              title="群发任务"
+              aria-label="群发任务"
+              data-tooltip="群发任务"
+            >
+              <ListChecks className="h-4 w-4" />
+              {hasActiveBulkJobs && (
+                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-sky-500" />
+              )}
             </button>
             <button
               type="button"
@@ -3728,6 +3877,112 @@ export default function MailPage() {
         </ModalShell>
       )}
 
+      {bulkJobsOpen && (
+        <ModalShell
+          title="群发任务"
+          subtitle="最近 30 个任务"
+          onClose={() => setBulkJobsOpen(false)}
+          maxWidth="max-w-2xl"
+        >
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-100 px-4 sm:px-5">
+              <span className="text-xs text-slate-500">
+                {hasActiveBulkJobs ? "发送队列运行中" : "当前没有运行中的任务"}
+              </span>
+              <button
+                type="button"
+                onClick={() => void loadBulkJobs()}
+                disabled={loadingBulkJobs}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+                title="刷新群发任务"
+              >
+                <RefreshCw
+                  className={`h-4 w-4 ${loadingBulkJobs ? "animate-spin" : ""}`}
+                />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-5">
+              {bulkJobs.length === 0 ? (
+                <div className="flex min-h-48 flex-col items-center justify-center text-slate-400">
+                  <ListChecks className="mb-3 h-8 w-8" />
+                  <p className="text-sm">暂无群发任务</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {bulkJobs.map((job) => {
+                    const completed = job.sent_count + job.failed_count;
+                    const progress = job.total_count
+                      ? Math.min(100, (completed / job.total_count) * 100)
+                      : 0;
+                    const cancellable =
+                      job.status === "queued" || job.status === "running";
+                    return (
+                      <article
+                        key={job.id}
+                        className="rounded-lg border border-slate-200 bg-white p-3 sm:p-4"
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <h3 className="max-w-full truncate text-sm font-semibold text-slate-900">
+                                {job.subject || "（无主题）"}
+                              </h3>
+                              <span
+                                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${bulkJobStatusClass(job.status)}`}
+                              >
+                                {bulkJobStatusLabel(job.status)}
+                              </span>
+                            </div>
+                            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
+                              <span>{job.total_count} 位收件人</span>
+                              <span className="text-emerald-700">
+                                成功 {job.sent_count}
+                              </span>
+                              {job.failed_count > 0 && (
+                                <span className="text-rose-700">
+                                  失败 {job.failed_count}
+                                </span>
+                              )}
+                              <span>{formatDate(job.created_at, true)}</span>
+                            </div>
+                          </div>
+                          {cancellable && (
+                            <button
+                              type="button"
+                              onClick={() => void cancelBulkJob(job)}
+                              disabled={cancellingBulkJobID === job.id}
+                              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
+                              title="取消群发任务"
+                            >
+                              {cancellingBulkJobID === job.id ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <Ban className="h-4 w-4" />
+                              )}
+                            </button>
+                          )}
+                        </div>
+                        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                          <div
+                            className={`h-full rounded-full ${job.failed_count > 0 ? "bg-amber-500" : "bg-sky-500"}`}
+                            style={{ width: `${progress}%` }}
+                          />
+                        </div>
+                        {job.last_error && (
+                          <p className="mt-2 line-clamp-2 text-xs text-rose-600">
+                            {job.last_error}
+                          </p>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </ModalShell>
+      )}
+
       {compose && (
         <div
           className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4"
@@ -3739,8 +3994,12 @@ export default function MailPage() {
           <div className="flex h-[96dvh] w-full max-w-4xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:h-auto sm:max-h-[94dvh] sm:rounded-lg">
             <div className="flex h-14 shrink-0 items-center justify-between bg-slate-900 px-4 text-white">
               <div className="flex items-center gap-2 text-sm font-semibold">
-                <Pencil className="h-4 w-4" />
-                新邮件
+                {compose.bulk ? (
+                  <Users className="h-4 w-4" />
+                ) : (
+                  <Pencil className="h-4 w-4" />
+                )}
+                {compose.bulk ? "群发邮件" : "新邮件"}
               </div>
               <div className="flex items-center gap-1">
                 <button
@@ -3763,6 +4022,36 @@ export default function MailPage() {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
+              {compose.context === "new" && (
+                <div className="mb-3 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setCompose((current) =>
+                        current ? { ...current, bulk: false } : current,
+                      )
+                    }
+                    className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium ${!compose.bulk ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                  >
+                    <Mail className="h-3.5 w-3.5" />
+                    普通发送
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setCompose((current) =>
+                        current
+                          ? { ...current, bulk: true, cc: "", bcc: "" }
+                          : current,
+                      )
+                    }
+                    className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium ${compose.bulk ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                  >
+                    <Users className="h-3.5 w-3.5" />
+                    逐封群发
+                  </button>
+                </div>
+              )}
               <datalist id="mail-contact-options">
                 {contacts.map((contact) => (
                   <option
@@ -3788,35 +4077,48 @@ export default function MailPage() {
                         : current,
                     )
                   }
-                  placeholder="收件人，可输入客户姓名搜索；多人用分号分隔"
-                  className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
-                />
-                <input
-                  list="mail-contact-options"
-                  value={compose.cc}
-                  onChange={(event) =>
-                    setCompose((current) =>
-                      current
-                        ? { ...current, cc: event.target.value }
-                        : current,
-                    )
+                  placeholder={
+                    compose.bulk
+                      ? "群发收件人，多人用分号分隔"
+                      : "收件人，可输入客户姓名搜索；多人用分号分隔"
                   }
-                  placeholder="抄送"
                   className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
                 />
-                <input
-                  list="mail-contact-options"
-                  value={compose.bcc}
-                  onChange={(event) =>
-                    setCompose((current) =>
-                      current
-                        ? { ...current, bcc: event.target.value }
-                        : current,
-                    )
-                  }
-                  placeholder="密送"
-                  className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
-                />
+                {compose.bulk ? (
+                  <div className="flex h-8 items-center justify-between border-b border-slate-100 px-2 text-xs text-slate-500">
+                    <span>逐封发送</span>
+                    <span>{splitAddresses(compose.to).length} 位收件人</span>
+                  </div>
+                ) : (
+                  <>
+                    <input
+                      list="mail-contact-options"
+                      value={compose.cc}
+                      onChange={(event) =>
+                        setCompose((current) =>
+                          current
+                            ? { ...current, cc: event.target.value }
+                            : current,
+                        )
+                      }
+                      placeholder="抄送"
+                      className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
+                    />
+                    <input
+                      list="mail-contact-options"
+                      value={compose.bcc}
+                      onChange={(event) =>
+                        setCompose((current) =>
+                          current
+                            ? { ...current, bcc: event.target.value }
+                            : current,
+                        )
+                      }
+                      placeholder="密送"
+                      className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
+                    />
+                  </>
+                )}
                 <input
                   value={compose.subject}
                   onChange={(event) =>
@@ -4045,7 +4347,13 @@ export default function MailPage() {
                 ) : (
                   <Send className="h-4 w-4" />
                 )}
-                {sending ? "发送中" : "发送"}
+                {sending
+                  ? compose.bulk
+                    ? "创建中"
+                    : "发送中"
+                  : compose.bulk
+                    ? "开始群发"
+                    : "发送"}
               </button>
             </div>
           </div>
