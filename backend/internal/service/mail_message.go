@@ -166,7 +166,7 @@ func (s *MailService) ListMessages(userID int64, folder string, page, pageSize i
 			all = filtered
 		}
 		if filter == "contacts" {
-			contacts, contactErr := s.ListContacts(userID, "")
+			contacts, contactErr := s.ListContacts(userID, "", false)
 			if contactErr != nil {
 				return nil, contactErr
 			}

@@ -9,7 +9,7 @@ import (
 	"yaerp/internal/model"
 )
 
-func (s *MailService) ListContacts(userID int64, query string) ([]model.MailContact, error) {
+func (s *MailService) ListContacts(userID int64, query string, includeCustomers bool) ([]model.MailContact, error) {
 	contacts, err := s.repo.ListContacts(userID, query)
 	if err != nil {
 		return nil, err
@@ -21,7 +21,19 @@ func (s *MailService) ListContacts(userID int64, query string) ([]model.MailCont
 		contacts[index].Sources = []string{"saved"}
 		byEmail[contacts[index].Email] = index
 	}
-	if s.tradeSvc != nil {
+	if includeCustomers {
+		if s.permSvc == nil {
+			return nil, ErrMailContactAccessDenied
+		}
+		isAdmin, adminErr := s.permSvc.IsAdmin(userID)
+		if adminErr != nil {
+			return nil, adminErr
+		}
+		if !isAdmin {
+			return nil, ErrMailContactAccessDenied
+		}
+	}
+	if includeCustomers && s.tradeSvc != nil {
 		customers, listErr := s.tradeSvc.ListCustomers(userID, query)
 		if listErr != nil {
 			return nil, listErr

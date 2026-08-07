@@ -363,7 +363,9 @@ func (h *MailHandler) BatchMessages(c *gin.Context) {
 }
 
 func (h *MailHandler) ListContacts(c *gin.Context) {
-	contacts, err := h.service.ListContacts(c.GetInt64("user_id"), c.Query("query"))
+	includeCustomers := strings.EqualFold(strings.TrimSpace(c.Query("include_customers")), "1") ||
+		strings.EqualFold(strings.TrimSpace(c.Query("include_customers")), "true")
+	contacts, err := h.service.ListContacts(c.GetInt64("user_id"), c.Query("query"), includeCustomers)
 	if err != nil {
 		handleMailError(c, err)
 		return
@@ -622,6 +624,8 @@ func parseMailDateQuery(value string) (time.Time, error) {
 
 func handleMailError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, service.ErrMailContactAccessDenied):
+		response.Forbidden(c, err.Error())
 	case errors.Is(err, service.ErrMailAccessDenied):
 		response.Forbidden(c, err.Error())
 	case errors.Is(err, service.ErrMailMessageNotFound):

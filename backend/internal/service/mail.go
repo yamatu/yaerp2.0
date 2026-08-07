@@ -43,6 +43,7 @@ var (
 	ErrMailDisabled             = errors.New("邮件服务尚未启用")
 	ErrMailAccountNotConfigured = errors.New("当前员工尚未绑定邮箱")
 	ErrMailAccessDenied         = errors.New("没有权限管理邮件配置")
+	ErrMailContactAccessDenied  = errors.New("只有管理员可以查看 ERP 客户通讯录")
 	ErrMailMessageNotFound      = errors.New("邮件不存在或已被移动")
 )
 

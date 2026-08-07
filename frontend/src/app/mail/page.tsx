@@ -62,6 +62,8 @@ import { useRouter } from "next/navigation";
 import { AuthGuard } from "@/components/auth/AuthGuard";
 import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
 import api from "@/lib/api";
+import { getStoredUser, isAdmin } from "@/lib/auth";
+import type { AuthUser } from "@/types";
 
 interface MailAccount {
   id: number;
@@ -500,6 +502,8 @@ export default function MailPage() {
   const previousInboxUnreadRef = useRef<number | null>(null);
   const mailStatusPollingRef = useRef(false);
   const mailAudioContextRef = useRef<AudioContext | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const adminMode = isAdmin(currentUser);
   const [account, setAccount] = useState<MailAccount | null | undefined>(
     undefined,
   );
@@ -547,6 +551,7 @@ export default function MailPage() {
   const [testingAccount, setTestingAccount] = useState(false);
   const [runningForward, setRunningForward] = useState(false);
   const [contacts, setContacts] = useState<MailContact[]>([]);
+  const [showCustomerContacts, setShowCustomerContacts] = useState(false);
   const [signatures, setSignatures] = useState<MailSignature[]>([]);
   const [signaturesOpen, setSignaturesOpen] = useState(false);
   const [signatureDraft, setSignatureDraft] =
@@ -804,9 +809,13 @@ export default function MailPage() {
 
   const loadContacts = useCallback(async () => {
     if (!account) return;
-    const res = await api.get<MailContact[]>("/mail/contacts");
+    const endpoint =
+      adminMode && showCustomerContacts
+        ? "/mail/contacts?include_customers=1"
+        : "/mail/contacts";
+    const res = await api.get<MailContact[]>(endpoint);
     if (res.code === 0 && res.data) setContacts(res.data);
-  }, [account]);
+  }, [account, adminMode, showCustomerContacts]);
 
   const loadSignatures = useCallback(async () => {
     if (!account) return;
@@ -975,6 +984,9 @@ export default function MailPage() {
     selectedFolderMeta?.role,
   ]);
 
+  useEffect(() => {
+    setCurrentUser(getStoredUser());
+  }, []);
   useEffect(() => {
     void loadAccount();
   }, [loadAccount]);
@@ -3496,7 +3508,7 @@ export default function MailPage() {
       {contactsOpen && (
         <ModalShell
           title="邮箱通讯录"
-          subtitle="集中管理 ERP 客户和个人联系人，可批量写信或查询历史往来"
+          subtitle="个人联系人按账号隔离；管理员可按需查看 ERP 客户信息"
           onClose={() => {
             setContactsOpen(false);
             setSelectedContactKeys(new Set());
@@ -3515,7 +3527,12 @@ export default function MailPage() {
                   ["saved", "个人联系人", contactCounts.saved],
                   ["alimail", "阿里邮箱", contactCounts.alimail],
                 ] as Array<[ContactSourceFilter, string, number]>
-              ).map(([value, label, count]) => (
+              )
+                .filter(
+                  ([value]) =>
+                    value !== "erp" || (adminMode && showCustomerContacts),
+                )
+                .map(([value, label, count]) => (
                 <button
                   key={value}
                   type="button"
@@ -3533,7 +3550,7 @@ export default function MailPage() {
                 </button>
               ))}
               <div className="mt-auto hidden rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-xs leading-5 text-emerald-700 lg:block">
-                ERP 客户和阿里邮箱公共通讯录为只读来源；个人联系人由当前员工跨邮箱共享，可编辑或删除。
+                个人联系人仅当前登录账号可见；阿里邮箱通讯录仅来自当前账号绑定的邮箱。ERP 客户信息默认隐藏。
               </div>
             </aside>
 
@@ -3573,6 +3590,21 @@ export default function MailPage() {
                       </button>
                     )}
                   </label>
+                  {adminMode && (
+                    <label className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 text-xs font-medium text-amber-800">
+                      <input
+                        type="checkbox"
+                        checked={showCustomerContacts}
+                        onChange={(event) => {
+                          setShowCustomerContacts(event.target.checked);
+                          setContactSourceFilter("all");
+                          setSelectedContactKeys(new Set());
+                        }}
+                        className="h-4 w-4 accent-amber-600"
+                      />
+                      查看 ERP 客户
+                    </label>
+                  )}
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
