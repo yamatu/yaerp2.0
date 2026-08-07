@@ -674,24 +674,25 @@ func (r *MailRepo) CompleteBulkRecipient(recipientID int64, status, messageID, e
 	if status != "sent" && status != "failed" {
 		return fmt.Errorf("invalid bulk recipient status")
 	}
-	_, err := r.db.Exec(
-		`WITH completed AS (
-		     UPDATE mail_bulk_recipients
-		        SET status=$2,message_id=$3,error_message=$4,
-		            sent_at=CASE WHEN $2='sent' THEN NOW() ELSE NULL END,updated_at=NOW()
-		      WHERE id=$1 AND status='sending'
-		  RETURNING job_id
-		 )
-		 UPDATE mail_bulk_jobs AS job
-		    SET sent_count=sent_count + CASE WHEN $2='sent' THEN 1 ELSE 0 END,
-		        failed_count=failed_count + CASE WHEN $2='failed' THEN 1 ELSE 0 END,
-		        last_error=CASE WHEN $2='failed' THEN $4 ELSE last_error END,
-		        updated_at=NOW()
-		   FROM completed WHERE job.id=completed.job_id`,
+	_, err := r.db.Exec(completeBulkRecipientSQL,
 		recipientID, status, strings.TrimSpace(messageID), strings.TrimSpace(errorMessage),
 	)
 	return err
 }
+
+const completeBulkRecipientSQL = `WITH completed AS (
+     UPDATE mail_bulk_recipients
+        SET status=$2::VARCHAR(16),message_id=$3::TEXT,error_message=$4::TEXT,
+            sent_at=CASE WHEN $2::VARCHAR(16)='sent' THEN NOW() ELSE NULL END,updated_at=NOW()
+      WHERE id=$1 AND status='sending'
+  RETURNING job_id
+ )
+ UPDATE mail_bulk_jobs AS job
+    SET sent_count=sent_count + CASE WHEN $2::VARCHAR(16)='sent' THEN 1 ELSE 0 END,
+        failed_count=failed_count + CASE WHEN $2::VARCHAR(16)='failed' THEN 1 ELSE 0 END,
+        last_error=CASE WHEN $2::VARCHAR(16)='failed' THEN $4::TEXT ELSE last_error END,
+        updated_at=NOW()
+   FROM completed WHERE job.id=completed.job_id`
 
 func (r *MailRepo) FinishBulkJob(jobID int64) error {
 	_, err := r.db.Exec(
@@ -727,7 +728,7 @@ func (r *MailRepo) FailBulkJob(jobID int64, errorMessage string) error {
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.Exec(
 		`UPDATE mail_bulk_recipients
-		    SET status='failed',error_message=$2,updated_at=NOW()
+		    SET status='failed',error_message=$2::TEXT,updated_at=NOW()
 		  WHERE job_id=$1 AND status IN ('pending','sending')`,
 		jobID, strings.TrimSpace(errorMessage),
 	); err != nil {
@@ -742,7 +743,7 @@ func (r *MailRepo) FailBulkJob(jobID int64, errorMessage string) error {
 		            WHEN EXISTS (SELECT 1 FROM mail_bulk_recipients WHERE job_id=job.id AND status='sent') THEN 'partial'
 		            ELSE 'failed'
 		        END,
-		        last_error=$2,finished_at=NOW(),updated_at=NOW()
+		        last_error=$2::TEXT,finished_at=NOW(),updated_at=NOW()
 		  WHERE job.id=$1`,
 		jobID, strings.TrimSpace(errorMessage),
 	); err != nil {

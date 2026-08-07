@@ -91,3 +91,12 @@ func TestSwitchDefaultMailAccountRejectsMissingTarget(t *testing.T) {
 		t.Fatalf("expected sql.ErrNoRows, got %v", err)
 	}
 }
+
+func TestCompleteBulkRecipientSQLTypesStatusParameters(t *testing.T) {
+	if strings.Count(completeBulkRecipientSQL, "$2::VARCHAR(16)") != 5 {
+		t.Fatalf("expected every status parameter use to be explicitly typed: %s", completeBulkRecipientSQL)
+	}
+	if !strings.Contains(completeBulkRecipientSQL, "$3::TEXT") || !strings.Contains(completeBulkRecipientSQL, "$4::TEXT") {
+		t.Fatalf("expected message parameters to be explicitly typed: %s", completeBulkRecipientSQL)
+	}
+}
