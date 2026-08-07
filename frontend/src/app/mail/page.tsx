@@ -1689,17 +1689,24 @@ export default function MailPage() {
     if (append && compose) {
       setCompose((current) => {
         if (!current) return current;
-        return selectedContacts.reduce(
+        const next = selectedContacts.reduce(
           (next, contact) => ({
             ...next,
             to: appendAddress(next.to, contact),
           }),
           current,
         );
+        const shouldUseBulk =
+          next.context === "new" &&
+          (next.bulk || splitAddresses(next.to).length > 1);
+        return shouldUseBulk
+          ? { ...next, bulk: true, cc: "", bcc: "" }
+          : next;
       });
     } else {
       setCompose({
         ...emptyCompose,
+        bulk: selectedContacts.length > 1,
         to: selectedContacts
           .map((contact) =>
             contact.name
@@ -3627,7 +3634,13 @@ export default function MailPage() {
                     ) : (
                       <Send className="h-4 w-4" />
                     )}
-                    {compose ? "加入收件人" : "写邮件"}
+                    {selectedContacts.length > 1
+                      ? compose
+                        ? "加入并逐封群发"
+                        : "逐封群发"
+                      : compose
+                        ? "加入收件人"
+                        : "写邮件"}
                     {selectedContacts.length > 0 &&
                       ` (${selectedContacts.length})`}
                   </button>
@@ -4118,7 +4131,7 @@ export default function MailPage() {
                 />
                 {compose.bulk ? (
                   <div className="flex h-8 items-center justify-between border-b border-slate-100 px-2 text-xs text-slate-500">
-                    <span>逐封发送</span>
+                    <span>每位收件人独立发送</span>
                     <span>{splitAddresses(compose.to).length} 位收件人</span>
                   </div>
                 ) : (

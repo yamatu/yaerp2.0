@@ -267,13 +267,74 @@ func TestNormalizeBulkRecipients(t *testing.T) {
 
 func TestPersonalizeBulkMessage(t *testing.T) {
 	message := personalizeBulkMessage(model.MailSendInput{
-		Subject: "Hello {{name}}", TextBody: "Account: {{email}}", CC: []string{"hidden@example.com"},
+		To: []string{"leaked@example.com"}, CC: []string{"hidden@example.com"}, BCC: []string{"secret@example.com"},
+		Subject: "Hello {{name}}", TextBody: "Account: {{email}}", InReplyTo: "previous@example.com",
+		References: []string{"previous@example.com"},
 	}, model.MailBulkRecipient{Name: "Jane", Email: "jane@example.com"})
 	if message.Subject != "Hello Jane" || message.TextBody != "Account: jane@example.com" {
 		t.Fatalf("unexpected personalized message: %#v", message)
 	}
-	if len(message.To) != 1 || len(message.CC) != 0 || !strings.Contains(message.To[0], "jane@example.com") {
+	if len(message.To) != 1 || len(message.CC) != 0 || len(message.BCC) != 0 ||
+		message.InReplyTo != "" || len(message.References) != 0 || !strings.Contains(message.To[0], "jane@example.com") {
 		t.Fatalf("bulk recipient isolation failed: %#v", message)
+	}
+	if err := validateBulkRecipientMessage(&message, "jane@example.com"); err != nil {
+		t.Fatalf("isolated bulk message was rejected: %v", err)
+	}
+	leaked := message
+	leaked.To = append(leaked.To, "other@example.com")
+	if err := validateBulkRecipientMessage(&leaked, "jane@example.com"); err == nil {
+		t.Fatal("bulk message with multiple visible recipients was accepted")
+	}
+}
+
+func TestBulkMessagesExposeOnlyCurrentRecipient(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	session := &mailSession{
+		settings: &model.MailServerSettings{DefaultDomain: "example.com"},
+		account:  &model.MailAccount{EmailAddress: "sales@example.com", DisplayName: "Sales"},
+	}
+	template := model.MailSendInput{
+		To: []string{"first@example.com", "second@example.com"}, CC: []string{"copy@example.com"},
+		BCC: []string{"blind@example.com"}, Subject: "Private offer", TextBody: "body", SaveToSent: true,
+	}
+	recipients := []model.MailBulkRecipient{
+		{Name: "First", Email: "first@example.com"},
+		{Name: "Second", Email: "second@example.com"},
+	}
+	messageIDs := make(map[string]struct{}, len(recipients))
+	for index, recipient := range recipients {
+		message := personalizeBulkMessage(template, recipient)
+		if err := validateBulkRecipientMessage(&message, recipient.Email); err != nil {
+			t.Fatalf("recipient %d failed isolation: %v", index, err)
+		}
+		to, _, err := parseMailAddresses(message.To)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, messageID, _, err := service.buildOutgoingMessage(session, &message, nil, to, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := service.parseMailData(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(parsed.To) != 1 || parsed.To[0].Address != recipient.Email || len(parsed.CC) != 0 || len(parsed.BCC) != 0 {
+			t.Fatalf("SMTP message exposed another recipient: %#v", parsed)
+		}
+		otherEmail := recipients[(index+1)%len(recipients)].Email
+		if strings.Contains(strings.ToLower(string(raw)), otherEmail) {
+			t.Fatalf("SMTP message for %s contains %s", recipient.Email, otherEmail)
+		}
+		aliTo, err := aliMailRecipients(message.To)
+		if err != nil || len(aliTo) != 1 || aliTo[0].Email != recipient.Email {
+			t.Fatalf("AliMail message exposed another recipient: %#v, %v", aliTo, err)
+		}
+		if _, exists := messageIDs[messageID]; exists {
+			t.Fatalf("bulk recipients shared message id %q", messageID)
+		}
+		messageIDs[messageID] = struct{}{}
 	}
 }
 

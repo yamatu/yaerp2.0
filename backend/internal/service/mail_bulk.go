@@ -234,6 +234,16 @@ func (s *MailService) processBulkJob(ctx context.Context, jobID int64) error {
 				if !marked {
 					continue
 				}
+				message := personalizeBulkMessage(template, recipient)
+				if isolationErr := validateBulkRecipientMessage(&message, recipient.Email); isolationErr != nil {
+					if completeErr := s.completeBulkRecipient(recipient.ID, "failed", "", cleanMailError(isolationErr)); completeErr != nil {
+						select {
+						case operationErrors <- completeErr:
+						default:
+						}
+					}
+					continue
+				}
 				select {
 				case <-ctx.Done():
 					select {
@@ -243,7 +253,6 @@ func (s *MailService) processBulkJob(ctx context.Context, jobID int64) error {
 					continue
 				case s.bulkSendSem <- struct{}{}:
 				}
-				message := personalizeBulkMessage(template, recipient)
 				result, sendErr := s.sendMessageForAccount(account, &message, attachments)
 				<-s.bulkSendSem
 				if sendErr != nil {
@@ -303,13 +312,27 @@ func personalizeBulkMessage(template model.MailSendInput, recipient model.MailBu
 		value = strings.ReplaceAll(value, "{{name}}", recipient.Name)
 		return strings.ReplaceAll(value, "{{email}}", recipient.Email)
 	}
-	template.Subject = replace(template.Subject)
-	template.TextBody = replace(template.TextBody)
-	template.HTMLBody = replace(template.HTMLBody)
-	template.To = []string{(&stdmail.Address{Name: recipient.Name, Address: recipient.Email}).String()}
-	template.CC = nil
-	template.BCC = nil
-	return template
+	return model.MailSendInput{
+		To:                 []string{(&stdmail.Address{Name: recipient.Name, Address: recipient.Email}).String()},
+		Subject:            replace(template.Subject),
+		TextBody:           replace(template.TextBody),
+		HTMLBody:           replace(template.HTMLBody),
+		SaveToSent:         template.SaveToSent,
+		Priority:           template.Priority,
+		RequestReadReceipt: template.RequestReadReceipt,
+		SignatureHTML:      template.SignatureHTML,
+	}
+}
+
+func validateBulkRecipientMessage(message *model.MailSendInput, recipientEmail string) error {
+	if message == nil || len(message.To) != 1 || len(message.CC) != 0 || len(message.BCC) != 0 {
+		return fmt.Errorf("群发收件人隔离校验失败")
+	}
+	address, err := stdmail.ParseAddress(message.To[0])
+	if err != nil || !strings.EqualFold(strings.TrimSpace(address.Address), strings.TrimSpace(recipientEmail)) {
+		return fmt.Errorf("群发收件人与发送地址不一致")
+	}
+	return nil
 }
 
 func (s *MailService) runBulkQueueReconciler(ctx context.Context) {
