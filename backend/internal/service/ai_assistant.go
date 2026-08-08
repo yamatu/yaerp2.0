@@ -2,8 +2,11 @@ package service
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
+	"time"
 
 	"yaerp/internal/model"
 )
@@ -17,9 +20,19 @@ type aiRowScanner interface {
 	Scan(dest ...any) error
 }
 
+type AIAssistantTestResult struct {
+	Provider   string `json:"provider"`
+	Protocol   string `json:"protocol"`
+	Model      string `json:"model"`
+	LatencyMS  int64  `json:"latency_ms"`
+	TextOK     bool   `json:"text_ok"`
+	ToolCallOK bool   `json:"tool_call_ok"`
+}
+
 const aiAssistantSelectColumns = `
-	id, name, description, endpoint, model, api_key, system_prompt,
-	enabled, is_default, supports_vision, supports_files, created_by, created_at, updated_at`
+	id, name, description, provider, api_protocol, endpoint, model, reasoning_effort,
+	api_key, system_prompt, enabled, is_default, supports_vision, supports_files,
+	supports_tools, created_by, created_at, updated_at`
 
 func scanActiveAIAssistant(scanner aiRowScanner) (*activeAIAssistant, error) {
 	var assistant activeAIAssistant
@@ -27,14 +40,18 @@ func scanActiveAIAssistant(scanner aiRowScanner) (*activeAIAssistant, error) {
 		&assistant.ID,
 		&assistant.Name,
 		&assistant.Description,
+		&assistant.Provider,
+		&assistant.APIProtocol,
 		&assistant.Endpoint,
 		&assistant.Model,
+		&assistant.ReasoningEffort,
 		&assistant.APIKey,
 		&assistant.SystemPrompt,
 		&assistant.Enabled,
 		&assistant.IsDefault,
 		&assistant.SupportsVision,
 		&assistant.SupportsFiles,
+		&assistant.SupportsTools,
 		&assistant.CreatedBy,
 		&assistant.CreatedAt,
 		&assistant.UpdatedAt,
@@ -85,13 +102,17 @@ func (s *AIService) ListAIAssistants(admin bool) ([]model.AIAssistant, error) {
 		endpoint, modelName := s.getActiveConfig()
 		if strings.TrimSpace(endpoint) != "" && strings.TrimSpace(modelName) != "" {
 			items = append(items, model.AIAssistant{
-				ID:          0,
-				Name:        "默认助手",
-				Description: "系统默认 AI 助手",
-				Model:       modelName,
-				HasAPIKey:   strings.TrimSpace(s.getAPIKey()) != "",
-				Enabled:     true,
-				IsDefault:   true,
+				ID:              0,
+				Name:            "默认助手",
+				Description:     "系统默认 AI 助手",
+				Provider:        "openai_compatible",
+				APIProtocol:     "chat_completions",
+				Model:           modelName,
+				ReasoningEffort: "auto",
+				HasAPIKey:       strings.TrimSpace(s.getAPIKey()) != "",
+				Enabled:         true,
+				IsDefault:       true,
+				SupportsTools:   true,
 			})
 		}
 	}
@@ -100,11 +121,15 @@ func (s *AIService) ListAIAssistants(admin bool) ([]model.AIAssistant, error) {
 }
 
 func (s *AIService) CreateAIAssistant(userID int64, input *model.AIAssistantInput) (*model.AIAssistant, error) {
-	name := strings.TrimSpace(input.Name)
-	endpoint := strings.TrimRight(strings.TrimSpace(input.Endpoint), "/")
-	modelName := strings.TrimSpace(input.Model)
-	if name == "" || endpoint == "" || modelName == "" {
-		return nil, fmt.Errorf("助手名称、API 端点和模型名称不能为空")
+	if input == nil {
+		return nil, fmt.Errorf("AI 助手配置不能为空")
+	}
+	name, provider, protocol, endpoint, modelName, reasoningEffort, err := normalizeAIAssistantInput(input)
+	if err != nil {
+		return nil, err
+	}
+	if provider == "openai" && strings.TrimSpace(input.APIKey) == "" {
+		return nil, fmt.Errorf("OpenAI 官方接口必须填写 API 密钥")
 	}
 
 	tx, err := s.db.Begin()
@@ -133,19 +158,24 @@ func (s *AIService) CreateAIAssistant(userID int64, input *model.AIAssistantInpu
 
 	row := tx.QueryRow(
 		`INSERT INTO ai_assistants
-		 (name, description, endpoint, model, api_key, system_prompt, enabled, is_default, supports_vision, supports_files, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		 (name, description, provider, api_protocol, endpoint, model, reasoning_effort,
+		  api_key, system_prompt, enabled, is_default, supports_vision, supports_files, supports_tools, created_by)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		 RETURNING `+aiAssistantSelectColumns,
 		name,
 		strings.TrimSpace(input.Description),
+		provider,
+		protocol,
 		endpoint,
 		modelName,
+		reasoningEffort,
 		strings.TrimSpace(input.APIKey),
 		strings.TrimSpace(input.SystemPrompt),
 		enabled,
 		isDefault,
 		input.SupportsVision,
 		input.SupportsFiles,
+		input.SupportsTools,
 		userID,
 	)
 	created, err := scanActiveAIAssistant(row)
@@ -161,16 +191,17 @@ func (s *AIService) CreateAIAssistant(userID int64, input *model.AIAssistantInpu
 }
 
 func (s *AIService) UpdateAIAssistant(id int64, input *model.AIAssistantInput) (*model.AIAssistant, error) {
+	if input == nil {
+		return nil, fmt.Errorf("AI 助手配置不能为空")
+	}
 	current, err := s.getAIAssistantByID(id, false)
 	if err != nil {
 		return nil, err
 	}
 
-	name := strings.TrimSpace(input.Name)
-	endpoint := strings.TrimRight(strings.TrimSpace(input.Endpoint), "/")
-	modelName := strings.TrimSpace(input.Model)
-	if name == "" || endpoint == "" || modelName == "" {
-		return nil, fmt.Errorf("助手名称、API 端点和模型名称不能为空")
+	name, provider, protocol, endpoint, modelName, reasoningEffort, err := normalizeAIAssistantInput(input)
+	if err != nil {
+		return nil, err
 	}
 	if current.IsDefault && !input.Enabled {
 		return nil, fmt.Errorf("默认助手不能停用，请先设置其他默认助手")
@@ -190,37 +221,45 @@ func (s *AIService) UpdateAIAssistant(id int64, input *model.AIAssistantInput) (
 		}
 	}
 
-	apiKey := current.APIKey
-	if strings.TrimSpace(input.APIKey) != "" {
-		apiKey = strings.TrimSpace(input.APIKey)
+	apiKey, err := updatedAIAssistantAPIKey(current, provider, endpoint, input)
+	if err != nil {
+		return nil, err
 	}
 
 	row := tx.QueryRow(
 		`UPDATE ai_assistants
 		 SET name = $2,
 		     description = $3,
-		     endpoint = $4,
-		     model = $5,
-		     api_key = $6,
-		     system_prompt = $7,
-		     enabled = $8,
-		     is_default = $9,
-		     supports_vision = $10,
-		     supports_files = $11,
+		     provider = $4,
+		     api_protocol = $5,
+		     endpoint = $6,
+		     model = $7,
+		     reasoning_effort = $8,
+		     api_key = $9,
+		     system_prompt = $10,
+		     enabled = $11,
+		     is_default = $12,
+		     supports_vision = $13,
+		     supports_files = $14,
+		     supports_tools = $15,
 		     updated_at = NOW()
 		 WHERE id = $1
 		 RETURNING `+aiAssistantSelectColumns,
 		id,
 		name,
 		strings.TrimSpace(input.Description),
+		provider,
+		protocol,
 		endpoint,
 		modelName,
+		reasoningEffort,
 		apiKey,
 		strings.TrimSpace(input.SystemPrompt),
 		enabled,
 		isDefault,
 		input.SupportsVision,
 		input.SupportsFiles,
+		input.SupportsTools,
 	)
 	updated, err := scanActiveAIAssistant(row)
 	if err == sql.ErrNoRows {
@@ -266,6 +305,67 @@ func (s *AIService) SetDefaultAIAssistant(id int64) (*model.AIAssistant, error) 
 	}
 	result := publicAIAssistant(updated, true)
 	return &result, nil
+}
+
+func (s *AIService) TestAIAssistant(id int64) (*AIAssistantTestResult, error) {
+	assistant, err := s.getAIAssistantByID(id, false)
+	if err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	response, err := s.callAssistantCompletion(assistant, []ChatMessage{
+		{Role: "system", Content: "You are a connectivity test. Reply with exactly YAERP_OK."},
+		{Role: "user", Content: "Run the connectivity test."},
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := &AIAssistantTestResult{
+		Provider: assistant.Provider, Protocol: assistant.APIProtocol,
+		Model: firstNonEmpty(response.Model, assistant.Model), LatencyMS: time.Since(started).Milliseconds(),
+		TextOK: isAIConnectionTestText(response.Reply),
+	}
+	if !assistant.SupportsTools {
+		return result, nil
+	}
+	tool := buildToolDefinition("yaerp_connection_test", "Return a YaERP connectivity-test acknowledgement.", map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"message": map[string]any{"type": "string"}},
+		"required":             []string{"message"},
+		"additionalProperties": false,
+	})
+	toolResponse, _, toolErr := s.callAssistantCompletionWithTools(assistant, []map[string]any{
+		{"role": "system", "content": "This is a connection test. You must call yaerp_connection_test once with message YAERP_OK."},
+		{"role": "user", "content": "Call the test function now."},
+	}, []openAIToolDefinition{tool})
+	if toolErr == nil && toolResponse != nil && len(toolResponse.Choices) > 0 {
+		result.ToolCallOK = isAIConnectionTestToolCall(toolResponse.Choices[0].Message.ToolCalls)
+	}
+	result.LatencyMS = time.Since(started).Milliseconds()
+	return result, nil
+}
+
+func isAIConnectionTestText(reply string) bool {
+	return strings.TrimSpace(reply) == "YAERP_OK"
+}
+
+func isAIConnectionTestToolCall(calls []openAIToolCall) bool {
+	if len(calls) != 1 || calls[0].Function.Name != "yaerp_connection_test" {
+		return false
+	}
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil || len(args) != 1 {
+		return false
+	}
+	message, ok := args["message"]
+	if !ok {
+		return false
+	}
+	var value string
+	if err := json.Unmarshal(message, &value); err != nil {
+		return false
+	}
+	return value == "YAERP_OK"
 }
 
 func (s *AIService) DeleteAIAssistant(id int64) error {
@@ -341,17 +441,101 @@ func (s *AIService) resolveAIAssistant(id int64) (*activeAIAssistant, error) {
 	}
 	return &activeAIAssistant{
 		AIAssistant: model.AIAssistant{
-			ID:          0,
-			Name:        "默认助手",
-			Description: "系统默认 AI 助手",
-			Endpoint:    endpoint,
-			Model:       modelName,
-			HasAPIKey:   strings.TrimSpace(s.getAPIKey()) != "",
-			Enabled:     true,
-			IsDefault:   true,
+			ID:              0,
+			Name:            "默认助手",
+			Description:     "系统默认 AI 助手",
+			Provider:        "openai_compatible",
+			APIProtocol:     "chat_completions",
+			Endpoint:        endpoint,
+			Model:           modelName,
+			ReasoningEffort: "auto",
+			HasAPIKey:       strings.TrimSpace(s.getAPIKey()) != "",
+			Enabled:         true,
+			IsDefault:       true,
+			SupportsTools:   true,
 		},
 		APIKey: s.getAPIKey(),
 	}, nil
+}
+
+func normalizeAIAssistantInput(input *model.AIAssistantInput) (name, provider, protocol, endpoint, modelName, reasoningEffort string, err error) {
+	name = strings.TrimSpace(input.Name)
+	provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	if provider == "" {
+		provider = "openai_compatible"
+	}
+	if provider != "openai" && provider != "openai_compatible" {
+		err = fmt.Errorf("不支持的 AI 提供商")
+		return
+	}
+	protocol = strings.ToLower(strings.TrimSpace(input.APIProtocol))
+	if protocol == "" {
+		if provider == "openai" {
+			protocol = "responses"
+		} else {
+			protocol = "chat_completions"
+		}
+	}
+	if protocol != "responses" && protocol != "chat_completions" {
+		err = fmt.Errorf("不支持的 AI API 协议")
+		return
+	}
+	if provider == "openai" {
+		endpoint = "https://api.openai.com/v1"
+		protocol = "responses"
+	} else {
+		endpoint = strings.TrimRight(strings.TrimSpace(input.Endpoint), "/")
+	}
+	modelName = strings.TrimSpace(input.Model)
+	if name == "" || endpoint == "" || modelName == "" {
+		err = fmt.Errorf("助手名称、API 端点和模型名称不能为空")
+		return
+	}
+	parsedURL, parseErr := url.Parse(endpoint)
+	if parseErr != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.User != nil {
+		err = fmt.Errorf("API 端点必须是有效的 HTTP(S) 地址")
+		return
+	}
+	reasoningEffort = strings.ToLower(strings.TrimSpace(input.ReasoningEffort))
+	if reasoningEffort == "" {
+		reasoningEffort = "auto"
+	}
+	switch reasoningEffort {
+	case "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max":
+	default:
+		err = fmt.Errorf("不支持的模型能力等级")
+	}
+	return
+}
+
+func updatedAIAssistantAPIKey(current *activeAIAssistant, provider, endpoint string, input *model.AIAssistantInput) (string, error) {
+	if current == nil || input == nil {
+		return "", fmt.Errorf("AI 助手配置不能为空")
+	}
+	if input.ClearAPIKey {
+		if provider == "openai" {
+			return "", fmt.Errorf("OpenAI 官方接口必须保留或填写 API 密钥")
+		}
+		return "", nil
+	}
+	if apiKey := strings.TrimSpace(input.APIKey); apiKey != "" {
+		return apiKey, nil
+	}
+
+	// A saved bearer token belongs to its current trust boundary. Never send it
+	// to a newly selected provider or endpoint unless the administrator enters
+	// it again explicitly.
+	sameCredentialBoundary := current.Provider == provider && strings.TrimRight(strings.TrimSpace(current.Endpoint), "/") == endpoint
+	if sameCredentialBoundary {
+		if provider == "openai" && strings.TrimSpace(current.APIKey) == "" {
+			return "", fmt.Errorf("OpenAI 官方接口必须保留或填写 API 密钥")
+		}
+		return current.APIKey, nil
+	}
+	if provider == "openai" {
+		return "", fmt.Errorf("切换到 OpenAI 官方接口时必须重新填写 API 密钥")
+	}
+	return "", nil
 }
 
 func (s *AIService) aiAssistantsMigrated() bool {

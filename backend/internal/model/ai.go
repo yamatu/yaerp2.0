@@ -3,33 +3,42 @@ package model
 import "time"
 
 type AIAssistant struct {
-	ID             int64     `json:"id"`
-	Name           string    `json:"name"`
-	Description    string    `json:"description"`
-	Endpoint       string    `json:"endpoint,omitempty"`
-	Model          string    `json:"model"`
-	HasAPIKey      bool      `json:"has_api_key"`
-	SystemPrompt   string    `json:"system_prompt,omitempty"`
-	Enabled        bool      `json:"enabled"`
-	IsDefault      bool      `json:"is_default"`
-	SupportsVision bool      `json:"supports_vision"`
-	SupportsFiles  bool      `json:"supports_files"`
-	CreatedBy      *int64    `json:"created_by,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID              int64     `json:"id"`
+	Name            string    `json:"name"`
+	Description     string    `json:"description"`
+	Provider        string    `json:"provider"`
+	APIProtocol     string    `json:"api_protocol"`
+	Endpoint        string    `json:"endpoint,omitempty"`
+	Model           string    `json:"model"`
+	ReasoningEffort string    `json:"reasoning_effort"`
+	HasAPIKey       bool      `json:"has_api_key"`
+	SystemPrompt    string    `json:"system_prompt,omitempty"`
+	Enabled         bool      `json:"enabled"`
+	IsDefault       bool      `json:"is_default"`
+	SupportsVision  bool      `json:"supports_vision"`
+	SupportsFiles   bool      `json:"supports_files"`
+	SupportsTools   bool      `json:"supports_tools"`
+	CreatedBy       *int64    `json:"created_by,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type AIAssistantInput struct {
-	Name           string `json:"name" binding:"required"`
-	Description    string `json:"description"`
-	Endpoint       string `json:"endpoint" binding:"required"`
-	Model          string `json:"model" binding:"required"`
-	APIKey         string `json:"api_key"`
-	SystemPrompt   string `json:"system_prompt"`
-	Enabled        bool   `json:"enabled"`
-	IsDefault      bool   `json:"is_default"`
-	SupportsVision bool   `json:"supports_vision"`
-	SupportsFiles  bool   `json:"supports_files"`
+	Name            string `json:"name" binding:"required"`
+	Description     string `json:"description"`
+	Provider        string `json:"provider"`
+	APIProtocol     string `json:"api_protocol"`
+	Endpoint        string `json:"endpoint"`
+	Model           string `json:"model" binding:"required"`
+	ReasoningEffort string `json:"reasoning_effort"`
+	APIKey          string `json:"api_key"`
+	ClearAPIKey     bool   `json:"clear_api_key"`
+	SystemPrompt    string `json:"system_prompt"`
+	Enabled         bool   `json:"enabled"`
+	IsDefault       bool   `json:"is_default"`
+	SupportsVision  bool   `json:"supports_vision"`
+	SupportsFiles   bool   `json:"supports_files"`
+	SupportsTools   bool   `json:"supports_tools"`
 }
 
 type AISummaryMetric struct {

@@ -134,7 +134,7 @@ func (s *AIService) generateAISummaryContent(assistant *activeAIAssistant, title
 		userPrompt = "请总结关键指标、异常、趋势和后续建议。"
 	}
 
-	response, err := s.callChatCompletion(assistant.Endpoint, assistant.APIKey, assistant.Model, []ChatMessage{
+	response, err := s.callAssistantCompletion(assistant, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: fmt.Sprintf("页面标题：%s\n分析要求：%s\n\n可访问数据(JSON)：\n%s", title, userPrompt, string(contextJSON))},
 	})

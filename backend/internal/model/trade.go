@@ -406,6 +406,12 @@ type TradeOrder struct {
 	WorkspaceFolderName          string                    `json:"workspace_folder_name"`
 	ChannelID                    *int64                    `json:"channel_id,omitempty"`
 	Notes                        string                    `json:"notes"`
+	Source                       string                    `json:"source"`
+	DataStatus                   string                    `json:"data_status"`
+	AIImportID                   string                    `json:"ai_import_id,omitempty"`
+	AISourceText                 string                    `json:"ai_source_text,omitempty"`
+	AIMissingFields              []string                  `json:"ai_missing_fields,omitempty"`
+	AIImportModel                string                    `json:"ai_import_model,omitempty"`
 	LabelWidthMM                 float64                   `json:"label_width_mm"`
 	LabelHeightMM                float64                   `json:"label_height_mm"`
 	LabelPaperSize               string                    `json:"label_paper_size"`
@@ -715,12 +721,22 @@ type CreateTradeOrderRequest struct {
 	CreateWorkspace    *bool                         `json:"create_workspace"`
 	SharedWorkspace    *bool                         `json:"shared_workspace"`
 	WorkbookFolderID   *int64                        `json:"workbook_folder_id"`
+	// AI import metadata is service-internal and cannot be supplied through the
+	// public create-order API.
+	AIImportID      string   `json:"-"`
+	AISourceText    string   `json:"-"`
+	AIMissingFields []string `json:"-"`
+	AIImportModel   string   `json:"-"`
 }
 
 type AdvanceTradeOrderRequest struct {
 	ToStage string `json:"to_stage" binding:"required"`
 	Note    string `json:"note"`
 }
+
+// AI import records are intentionally cleared by an explicit user action after
+// the operator has filled and checked the missing fields in the order/workbook.
+type CompleteAITradeImportRequest struct{}
 
 type CreateTradeSupplierRequest struct {
 	Name            string `json:"name" binding:"required"`

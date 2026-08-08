@@ -76,6 +76,8 @@ type SheetStateAction =
 type SheetSortBy = "workflow" | "updated_at" | "created_at" | "name";
 type SheetSortOrder = "asc" | "desc";
 
+const EMPTY_SHEETS: Sheet[] = [];
+
 function isSheetSortBy(value: unknown): value is SheetSortBy {
   return (
     value === "workflow" ||
@@ -180,7 +182,9 @@ export default function WorkbookEditorShell({
     setReloadToken((prev) => prev + 1);
   }, [refresh]);
 
-  const sheets = workbook?.sheets || [];
+  // Keep the empty fallback stable so derived dependencies do not change on
+  // every render while the workbook is loading.
+  const sheets = workbook?.sheets ?? EMPTY_SHEETS;
   const isAdminUser = Boolean(currentUser && isAdmin(currentUser));
   const canManageWorkbook = Boolean(
     currentUser &&
@@ -333,14 +337,22 @@ export default function WorkbookEditorShell({
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
   }, []);
 
-  // Stable sheet-id list so the redirect effect does not re-fire on every
-  // workbook refresh (which gives a new `sheets` array reference).
+  // Recompute the id list only when the workbook's sheet collection changes.
   const sheetIds = useMemo(() => sheets.map((s) => s.id), [sheets]);
 
   useEffect(() => {
-    setSelectedSheetIds((current) =>
-      current.filter((id) => sheetIds.includes(id)),
-    );
+    setSelectedSheetIds((current) => {
+      const next = current.filter((id) => sheetIds.includes(id));
+      // Returning the existing reference is important here: `filter()`
+      // creates a new array even when no selection needs to change.
+      if (
+        next.length === current.length &&
+        next.every((id, index) => id === current[index])
+      ) {
+        return current;
+      }
+      return next;
+    });
   }, [sheetIds]);
 
   useEffect(() => {

@@ -762,17 +762,63 @@ export interface AIAssistant {
   id: number;
   name: string;
   description: string;
+  provider: "openai" | "openai_compatible";
+  api_protocol: "responses" | "chat_completions";
   endpoint?: string;
   model: string;
+  reasoning_effort: "auto" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   has_api_key: boolean;
   system_prompt?: string;
   enabled: boolean;
   is_default: boolean;
   supports_vision: boolean;
   supports_files: boolean;
+  supports_tools: boolean;
   created_by?: number;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface AITradeOrderImportItem {
+  sku: string;
+  product_name: string;
+  description: string;
+  specification: string;
+  quantity: number;
+  unit: string;
+  sales_unit_price: number;
+  supplier_name: string;
+  purchase_currency: string;
+  purchase_unit_price: number;
+}
+
+export interface AITradeOrderImportDraft {
+  import_id: string;
+  raw_text: string;
+  assistant_id?: number;
+  model?: string;
+  target_stage: "receiving";
+  customer_id?: number;
+  customer_query: string;
+  customer_name: string;
+  country: string;
+  title: string;
+  priority: "low" | "normal" | "high" | "urgent";
+  currency: string;
+  destination_country: string;
+  payment_method: string;
+  settlement_currency: string;
+  settlement_amount: number;
+  goods_amount: number;
+  shipping_cost: number;
+  total_amount: number;
+  workbook_folder_id?: number;
+  create_workspace: boolean;
+  shared_workspace: false;
+  items: AITradeOrderImportItem[];
+  warnings: string[];
+  missing_fields: string[];
+  confidence: number;
 }
 
 export interface AISummaryMetric {
@@ -1677,6 +1723,12 @@ export interface TradeOrder {
   workspace_folder_name: string;
   channel_id?: number;
   notes: string;
+  source: "manual" | "ai_import";
+  data_status: "ready" | "incomplete" | "importing";
+  ai_import_id?: string;
+  ai_source_text?: string;
+  ai_missing_fields?: string[];
+  ai_import_model?: string;
   label_width_mm: number;
   label_height_mm: number;
   label_paper_size: string;

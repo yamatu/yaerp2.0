@@ -368,6 +368,12 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	if err != nil {
 		return err
 	}
+	// Keep the original unstructured import for audit on the server. It can mix
+	// customer pricing, supplier cost, and payment details, so only a fully
+	// privileged trade view may receive it.
+	if !orderAccess.CanViewCustomerPricing || !orderAccess.CanViewSupplierPricing || !orderAccess.CanViewPaymentRecords {
+		order.AISourceText = ""
+	}
 	order.Access = orderAccess
 	if order.WorkbookID != nil {
 		if sheetID, sheetErr := s.repo.FirstSheetIDByNames(*order.WorkbookID, orderAccess.VisibleSheetNames); sheetErr == nil {

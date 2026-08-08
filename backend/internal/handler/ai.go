@@ -149,6 +149,34 @@ func (h *AIHandler) ApplyERPPlan(c *gin.Context) {
 	response.OK(c, result)
 }
 
+func (h *AIHandler) PreviewERPOrderImport(c *gin.Context) {
+	var req service.AITradeOrderPreviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.aiService.PreviewAITradeOrder(c.GetInt64("user_id"), &req)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
+func (h *AIHandler) ApplyERPOrderImport(c *gin.Context) {
+	var req service.AITradeOrderApplyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.aiService.ApplyAITradeOrder(c.GetInt64("user_id"), &req)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *AIHandler) ListAvailableAssistants(c *gin.Context) {
 	items, err := h.aiService.ListAIAssistants(false)
 	if err != nil {
@@ -225,6 +253,20 @@ func (h *AIHandler) SetDefaultAssistant(c *gin.Context) {
 		return
 	}
 	response.OK(c, item)
+}
+
+func (h *AIHandler) TestAssistant(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.BadRequest(c, "invalid assistant id")
+		return
+	}
+	result, err := h.aiService.TestAIAssistant(id)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
 }
 
 func (h *AIHandler) ListSummaryPages(c *gin.Context) {

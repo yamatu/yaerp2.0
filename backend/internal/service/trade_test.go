@@ -588,6 +588,17 @@ func TestTradeOrderAdvanceBlockers(t *testing.T) {
 	}
 }
 
+func TestTradeOrderAdvanceBlockersRejectsImportStillInProgress(t *testing.T) {
+	order := &model.TradeOrder{
+		Stage: model.TradeStageReceiving, Source: "ai_import", DataStatus: "importing",
+		Items: []model.TradeOrderItem{{ID: 1, ProductName: "产品", Quantity: 1, ReceivedQuantity: 1}},
+	}
+	blockers := tradeOrderAdvanceBlockers(order)
+	if len(blockers) != 1 || blockers[0] != "AI 导入仍在处理中，请等待系统完成导入" {
+		t.Fatalf("importing order blockers = %#v", blockers)
+	}
+}
+
 func TestDefaultTradeSupplierQuoteCurrencyUsesCNYForDomesticSuppliers(t *testing.T) {
 	for _, supplier := range []*model.TradeSupplier{
 		nil,

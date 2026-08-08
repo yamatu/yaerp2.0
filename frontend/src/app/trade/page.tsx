@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   BarChart3,
+  Bot,
   Boxes,
   BriefcaseBusiness,
   Calculator,
@@ -44,6 +45,7 @@ import {
   Ship,
   ShoppingCart,
   SlidersHorizontal,
+  Sparkles,
   Store,
   Trash2,
   Truck,
@@ -74,6 +76,9 @@ import {
   type ImageTransform,
 } from "@/lib/imageTransform";
 import type {
+  AIAssistant,
+  AITradeOrderImportDraft,
+  AITradeOrderImportItem,
   TradeCustomer,
   TradeCustomerDeleteRequest,
   TradeCustomerQuoteRound,
@@ -499,6 +504,21 @@ function newOrderItem(): OrderItemDraft {
   };
 }
 
+function newAIImportItem(): AITradeOrderImportItem {
+  return {
+    sku: "",
+    product_name: "",
+    description: "",
+    specification: "",
+    quantity: 1,
+    unit: "件",
+    sales_unit_price: 0,
+    supplier_name: "",
+    purchase_currency: "",
+    purchase_unit_price: 0,
+  };
+}
+
 function newOrderDraft(
   customerId = 0,
   paymentMethod = "T/T 电汇",
@@ -517,7 +537,7 @@ function newOrderDraft(
     payment_method: paymentMethod,
     notes: "",
     create_workspace: true,
-    shared_workspace: true,
+    shared_workspace: false,
     workbook_folder_id: workbookFolderID,
   };
 }
@@ -1036,6 +1056,18 @@ export default function TradeWorkspacePage() {
     newOrderItem(),
   ]);
   const [savingOrder, setSavingOrder] = useState(false);
+  const [aiImportOpen, setAIImportOpen] = useState(false);
+  const [aiImportRawText, setAIImportRawText] = useState("");
+  const [aiImportDraft, setAIImportDraft] =
+    useState<AITradeOrderImportDraft | null>(null);
+  const [aiImportAssistants, setAIImportAssistants] = useState<AIAssistant[]>(
+    [],
+  );
+  const [aiImportAssistantID, setAIImportAssistantID] = useState<number | "">(
+    "",
+  );
+  const [parsingAIImport, setParsingAIImport] = useState(false);
+  const [applyingAIImport, setApplyingAIImport] = useState(false);
   const [itemModalOpen, setItemModalOpen] = useState(false);
   const [additionalItems, setAdditionalItems] = useState<OrderItemDraft[]>([
     newOrderItem(),
@@ -1123,6 +1155,7 @@ export default function TradeWorkspacePage() {
   >("inquiry");
   const [detailLoading, setDetailLoading] = useState(false);
   const [flowing, setFlowing] = useState(false);
+  const [completingAIImport, setCompletingAIImport] = useState(false);
   const [advanceNote, setAdvanceNote] = useState("");
   const [syncingWorkbook, setSyncingWorkbook] = useState(false);
   const [inspectionItemID, setInspectionItemID] = useState<
@@ -1173,6 +1206,26 @@ export default function TradeWorkspacePage() {
   const [piAction, setPIAction] = useState<
     "preview" | "download" | "send" | null
   >(null);
+
+  const createWorkbookFolder = useCallback(
+    async (name: string, parentID?: number) => {
+      const createResponse = await api.post<{ id: number }>("/folders", {
+        name,
+        parent_id: parentID,
+      });
+      if (createResponse.code !== 0 || !createResponse.data?.id) {
+        throw new Error(createResponse.message || "创建文件夹失败");
+      }
+
+      const optionsResponse = await api.get<FolderOption[]>("/folders/options");
+      if (optionsResponse.code !== 0) {
+        throw new Error(optionsResponse.message || "刷新文件夹列表失败");
+      }
+      setFolderOptions(optionsResponse.data || []);
+      return createResponse.data.id;
+    },
+    [],
+  );
 
   const loadData = useCallback(
     async (quiet = false) => {
@@ -1885,6 +1938,117 @@ export default function TradeWorkspacePage() {
     setOrderItems([newOrderItem()]);
     setOrderModalOpen(true);
     setError("");
+  };
+
+  const openAIImport = async () => {
+    setAIImportOpen(true);
+    setAIImportDraft(null);
+    setAIImportRawText("");
+    setError("");
+    try {
+      const response = await api.get<AIAssistant[]>("/ai/assistants");
+      if (response.code !== 0)
+        throw new Error(response.message || "加载 AI 助手失败");
+      const assistants = response.data || [];
+      setAIImportAssistants(assistants);
+      const preferred =
+        assistants.find((assistant) => assistant.is_default) || assistants[0];
+      setAIImportAssistantID(preferred?.id || "");
+    } catch (assistantError) {
+      setAIImportAssistants([]);
+      setAIImportAssistantID("");
+      setNotice(
+        assistantError instanceof Error
+          ? `${assistantError.message}，仍可使用本地规则识别。`
+          : "AI 助手加载失败，仍可使用本地规则识别。",
+      );
+    }
+  };
+
+  const parseAIImport = async () => {
+    if (!aiImportRawText.trim()) {
+      setError("请先粘贴聊天、报价或付款资料。");
+      return;
+    }
+    setParsingAIImport(true);
+    setError("");
+    try {
+      const response = await api.post<AITradeOrderImportDraft>(
+        "/ai/erp/import/preview",
+        {
+          assistant_id: aiImportAssistantID || undefined,
+          raw_text: aiImportRawText.trim(),
+          target_stage: "receiving",
+        },
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "AI 订单识别失败");
+      setAIImportDraft(response.data);
+    } catch (parseError) {
+      setError(
+        parseError instanceof Error ? parseError.message : "AI 订单识别失败",
+      );
+    } finally {
+      setParsingAIImport(false);
+    }
+  };
+
+  const updateAIImportItem = (
+    index: number,
+    key: keyof AITradeOrderImportItem,
+    value: string | number,
+  ) => {
+    setAIImportDraft((current) =>
+      current
+        ? {
+            ...current,
+            items: current.items.map((item, itemIndex) =>
+              itemIndex === index ? { ...item, [key]: value } : item,
+            ),
+          }
+        : current,
+    );
+  };
+
+  const applyAIImport = async () => {
+    if (!aiImportDraft) return;
+    if (!aiImportDraft.customer_id && !aiImportDraft.customer_name.trim()) {
+      setError("请先选择已有客户，或补充未匹配客户的名称。");
+      return;
+    }
+    if (
+      !aiImportDraft.title.trim() ||
+      aiImportDraft.items.length === 0 ||
+      aiImportDraft.items.some(
+        (item) => !item.product_name.trim() || Number(item.quantity) <= 0,
+      )
+    ) {
+      setError("请补全订单主题、产品名称和有效数量后再创建。");
+      return;
+    }
+    setApplyingAIImport(true);
+    setError("");
+    try {
+      const response = await api.post<TradeOrder>("/ai/erp/import/apply", {
+        draft: { ...aiImportDraft, shared_workspace: false },
+      });
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "AI 建单失败");
+      setAIImportOpen(false);
+      setAIImportDraft(null);
+      setAIImportRawText("");
+      setDetailOrder(response.data);
+      detailOrderIDRef.current = response.data.id;
+      setDetailViewStage("receiving");
+      setNotice(
+        `${response.data.order_no} 已由 AI 创建并进入仓库到货，未识别字段可继续人工补充。`,
+      );
+      await loadData(true);
+    } catch (applyError) {
+      setError(applyError instanceof Error ? applyError.message : "AI 建单失败");
+    } finally {
+      setApplyingAIImport(false);
+    }
   };
 
   const updateOrderItem = (
@@ -2667,6 +2831,31 @@ export default function TradeWorkspacePage() {
       );
     } finally {
       setFlowing(false);
+    }
+  };
+
+  const completeAIImport = async () => {
+    if (!detailOrder || completingAIImport) return;
+    setCompletingAIImport(true);
+    setError("");
+    try {
+      const response = await api.post<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/ai-import/complete`,
+      );
+      if (response.code !== 0 || !response.data) {
+        throw new Error(response.message || "确认 AI 导入资料失败");
+      }
+      setDetailOrder(response.data);
+      setNotice("AI 导入待补标记已清除，现在可以按正常流程继续推进。");
+      await loadData(true);
+    } catch (completeError) {
+      setError(
+        completeError instanceof Error
+          ? completeError.message
+          : "确认 AI 导入资料失败",
+      );
+    } finally {
+      setCompletingAIImport(false);
     }
   };
 
@@ -3484,6 +3673,17 @@ export default function TradeWorkspacePage() {
                 >
                   <UserPlus className="h-4 w-4" />
                   录入客户
+                </button>
+              )}
+              {tradeAccess?.can_create_orders && (
+                <button
+                  type="button"
+                  onClick={() => void openAIImport()}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 text-sm font-semibold text-sky-700 hover:bg-sky-100"
+                >
+                  <Sparkles className="h-4 w-4" />
+                  <span className="hidden sm:inline">AI 智能建单</span>
+                  <span className="sm:hidden">AI 建单</span>
                 </button>
               )}
               {tradeAccess?.can_create_orders && (
@@ -4986,6 +5186,7 @@ export default function TradeWorkspacePage() {
                     <FolderCombobox
                       folders={folderOptions}
                       value={customerDraft.workbook_folder_id}
+                      onCreateFolder={createWorkbookFolder}
                       onChange={(folderID) =>
                         setCustomerDraft((current) => ({
                           ...current,
@@ -5252,6 +5453,607 @@ export default function TradeWorkspacePage() {
           </div>
         )}
 
+        {aiImportOpen && (
+          <div
+            className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            onMouseDown={(event) => {
+              if (
+                event.target === event.currentTarget &&
+                !parsingAIImport &&
+                !applyingAIImport
+              )
+                setAIImportOpen(false);
+            }}
+          >
+            <div className="flex max-h-[95vh] w-full max-w-6xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+              <div className="flex items-start justify-between border-b border-slate-200 px-4 py-3">
+                <div className="flex min-w-0 items-start gap-3">
+                  <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-50 text-sky-700">
+                    <Bot className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <h2 className="font-semibold">AI 智能建单</h2>
+                    <p className="mt-0.5 text-xs text-slate-500">
+                      先识别为可编辑草稿；确认后创建私有流程工作簿，并进入仓库到货。
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAIImportOpen(false)}
+                  disabled={parsingAIImport || applyingAIImport}
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 disabled:opacity-40"
+                  title="关闭"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_240px]">
+                  <label className="text-sm font-medium text-slate-700">
+                    粘贴原始资料
+                    <textarea
+                      value={aiImportRawText}
+                      onChange={(event) => setAIImportRawText(event.target.value)}
+                      className="mt-1.5 min-h-40 w-full resize-y rounded-lg border border-slate-200 px-3 py-2 font-mono text-sm leading-6 outline-none focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
+                      placeholder={"A860-0309-T302 $104 卖3个\n104*3=$312\nShipping cost:$78\nTotal:$390\nPay MXN:6942.00\n墨西哥Cristain\n供应商汤米 A860-0309-T302 原装3500 单价"}
+                    />
+                  </label>
+                  <div className="space-y-3">
+                    <label className="block text-sm font-medium text-slate-700">
+                      识别模型
+                      <select
+                        value={aiImportAssistantID}
+                        onChange={(event) =>
+                          setAIImportAssistantID(
+                            event.target.value ? Number(event.target.value) : "",
+                          )
+                        }
+                        className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none"
+                      >
+                        <option value="">系统默认 / 本地规则</option>
+                        {aiImportAssistants.map((assistant) => (
+                          <option key={assistant.id} value={assistant.id}>
+                            {assistant.name} · {assistant.model}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2.5">
+                      <div className="text-xs font-medium text-cyan-800">
+                        目标环节
+                      </div>
+                      <div className="mt-1 flex items-center gap-2 text-sm font-semibold text-cyan-950">
+                        <Warehouse className="h-4 w-4" />仓库到货
+                      </div>
+                      <div className="mt-1 text-xs leading-5 text-cyan-700">
+                        实到数量保持为 0，等待仓库手动登记。
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void parseAIImport()}
+                      disabled={parsingAIImport || !aiImportRawText.trim()}
+                      className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-40"
+                    >
+                      {parsingAIImport ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Sparkles className="h-4 w-4" />
+                      )}
+                      {aiImportDraft ? "重新识别" : "识别订单资料"}
+                    </button>
+                  </div>
+                </div>
+
+                {aiImportDraft && (
+                  <div className="mt-5 space-y-5 border-t border-slate-200 pt-5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-sm font-semibold text-slate-900">
+                          识别结果
+                        </h3>
+                        <p className="mt-0.5 text-xs text-slate-500">
+                          {aiImportDraft.model
+                            ? `模型 ${aiImportDraft.model}`
+                            : "本地规则识别"}
+                          {` · 置信度 ${Math.round(aiImportDraft.confidence * 100)}%`}
+                        </p>
+                      </div>
+                      <span
+                        className={`rounded-md px-2 py-1 text-xs font-semibold ${aiImportDraft.missing_fields.length ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}
+                      >
+                        {aiImportDraft.missing_fields.length
+                          ? `${aiImportDraft.missing_fields.length} 项待补`
+                          : "关键字段齐全"}
+                      </span>
+                    </div>
+
+                    {(aiImportDraft.warnings.length > 0 ||
+                      aiImportDraft.missing_fields.length > 0) && (
+                      <div className="grid gap-3 lg:grid-cols-2">
+                        {aiImportDraft.missing_fields.length > 0 && (
+                          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-800">
+                            <span className="font-semibold">待人工补充：</span>
+                            {aiImportDraft.missing_fields.join("、")}
+                          </div>
+                        )}
+                        {aiImportDraft.warnings.length > 0 && (
+                          <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs leading-5 text-rose-700">
+                            <span className="font-semibold">核对提示：</span>
+                            {aiImportDraft.warnings.join("；")}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                      <label className="text-sm font-medium text-slate-700 sm:col-span-2">
+                        客户<span className="text-rose-500"> *</span>
+                        <div className="mt-1.5">
+                          <CustomerCombobox
+                            customers={customers}
+                            value={aiImportDraft.customer_id || 0}
+                            onChange={(customerID, customer) =>
+                              setAIImportDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      customer_id: customerID,
+                                      customer_name: customer.name,
+                                      customer_query: customer.name,
+                                      country:
+                                        current.country || customer.country,
+                                      destination_country:
+                                        current.destination_country ||
+                                        customer.country,
+                                      workbook_folder_id:
+                                        current.workbook_folder_id ||
+                                        customer.workbook_folder_id,
+                                    }
+                                  : current,
+                              )
+                            }
+                          />
+                          {!aiImportDraft.customer_id && (
+                            <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50/60 p-2">
+                              <input
+                                value={aiImportDraft.customer_name}
+                                onChange={(event) =>
+                                  setAIImportDraft((current) =>
+                                    current
+                                      ? {
+                                          ...current,
+                                          customer_name: event.target.value,
+                                          customer_query: event.target.value,
+                                        }
+                                      : current,
+                                  )
+                                }
+                                placeholder="未匹配时填写客户名称，确认后自动建立待核验档案"
+                                className="h-9 w-full rounded-md border border-amber-200 bg-white px-2.5 text-sm outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100"
+                              />
+                              <p className="mt-1 text-[11px] leading-5 text-amber-700">
+                                找不到已有客户时，系统会以当前名称建立私有客户档案，不自动创建内部共享。
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </label>
+                      <label className="text-sm font-medium text-slate-700 sm:col-span-2">
+                        订单主题<span className="text-rose-500"> *</span>
+                        <input
+                          value={aiImportDraft.title}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? { ...current, title: event.target.value }
+                                : current,
+                            )
+                          }
+                          className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none"
+                        />
+                      </label>
+                      <label className="text-sm font-medium text-slate-700">
+                        报价币种
+                        <input
+                          value={aiImportDraft.currency}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    currency: event.target.value.toUpperCase(),
+                                  }
+                                : current,
+                            )
+                          }
+                          className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 uppercase outline-none"
+                        />
+                      </label>
+                      <label className="text-sm font-medium text-slate-700">
+                        目的地
+                        <input
+                          value={aiImportDraft.destination_country}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    destination_country: event.target.value,
+                                  }
+                                : current,
+                            )
+                          }
+                          className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
+                        />
+                      </label>
+                      <label className="text-sm font-medium text-slate-700">
+                        付款方式
+                        <input
+                          value={aiImportDraft.payment_method}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    payment_method: event.target.value,
+                                  }
+                                : current,
+                            )
+                          }
+                          list="trade-payment-options"
+                          className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
+                        />
+                      </label>
+                      <label className="text-sm font-medium text-slate-700">
+                        优先级
+                        <select
+                          value={aiImportDraft.priority}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    priority: event.target
+                                      .value as AITradeOrderImportDraft["priority"],
+                                  }
+                                : current,
+                            )
+                          }
+                          className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 outline-none"
+                        >
+                          {Object.entries(PRIORITY_LABELS).map(([value, label]) => (
+                            <option key={value} value={value}>
+                              {label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+
+                    <div className="grid gap-3 border-y border-slate-200 py-4 sm:grid-cols-2 lg:grid-cols-5">
+                      {[
+                        ["goods_amount", "商品金额", aiImportDraft.currency],
+                        ["shipping_cost", "报价运费", aiImportDraft.currency],
+                        ["total_amount", "订单总额", aiImportDraft.currency],
+                        [
+                          "settlement_amount",
+                          "付款指令金额",
+                          aiImportDraft.settlement_currency || "币种待补",
+                        ],
+                      ].map(([key, label, unit]) => (
+                        <label key={key} className="text-sm font-medium text-slate-700">
+                          {label}
+                          <div className="mt-1.5 flex h-10 overflow-hidden rounded-lg border border-slate-200">
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={String(aiImportDraft[key as keyof AITradeOrderImportDraft] || "")}
+                              onChange={(event) =>
+                                setAIImportDraft((current) =>
+                                  current
+                                    ? {
+                                        ...current,
+                                        [key]: Number(event.target.value || 0),
+                                      }
+                                    : current,
+                                )
+                              }
+                              className="min-w-0 flex-1 px-3 text-sm outline-none"
+                            />
+                            <span className="flex items-center border-l border-slate-200 bg-slate-50 px-2 text-xs text-slate-500">
+                              {unit}
+                            </span>
+                          </div>
+                        </label>
+                      ))}
+                      <label className="text-sm font-medium text-slate-700">
+                        付款指令币种
+                        <input
+                          value={aiImportDraft.settlement_currency}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    settlement_currency:
+                                      event.target.value.toUpperCase(),
+                                  }
+                                : current,
+                            )
+                          }
+                          className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 uppercase outline-none"
+                        />
+                      </label>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-900">
+                            产品与采购数据
+                          </h3>
+                          <p className="mt-0.5 text-xs text-slate-500">
+                            未识别的采购币种保持空白，不会自动猜测。
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    items: [...current.items, newAIImportItem()],
+                                  }
+                                : current,
+                            )
+                          }
+                          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                        >
+                          <Plus className="h-3.5 w-3.5" />添加产品
+                        </button>
+                      </div>
+                      <div className="mt-3 space-y-3">
+                        {aiImportDraft.items.map((item, index) => (
+                          <div
+                            key={index}
+                            className="grid gap-3 rounded-lg border border-slate-200 p-3 sm:grid-cols-2 lg:grid-cols-12"
+                          >
+                            <input
+                              value={item.sku}
+                              onChange={(event) =>
+                                updateAIImportItem(index, "sku", event.target.value)
+                              }
+                              placeholder="SKU"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-2"
+                            />
+                            <input
+                              value={item.product_name}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "product_name",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="产品名称 *"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-3"
+                            />
+                            <input
+                              value={item.specification}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "specification",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="规格/材质/颜色"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-3"
+                            />
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={item.quantity}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "quantity",
+                                  Number(event.target.value || 0),
+                                )
+                              }
+                              placeholder="数量"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-1"
+                            />
+                            <input
+                              value={item.unit}
+                              onChange={(event) =>
+                                updateAIImportItem(index, "unit", event.target.value)
+                              }
+                              placeholder="单位"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-1"
+                            />
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={item.sales_unit_price || ""}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "sales_unit_price",
+                                  Number(event.target.value || 0),
+                                )
+                              }
+                              placeholder="对客单价"
+                              className="h-9 rounded-lg border border-sky-200 bg-sky-50/50 px-3 text-sm outline-none lg:col-span-1"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setAIImportDraft((current) =>
+                                  current
+                                    ? {
+                                        ...current,
+                                        items:
+                                          current.items.length === 1
+                                            ? [newAIImportItem()]
+                                            : current.items.filter(
+                                                (_, itemIndex) =>
+                                                  itemIndex !== index,
+                                              ),
+                                      }
+                                    : current,
+                                )
+                              }
+                              className="inline-flex h-9 items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 lg:col-span-1"
+                              title="删除产品"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                            <input
+                              value={item.supplier_name}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "supplier_name",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="供应商"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-3"
+                            />
+                            <input
+                              value={item.purchase_currency}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "purchase_currency",
+                                  event.target.value.toUpperCase(),
+                                )
+                              }
+                              placeholder="采购币种（待确认可留空）"
+                              className="h-9 rounded-lg border border-amber-200 bg-amber-50/50 px-3 text-sm uppercase outline-none lg:col-span-3"
+                            />
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={item.purchase_unit_price || ""}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "purchase_unit_price",
+                                  Number(event.target.value || 0),
+                                )
+                              }
+                              placeholder="采购单价"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-2"
+                            />
+                            <input
+                              value={item.description}
+                              onChange={(event) =>
+                                updateAIImportItem(
+                                  index,
+                                  "description",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="补充说明"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-4"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="text-sm font-medium text-slate-700">
+                        流程工作簿文件夹
+                        <div className="mt-1.5">
+                          <FolderCombobox
+                            folders={folderOptions}
+                            value={aiImportDraft.workbook_folder_id}
+                            onCreateFolder={createWorkbookFolder}
+                            onChange={(folderID) =>
+                              setAIImportDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      workbook_folder_id: folderID,
+                                    }
+                                  : current,
+                              )
+                            }
+                          />
+                        </div>
+                      </div>
+                      <label className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={aiImportDraft.create_workspace}
+                          onChange={(event) =>
+                            setAIImportDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    create_workspace: event.target.checked,
+                                    shared_workspace: false,
+                                  }
+                                : current,
+                            )
+                          }
+                          className="h-4 w-4 accent-slate-900"
+                        />
+                        <span>
+                          <span className="block font-medium">生成私有流程工作簿</span>
+                          <span className="mt-0.5 block text-xs text-slate-400">
+                            默认不向内部共享，可在创建后按需授权。
+                          </span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-4 py-3">
+                <p className="hidden text-xs text-slate-400 sm:block">
+                  创建后会保留原文、识别模型和待补字段，便于后续核验。
+                </p>
+                <div className="ml-auto flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAIImportOpen(false)}
+                    disabled={applyingAIImport}
+                    className="h-9 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-600"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void applyAIImport()}
+                    disabled={!aiImportDraft || applyingAIImport}
+                    className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                  >
+                    {applyingAIImport ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Warehouse className="h-4 w-4" />
+                    )}
+                    创建并进入到货
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {orderModalOpen && (
           <div
             className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
@@ -5393,6 +6195,7 @@ export default function TradeWorkspacePage() {
                       <FolderCombobox
                         folders={folderOptions}
                         value={orderDraft.workbook_folder_id}
+                        onCreateFolder={createWorkbookFolder}
                         onChange={(folderID) =>
                           setOrderDraft((current) => ({
                             ...current,
@@ -7445,6 +8248,39 @@ export default function TradeWorkspacePage() {
                         {detailOrder.rework_reason || "请重新核对采购资料后继续。"}
                       </div>
                     )}
+                    {detailOrder.source === "ai_import" &&
+                      detailOrder.data_status !== "ready" && (
+                        <div className="flex flex-col gap-3 border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="font-semibold">
+                              {detailOrder.data_status === "importing"
+                                ? "AI 导入正在完成"
+                                : "AI 导入资料待人工核验"}
+                            </div>
+                            <div className="mt-1 leading-5 text-amber-800">
+                              {detailOrder.data_status === "importing"
+                                ? "系统已保留本次导入编号。若导入中断，可使用同一份预览资料重新提交并继续完成。"
+                                : `待补：${(detailOrder.ai_missing_fields || []).join("、") || "请核对订单字段"}。补齐订单或工作簿后，点击确认即可解除流程推进拦截。`}
+                            </div>
+                          </div>
+                          {detailOrder.data_status === "incomplete" &&
+                            (tradeAccess?.is_admin ||
+                              tradeAccess?.is_manager ||
+                              detailOrder.owner_id === profile?.id) && (
+                            <button
+                              type="button"
+                              onClick={() => void completeAIImport()}
+                              disabled={completingAIImport}
+                              className="inline-flex h-8 shrink-0 items-center justify-center gap-2 rounded-md border border-amber-300 bg-white px-3 font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                            >
+                              {completingAIImport && (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              )}
+                              确认已补齐
+                            </button>
+                          )}
+                        </div>
+                      )}
                     <div className="grid gap-px border-b border-slate-200 bg-slate-200 sm:grid-cols-4">
                       <div className="bg-white px-4 py-3">
                         <div className="text-xs text-slate-400">币种</div>

@@ -176,7 +176,7 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 	var pendingERPPlan *ERPPendingPlan
 
 	for round := 0; round < 8; round++ {
-		resp, assistantMessage, err := s.callChatCompletionWithTools(assistant.Endpoint, assistant.APIKey, assistant.Model, conversation, toolDefs)
+		resp, assistantMessage, err := s.callAssistantCompletionWithTools(assistant, conversation, toolDefs)
 		if err != nil {
 			return nil, err
 		}
@@ -858,10 +858,12 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 
 func (s *AIService) callChatCompletionWithTools(endpoint, apiKey, model string, messages []map[string]any, tools []openAIToolDefinition) (*openAIChatToolResponse, map[string]any, error) {
 	requestBody := map[string]any{
-		"model":       model,
-		"messages":    messages,
-		"tools":       tools,
-		"tool_choice": "auto",
+		"model":    model,
+		"messages": messages,
+	}
+	if len(tools) > 0 {
+		requestBody["tools"] = tools
+		requestBody["tool_choice"] = "auto"
 	}
 
 	body, err := json.Marshal(requestBody)
@@ -921,8 +923,12 @@ func doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d: %s", response.StatusCode, string(respBody))
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		message := strings.TrimSpace(string(respBody))
+		if len(message) > 2048 {
+			message = message[:2048]
+		}
+		return nil, fmt.Errorf("API returned status %d: %s", response.StatusCode, message)
 	}
 
 	return respBody, nil

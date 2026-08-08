@@ -261,6 +261,24 @@ func (h *TradeHandler) GetOrder(c *gin.Context) {
 	response.OK(c, order)
 }
 
+func (h *TradeHandler) CompleteAIImport(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	order, err := h.service.CompleteAIImport(c.GetInt64("user_id"), orderID)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "业务单不存在或无权访问")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) UpdateProfitSettings(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {

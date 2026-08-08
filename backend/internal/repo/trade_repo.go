@@ -1,11 +1,13 @@
 package repo
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lib/pq"
@@ -17,7 +19,10 @@ type TradeRepo struct {
 	db *sql.DB
 }
 
-var ErrLastTradeOrderItem = errors.New("trade order must keep at least one item")
+var (
+	ErrLastTradeOrderItem = errors.New("trade order must keep at least one item")
+	ErrAIImportInProgress = errors.New("AI trade order import is already in progress")
+)
 
 func NewTradeRepo(db *sql.DB) *TradeRepo {
 	return &TradeRepo{db: db}
@@ -25,6 +30,43 @@ func NewTradeRepo(db *sql.DB) *TradeRepo {
 
 type tradeRowScanner interface {
 	Scan(dest ...any) error
+}
+
+// LockAIImport serializes one import id across application instances. The lock
+// is session-scoped and is automatically released if the process/connection
+// exits unexpectedly.
+func (r *TradeRepo) LockAIImport(importID string) (func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open AI import lock connection: %w", err)
+	}
+	var acquired bool
+	if err := conn.QueryRowContext(ctx,
+		`SELECT pg_try_advisory_lock(hashtextextended($1, 0))`,
+		strings.TrimSpace(importID),
+	).Scan(&acquired); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("acquire AI import lock: %w", err)
+	}
+	if !acquired {
+		_ = conn.Close()
+		return nil, ErrAIImportInProgress
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer releaseCancel()
+			_, _ = conn.ExecContext(releaseCtx,
+				`SELECT pg_advisory_unlock(hashtextextended($1, 0))`,
+				strings.TrimSpace(importID),
+			)
+			_ = conn.Close()
+		})
+	}, nil
 }
 
 const tradeOrderItemSelect = `
@@ -422,6 +464,23 @@ func (r *TradeRepo) AdminDeleteCustomer(customerID, adminID int64) (*model.Trade
 }
 
 func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrderItem) error {
+	source := strings.TrimSpace(order.Source)
+	if source == "" {
+		source = "manual"
+	}
+	dataStatus := strings.TrimSpace(order.DataStatus)
+	if dataStatus == "" {
+		dataStatus = "ready"
+	}
+	missingFields := order.AIMissingFields
+	if missingFields == nil {
+		missingFields = []string{}
+	}
+	missingRaw, err := json.Marshal(missingFields)
+	if err != nil {
+		return fmt.Errorf("encode AI import missing fields: %w", err)
+	}
+
 	tx, err := r.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin trade order: %w", err)
@@ -439,13 +498,16 @@ func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrde
 			order_no, customer_id, owner_id, title, stage, priority, inquiry_date, quote_deadline,
 			expected_ship_date, currency, incoterm, destination_country, destination_port,
 			payment_terms, payment_method, total_amount, channel_id, workspace_folder_id, notes,
+			source, data_status, ai_import_id, ai_source_text, ai_missing_fields, ai_import_model,
 			stage_updated_at, created_at, updated_at
-		 ) VALUES ($1,$2,$3,$4,'inquiry',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19,$19)
+		 ) VALUES ($1,$2,$3,$4,'inquiry',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$25,$25)
 		 RETURNING id`,
 		order.OrderNo, order.CustomerID, order.OwnerID, order.Title, order.Priority, order.InquiryDate,
 		order.QuoteDeadline, order.ExpectedShipDate, order.Currency, order.Incoterm,
 		order.DestinationCountry, order.DestinationPort, order.PaymentTerms, order.PaymentMethod,
-		order.TotalAmount, order.ChannelID, order.WorkspaceFolderID, order.Notes, now,
+		order.TotalAmount, order.ChannelID, order.WorkspaceFolderID, order.Notes,
+		source, dataStatus, strings.TrimSpace(order.AIImportID), strings.TrimSpace(order.AISourceText),
+		missingRaw, strings.TrimSpace(order.AIImportModel), now,
 	).Scan(&order.ID)
 	if err != nil {
 		return fmt.Errorf("create trade order: %w", err)
@@ -487,6 +549,9 @@ func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrde
 		return fmt.Errorf("commit trade order: %w", err)
 	}
 	order.Stage = model.TradeStageInquiry
+	order.Source = source
+	order.DataStatus = dataStatus
+	order.AIMissingFields = missingFields
 	order.StageUpdatedAt = now
 	order.CreatedAt = now
 	order.UpdatedAt = now
@@ -684,6 +749,7 @@ const tradeOrderSelect = `
 	       o.workbook_id,
 	       (SELECT s.id FROM sheets s WHERE s.workbook_id = o.workbook_id ORDER BY s.sort_order, s.id LIMIT 1),
 	       o.workspace_folder_id, COALESCE(wf.name,''), o.channel_id, o.notes, o.label_width_mm, o.label_height_mm,
+	       o.source, o.data_status, o.ai_import_id, o.ai_source_text, o.ai_missing_fields, o.ai_import_model,
 	       o.label_paper_size, o.label_paper_width_mm, o.label_paper_height_mm, o.label_orientation,
 	       o.label_margin_top_mm, o.label_margin_right_mm, o.label_margin_bottom_mm, o.label_margin_left_mm,
 	       o.label_gap_x_mm, o.label_gap_y_mm, o.label_content_scale, o.label_start_slot,
@@ -701,6 +767,7 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 	var quoteDeadline, expectedShipDate sql.NullTime
 	var workbookID, workbookSheetID, workspaceFolderID, channelID sql.NullInt64
 	var inspectionGalleryDirectoryID, paymentGalleryDirectoryID sql.NullInt64
+	var aiMissingFieldsRaw []byte
 	if err := scanner.Scan(
 		&order.ID, &order.OrderNo, &order.CustomerID, &order.CustomerName, &order.CustomerCompany,
 		&order.CustomerAvatarURL, &order.OwnerID, &order.OwnerName, &order.Title, &order.Stage,
@@ -711,7 +778,8 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 		&order.ActualFreightAmount, &order.ActualFreightToCNYRate, &order.ActualFreightNotes,
 		&order.AdditionalCostAmount, &order.AdditionalCostNotes,
 		&workbookID, &workbookSheetID, &workspaceFolderID, &order.WorkspaceFolderName, &channelID, &order.Notes,
-		&order.LabelWidthMM, &order.LabelHeightMM, &order.LabelPaperSize, &order.LabelPaperWidthMM,
+		&order.LabelWidthMM, &order.LabelHeightMM, &order.Source, &order.DataStatus, &order.AIImportID,
+		&order.AISourceText, &aiMissingFieldsRaw, &order.AIImportModel, &order.LabelPaperSize, &order.LabelPaperWidthMM,
 		&order.LabelPaperHeightMM, &order.LabelOrientation, &order.LabelMarginTopMM, &order.LabelMarginRightMM,
 		&order.LabelMarginBottomMM, &order.LabelMarginLeftMM, &order.LabelGapXMM, &order.LabelGapYMM,
 		&order.LabelContentScale, &order.LabelStartSlot, &order.LabelOffsetXMM, &order.LabelOffsetYMM,
@@ -745,7 +813,78 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 	if paymentGalleryDirectoryID.Valid {
 		order.PaymentGalleryDirectoryID = &paymentGalleryDirectoryID.Int64
 	}
+	order.AIMissingFields = []string{}
+	if len(aiMissingFieldsRaw) > 0 {
+		_ = json.Unmarshal(aiMissingFieldsRaw, &order.AIMissingFields)
+	}
 	return &order, nil
+}
+
+func (r *TradeRepo) GetOrderByAIImportID(importID string, userID int64, isAdmin bool) (*model.TradeOrder, error) {
+	query := tradeOrderSelect + ` WHERE o.ai_import_id = $1 AND ($2 OR o.owner_id = $3)`
+	return scanTradeOrder(r.db.QueryRow(query, strings.TrimSpace(importID), isAdmin, userID))
+}
+
+func (r *TradeRepo) SetOrderAIImportMetadata(orderID int64, importID, sourceText, importModel string, missingFields []string) error {
+	if missingFields == nil {
+		missingFields = []string{}
+	}
+	missingRaw, err := json.Marshal(missingFields)
+	if err != nil {
+		return err
+	}
+	status := "ready"
+	if len(missingFields) > 0 {
+		status = "incomplete"
+	}
+	result, err := r.db.Exec(
+		`UPDATE trade_orders SET source='ai_import',data_status=$2,ai_import_id=$3,
+		 ai_source_text=$4,ai_missing_fields=$5,ai_import_model=$6,updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`,
+		orderID, status, strings.TrimSpace(importID), strings.TrimSpace(sourceText), missingRaw, strings.TrimSpace(importModel),
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (r *TradeRepo) CompleteAIImport(orderID int64) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_orders
+		 SET data_status='ready', ai_missing_fields='[]'::jsonb, updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL AND source='ai_import'`,
+		orderID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (r *TradeRepo) UpdateImportedOrderCommercials(orderID int64, currency string, freightAmount float64, notes string) error {
+	freightMode := "customer_forwarder"
+	if freightAmount > 0 {
+		freightMode = "quoted"
+	}
+	result, err := r.db.Exec(
+		`UPDATE trade_orders SET currency=$2,freight_mode=$3,quoted_freight_amount=$4,
+		 notes=$5,updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`,
+		orderID, strings.ToUpper(strings.TrimSpace(currency)), freightMode, freightAmount, strings.TrimSpace(notes),
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return r.RecalculateOrderTotal(orderID)
 }
 
 func (r *TradeRepo) ListOrders(userID int64, isAdmin bool, filter model.TradeOrderFilter) ([]model.TradeOrder, error) {

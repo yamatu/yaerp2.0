@@ -775,6 +775,37 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 	return order, nil
 }
 
+// CompleteAIImport removes the temporary completeness blocker after an
+// operator has manually checked the imported order and filled the remaining
+// fields in the order/workbook.
+func (s *TradeService) CompleteAIImport(userID, orderID int64) (*model.TradeOrder, error) {
+	access, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	order, err := s.repo.GetOrder(orderID, userID, access.profile.CanViewAllOrders)
+	if err != nil {
+		return nil, err
+	}
+	if !s.canViewTradeOrder(userID, order, access) {
+		return nil, sql.ErrNoRows
+	}
+	if order.Source != "ai_import" {
+		return nil, fmt.Errorf("该业务单不是 AI 导入订单")
+	}
+	if order.DataStatus == "importing" {
+		return nil, fmt.Errorf("AI 导入仍在处理中，请等待完成或重新提交原导入任务")
+	}
+	if !access.profile.IsAdmin && !access.profile.IsManager && order.OwnerID != userID {
+		return nil, fmt.Errorf("只有订单负责人、业务经理或管理员可以确认 AI 导入资料")
+	}
+	if err := s.repo.CompleteAIImport(orderID); err != nil {
+		return nil, err
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
 func (s *TradeService) UpdateProfitSettings(userID, orderID int64, request *model.UpdateTradeProfitSettingsRequest) (*model.TradeOrder, error) {
 	if request == nil {
 		return nil, fmt.Errorf("利润设置不能为空")
@@ -911,11 +942,21 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 		Currency: currency, Incoterm: "", DestinationCountry: destination,
 		DestinationPort: "", PaymentTerms: paymentMethod, PaymentMethod: paymentMethod,
 		ChannelID: customer.ChannelID, WorkspaceFolderID: workspaceFolderID, Notes: strings.TrimSpace(request.Notes),
+		Source: "manual", DataStatus: "ready",
+	}
+	isAIImport := strings.TrimSpace(request.AIImportID) != ""
+	if isAIImport {
+		order.Source = "ai_import"
+		order.DataStatus = "importing"
+		order.AIImportID = strings.TrimSpace(request.AIImportID)
+		order.AISourceText = strings.TrimSpace(request.AISourceText)
+		order.AIMissingFields = append([]string(nil), request.AIMissingFields...)
+		order.AIImportModel = strings.TrimSpace(request.AIImportModel)
 	}
 	if err := s.repo.CreateOrder(order, items); err != nil {
 		return nil, err
 	}
-	if request.WorkbookFolderID != nil {
+	if request.WorkbookFolderID != nil && !isAIImport {
 		if err := s.repo.SetCustomerWorkbookFolder(customer.ID, request.WorkbookFolderID); err != nil {
 			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
 			return nil, err
@@ -924,7 +965,7 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	}
 
 	createWorkspace := request.CreateWorkspace == nil || *request.CreateWorkspace
-	sharedWorkspace := request.SharedWorkspace == nil || *request.SharedWorkspace
+	sharedWorkspace := request.SharedWorkspace != nil && *request.SharedWorkspace
 	if createWorkspace {
 		workbook, firstSheetID, workspaceErr := s.createOrderWorkspace(userID, order, customer, items, sharedWorkspace)
 		if workspaceErr != nil {
@@ -938,7 +979,7 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
 			return nil, err
 		}
-		if order.ChannelID != nil {
+		if order.ChannelID != nil && !isAIImport {
 			_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
 				Content:          fmt.Sprintf("已创建外贸业务单 %s：%s。当前阶段：询价。", order.OrderNo, order.Title),
 				LinkedWorkbookID: &workbook.ID,
@@ -946,7 +987,9 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 			})
 		}
 	}
-	s.notifyStageAssignees(order, model.TradeStageInquiry, "新的客户询价待处理")
+	if !isAIImport {
+		s.notifyStageAssignees(order, model.TradeStageInquiry, "新的客户询价待处理")
+	}
 	s.notifyOrderUpdated(order.ID)
 	return s.GetOrder(userID, order.ID)
 }
@@ -1281,7 +1324,14 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 			lineComplete = false
 			addWarning(fmt.Sprintf("第 %d 行尚未录入对客报价", item.LineNo))
 		}
-		purchaseCurrency := strings.ToUpper(firstNonEmptyTrade(item.PurchaseCurrency, currency))
+		purchaseCurrency := strings.ToUpper(strings.TrimSpace(item.PurchaseCurrency))
+		if purchaseCurrency == "" {
+			if isAIImportedTradeItem(&item) {
+				purchaseCurrency = "待补"
+			} else {
+				purchaseCurrency = currency
+			}
+		}
 		rate := tradeProfitExchangeRate(currency, quoteRateCNY, &item)
 		if rate <= 0 {
 			lineComplete = false
@@ -1389,6 +1439,9 @@ func tradeProfitExchangeRate(orderCurrency string, quoteRateCNY float64, item *m
 	if item == nil {
 		return 1
 	}
+	if strings.TrimSpace(item.PurchaseCurrency) == "" && isAIImportedTradeItem(item) {
+		return 0
+	}
 	purchaseCurrency := strings.ToUpper(firstNonEmptyTrade(item.PurchaseCurrency, orderCurrency))
 	if strings.EqualFold(purchaseCurrency, orderCurrency) {
 		return 1
@@ -1401,6 +1454,14 @@ func tradeProfitExchangeRate(orderCurrency string, quoteRateCNY float64, item *m
 		return 1 / quoteRateCNY
 	}
 	return 0
+}
+
+func isAIImportedTradeItem(item *model.TradeOrderItem) bool {
+	if item == nil || item.WorkflowData == nil {
+		return false
+	}
+	value, ok := item.WorkflowData["ai_import"].(bool)
+	return ok && value
 }
 
 func tradeFreightModeLabel(mode string) string {
@@ -2830,7 +2891,7 @@ func (s *TradeService) ensureOrderWorkspace(userID int64, order *model.TradeOrde
 	if err := s.ensureWritableTradeFolder(userID, order.WorkspaceFolderID); err != nil {
 		order.WorkspaceFolderID = nil
 	}
-	workbook, firstSheetID, err := s.createOrderWorkspace(userID, order, customer, items, true)
+	workbook, firstSheetID, err := s.createOrderWorkspace(userID, order, customer, items, false)
 	if err != nil {
 		return err
 	}
@@ -3382,6 +3443,16 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 		return []string{"至少需要一项有效产品"}
 	}
 	blockers := make([]string, 0, 3)
+	if order.Source == "ai_import" && order.DataStatus == "importing" {
+		blockers = append(blockers, "AI 导入仍在处理中，请等待系统完成导入")
+	}
+	if order.Source == "ai_import" && len(order.AIMissingFields) > 0 {
+		labels := order.AIMissingFields
+		if len(labels) > 5 {
+			labels = append(append([]string{}, labels[:5]...), "等")
+		}
+		blockers = append(blockers, "AI 导入订单仍有待补字段："+strings.Join(labels, "、"))
+	}
 	switch order.Stage {
 	case model.TradeStageInquiry:
 		if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
@@ -3729,10 +3800,14 @@ func tradeWorkbookDefinitionsWithContext(
 		if supplierQuotePrice <= 0 {
 			supplierQuotePrice = item.PurchasePrice
 		}
+		purchaseCurrency := strings.TrimSpace(item.PurchaseCurrency)
+		if purchaseCurrency == "" && !isAIImportedTradeItem(&item) {
+			purchaseCurrency = order.Currency
+		}
 		purchaseRows = append(purchaseRows, map[string]any{
 			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
 			"quantity": item.Quantity, "unit": item.Unit, "supplier": supplierName, "supplier_quote": supplierQuotePrice,
-			"purchase_currency": firstNonEmptyTrade(item.PurchaseCurrency, order.Currency),
+			"purchase_currency": purchaseCurrency,
 			"purchase_price":    item.PurchasePrice, "cost_exchange_rate": tradeProfitExchangeRate(order.Currency, order.QuoteExchangeRateCNY, &item),
 			"lead_time_days":  selectedQuote.LeadTimeDays,
 			"purchase_status": firstNonEmptyTrade(tradeWorkflowString(&item, "purchase_status"), "待采购"),
