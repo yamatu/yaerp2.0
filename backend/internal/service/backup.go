@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,6 +29,24 @@ type BackupService struct {
 	minio     *miniopkg.Client
 	restoreMu sync.Mutex
 	backupMu  sync.Mutex
+}
+
+var ErrBackupTooLarge = errors.New("backup exceeds configured size limit")
+
+const backupCommandTimeout = 2 * time.Hour
+
+type boundedBuffer struct {
+	bytes.Buffer
+	max     int64
+	limited bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if b.max > 0 && int64(b.Len())+int64(len(p)) > b.max {
+		b.limited = true
+		return 0, ErrBackupTooLarge
+	}
+	return b.Buffer.Write(p)
 }
 
 const automaticBackupPrefix = "yaerp_database_"
@@ -64,10 +83,6 @@ func (s *BackupService) CreateAutomaticDatabaseBackup() (*AutomaticBackupStatus,
 	s.backupMu.Lock()
 	defer s.backupMu.Unlock()
 
-	dump, err := s.DumpDatabase()
-	if err != nil {
-		return nil, err
-	}
 	if err := os.MkdirAll(s.cfg.Backup.Directory, 0750); err != nil {
 		return nil, fmt.Errorf("create backup directory: %w", err)
 	}
@@ -88,9 +103,9 @@ func (s *BackupService) CreateAutomaticDatabaseBackup() (*AutomaticBackupStatus,
 	}()
 
 	gzipWriter := gzip.NewWriter(temporaryFile)
-	if _, err := gzipWriter.Write(dump); err != nil {
+	if err := s.streamDatabaseDump(context.Background(), gzipWriter); err != nil {
 		_ = gzipWriter.Close()
-		return nil, fmt.Errorf("compress automatic backup: %w", err)
+		return nil, fmt.Errorf("write automatic backup: %w", err)
 	}
 	if err := gzipWriter.Close(); err != nil {
 		return nil, fmt.Errorf("finish automatic backup compression: %w", err)
@@ -224,15 +239,87 @@ func isAutomaticBackupFilename(name string) bool {
 	return strings.HasPrefix(name, automaticBackupPrefix) && strings.HasSuffix(name, ".sql.gz")
 }
 
-// DumpDatabase runs pg_dump and returns the SQL dump as bytes.
-func (s *BackupService) DumpDatabase() ([]byte, error) {
-	cmd := exec.Command("pg_dump", s.baseCommandArgs("--no-password")...)
+// StreamDatabaseDump runs pg_dump directly into dst. It does not accumulate
+// the SQL dump in memory, which is essential for large automatic backups.
+func (s *BackupService) StreamDatabaseDump(ctx context.Context, dst io.Writer) error {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	return s.streamDatabaseDump(ctx, dst)
+}
+
+func (s *BackupService) streamDatabaseDump(ctx context.Context, dst io.Writer) error {
+	if dst == nil {
+		return errors.New("backup destination is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, backupCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "pg_dump", s.baseCommandArgs("--no-password")...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
-	var stdout, stderr bytes.Buffer
+	pipeReader, pipeWriter := io.Pipe()
+	cmd.Stdout = pipeWriter
+	var stderr boundedBuffer
+	stderr.max = 1 << 20
+	cmd.Stderr = &stderr
+
+	copyErr := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(dst, pipeReader)
+		_ = pipeReader.CloseWithError(err)
+		copyErr <- err
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	commandErr := cmd.Run()
+	_ = pipeWriter.Close()
+	destinationErr := <-copyErr
+	if destinationErr != nil {
+		return fmt.Errorf("stream database dump: %w", destinationErr)
+	}
+	if commandErr != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("pg_dump stopped: %w", ctx.Err())
+		}
+		if stderr.limited {
+			return ErrBackupTooLarge
+		}
+		return fmt.Errorf("pg_dump failed: %s: %w", stderr.String(), commandErr)
+	}
+	return nil
+}
+
+// DumpDatabase runs pg_dump and returns the SQL dump as bytes. It remains for
+// the in-memory combined-backup API, but automatic and direct downloads use
+// StreamDatabaseDump instead.
+func (s *BackupService) DumpDatabase() ([]byte, error) {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	return s.dumpDatabase()
+}
+
+func (s *BackupService) dumpDatabase() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), backupCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "pg_dump", s.baseCommandArgs("--no-password")...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
+	var stdout boundedBuffer
+	stdout.max = s.cfg.Backup.MaxBytes
+	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if stdout.limited {
+			return nil, ErrBackupTooLarge
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("pg_dump timed out: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("pg_dump failed: %s: %w", stderr.String(), err)
 	}
 
@@ -314,7 +401,8 @@ func (s *BackupService) CombinedBackup() ([]byte, error) {
 		return nil, fmt.Errorf("config export failed: %w", err)
 	}
 
-	var buf bytes.Buffer
+	var buf boundedBuffer
+	buf.max = s.cfg.Backup.MaxBytes
 	gzWriter := gzip.NewWriter(&buf)
 	tarWriter := tar.NewWriter(gzWriter)
 
@@ -373,6 +461,24 @@ func addToTar(tw *tar.Writer, name string, data []byte) error {
 	return nil
 }
 
+func addReaderToTar(tw *tar.Writer, name string, reader io.Reader, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("invalid size for %s", name)
+	}
+	header := &tar.Header{Name: name, Size: size, Mode: 0644, ModTime: time.Now()}
+	if err := tw.WriteHeader(header); err != nil {
+		return fmt.Errorf("write tar header for %s: %w", name, err)
+	}
+	written, err := io.CopyN(tw, reader, size)
+	if err != nil {
+		return fmt.Errorf("write tar data for %s: %w", name, err)
+	}
+	if written != size {
+		return fmt.Errorf("write tar data for %s: expected %d bytes, wrote %d", name, size, written)
+	}
+	return nil
+}
+
 func (s *BackupService) ExportManifest(includedFiles []string) ([]byte, error) {
 	manifest := backupManifest{
 		Version:            2,
@@ -400,20 +506,29 @@ func (s *BackupService) addObjectStorageBackup(tw *tar.Writer) ([]string, error)
 	manifest := make([]map[string]any, 0, len(keys))
 	includedFiles := make([]string, 0, len(keys)+1)
 	for _, key := range keys {
-		data, err := s.minio.GetObjectBytes(ctx, key)
+		object, err := s.minio.GetObject(ctx, key)
 		if err != nil {
 			return nil, fmt.Errorf("read object %s: %w", key, err)
 		}
+		info, err := object.Stat()
+		if err != nil {
+			_ = object.Close()
+			return nil, fmt.Errorf("stat object %s: %w", key, err)
+		}
 		relativeName := strings.TrimLeft(strings.TrimPrefix(key, prefix), "/")
 		archivePath := filepath.ToSlash(filepath.Join("objects", relativeName))
-		if err := addToTar(tw, archivePath, data); err != nil {
+		if err := addReaderToTar(tw, archivePath, object, info.Size); err != nil {
+			_ = object.Close()
 			return nil, err
+		}
+		if err := object.Close(); err != nil {
+			return nil, fmt.Errorf("close object %s: %w", key, err)
 		}
 		includedFiles = append(includedFiles, archivePath)
 		manifest = append(manifest, map[string]any{
 			"object_key":   key,
 			"archive_path": archivePath,
-			"size":         len(data),
+			"size":         info.Size,
 			"url":          s.minio.PublicURLForObject(key),
 		})
 	}

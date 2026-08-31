@@ -50,6 +50,16 @@ func (s *AIScheduleService) Start() error {
 	return nil
 }
 
+// Stop releases cron's scheduler goroutine and prevents jobs from starting
+// while the HTTP server is being torn down.
+func (s *AIScheduleService) Stop() {
+	if s == nil || s.cron == nil {
+		return
+	}
+	ctx := s.cron.Stop()
+	<-ctx.Done()
+}
+
 func (s *AIScheduleService) CreateDailyReportSchedule(userID, sheetID int64, timeOfDay, timezone, filenameTemplate string) (*model.AISchedule, error) {
 	cronExpr, err := buildDailyCron(timeOfDay)
 	if err != nil {

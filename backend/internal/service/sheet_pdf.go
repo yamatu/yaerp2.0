@@ -26,6 +26,13 @@ var sheetPDFFontBase64 = base64.StdEncoding.EncodeToString(sheetPDFChineseFont)
 
 const sheetPDFBaseFontFamily = "YaERPPDF"
 const pxToMM = 0.2645833333
+const sheetPDFMaxHTMLBytes = 32 * 1024 * 1024
+const sheetPDFMaxCells = 1_000_000
+
+// Chromium is a heavyweight child process. A bounded pool prevents a burst
+// of PDF requests from starting one browser per request and exhausting the
+// container before the Go heap has a chance to recover.
+var sheetPDFSlots = make(chan struct{}, 2)
 
 type sheetPDFCell struct {
 	Text  string
@@ -107,6 +114,9 @@ func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string,
 	}
 	layout := buildSheetPDFLayoutWithOptions(grid, options)
 	htmlDoc := renderSheetPDFHTML(grid, layout)
+	if len(htmlDoc) > sheetPDFMaxHTMLBytes {
+		return nil, fmt.Errorf("sheet is too large to render as PDF (HTML exceeds %d bytes)", sheetPDFMaxHTMLBytes)
+	}
 
 	pdfBytes, err := renderSheetPDFWithChromium(htmlDoc, layout)
 	if err != nil {
@@ -157,6 +167,13 @@ func renderSheetPDFWithChromium(htmlDoc string, layout sheetPDFLayout) ([]byte, 
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+
+	select {
+	case sheetPDFSlots <- struct{}{}:
+		defer func() { <-sheetPDFSlots }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("timed out waiting for a PDF renderer: %w", ctx.Err())
+	}
 
 	allocatorOptions := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(chromePath),
@@ -292,18 +309,26 @@ func (s *SheetService) buildSheetPDFGridFromSnapshot(ctx *sheetExportContext) (*
 	if !found {
 		return &sheetPDFGrid{SheetName: ctx.Sheet.Name, DefaultFontSize: 10}, nil
 	}
+	rowSpan := int64(maxRow) - int64(minRow) + 1
+	columnSpan := int64(maxCol) - int64(minCol) + 1
+	if rowSpan <= 0 || columnSpan <= 0 || rowSpan > sheetPDFMaxCells || columnSpan > sheetPDFMaxCells || rowSpan > int64(sheetPDFMaxCells)/columnSpan {
+		return nil, fmt.Errorf("sheet is too large to render as PDF (more than %d cells)", sheetPDFMaxCells)
+	}
 
-	rows := make([]int, 0, maxRow-minRow+1)
+	rows := make([]int, 0, int(rowSpan))
 	for row := minRow; row <= maxRow; row += 1 {
 		if !hiddenRows[row] {
 			rows = append(rows, row)
 		}
 	}
-	columns := make([]int, 0, maxCol-minCol+1)
+	columns := make([]int, 0, int(columnSpan))
 	for column := minCol; column <= maxCol; column += 1 {
 		if !hiddenColumns[column] {
 			columns = append(columns, column)
 		}
+	}
+	if len(columns) > 0 && len(rows) > sheetPDFMaxCells/len(columns) {
+		return nil, fmt.Errorf("sheet is too large to render as PDF (more than %d cells)", sheetPDFMaxCells)
 	}
 
 	grid := &sheetPDFGrid{
@@ -462,6 +487,9 @@ func (s *SheetService) buildSheetPDFGridFromRows(ctx *sheetExportContext) (*shee
 	visibleColumns := sortedExportColumns(usedColumns)
 	if len(visibleColumns) == 0 {
 		visibleColumns = buildFallbackExportColumns(ctx.Columns)
+	}
+	if len(visibleColumns) > 0 && len(parsedRows) > sheetPDFMaxCells/len(visibleColumns) {
+		return nil, fmt.Errorf("sheet is too large to render as PDF (more than %d cells)", sheetPDFMaxCells)
 	}
 
 	grid := &sheetPDFGrid{

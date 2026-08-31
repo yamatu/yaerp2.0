@@ -16,6 +16,7 @@ type Config struct {
 	AI       AIConfig
 	Backup   BackupConfig
 	WhatsApp WhatsAppConfig
+	Debug    DebugConfig
 }
 
 type PostgresConfig struct {
@@ -74,6 +75,13 @@ type BackupConfig struct {
 	HostDirectory        string
 	IntervalHours        int
 	RetentionDays        int
+	MaxBytes             int64
+}
+
+type DebugConfig struct {
+	PprofEnabled    bool
+	PprofToken      string
+	MaxRequestBytes int64
 }
 
 type WhatsAppConfig struct {
@@ -127,15 +135,23 @@ func Load() *Config {
 			IncludeObjectStorage: getEnv("BACKUP_INCLUDE_OBJECT_STORAGE", "true") == "true",
 			ObjectPrefix:         getEnv("BACKUP_OBJECT_PREFIX", "uploads/"),
 			PublicBaseURL:        getEnv("BACKUP_PUBLIC_BASE_URL", ""),
-			AutomaticEnabled:     getEnv("BACKUP_AUTO_ENABLED", "true") == "true",
-			Directory:            getEnv("BACKUP_DIRECTORY", "/backups"),
-			HostDirectory:        getEnv("BACKUP_HOST_DIR", "./backups"),
-			IntervalHours:        getPositiveEnvInt("BACKUP_INTERVAL_HOURS", 24),
-			RetentionDays:        getPositiveEnvInt("BACKUP_RETENTION_DAYS", 30),
+			// Automatic backups are opt-in. A service restart must not
+			// unexpectedly launch a potentially multi-gigabyte pg_dump.
+			AutomaticEnabled: getEnv("BACKUP_AUTO_ENABLED", "false") == "true",
+			Directory:        getEnv("BACKUP_DIRECTORY", "/backups"),
+			HostDirectory:    getEnv("BACKUP_HOST_DIR", "./backups"),
+			IntervalHours:    getPositiveEnvInt("BACKUP_INTERVAL_HOURS", 24),
+			RetentionDays:    getPositiveEnvInt("BACKUP_RETENTION_DAYS", 30),
+			MaxBytes:         getEnvInt64("BACKUP_MAX_BYTES", 256*1024*1024),
 		},
 		WhatsApp: WhatsAppConfig{
 			ServiceURL:     getEnv("WHATSAPP_SERVICE_URL", "http://whatsapp:3010"),
 			InternalSecret: getEnv("WHATSAPP_INTERNAL_SECRET", ""),
+		},
+		Debug: DebugConfig{
+			PprofEnabled:    getEnv("PPROF_ENABLED", "false") == "true",
+			PprofToken:      getEnv("PPROF_TOKEN", ""),
+			MaxRequestBytes: getEnvInt64("MAX_REQUEST_BYTES", 64*1024*1024),
 		},
 	}
 }
@@ -162,6 +178,15 @@ func getPositiveEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil && i > 0 {
+			return i
+		}
+	}
+	return fallback
 }
 
 func getEnvList(key string, fallback []string) []string {

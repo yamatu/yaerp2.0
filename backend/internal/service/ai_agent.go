@@ -65,6 +65,8 @@ type openAIChatToolResponse struct {
 	Model string `json:"model"`
 }
 
+const maxAIToolResultBytes = 2 * 1024 * 1024
+
 var formulaArithmeticReferencePattern = regexp.MustCompile(`(?i)([A-Z]{1,3})(?:\{\{row\}\}|[0-9]+)\s*([*/+\-])\s*([A-Z]{1,3})(?:\{\{row\}\}|[0-9]+)`)
 var formulaKeyArithmeticPattern = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}\s*([*/+\-])\s*\{\{([a-zA-Z0-9_]+)\}\}`)
 
@@ -281,6 +283,9 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 			encoded, err := json.Marshal(result.Data)
 			if err != nil {
 				encoded = []byte(`{"ok":true}`)
+			}
+			if len(encoded) > maxAIToolResultBytes {
+				encoded = []byte(fmt.Sprintf(`{"truncated":true,"message":"tool result exceeded %d bytes"}`, maxAIToolResultBytes))
 			}
 			conversation = append(conversation, map[string]any{
 				"role":         "tool",
@@ -918,7 +923,7 @@ func doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
 	}
 	defer response.Body.Close()
 
-	respBody, err := io.ReadAll(response.Body)
+	respBody, err := readAIResponseBody(response.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}

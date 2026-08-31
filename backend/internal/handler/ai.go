@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 
 	"yaerp/internal/model"
@@ -10,6 +11,13 @@ import (
 	"yaerp/pkg/response"
 
 	"github.com/gin-gonic/gin"
+)
+
+const (
+	maxChatMessages     = 100
+	maxChatMessageChars = 120000
+	maxChatRequestChars = 2 * 1024 * 1024
+	maxSpreadsheetOps   = 10000
 )
 
 type AIHandler struct {
@@ -32,6 +40,22 @@ func (h *AIHandler) Chat(c *gin.Context) {
 
 	if len(req.Messages) == 0 {
 		response.BadRequest(c, "messages cannot be empty")
+		return
+	}
+	if len(req.Messages) > maxChatMessages {
+		response.BadRequest(c, fmt.Sprintf("messages cannot exceed %d items", maxChatMessages))
+		return
+	}
+	totalChars := 0
+	for _, message := range req.Messages {
+		if len(message.Content) > maxChatMessageChars {
+			response.BadRequest(c, fmt.Sprintf("each message cannot exceed %d characters", maxChatMessageChars))
+			return
+		}
+		totalChars += len(message.Content)
+	}
+	if totalChars > maxChatRequestChars {
+		response.BadRequest(c, fmt.Sprintf("message content cannot exceed %d characters", maxChatRequestChars))
 		return
 	}
 
@@ -76,7 +100,6 @@ func (h *AIHandler) UpdateConfig(c *gin.Context) {
 		response.BadRequest(c, "invalid request body")
 		return
 	}
-
 	if err := h.aiService.UpdateConfig(req.Endpoint, req.APIKey, req.Model); err != nil {
 		response.ServerError(c, err.Error())
 		return
@@ -107,6 +130,10 @@ func (h *AIHandler) ApplySpreadsheetPlan(c *gin.Context) {
 	var req service.SpreadsheetApplyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "invalid request body")
+		return
+	}
+	if len(req.Operations) > maxSpreadsheetOps {
+		response.BadRequest(c, fmt.Sprintf("operations cannot exceed %d items", maxSpreadsheetOps))
 		return
 	}
 

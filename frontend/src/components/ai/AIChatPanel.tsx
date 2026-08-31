@@ -54,6 +54,53 @@ interface AIComposeEventDetail {
 const DEFAULT_PANEL_SIZE: PanelSize = { width: 576, height: 720 }
 const MIN_PANEL_WIDTH = 360
 const MIN_PANEL_HEIGHT = 420
+const MAX_CHAT_MESSAGES = 100
+const MAX_CHAT_CONTEXT_MESSAGES = 24
+const MAX_CHAT_HISTORY_CHARS = 2 * 1024 * 1024
+const MAX_CHAT_MESSAGE_CHARS = 120_000
+const MAX_CHAT_INPUT_CHARS = 20_000
+const MAX_CHAT_TRACE_DATA_CHARS = 256_000
+
+function compactTrace(trace: AIChatToolTrace): AIChatToolTrace {
+  if (trace.data === undefined) return trace
+  let serialized = ''
+  try {
+    serialized = JSON.stringify(trace.data)
+  } catch {
+    return { ...trace, data: { truncated: true } }
+  }
+  if (serialized.length <= MAX_CHAT_TRACE_DATA_CHARS) return trace
+  return { ...trace, data: { truncated: true, preview: serialized.slice(0, MAX_CHAT_TRACE_DATA_CHARS) } }
+}
+
+function compactChatMessages(items: PersistedMessage[]): PersistedMessage[] {
+  const normalized = items
+    .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
+    .slice(-MAX_CHAT_MESSAGES)
+    .map((item) => ({
+      ...item,
+      id: typeof item.id === 'string' ? item.id.slice(0, 128) : makeId(),
+      content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
+      toolTraces: Array.isArray(item.toolTraces) ? item.toolTraces.slice(0, 24).map(compactTrace) : undefined,
+      pendingOperations: Array.isArray(item.pendingOperations) ? item.pendingOperations.slice(0, 100) : undefined,
+      touchedSheetIds: Array.isArray(item.touchedSheetIds) ? item.touchedSheetIds.slice(0, 100) : undefined,
+    }))
+
+  const result: PersistedMessage[] = []
+  let totalChars = 0
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    let item = normalized[index]
+    let itemChars = JSON.stringify(item).length
+    if (itemChars > MAX_CHAT_HISTORY_CHARS) {
+      item = { ...item, content: item.content.slice(0, 1024), toolTraces: undefined, pendingOperations: undefined }
+      itemChars = JSON.stringify(item).length
+    }
+    if (result.length > 0 && totalChars + itemChars > MAX_CHAT_HISTORY_CHARS) break
+    result.unshift(item)
+    totalChars += itemChars
+  }
+  return result
+}
 
 type AIIdeaIcon = 'sparkles' | 'table' | 'chart' | 'wand'
 
@@ -602,7 +649,10 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const panelSizeStorageKey = userId ? `yaerp_ai_panel_size_${userId}` : 'yaerp_ai_panel_size_guest'
 
   const requestMessages = useMemo(
-    () => messages.map((item) => ({ role: item.role, content: item.content })),
+	() => messages.slice(-MAX_CHAT_CONTEXT_MESSAGES).map((item) => ({
+	  role: item.role,
+	  content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
+	})),
     [messages]
   )
 
@@ -734,7 +784,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         return
       }
       const parsed = JSON.parse(raw) as PersistedMessage[]
-      setMessages(Array.isArray(parsed) ? parsed : [])
+	  setMessages(Array.isArray(parsed) ? compactChatMessages(parsed) : [])
     } catch {
       setMessages([])
     } finally {
@@ -789,11 +839,15 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
 
   useEffect(() => {
     if (typeof window === 'undefined' || !historyReadyRef.current) return
-    localStorage.setItem(storageKey, JSON.stringify(messages))
+	try {
+	  localStorage.setItem(storageKey, JSON.stringify(compactChatMessages(messages)))
+	} catch {
+	  // Storage can be disabled or full; keep the in-memory conversation usable.
+	}
   }, [messages, storageKey])
 
   const handleSend = async () => {
-    const trimmed = inputValue.trim()
+	const trimmed = inputValue.trim().slice(0, MAX_CHAT_INPUT_CHARS)
     if (!trimmed || loading) return
 
     const userMessage: PersistedMessage = {
@@ -803,7 +857,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       createdAt: Date.now(),
     }
 
-    const nextMessages = [...messages, userMessage]
+	const nextMessages = compactChatMessages([...messages, userMessage])
     setMessages(nextMessages)
     setInputValue('')
     setLoading(true)
@@ -835,7 +889,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         applyState: 'idle',
         erpApplyState: 'idle',
       }
-      setMessages((prev) => [...prev, assistantMessage])
+	  setMessages((prev) => compactChatMessages([...prev, assistantMessage]))
 
       if (res.data.resources_changed || (res.data.changed_sheet_ids?.length ?? 0) > 0) {
         notifyDataChanged({
@@ -845,15 +899,15 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         })
       }
 	} catch (error) {
-      setMessages((prev) => [
-        ...prev,
+	  setMessages((prev) => compactChatMessages([
+		...prev,
         {
           id: makeId(),
           role: 'assistant',
 		  content: error instanceof Error ? error.message : '请求失败，请稍后重试。',
           createdAt: Date.now(),
         },
-      ])
+	  ]))
     } finally {
       setLoading(false)
     }
@@ -1393,6 +1447,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             onKeyDown={handleKeyDown}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
+            maxLength={MAX_CHAT_INPUT_CHARS}
             placeholder="输入消息，或拖入单元格内容..."
             rows={1}
             className="min-h-[46px] flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2.5 text-sm leading-6 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-100"

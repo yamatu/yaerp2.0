@@ -3165,6 +3165,19 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     let disposed = false
     let cleanup: (() => void) | null = null
+	let createdUniver: ReturnType<typeof createUniver> | null = null
+	let cancelHeightWait: (() => void) | null = null
+
+	const disposeCreatedUniver = () => {
+	  if (!createdUniver) return
+	  try {
+		;(createdUniver.univer as { dispose?: () => void }).dispose?.()
+	  } catch (disposeError) {
+		console.error('Failed to dispose Univer instance:', disposeError)
+	  } finally {
+		createdUniver = null
+	  }
+	}
 
     const mount = async () => {
       setLoading(true)
@@ -3219,19 +3232,32 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // CRITICAL: Ensure the container has actual pixel dimensions before
         // Univer tries to read offsetHeight. If flex layout hasn't resolved
         // yet (e.g. 0px), wait one frame.
-        const ensureHeight = () =>
-          new Promise<void>((resolve) => {
-            const check = () => {
-              if (containerRef.current && containerRef.current.offsetHeight > 0) {
-                resolve()
-              } else {
-                requestAnimationFrame(check)
-              }
-            }
-            check()
-          })
+		const ensureHeight = () => new Promise<boolean>((resolve) => {
+		  let frame: number | null = null
+		  let settled = false
+		  const deadline = performance.now() + 5000
+		  const finish = (ready: boolean) => {
+			if (settled) return
+			settled = true
+			if (frame !== null) window.cancelAnimationFrame(frame)
+			cancelHeightWait = null
+			resolve(ready)
+		  }
+		  const check = () => {
+			if (disposed) return finish(false)
+			if (containerRef.current && containerRef.current.offsetHeight > 0) return finish(true)
+			if (performance.now() >= deadline) return finish(false)
+			frame = window.requestAnimationFrame(check)
+		  }
+		  cancelHeightWait = () => finish(false)
+		  check()
+		})
 
-        await ensureHeight()
+		const hasHeight = await ensureHeight()
+		if (!hasHeight) {
+		  if (disposed) return
+		  throw new Error('工作表容器未能在限定时间内完成布局')
+		}
         if (disposed || !containerRef.current) return
 
         const localeKey = LocaleType.ZH_CN
@@ -3265,8 +3291,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             UniverSheetsConditionalFormattingPreset(),
           ],
         })
+		createdUniver = univerResult
+		if (disposed) {
+		  disposeCreatedUniver()
+		  return
+		}
 
-        const { univer, univerAPI } = univerResult
+		const { univerAPI } = univerResult
         univerApiRef.current = univerResult
 
         const workbookApi = univerAPI.createUniverSheet(workbookData)
@@ -3359,6 +3390,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         }
 
         const persistSnapshot = async () => {
+		  if (disposed) return
           persistQueuedRef.current = true
           if (persistInFlightRef.current) {
             await persistInFlightRef.current
@@ -3366,7 +3398,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           }
 
           const runPersist = async () => {
-            while (persistQueuedRef.current) {
+			while (persistQueuedRef.current && !disposed) {
               persistQueuedRef.current = false
               const snap = latestSheetRef.current
               const saved = workbookApi.save()
@@ -3417,6 +3449,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 config: nextConfig,
                 cell_changes: cellChanges,
               })
+			  if (disposed) return
 
               if (res.code !== 0) {
                 throw new Error(res.message || '保存工作表失败')
@@ -3602,6 +3635,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         })
 
         cleanup = () => {
+		  disposed = true
           persistSheetViewMemory()
           disposable.dispose()
           selectionPresenceDisposable.dispose()
@@ -3638,14 +3672,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           setOptionPickerTarget(null)
           setOptionPickerSearch('')
 
-          try {
-            ;(univer as { dispose?: () => void }).dispose?.()
-          } catch (disposeError) {
-            console.error('Failed to dispose Univer instance:', disposeError)
-          }
+		  disposeCreatedUniver()
+		  containerRef.current?.replaceChildren()
 
 		}
       } catch (mountError) {
+		disposeCreatedUniver()
         console.error('Failed to initialize Univer sheet:', mountError)
         if (!disposed) {
           setError(mountError instanceof Error ? mountError.message : 'Univer 工作表初始化失败，请稍后重试。')
@@ -3655,7 +3687,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
 
     mount()
-    return () => { disposed = true; cleanup?.() }
+	return () => {
+	  disposed = true
+	  cancelHeightWait?.()
+	  cleanup?.()
+	  disposeCreatedUniver()
+	}
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
   }, [sheetId, workbookId, reloadToken, canInitializeEditor, persistSheetViewMemory, requestProtectionHighlightRefresh, scheduleSheetViewMemoryPersist])
 

@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"sync"
@@ -8,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+const maxRateLimitEntries = 10000
 
 // ipCounter tracks request counts for a single IP address within a
 // one-minute window.
@@ -57,7 +61,8 @@ func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 
 		authHeader := c.GetHeader("Authorization")
 		if token, ok := strings.CutPrefix(authHeader, "Bearer "); ok && strings.TrimSpace(token) != "" {
-			key = "token:" + strings.TrimSpace(token)
+			digest := sha256.Sum256([]byte(strings.TrimSpace(token)))
+			key = "token:" + hex.EncodeToString(digest[:])
 			limit = requestsPerMinute * 10
 		}
 
@@ -66,6 +71,18 @@ func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 		mu.Lock()
 		entry, exists := counters[key]
 		if !exists || now.After(entry.expiresAt) {
+			if !exists && len(counters) >= maxRateLimitEntries {
+				for oldKey, counter := range counters {
+					if now.After(counter.expiresAt) {
+						delete(counters, oldKey)
+					}
+				}
+				if len(counters) >= maxRateLimitEntries {
+					mu.Unlock()
+					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limiter is busy, please try again later"})
+					return
+				}
+			}
 			// First request or window expired – start a new window.
 			counters[key] = &ipCounter{
 				count:     1,

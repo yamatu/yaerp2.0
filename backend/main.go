@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"yaerp/config"
+	"yaerp/internal/diagnostics"
 	"yaerp/internal/handler"
 	"yaerp/internal/middleware"
 	"yaerp/internal/model"
@@ -146,6 +148,7 @@ func main() {
 	if err := scheduleService.Start(); err != nil {
 		log.Fatalf("failed to start AI schedule service: %v", err)
 	}
+	defer scheduleService.Stop()
 	go mailService.StartAutoForward(context.Background(), 2*time.Minute)
 	if err := mailService.StartBulkWorkers(context.Background()); err != nil {
 		log.Fatalf("failed to start bulk mail workers: %v", err)
@@ -154,6 +157,7 @@ func main() {
 	// WebSocket
 	hub := ws.NewHub()
 	go hub.Run()
+	defer hub.Close()
 	broadcastChannelMessage := func(message *model.ChannelMessage) {
 		if message == nil {
 			return
@@ -246,7 +250,9 @@ func main() {
 
 	// Middleware
 	r.Use(middleware.CORSMiddleware(cfg.Server.AllowedOrigins))
+	r.Use(middleware.RequestBodyLimit(cfg.Debug.MaxRequestBytes))
 	r.Use(middleware.RateLimitMiddleware(100))
+	diagnostics.Register(r, cfg.Debug.PprofEnabled, cfg.Debug.PprofToken, db.Stats, hub.ClientCount, hub.DroppedBroadcastCount, hub.SlowClientCount)
 
 	// Public routes
 	auth := r.Group("/api/auth")
@@ -616,7 +622,14 @@ func main() {
 	go whatsAppService.AutoStart()
 
 	log.Printf("Server starting on port %s", cfg.Server.Port)
-	if err := r.Run(":" + cfg.Server.Port); err != nil {
+	server := &http.Server{
+		Addr:              ":" + cfg.Server.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

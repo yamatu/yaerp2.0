@@ -23,6 +23,11 @@ export function useSheetWebSocket(sheetId: number, onReload?: () => Promise<void
 
     return () => {
       unsubscribeReload()
+      wsClient.leaveSheet(sheetId)
+      // The client is a singleton, but this hook owns the connection used by
+      // the workbook screen. Closing it on unmount prevents an abandoned tab
+      // from keeping a server-side WebSocket forever.
+      wsClient.disconnect()
     }
   }, [sheetId])
 }

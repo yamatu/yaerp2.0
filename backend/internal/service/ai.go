@@ -37,6 +37,7 @@ func (s *AIService) SetAutomationService(automationService *AutomationService) {
 }
 
 const aiRequestTimeout = 180 * time.Second
+const maxAIResponseBytes = 8 * 1024 * 1024
 
 var bulkRowCountPattern = regexp.MustCompile(`(?i)(\d+)\s*(?:行|条|rows?)`)
 
@@ -582,7 +583,7 @@ func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readAIResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -609,6 +610,17 @@ func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages 
 	}
 
 	return &ChatResponse{Reply: apiResp.Choices[0].Message.Content, Model: apiResp.Model}, nil
+}
+
+func readAIResponseBody(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxAIResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxAIResponseBytes {
+		return nil, fmt.Errorf("AI response exceeds %d bytes", maxAIResponseBytes)
+	}
+	return data, nil
 }
 
 func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs []int64) (string, map[int64]sheetPreviewMeta, error) {
