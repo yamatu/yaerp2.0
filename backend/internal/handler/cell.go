@@ -17,6 +17,8 @@ type CellHandler struct {
 	permService  *service.PermissionService
 }
 
+const maxBatchCellUpdates = 10000
+
 func NewCellHandler(sheetService *service.SheetService, permService *service.PermissionService) *CellHandler {
 	return &CellHandler{sheetService: sheetService, permService: permService}
 }
@@ -27,6 +29,10 @@ func (h *CellHandler) BatchUpdate(c *gin.Context) {
 	var req model.BatchUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "invalid request body")
+		return
+	}
+	if len(req.Changes) > maxBatchCellUpdates {
+		response.BadRequest(c, fmt.Sprintf("changes cannot exceed %d items", maxBatchCellUpdates))
 		return
 	}
 

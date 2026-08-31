@@ -25,3 +25,4 @@ ai-chat-response*.json
 ai-preview-response*.json
 docker-compose*.bak
 frontend/tsconfig.tsbuildinfo
+memory-*/

@@ -3,6 +3,9 @@ import { getAccessToken } from './auth'
 
 type MessageHandler = (msg: WSMessage) => void
 
+const MAX_PENDING_MESSAGES = 100
+const MAX_PENDING_BYTES = 4 * 1024 * 1024
+
 class WSClient {
   private ws: WebSocket | null = null
   private handlers: Map<string, Set<MessageHandler>> = new Map()
@@ -10,7 +13,9 @@ class WSClient {
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
   private pendingMessages: string[] = []
+  private pendingBytes = 0
   private joinedSheetId: number | null = null
+  private shouldReconnect = true
 
   private getWSUrl() {
     if (typeof window === 'undefined') {
@@ -32,6 +37,12 @@ class WSClient {
   }
 
   connect() {
+    this.shouldReconnect = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return
     }
@@ -39,28 +50,42 @@ class WSClient {
     const token = getAccessToken()
     if (!token) return
 
-    const wsUrl = this.getWSUrl()
-    this.ws = new WebSocket(`${wsUrl}?token=${token}`)
+    const socket = new WebSocket(`${this.getWSUrl()}?token=${token}`)
+    this.ws = socket
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      // A stale socket can finish opening after a newer connection replaced
+      // it. Ignore that event so it cannot drain messages into the wrong
+      // connection.
+      if (this.ws !== socket) return
       this.reconnectAttempts = 0
       console.log('WebSocket connected')
-      this.pendingMessages.forEach((message) => this.ws?.send(message))
-      const hadPendingMessages = this.pendingMessages.length > 0
+
+      const pending = this.pendingMessages
       this.pendingMessages = []
-      if (!hadPendingMessages && this.joinedSheetId !== null) {
-        this.ws?.send(JSON.stringify({ type: 'join_sheet', sheetId: this.joinedSheetId }))
+      this.pendingBytes = 0
+      for (const message of pending) {
+        if (socket.readyState !== WebSocket.OPEN) {
+          this.enqueue(message)
+          break
+        }
+        socket.send(message)
+      }
+
+      const hadPendingJoin = pending.some((message) => this.isJoinMessage(message))
+      if (!hadPendingJoin && this.joinedSheetId !== null && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'join_sheet', sheetId: this.joinedSheetId }))
       }
     }
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return
       try {
         const msg: WSMessage = JSON.parse(event.data)
         const typeHandlers = this.handlers.get(msg.type)
         if (typeHandlers) {
           typeHandlers.forEach((handler) => handler(msg))
         }
-        // Also notify wildcard handlers
         const allHandlers = this.handlers.get('*')
         if (allHandlers) {
           allHandlers.forEach((handler) => handler(msg))
@@ -70,31 +95,51 @@ class WSClient {
       }
     }
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return
+      this.ws = null
       console.log('WebSocket disconnected')
-      this.attemptReconnect()
+      if (this.shouldReconnect) this.attemptReconnect()
     }
 
-    this.ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
+    socket.onerror = (error) => {
+      if (this.ws === socket) console.error('WebSocket error:', error)
     }
   }
 
   private attemptReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) return
+    if (!this.shouldReconnect || !getAccessToken()) return
+    if (this.reconnectTimer || this.reconnectAttempts >= this.maxReconnectAttempts) return
     this.reconnectAttempts++
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
-    this.reconnectTimer = setTimeout(() => this.connect(), delay)
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, delay)
   }
 
   disconnect() {
+    this.shouldReconnect = false
+    this.reconnectAttempts = 0
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
+
+    this.pendingMessages = []
+    this.pendingBytes = 0
+    this.joinedSheetId = null
+
+    const socket = this.ws
+    this.ws = null
+    if (socket) {
+      // Clearing callbacks prevents an intentional close from scheduling a
+      // reconnect and releases closures captured by the old WebSocket.
+      socket.onopen = null
+      socket.onmessage = null
+      socket.onclose = null
+      socket.onerror = null
+      socket.close()
     }
   }
 
@@ -105,16 +150,25 @@ class WSClient {
       return
     }
 
-    this.pendingMessages.push(payload)
+    if (!getAccessToken()) return
+    this.enqueue(payload)
+    this.connect()
   }
 
   joinSheet(sheetId: number) {
+    if (!sheetId) return
     if (this.joinedSheetId === sheetId && this.ws?.readyState === WebSocket.OPEN) {
       return
     }
     this.joinedSheetId = sheetId
-    this.pendingMessages = this.pendingMessages.filter((message) => !message.includes('"type":"join_sheet"'))
+    this.removePendingJoins()
     this.send({ type: 'join_sheet', sheetId })
+  }
+
+  leaveSheet(sheetId: number) {
+    if (this.joinedSheetId !== sheetId) return
+    this.joinedSheetId = null
+    this.removePendingJoins()
   }
 
   sendCellUpdate(sheetId: number, row: number, col: string, value: unknown) {
@@ -131,12 +185,41 @@ class WSClient {
     }
     this.handlers.get(type)!.add(handler)
     return () => {
-      this.handlers.get(type)?.delete(handler)
+      const handlers = this.handlers.get(type)
+      handlers?.delete(handler)
+      if (handlers && handlers.size === 0) this.handlers.delete(type)
     }
   }
 
   off(type: string, handler: MessageHandler) {
-    this.handlers.get(type)?.delete(handler)
+    const handlers = this.handlers.get(type)
+    handlers?.delete(handler)
+    if (handlers && handlers.size === 0) this.handlers.delete(type)
+  }
+
+  private isJoinMessage(message: string) {
+    return message.includes('"type":"join_sheet"')
+  }
+
+  private removePendingJoins() {
+    if (this.pendingMessages.length === 0) return
+    this.pendingMessages = this.pendingMessages.filter((message) => !this.isJoinMessage(message))
+    this.pendingBytes = this.pendingMessages.reduce((total, message) => total + message.length, 0)
+  }
+
+  private enqueue(payload: string) {
+    if (payload.length > MAX_PENDING_BYTES) return
+    this.pendingMessages.push(payload)
+    this.pendingBytes += payload.length
+
+    while (this.pendingMessages.length > MAX_PENDING_MESSAGES || this.pendingBytes > MAX_PENDING_BYTES) {
+      // Preserve the most recent join request; discard the oldest data update
+      // first so an outage cannot grow the queue without bound.
+      let index = this.pendingMessages.findIndex((message) => !this.isJoinMessage(message))
+      if (index < 0) index = 0
+      const [removed] = this.pendingMessages.splice(index, 1)
+      this.pendingBytes -= removed.length
+    }
   }
 }
 

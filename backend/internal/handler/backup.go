@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,10 @@ func NewBackupHandler(backupService *service.BackupService) *BackupHandler {
 func (h *BackupHandler) DownloadDatabase(c *gin.Context) {
 	data, err := h.backupService.DumpDatabase()
 	if err != nil {
+		if errors.Is(err, service.ErrBackupTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"code": -1, "message": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
 	}
@@ -46,6 +51,10 @@ func (h *BackupHandler) DownloadConfig(c *gin.Context) {
 func (h *BackupHandler) DownloadCombined(c *gin.Context) {
 	data, err := h.backupService.CombinedBackup()
 	if err != nil {
+		if errors.Is(err, service.ErrBackupTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"code": -1, "message": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"code": -1, "message": err.Error()})
 		return
 	}

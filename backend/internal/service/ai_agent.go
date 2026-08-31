@@ -7,7 +7,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io"
 	"math"
 	"net/http"
 	"sort"
@@ -57,6 +56,8 @@ type openAIChatToolResponse struct {
 	} `json:"choices"`
 	Model string `json:"model"`
 }
+
+const maxAIToolResultBytes = 2 * 1024 * 1024
 
 func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 	return map[string]ToolFunc{
@@ -183,6 +184,9 @@ func (s *AIService) chatWithTools(userID int64, messages []ChatMessage) (*ChatRe
 			encoded, err := json.Marshal(result.Data)
 			if err != nil {
 				encoded = []byte(`{"ok":true}`)
+			}
+			if len(encoded) > maxAIToolResultBytes {
+				encoded = []byte(fmt.Sprintf(`{"truncated":true,"message":"tool result exceeded %d bytes"}`, maxAIToolResultBytes))
 			}
 			conversation = append(conversation, map[string]any{
 				"role":         "tool",
@@ -508,7 +512,7 @@ func doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
 	}
 	defer response.Body.Close()
 
-	respBody, err := io.ReadAll(response.Body)
+	respBody, err := readAIResponseBody(response.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}

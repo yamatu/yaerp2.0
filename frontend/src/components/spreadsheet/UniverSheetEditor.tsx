@@ -353,11 +353,19 @@ function printHtmlWithHiddenFrame(html: string) {
       return
     }
 
-    let cleaned = false
-    const cleanup = () => {
-      if (cleaned) return
-      cleaned = true
-      window.setTimeout(() => iframe.remove(), 300)
+		let cleaned = false
+		let printTimer: number | null = null
+		let fallbackCleanupTimer: number | null = null
+		let removeTimer: number | null = null
+		const cleanup = () => {
+			if (cleaned) return
+			cleaned = true
+			if (printTimer) window.clearTimeout(printTimer)
+			if (fallbackCleanupTimer) window.clearTimeout(fallbackCleanupTimer)
+			removeTimer = window.setTimeout(() => {
+				removeTimer = null
+				iframe.remove()
+			}, 300)
     }
 
     frameWindow.addEventListener('afterprint', cleanup, { once: true })
@@ -367,11 +375,15 @@ function printHtmlWithHiddenFrame(html: string) {
       frameDocument.write(html)
       frameDocument.close()
 
-      window.setTimeout(() => {
-        try {
-          frameWindow.focus()
-          frameWindow.print()
-          window.setTimeout(cleanup, 60000)
+		printTimer = window.setTimeout(() => {
+			printTimer = null
+			try {
+				frameWindow.focus()
+				frameWindow.print()
+				fallbackCleanupTimer = window.setTimeout(() => {
+					fallbackCleanupTimer = null
+					cleanup()
+				}, 60000)
           resolve()
         } catch (error) {
           cleanup()
@@ -411,6 +423,7 @@ function mergeUniverStyleMap(base: Record<string, unknown> | undefined, next: Re
 export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onExternalReload, optimisticCanEdit = false, canImportWorkbook = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const saveStatusTimerRef = useRef<number | null>(null)
   const persistInFlightRef = useRef<Promise<void> | null>(null)
   const persistQueuedRef = useRef(false)
   const latestSheetRef = useRef(sheet)
@@ -600,7 +613,11 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     try {
       await persistRef.current()
       setSaveStatus('saved')
-      setTimeout(() => setSaveStatus('idle'), 1500)
+      if (saveStatusTimerRef.current) clearTimeout(saveStatusTimerRef.current)
+      saveStatusTimerRef.current = window.setTimeout(() => {
+        saveStatusTimerRef.current = null
+        setSaveStatus('idle')
+      }, 1500)
     } catch (e) {
       console.error('Manual save failed:', e)
       const message = e instanceof Error ? e.message : '保存失败，请稍后再试。'
@@ -914,12 +931,25 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
     return () => window.removeEventListener('keydown', handleKeyDown, true)
   }, [handleManualSave])
 
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
+	useEffect(() => {
+		const el = containerRef.current
+		if (!el) return
 
-    let disposed = false
-    let cleanup: (() => void) | null = null
+		let disposed = false
+		let cleanup: (() => void) | null = null
+		let createdUniver: ReturnType<typeof createUniver> | null = null
+		let cancelHeightWait: (() => void) | null = null
+
+		const disposeCreatedUniver = () => {
+			if (!createdUniver) return
+			try {
+				;(createdUniver.univer as { dispose?: () => void }).dispose?.()
+			} catch (disposeError) {
+				console.error('Failed to dispose Univer instance:', disposeError)
+			} finally {
+				createdUniver = null
+			}
+		}
 
     const mount = async () => {
       setLoading(true)
@@ -971,23 +1001,46 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
         // CRITICAL: Ensure the container has actual pixel dimensions before
         // Univer tries to read offsetHeight. If flex layout hasn't resolved
         // yet (e.g. 0px), wait one frame.
-        const ensureHeight = () =>
-          new Promise<void>((resolve) => {
-            const check = () => {
-              if (containerRef.current && containerRef.current.offsetHeight > 0) {
-                resolve()
-              } else {
-                requestAnimationFrame(check)
-              }
-            }
-            check()
-          })
+		const ensureHeight = () =>
+			new Promise<boolean>((resolve) => {
+				let frame: number | null = null
+				let settled = false
+				const deadline = performance.now() + 5000
+				const finish = (ready: boolean) => {
+					if (settled) return
+					settled = true
+					if (frame !== null) cancelAnimationFrame(frame)
+					cancelHeightWait = null
+					resolve(ready)
+				}
+				const check = () => {
+					if (disposed) {
+						finish(false)
+						return
+					}
+					if (containerRef.current && containerRef.current.offsetHeight > 0) {
+						finish(true)
+						return
+					}
+					if (performance.now() >= deadline) {
+						finish(false)
+						return
+					}
+					frame = requestAnimationFrame(check)
+				}
+				cancelHeightWait = () => finish(false)
+				check()
+			})
 
-        await ensureHeight()
-        if (disposed || !containerRef.current) return
+		const hasHeight = await ensureHeight()
+		if (!hasHeight) {
+			if (disposed) return
+			throw new Error('工作表容器未能在限定时间内完成布局')
+		}
+		if (disposed || !containerRef.current) return
 
 		const localeKey = LocaleType.ZH_CN
-        const univerResult = createUniver({
+		createdUniver = createUniver({
           locale: localeKey,
           theme: defaultTheme,
           locales: {
@@ -1011,27 +1064,37 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
             UniverSheetsFilterPreset(),
             UniverSheetsFindReplacePreset(),
           ],
-        })
+		})
+		if (disposed) {
+			disposeCreatedUniver()
+			return
+		}
 
-        const { univer, univerAPI } = univerResult
-        univerApiRef.current = univerResult
+		const univerResult = createdUniver
+		const { univer, univerAPI } = univerResult
+		univerApiRef.current = univerResult
 
-        const workbookApi = univerAPI.createUniverSheet(workbookData)
+		const workbookApi = univerAPI.createUniverSheet(workbookData)
+		if (disposed) {
+			disposeCreatedUniver()
+			return
+		}
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         syncFilterState()
         syncSelectionState()
         if (!disposed) setLoading(false)
 
-        const persistSnapshot = async () => {
-          persistQueuedRef.current = true
+		const persistSnapshot = async () => {
+			if (disposed) return
+			persistQueuedRef.current = true
           if (persistInFlightRef.current) {
             await persistInFlightRef.current
             return
           }
 
-          const runPersist = async () => {
-            while (persistQueuedRef.current) {
+			const runPersist = async () => {
+				while (persistQueuedRef.current && !disposed) {
               persistQueuedRef.current = false
               const snap = latestSheetRef.current
               const saved = workbookApi.save()
@@ -1049,13 +1112,14 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
                   saved.styles as Record<string, unknown> | undefined
                 ),
               }
-              const res = await api.put(`/sheets/${snap.id}`, {
+				const res = await api.put(`/sheets/${snap.id}`, {
                 name: savedSheet.name || snap.name,
                 sort_order: snap.sort_order,
                 columns: nextColumns,
                 frozen: snap.frozen || { row: 0, col: 0 },
                 config: nextConfig,
-              })
+				})
+				if (disposed) return
 
               if (res.code !== 0) {
                 throw new Error(res.message || '保存工作表失败')
@@ -1090,31 +1154,37 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
           }, 900)
         }
 
-        const disposable = workbookApi.onCommandExecuted(() => {
+		const disposable = workbookApi.onCommandExecuted(() => {
           schedulePersist()
           syncFilterState()
           syncSelectionState()
         })
 
-        cleanup = () => {
-          disposable.dispose()
+		let cleaned = false
+		cleanup = () => {
+			if (cleaned) return
+			cleaned = true
+			disposed = true
+			disposable.dispose()
           persistRef.current = null
           workbookApiRef.current = null
           persistQueuedRef.current = false
           persistInFlightRef.current = null
-          if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
-          univerApiRef.current = null
+			if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null }
+			if (saveStatusTimerRef.current) { clearTimeout(saveStatusTimerRef.current); saveStatusTimerRef.current = null }
+			univerApiRef.current = null
           setHasFilter(false)
           setSelectionState(null)
 
-          try {
-            ;(univer as { dispose?: () => void }).dispose?.()
-          } catch (disposeError) {
-            console.error('Failed to dispose Univer instance:', disposeError)
-          }
+			disposeCreatedUniver()
+			// Univer normally removes its canvases during dispose. Clear any
+			// residual nodes as a final guard against detached DOM trees keeping
+			// workbook models alive across sheet switches.
+			containerRef.current?.replaceChildren()
 
 		}
-      } catch (mountError) {
+		} catch (mountError) {
+			disposeCreatedUniver()
         console.error('Failed to initialize Univer sheet:', mountError)
         if (!disposed) {
           setError(mountError instanceof Error ? mountError.message : 'Univer 工作表初始化失败，请稍后重试。')
@@ -1123,8 +1193,14 @@ export default function UniverSheetEditor({ workbookId, sheet, reloadToken, onEx
       }
     }
 
-    mount()
-    return () => { disposed = true; cleanup?.() }
+		mount()
+		return () => {
+			disposed = true
+			cancelHeightWait?.()
+			cleanup?.()
+			disposeCreatedUniver()
+			if (saveStatusTimerRef.current) { clearTimeout(saveStatusTimerRef.current); saveStatusTimerRef.current = null }
+		}
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
   }, [sheetId, workbookId, reloadToken])
 

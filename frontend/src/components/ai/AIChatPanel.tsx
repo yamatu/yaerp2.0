@@ -23,6 +23,79 @@ interface AIChatPanelProps {
   onClose: () => void
 }
 
+const MAX_CHAT_MESSAGES = 100
+const MAX_CHAT_CONTEXT_MESSAGES = 24
+const MAX_CHAT_HISTORY_CHARS = 2 * 1024 * 1024
+const MAX_CHAT_MESSAGE_CHARS = 120_000
+const MAX_CHAT_INPUT_CHARS = 20_000
+const MAX_CHAT_TRACE_DATA_CHARS = 256_000
+
+function compactTrace(trace: AIChatToolTrace): AIChatToolTrace {
+  if (trace.data === undefined) return trace
+  let serialized = ''
+  try {
+    serialized = JSON.stringify(trace.data)
+  } catch {
+    return { ...trace, data: { truncated: true } }
+  }
+  if (serialized.length <= MAX_CHAT_TRACE_DATA_CHARS) return trace
+  return {
+    ...trace,
+    data: {
+      truncated: true,
+      preview: serialized.slice(0, MAX_CHAT_TRACE_DATA_CHARS),
+    },
+  }
+}
+
+function compactChatMessages(items: PersistedMessage[]): PersistedMessage[] {
+  const normalized = items
+    .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
+    .slice(-MAX_CHAT_MESSAGES)
+    .map((item) => {
+      const normalizedItem: PersistedMessage = {
+        id: typeof item.id === 'string' ? item.id.slice(0, 128) : makeId(),
+        role: item.role,
+        content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
+        createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
+      }
+      if (Array.isArray(item.toolTraces)) {
+        normalizedItem.toolTraces = item.toolTraces
+          .slice(0, 24)
+          .filter((trace): trace is AIChatToolTrace => Boolean(trace && typeof trace === 'object'))
+          .map(compactTrace)
+      }
+      if (Array.isArray(item.pendingOperations)) normalizedItem.pendingOperations = item.pendingOperations.slice(0, 100)
+      if (Array.isArray(item.touchedSheetIds)) normalizedItem.touchedSheetIds = item.touchedSheetIds.slice(0, 100)
+      if (item.applyState) normalizedItem.applyState = item.applyState
+      if (typeof item.applyError === 'string') normalizedItem.applyError = item.applyError.slice(0, 2000)
+      return normalizedItem
+    })
+
+  const result: PersistedMessage[] = []
+  let totalChars = 0
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    let item = normalized[index]
+    let itemChars = JSON.stringify(item).length
+    if (itemChars > MAX_CHAT_HISTORY_CHARS) {
+      item = {
+        ...item,
+        content: item.content.slice(0, 1024),
+        toolTraces: undefined,
+        pendingOperations: undefined,
+        touchedSheetIds: undefined,
+      }
+      itemChars = JSON.stringify(item).length
+    }
+    if (result.length > 0 && totalChars + itemChars > MAX_CHAT_HISTORY_CHARS) {
+      break
+    }
+    result.unshift(item)
+    totalChars += itemChars
+  }
+  return result
+}
+
 function makeId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
@@ -194,11 +267,20 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const historyReadyRef = useRef(false)
+  const focusTimerRef = useRef<number | null>(null)
+  const scrollTimerRef = useRef<number | null>(null)
+  const historyRafRef = useRef<number | null>(null)
+  const [historyReady, setHistoryReady] = useState(false)
   const userId = getStoredUser()?.id ?? 0
   const storageKey = userId ? `yaerp_ai_chat_history_${userId}` : 'yaerp_ai_chat_history_guest'
 
   const requestMessages = useMemo(
-    () => messages.map((item) => ({ role: item.role, content: item.content })),
+    () => messages
+      .slice(-MAX_CHAT_CONTEXT_MESSAGES)
+      .map((item) => ({
+        role: item.role,
+        content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
+      })),
     [messages]
   )
 
@@ -211,30 +293,59 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   }, [messages, scrollToBottom])
 
   useEffect(() => {
+    if (focusTimerRef.current) window.clearTimeout(focusTimerRef.current)
+    if (scrollTimerRef.current) window.clearTimeout(scrollTimerRef.current)
+    focusTimerRef.current = null
+    scrollTimerRef.current = null
     if (open && textareaRef.current) {
-      setTimeout(() => textareaRef.current?.focus(), 100)
+      focusTimerRef.current = window.setTimeout(() => {
+        focusTimerRef.current = null
+        textareaRef.current?.focus()
+      }, 100)
     }
     if (open) {
-      setTimeout(() => scrollToBottom('auto'), 80)
+      scrollTimerRef.current = window.setTimeout(() => {
+        scrollTimerRef.current = null
+        scrollToBottom('auto')
+      }, 80)
+    }
+    return () => {
+      if (focusTimerRef.current) window.clearTimeout(focusTimerRef.current)
+      if (scrollTimerRef.current) window.clearTimeout(scrollTimerRef.current)
+      focusTimerRef.current = null
+      scrollTimerRef.current = null
     }
   }, [open, scrollToBottom])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
+    let active = true
+    setHistoryReady(false)
+    historyReadyRef.current = false
     try {
       const raw = localStorage.getItem(storageKey)
       if (!raw) {
-        setMessages([])
-        historyReadyRef.current = true
+        if (active) setMessages([])
         return
       }
       const parsed = JSON.parse(raw) as PersistedMessage[]
-      setMessages(Array.isArray(parsed) ? parsed : [])
+      if (active) setMessages(Array.isArray(parsed) ? compactChatMessages(parsed) : [])
     } catch {
-      setMessages([])
+      if (active) setMessages([])
     } finally {
-      historyReadyRef.current = true
-      requestAnimationFrame(() => scrollToBottom('auto'))
+      if (active) {
+        historyReadyRef.current = true
+        setHistoryReady(true)
+        historyRafRef.current = window.requestAnimationFrame(() => {
+          historyRafRef.current = null
+          scrollToBottom('auto')
+        })
+      }
+    }
+    return () => {
+      active = false
+      if (historyRafRef.current) window.cancelAnimationFrame(historyRafRef.current)
+      historyRafRef.current = null
     }
   }, [scrollToBottom, storageKey])
 
@@ -253,12 +364,17 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   }, [open, messages.length])
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !historyReadyRef.current) return
-    localStorage.setItem(storageKey, JSON.stringify(messages))
-  }, [messages, storageKey])
+    if (typeof window === 'undefined' || !historyReady || !historyReadyRef.current) return
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(compactChatMessages(messages)))
+    } catch {
+      // Storage can be disabled or full; the in-memory conversation remains
+      // usable and will be compacted on the next successful write.
+    }
+  }, [historyReady, messages, storageKey])
 
   const handleSend = async () => {
-    const trimmed = inputValue.trim()
+    const trimmed = inputValue.trim().slice(0, MAX_CHAT_INPUT_CHARS)
     if (!trimmed || loading) return
 
     const userMessage: PersistedMessage = {
@@ -268,7 +384,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       createdAt: Date.now(),
     }
 
-    const nextMessages = [...messages, userMessage]
+    const nextMessages = compactChatMessages([...messages, userMessage])
     setMessages(nextMessages)
     setInputValue('')
     setLoading(true)
@@ -288,17 +404,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         touchedSheetIds: res.data?.touched_sheet_ids,
         applyState: 'idle',
       }
-      setMessages((prev) => [...prev, assistantMessage])
+      setMessages((prev) => compactChatMessages([...prev, assistantMessage]))
     } catch {
-      setMessages((prev) => [
-        ...prev,
+      setMessages((prev) => compactChatMessages([...prev,
         {
           id: makeId(),
           role: 'assistant',
           content: '抱歉，请求失败，请稍后重试。',
           createdAt: Date.now(),
         },
-      ])
+      ]))
     } finally {
       setLoading(false)
     }
@@ -552,6 +667,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             onKeyDown={handleKeyDown}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
+            maxLength={MAX_CHAT_INPUT_CHARS}
             placeholder="输入消息，或拖入单元格内容..."
             rows={4}
             className="flex-1 resize-none rounded-2xl border border-slate-200 px-4 py-3 text-sm leading-7 focus:border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-900/10"

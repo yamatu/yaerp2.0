@@ -13,6 +13,7 @@ type Config struct {
 	Server   ServerConfig
 	AI       AIConfig
 	Backup   BackupConfig
+	Debug    DebugConfig
 }
 
 type PostgresConfig struct {
@@ -59,6 +60,13 @@ type BackupConfig struct {
 	IncludeObjectStorage bool
 	ObjectPrefix         string
 	PublicBaseURL        string
+	MaxBytes             int64
+}
+
+type DebugConfig struct {
+	PprofEnabled    bool
+	PprofToken      string
+	MaxRequestBytes int64
 }
 
 func Load() *Config {
@@ -101,6 +109,12 @@ func Load() *Config {
 			IncludeObjectStorage: getEnv("BACKUP_INCLUDE_OBJECT_STORAGE", "true") == "true",
 			ObjectPrefix:         getEnv("BACKUP_OBJECT_PREFIX", "uploads/"),
 			PublicBaseURL:        getEnv("BACKUP_PUBLIC_BASE_URL", ""),
+			MaxBytes:             getEnvInt64("BACKUP_MAX_BYTES", 256*1024*1024),
+		},
+		Debug: DebugConfig{
+			PprofEnabled:    getEnv("PPROF_ENABLED", "false") == "true",
+			PprofToken:      getEnv("PPROF_TOKEN", ""),
+			MaxRequestBytes: getEnvInt64("MAX_REQUEST_BYTES", 64*1024*1024),
 		},
 	}
 }
@@ -115,6 +129,15 @@ func getEnv(key, fallback string) string {
 func getEnvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil && i > 0 {
 			return i
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +27,23 @@ type BackupService struct {
 	db        *sql.DB
 	minio     *miniopkg.Client
 	restoreMu sync.Mutex
+	exportMu  sync.Mutex
+}
+
+var ErrBackupTooLarge = errors.New("backup exceeds configured size limit")
+
+type boundedBuffer struct {
+	bytes.Buffer
+	max     int64
+	limited bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if b.max > 0 && int64(b.Len())+int64(len(p)) > b.max {
+		b.limited = true
+		return 0, ErrBackupTooLarge
+	}
+	return b.Buffer.Write(p)
 }
 
 type backupManifest struct {
@@ -47,13 +65,29 @@ func NewBackupService(cfg *config.Config, db *sql.DB, minioClient *miniopkg.Clie
 
 // DumpDatabase runs pg_dump and returns the SQL dump as bytes.
 func (s *BackupService) DumpDatabase() ([]byte, error) {
-	cmd := exec.Command("pg_dump", s.baseCommandArgs("--no-password")...)
+	s.exportMu.Lock()
+	defer s.exportMu.Unlock()
+	return s.dumpDatabase()
+}
+
+func (s *BackupService) dumpDatabase() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "pg_dump", s.baseCommandArgs("--no-password")...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
-	var stdout, stderr bytes.Buffer
+	var stdout boundedBuffer
+	stdout.max = s.cfg.Backup.MaxBytes
+	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if stdout.limited {
+			return nil, ErrBackupTooLarge
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("pg_dump timed out: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("pg_dump failed: %s: %w", stderr.String(), err)
 	}
 
@@ -125,7 +159,10 @@ func (s *BackupService) ExportConfig() ([]byte, error) {
 
 // CombinedBackup creates a tar.gz bundle containing both the SQL dump and config JSON.
 func (s *BackupService) CombinedBackup() ([]byte, error) {
-	sqlDump, err := s.DumpDatabase()
+	s.exportMu.Lock()
+	defer s.exportMu.Unlock()
+
+	sqlDump, err := s.dumpDatabase()
 	if err != nil {
 		return nil, fmt.Errorf("database dump failed: %w", err)
 	}
@@ -135,7 +172,8 @@ func (s *BackupService) CombinedBackup() ([]byte, error) {
 		return nil, fmt.Errorf("config export failed: %w", err)
 	}
 
-	var buf bytes.Buffer
+	var buf boundedBuffer
+	buf.max = s.cfg.Backup.MaxBytes
 	gzWriter := gzip.NewWriter(&buf)
 	tarWriter := tar.NewWriter(gzWriter)
 
@@ -194,6 +232,29 @@ func addToTar(tw *tar.Writer, name string, data []byte) error {
 	return nil
 }
 
+func addReaderToTar(tw *tar.Writer, name string, reader io.Reader, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("invalid size for %s", name)
+	}
+	header := &tar.Header{
+		Name:    name,
+		Size:    size,
+		Mode:    0644,
+		ModTime: time.Now(),
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		return fmt.Errorf("write tar header for %s: %w", name, err)
+	}
+	written, err := io.CopyN(tw, reader, size)
+	if err != nil {
+		return fmt.Errorf("write tar data for %s: %w", name, err)
+	}
+	if written != size {
+		return fmt.Errorf("write tar data for %s: expected %d bytes, wrote %d", name, size, written)
+	}
+	return nil
+}
+
 func (s *BackupService) ExportManifest(includedFiles []string) ([]byte, error) {
 	manifest := backupManifest{
 		Version:            2,
@@ -221,20 +282,29 @@ func (s *BackupService) addObjectStorageBackup(tw *tar.Writer) ([]string, error)
 	manifest := make([]map[string]any, 0, len(keys))
 	includedFiles := make([]string, 0, len(keys)+1)
 	for _, key := range keys {
-		data, err := s.minio.GetObjectBytes(ctx, key)
+		object, err := s.minio.GetObject(ctx, key)
 		if err != nil {
 			return nil, fmt.Errorf("read object %s: %w", key, err)
 		}
+		info, err := object.Stat()
+		if err != nil {
+			_ = object.Close()
+			return nil, fmt.Errorf("stat object %s: %w", key, err)
+		}
 		relativeName := strings.TrimLeft(strings.TrimPrefix(key, prefix), "/")
 		archivePath := filepath.ToSlash(filepath.Join("objects", relativeName))
-		if err := addToTar(tw, archivePath, data); err != nil {
+		if err := addReaderToTar(tw, archivePath, object, info.Size); err != nil {
+			_ = object.Close()
 			return nil, err
+		}
+		if err := object.Close(); err != nil {
+			return nil, fmt.Errorf("close object %s: %w", key, err)
 		}
 		includedFiles = append(includedFiles, archivePath)
 		manifest = append(manifest, map[string]any{
 			"object_key":   key,
 			"archive_path": archivePath,
-			"size":         len(data),
+			"size":         info.Size,
 			"url":          s.minio.PublicURLForObject(key),
 		})
 	}
@@ -265,7 +335,9 @@ func (s *BackupService) baseCommandArgs(extraArgs ...string) []string {
 }
 
 func (s *BackupService) runPSQL(input []byte) error {
-	cmd := exec.Command("psql", s.baseCommandArgs("--no-password", "-v", "ON_ERROR_STOP=1", "-f", "-")...)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "psql", s.baseCommandArgs("--no-password", "-v", "ON_ERROR_STOP=1", "-f", "-")...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
 	cmd.Stdin = bytes.NewReader(input)
 
@@ -273,6 +345,9 @@ func (s *BackupService) runPSQL(input []byte) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("psql timed out: %w", ctx.Err())
+		}
 		return fmt.Errorf("psql failed: %s: %w", stderr.String(), err)
 	}
 

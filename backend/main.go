@@ -4,12 +4,15 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 
 	"yaerp/config"
+	"yaerp/internal/diagnostics"
 	"yaerp/internal/handler"
 	"yaerp/internal/middleware"
 	"yaerp/internal/repo"
@@ -46,6 +49,7 @@ func main() {
 		Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
 		Password: cfg.Redis.Password,
 	})
+	defer rdb.Close()
 	log.Println("Redis connected")
 
 	// MinIO
@@ -83,10 +87,12 @@ func main() {
 	if err := scheduleService.Start(); err != nil {
 		log.Fatalf("failed to start AI schedule service: %v", err)
 	}
+	defer scheduleService.Stop()
 
 	// WebSocket
 	hub := ws.NewHub()
 	go hub.Run()
+	defer hub.Close()
 	wsHandler := ws.NewWSHandler(hub, jwtUtil, permService, sheetService)
 
 	// Handlers
@@ -108,7 +114,9 @@ func main() {
 
 	// Middleware
 	r.Use(middleware.CORSMiddleware([]string{"*"}))
+	r.Use(middleware.RequestBodyLimit(cfg.Debug.MaxRequestBytes))
 	r.Use(middleware.RateLimitMiddleware(100))
+	diagnostics.Register(r, cfg.Debug.PprofEnabled, cfg.Debug.PprofToken, db.Stats, hub.ClientCount, hub.DroppedBroadcastCount, hub.SlowClientCount)
 
 	// Public routes
 	auth := r.Group("/api/auth")
@@ -240,7 +248,16 @@ func main() {
 	r.GET("/ws", wsHandler.HandleWS)
 
 	log.Printf("Server starting on port %s", cfg.Server.Port)
-	if err := r.Run(":" + cfg.Server.Port); err != nil {
+	server := &http.Server{
+		Addr:              ":" + cfg.Server.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

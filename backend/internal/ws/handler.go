@@ -60,14 +60,14 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		return
 	}
 
-	client := &Client{
-		Hub:      h.Hub,
-		UserID:   claims.UserID,
-		Username: claims.Username,
-		Send:     make(chan []byte, 256),
+	client := NewClient(h.Hub, claims.UserID, claims.Username)
+	if !h.Hub.Register(client) {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "server shutting down"),
+			time.Now().Add(writeWait))
+		_ = conn.Close()
+		return
 	}
-
-	h.Hub.register <- client
 
 	go h.writePump(conn, client)
 	go h.readPump(conn, client)
@@ -75,7 +75,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 
 func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 	defer func() {
-		h.Hub.unregister <- client
+		h.Hub.Unregister(client)
 		conn.Close()
 	}()
 
@@ -118,23 +118,27 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 
 		case "cell_update", "batch_update", "row_insert", "row_delete":
 			if err := h.validateMutationMessage(client, &msg); err != nil {
-				log.Printf("blocked websocket mutation for user %d on sheet %d: %v", client.UserID, client.SheetID, err)
+				log.Printf("blocked websocket mutation for user %d on sheet %d: %v", client.UserID, h.Hub.CurrentSheetID(client), err)
 				continue
 			}
 
 			// Broadcast to other users viewing same sheet
 			broadcastData, _ := json.Marshal(msg)
-			h.Hub.BroadcastToSheet(client.SheetID, broadcastData, client)
+			sheetID := h.Hub.CurrentSheetID(client)
+			if !h.Hub.BroadcastToSheet(sheetID, broadcastData, client) {
+				log.Printf("dropped websocket broadcast for sheet %d", sheetID)
+			}
 		}
 	}
 }
 
 func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error {
-	if client.SheetID == 0 || client.SheetID != msg.SheetID {
+	sheetID := h.Hub.CurrentSheetID(client)
+	if sheetID == 0 || sheetID != msg.SheetID {
 		return fmt.Errorf("client is not joined to target sheet")
 	}
 
-	matrix, err := h.PermService.GetPermissionMatrix(client.SheetID, client.UserID)
+	matrix, err := h.PermService.GetPermissionMatrix(sheetID, client.UserID)
 	if err != nil {
 		return err
 	}
@@ -151,7 +155,7 @@ func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error 
 			return fmt.Errorf("invalid batch payload: %w", err)
 		}
 		for _, change := range changes {
-			if change.SheetID != client.SheetID {
+			if change.SheetID != sheetID {
 				return fmt.Errorf("batch contains mismatched sheet id")
 			}
 			if err := h.validateCellChange(client, change.Row, change.Col); err != nil {
@@ -168,7 +172,8 @@ func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error 
 }
 
 func (h *WSHandler) validateCellChange(client *Client, row int, col string) error {
-	allowed, err := h.PermService.CheckCellPermission(client.SheetID, client.UserID, col, row, "write")
+	sheetID := h.Hub.CurrentSheetID(client)
+	allowed, err := h.PermService.CheckCellPermission(sheetID, client.UserID, col, row, "write")
 	if err != nil {
 		return err
 	}
@@ -176,7 +181,7 @@ func (h *WSHandler) validateCellChange(client *Client, row int, col string) erro
 		return fmt.Errorf("cell write permission denied")
 	}
 
-	protected, _, err := h.SheetService.CheckProtection(client.SheetID, row, col, client.UserID)
+	protected, _, err := h.SheetService.CheckProtection(sheetID, row, col, client.UserID)
 	if err != nil {
 		return err
 	}
@@ -188,7 +193,8 @@ func (h *WSHandler) validateCellChange(client *Client, row int, col string) erro
 }
 
 func (h *WSHandler) validateRowMutation(client *Client, row int) error {
-	allowed, err := h.PermService.CheckCellPermission(client.SheetID, client.UserID, "", row, "write")
+	sheetID := h.Hub.CurrentSheetID(client)
+	allowed, err := h.PermService.CheckCellPermission(sheetID, client.UserID, "", row, "write")
 	if err != nil {
 		return err
 	}
@@ -196,7 +202,7 @@ func (h *WSHandler) validateRowMutation(client *Client, row int) error {
 		return fmt.Errorf("row write permission denied")
 	}
 
-	protected, _, err := h.SheetService.CheckProtection(client.SheetID, row, "", client.UserID)
+	protected, _, err := h.SheetService.CheckProtection(sheetID, row, "", client.UserID)
 	if err != nil {
 		return err
 	}
@@ -211,6 +217,7 @@ func (h *WSHandler) writePump(conn *websocket.Conn, client *Client) {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
+		h.Hub.Unregister(client)
 		conn.Close()
 	}()
 
