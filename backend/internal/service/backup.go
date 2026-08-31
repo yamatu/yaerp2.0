@@ -32,6 +32,8 @@ type BackupService struct {
 
 var ErrBackupTooLarge = errors.New("backup exceeds configured size limit")
 
+const backupCommandTimeout = 2 * time.Hour
+
 type boundedBuffer struct {
 	bytes.Buffer
 	max     int64
@@ -70,8 +72,64 @@ func (s *BackupService) DumpDatabase() ([]byte, error) {
 	return s.dumpDatabase()
 }
 
+// StreamDatabaseDump runs pg_dump directly into dst. It deliberately does not
+// return a byte slice: a large database dump must never be accumulated in the
+// yaerp-server heap before being sent to the caller.
+func (s *BackupService) StreamDatabaseDump(ctx context.Context, dst io.Writer) error {
+	if dst == nil {
+		return errors.New("backup destination is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.exportMu.Lock()
+	defer s.exportMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, backupCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "pg_dump", s.baseCommandArgs("--no-password")...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
+
+	// Use an io.Pipe so a client disconnect/write error cancels pg_dump instead
+	// of leaving a child process running after the HTTP handler has returned.
+	pipeReader, pipeWriter := io.Pipe()
+	cmd.Stdout = pipeWriter
+	var stderr boundedBuffer
+	stderr.max = 1 << 20
+	cmd.Stderr = &stderr
+
+	copyErr := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(dst, pipeReader)
+		_ = pipeReader.CloseWithError(err)
+		copyErr <- err
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	commandErr := cmd.Run()
+	_ = pipeWriter.Close()
+	destinationErr := <-copyErr
+	if destinationErr != nil {
+		return fmt.Errorf("stream database dump: %w", destinationErr)
+	}
+	if commandErr != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("pg_dump stopped: %w", ctx.Err())
+		}
+		if stderr.limited {
+			return ErrBackupTooLarge
+		}
+		return fmt.Errorf("pg_dump failed: %s: %w", stderr.String(), commandErr)
+	}
+	return nil
+}
+
 func (s *BackupService) dumpDatabase() ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), backupCommandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "pg_dump", s.baseCommandArgs("--no-password")...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))

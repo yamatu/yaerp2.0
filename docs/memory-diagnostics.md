@@ -4,6 +4,8 @@ The repository now contains two kinds of protection:
 
 * WebSocket queues, browser reconnect queues, request bodies, AI responses,
   PDF renderer concurrency, and backup exports are bounded.
+* The database SQL backup endpoint streams `pg_dump` directly to the HTTP
+  client. It no longer builds a byte slice containing the complete dump.
 * Optional Go runtime diagnostics expose heap and goroutine data. They are
   disabled by default.
 
