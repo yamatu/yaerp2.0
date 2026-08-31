@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,10 +23,22 @@ var ErrSheetLocked = errors.New("sheet is locked")
 var ErrSheetArchived = errors.New("sheet is archived")
 var ErrSheetStateDenied = errors.New("sheet state change denied")
 
+const maxCopiedResourceNameRunes = 256
+
+var copiedResourceSuffixPattern = regexp.MustCompile(`^(.+) - 副本(?: [0-9]+)?$`)
+
 type protectionOwner struct {
-	OwnerID     int64  `json:"ownerId"`
-	OwnerName   string `json:"ownerName"`
-	ProtectedAt string `json:"protectedAt"`
+	OwnerID                 int64   `json:"ownerId"`
+	OwnerName               string  `json:"ownerName"`
+	ReadonlyUserIDs         []int64 `json:"readonlyUserIds,omitempty"`
+	ReadonlyDepartmentIDs   []int64 `json:"readonlyDepartmentIds,omitempty"`
+	EditableUserIDs         []int64 `json:"editableUserIds,omitempty"`
+	EditableDepartmentIDs   []int64 `json:"editableDepartmentIds,omitempty"`
+	ViewHiddenUserIDs       []int64 `json:"viewHiddenUserIds,omitempty"`
+	ViewHiddenDepartmentIDs []int64 `json:"viewHiddenDepartmentIds,omitempty"`
+	LockEditing             *bool   `json:"lockEditing,omitempty"`
+	Hidden                  bool    `json:"hidden,omitempty"`
+	ProtectedAt             string  `json:"protectedAt"`
 }
 
 type protectionMaps struct {
@@ -35,28 +48,248 @@ type protectionMaps struct {
 }
 
 type SheetService struct {
-	sheetRepo   *repo.SheetRepo
-	permService *PermissionService
+	sheetRepo               *repo.SheetRepo
+	permService             *PermissionService
+	history                 *SheetHistoryService
+	cellChangeHook          func(userID int64, changes []model.CellUpdate, source string)
+	cellApprovalInterceptor func(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error)
 }
 
-func NewSheetService(sheetRepo *repo.SheetRepo, permService *PermissionService) *SheetService {
-	return &SheetService{sheetRepo: sheetRepo, permService: permService}
+func NewSheetService(sheetRepo *repo.SheetRepo, permService *PermissionService, history ...*SheetHistoryService) *SheetService {
+	var historyService *SheetHistoryService
+	if len(history) > 0 {
+		historyService = history[0]
+	}
+	return &SheetService{sheetRepo: sheetRepo, permService: permService, history: historyService}
+}
+
+func (s *SheetService) SetCellChangeHook(hook func(userID int64, changes []model.CellUpdate, source string)) {
+	s.cellChangeHook = hook
+}
+
+func (s *SheetService) SetCellApprovalInterceptor(hook func(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error)) {
+	s.cellApprovalInterceptor = hook
+}
+
+func (s *SheetService) NotifyCellChanges(userID int64, changes []model.CellUpdate, source string) {
+	if s.cellChangeHook == nil || len(changes) == 0 {
+		return
+	}
+	copyOfChanges := append([]model.CellUpdate(nil), changes...)
+	for index := range copyOfChanges {
+		copyOfChanges[index].Value = append(json.RawMessage(nil), copyOfChanges[index].Value...)
+	}
+	if source == "automation" {
+		s.cellChangeHook(userID, copyOfChanges, source)
+		return
+	}
+	go s.cellChangeHook(userID, copyOfChanges, source)
+}
+
+func (s *SheetService) beginHistory(userID, sheetID int64, source, action, summary string, coalesce bool) (*sheetMutationHistory, error) {
+	if s.history == nil {
+		return nil, nil
+	}
+	return s.history.prepareMutation(userID, sheetID, source, action, summary, coalesce)
+}
+
+func (s *SheetService) finishHistory(history *sheetMutationHistory) error {
+	if s.history == nil || history == nil {
+		return nil
+	}
+	return s.history.completeMutation(history)
+}
+
+func (s *SheetService) CaptureCurrentVersion(userID, sheetID int64, source, summary string, coalesce bool) (*model.SheetVersion, error) {
+	if s.history == nil {
+		return nil, nil
+	}
+	snapshot, err := s.history.historyRepo.LoadSheetSnapshot(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	version, _, err := s.history.captureSnapshot(model.SheetVersionCapture{
+		UserID: userID, SheetID: sheetID, Source: source, Summary: summary, Coalesce: coalesce,
+	}, snapshot)
+	return version, err
+}
+
+func (s *SheetService) RecordOperation(event model.OperationEvent) error {
+	if s.history == nil {
+		return nil
+	}
+	return s.history.recordOperation(event)
+}
+
+func (s *SheetService) UpdateSheetWithSource(userID int64, sheet *model.Sheet, source, action, summary string, coalesce bool) error {
+	if sheet == nil || sheet.ID <= 0 {
+		return fmt.Errorf("invalid sheet")
+	}
+	history, err := s.beginHistory(userID, sheet.ID, source, action, summary, coalesce)
+	if err != nil {
+		return err
+	}
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 // Workbook operations
 
 func (s *SheetService) CreateWorkbookForUser(userID int64, workbook *model.Workbook) error {
-	if workbook.FolderID != nil {
-		canWriteFolder, err := s.permService.CanWriteFolder(*workbook.FolderID, userID)
-		if err != nil {
-			return err
+	return s.CreateWorkbookForUserWithSource(userID, workbook, "web", "创建工作簿")
+}
+
+func (s *SheetService) CreateWorkbookForUserWithSource(userID int64, workbook *model.Workbook, source, summary string) error {
+	if err := s.ensureWorkbookFolderWritable(userID, workbook.FolderID); err != nil {
+		return err
+	}
+	if err := s.sheetRepo.CreateWorkbook(workbook); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: workbook.ID,
+		Action: "workbook.create", Source: source, Summary: summary,
+		Metadata: map[string]any{
+			"workbook_id": workbook.ID, "workbook_name": workbook.Name, "folder_id": workbook.FolderID,
+		},
+	})
+}
+
+func (s *SheetService) ensureWorkbookFolderWritable(userID int64, folderID *int64) error {
+	if folderID == nil {
+		return nil
+	}
+	canWriteFolder, err := s.permService.CanWriteFolder(*folderID, userID)
+	if err != nil {
+		return err
+	}
+	if !canWriteFolder {
+		return ErrFolderManageDenied
+	}
+	return nil
+}
+
+func nextCopiedResourceName(sourceName string, existingNames []string) string {
+	baseName := strings.TrimSpace(sourceName)
+	if baseName == "" {
+		baseName = "未命名"
+	}
+	for {
+		matches := copiedResourceSuffixPattern.FindStringSubmatch(baseName)
+		if len(matches) != 2 {
+			break
 		}
-		if !canWriteFolder {
-			return ErrFolderManageDenied
-		}
+		baseName = strings.TrimSpace(matches[1])
 	}
 
-	return s.sheetRepo.CreateWorkbook(workbook)
+	existing := make(map[string]struct{}, len(existingNames))
+	for _, name := range existingNames {
+		existing[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+
+	for index := 0; ; index++ {
+		suffix := " - 副本"
+		if index > 0 {
+			suffix = fmt.Sprintf(" - 副本 %d", index)
+		}
+		candidate := fitCopiedResourceName(baseName, suffix)
+		if _, exists := existing[strings.ToLower(candidate)]; !exists {
+			return candidate
+		}
+	}
+}
+
+func fitCopiedResourceName(baseName, suffix string) string {
+	baseRunes := []rune(strings.TrimSpace(baseName))
+	suffixRunes := []rune(suffix)
+	maxBaseRunes := maxCopiedResourceNameRunes - len(suffixRunes)
+	if len(baseRunes) > maxBaseRunes {
+		baseRunes = baseRunes[:maxBaseRunes]
+	}
+	return string(baseRunes) + suffix
+}
+
+func duplicatedWorkbookMetadata(metadata json.RawMessage) (json.RawMessage, error) {
+	payload := make(map[string]interface{})
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			return nil, fmt.Errorf("parse workbook metadata for copy: %w", err)
+		}
+	}
+	if payload == nil {
+		payload = make(map[string]interface{})
+	}
+	delete(payload, "workbookState")
+	delete(payload, "source_workbook_id")
+	delete(payload, "assigned_by")
+	delete(payload, "assigned_at")
+	return json.Marshal(payload)
+}
+
+func (s *SheetService) DuplicateWorkbookForUser(userID, workbookID int64) (*model.Workbook, error) {
+	source, err := s.sheetRepo.GetWorkbook(workbookID)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyWorkbookLifecycleState(source); err != nil {
+		return nil, err
+	}
+	canManage, err := s.CanManageWorkbook(userID, source)
+	if err != nil {
+		return nil, err
+	}
+	if !canManage {
+		return nil, ErrWorkbookAccessDenied
+	}
+	if err := s.ensureWorkbookVisible(source, userID); err != nil {
+		return nil, err
+	}
+	if err := s.ensureWorkbookFolderWritable(userID, source.FolderID); err != nil {
+		return nil, err
+	}
+
+	existingNames, err := s.sheetRepo.ListWorkbookNames(userID, source.FolderID)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := duplicatedWorkbookMetadata(source.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	clone := &model.Workbook{
+		Name:        nextCopiedResourceName(source.Name, existingNames),
+		Description: source.Description,
+		OwnerID:     userID,
+		FolderID:    source.FolderID,
+		Metadata:    metadata,
+		IsTemplate:  source.IsTemplate,
+		Status:      source.Status,
+	}
+	if err := s.sheetRepo.DuplicateWorkbook(source.ID, clone, userID); err != nil {
+		return nil, err
+	}
+	clonedSheets, err := s.sheetRepo.GetSheetsByWorkbook(clone.ID)
+	if err != nil {
+		return nil, err
+	}
+	for index := range clonedSheets {
+		if _, err := s.CaptureCurrentVersion(userID, clonedSheets[index].ID, "web", "复制工作簿时创建初始版本", false); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: clone.ID,
+		Action: "workbook.duplicate", Source: "web", Summary: "复制工作簿",
+		Metadata: map[string]any{
+			"workbook_id": clone.ID, "workbook_name": clone.Name,
+			"source_workbook_id": source.ID, "source_workbook_name": source.Name,
+		},
+	}); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, error) {
@@ -82,7 +315,15 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 	if err != nil {
 		return nil, err
 	}
-	if canManageWorkbook {
+	wb.CanManage = canManageWorkbook
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if isAdmin {
+		for index := range sheets {
+			sheets[index].AccessLevel = "write"
+		}
 		wb.Sheets = sheets
 		return wb, nil
 	}
@@ -101,12 +342,24 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 
 	visibleSheets := make([]model.Sheet, 0, len(sheets))
 	for _, sheet := range sheets {
+		if sheet.IsHidden {
+			continue
+		}
 		matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
 		if err != nil {
 			return nil, fmt.Errorf("check sheet %d permission: %w", sheet.ID, err)
 		}
 		if matrix.Sheet.CanView {
-			visibleSheets = append(visibleSheets, sheet)
+			if matrix.Sheet.CanEdit {
+				sheet.AccessLevel = "write"
+			} else {
+				sheet.AccessLevel = "read"
+			}
+			masked, err := s.maskSheetForUser(&sheet, userID)
+			if err != nil {
+				return nil, err
+			}
+			visibleSheets = append(visibleSheets, *masked)
 		}
 	}
 
@@ -201,7 +454,16 @@ func (s *SheetService) UpdateWorkbookForUser(userID int64, workbook *model.Workb
 	workbook.IsTemplate = existing.IsTemplate
 	workbook.Status = existing.Status
 
-	return s.sheetRepo.UpdateWorkbook(workbook)
+	if err := s.sheetRepo.UpdateWorkbook(workbook); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: workbook.ID,
+		Action: "workbook.update", Source: "web", Summary: "更新工作簿信息",
+		OldValue: map[string]any{"name": existing.Name, "description": existing.Description},
+		NewValue: map[string]any{"name": workbook.Name, "description": workbook.Description},
+		Metadata: map[string]any{"workbook_id": workbook.ID, "workbook_name": workbook.Name},
+	})
 }
 
 func (s *SheetService) DeleteWorkbookForUser(userID, id int64) error {
@@ -244,10 +506,20 @@ func (s *SheetService) DeleteWorkbookForUser(userID, id int64) error {
 			if sheet.IsLocked || sheet.IsArchived {
 				return fmt.Errorf("%w: 包含已锁定或已归档的工作表，仅管理员可以删除", ErrWorkbookDeletionDenied)
 			}
+			if err := ensureProtectionOwnership(sheet.Config, userID, "删除工作簿"); err != nil {
+				return fmt.Errorf("%w: 工作表「%s」包含其他人设置的保护或隐藏区域", ErrWorkbookDeletionDenied, sheet.Name)
+			}
 		}
 	}
 
-	return s.sheetRepo.DeleteWorkbook(id)
+	if err := s.sheetRepo.SoftDeleteWorkbook(id, userID); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: id,
+		Action: "workbook.delete", Source: "web", Summary: "删除工作簿到回收站",
+		Metadata: map[string]any{"workbook_id": id, "workbook_name": workbook.Name},
+	})
 }
 
 func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action string) (*model.Workbook, error) {
@@ -255,17 +527,28 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 	if err != nil {
 		return nil, err
 	}
-	if !isAdmin {
-		return nil, fmt.Errorf("%w: only admins can change workbook state", ErrWorkbookAccessDenied)
-	}
 
 	workbook, err := s.sheetRepo.GetWorkbook(id)
 	if err != nil {
 		return nil, err
 	}
+	canManage, err := s.permService.CanManageWorkbook(workbook, userID)
+	if err != nil {
+		return nil, err
+	}
+	if action == "publish" || action == "unpublish" {
+		if !canManage {
+			return nil, fmt.Errorf("%w: only the owner or an admin can change public access", ErrWorkbookAccessDenied)
+		}
+	} else if !isAdmin {
+		return nil, fmt.Errorf("%w: only admins can change workbook state", ErrWorkbookAccessDenied)
+	}
 	payload, state, err := parseWorkbookLifecycleState(workbook.Metadata)
 	if err != nil {
 		return nil, err
+	}
+	oldState := map[string]any{
+		"locked": state.Locked != nil, "hidden": state.Hidden != nil, "public": state.Public != nil,
 	}
 
 	actor := &sheetStateUser{ID: userID, Name: username, At: time.Now().Format(time.RFC3339)}
@@ -278,11 +561,15 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 		state.Hidden = actor
 	case "unhide":
 		state.Hidden = nil
+	case "publish":
+		state.Public = actor
+	case "unpublish":
+		state.Public = nil
 	default:
 		return nil, fmt.Errorf("unsupported workbook state action")
 	}
 
-	if state.Locked == nil && state.Hidden == nil {
+	if state.Locked == nil && state.Hidden == nil && state.Public == nil {
 		delete(payload, "workbookState")
 	} else {
 		payload["workbookState"] = state
@@ -303,6 +590,19 @@ func (s *SheetService) UpdateWorkbookState(userID, id int64, username, action st
 		return nil, err
 	}
 	if err := applyWorkbookLifecycleState(updated); err != nil {
+		return nil, err
+	}
+	if err := s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "workbook", ResourceID: id,
+		Action: "workbook.state.update", Source: "web", Summary: "更新工作簿状态",
+		OldValue: oldState,
+		NewValue: map[string]any{
+			"locked": updated.IsLocked, "hidden": updated.IsHidden, "public": updated.IsPublic,
+		},
+		Metadata: map[string]any{
+			"workbook_id": id, "workbook_name": updated.Name, "state_action": action,
+		},
+	}); err != nil {
 		return nil, err
 	}
 	return updated, nil
@@ -334,32 +634,20 @@ func (s *SheetService) UpdateWorkbookStates(userID int64, workbookIDs []int64, u
 // Sheet operations
 
 func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) error {
+	return s.CreateSheetForUserWithSource(userID, sheet, "web", "创建工作表")
+}
+
+func (s *SheetService) CreateSheetForUserWithSource(userID int64, sheet *model.Sheet, source, summary string) error {
 	wb, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
 	if err != nil {
 		return err
 	}
-	if err := applyWorkbookLifecycleState(wb); err != nil {
-		return err
-	}
-
-	canManageWorkbook, err := s.CanManageWorkbook(userID, wb)
-	if err != nil {
-		return err
-	}
-	if !canManageWorkbook {
-		return ErrWorkbookAccessDenied
-	}
-	if err := s.ensureWorkbookVisible(wb, userID); err != nil {
-		return err
-	}
-	if wb.IsLocked {
-		isAdmin, err := s.permService.IsAdmin(userID)
-		if err != nil {
+	if source != "trade_erp" {
+		if err := s.ensureCanAddSheet(userID, wb); err != nil {
 			return err
 		}
-		if !isAdmin {
-			return fmt.Errorf("%w: 当前工作簿已锁定，仅管理员可以新增工作表", ErrWorkbookAccessDenied)
-		}
+	} else if err := applyWorkbookLifecycleState(wb); err != nil {
+		return err
 	}
 
 	nextSortOrder, err := s.sheetRepo.GetNextSheetSortOrder(sheet.WorkbookID)
@@ -368,7 +656,110 @@ func (s *SheetService) CreateSheetForUser(userID int64, sheet *model.Sheet) erro
 	}
 	sheet.SortOrder = nextSortOrder
 
-	return s.sheetRepo.CreateSheet(sheet)
+	if err := s.sheetRepo.CreateSheet(sheet); err != nil {
+		return err
+	}
+	if _, err := s.CaptureCurrentVersion(userID, sheet.ID, source, summary, false); err != nil {
+		return err
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, SheetID: sheet.ID, ResourceType: "sheet", ResourceID: sheet.ID,
+		Action: "sheet.create", Source: source, Summary: summary,
+		Metadata: map[string]any{"sheet_name": sheet.Name, "workbook_id": sheet.WorkbookID},
+	})
+}
+
+func (s *SheetService) ensureCanAddSheet(userID int64, workbook *model.Workbook) error {
+	if workbook == nil {
+		return ErrWorkbookAccessDenied
+	}
+	if err := applyWorkbookLifecycleState(workbook); err != nil {
+		return err
+	}
+
+	canManageWorkbook, err := s.CanManageWorkbook(userID, workbook)
+	if err != nil {
+		return err
+	}
+	if !canManageWorkbook {
+		return ErrWorkbookAccessDenied
+	}
+	if err := s.ensureWorkbookVisible(workbook, userID); err != nil {
+		return err
+	}
+	if workbook.IsLocked {
+		isAdmin, err := s.permService.IsAdmin(userID)
+		if err != nil {
+			return err
+		}
+		if !isAdmin {
+			return fmt.Errorf("%w: 当前工作簿已锁定，仅管理员可以新增工作表", ErrWorkbookAccessDenied)
+		}
+	}
+	return nil
+}
+
+func (s *SheetService) DuplicateSheetForUser(userID, sheetID int64) (*model.Sheet, error) {
+	source, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	if err := applySheetLifecycleState(source); err != nil {
+		return nil, err
+	}
+	workbook, err := s.sheetRepo.GetWorkbook(source.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ensureCanAddSheet(userID, workbook); err != nil {
+		return nil, err
+	}
+	if source.IsHidden {
+		isAdmin, err := s.permService.IsAdmin(userID)
+		if err != nil {
+			return nil, err
+		}
+		if !isAdmin {
+			return nil, fmt.Errorf("%w: 当前工作表已隐藏，仅管理员可以复制", ErrWorkbookAccessDenied)
+		}
+	}
+
+	sheets, err := s.sheetRepo.GetSheetsByWorkbook(source.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	existingNames := make([]string, 0, len(sheets))
+	for _, item := range sheets {
+		existingNames = append(existingNames, item.Name)
+	}
+	nextSortOrder, err := s.sheetRepo.GetNextSheetSortOrder(source.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	clone, err := s.sheetRepo.DuplicateSheet(
+		source.ID,
+		source.WorkbookID,
+		nextCopiedResourceName(source.Name, existingNames),
+		nextSortOrder,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := applySheetLifecycleState(clone); err != nil {
+		return nil, err
+	}
+	if _, err := s.CaptureCurrentVersion(userID, clone.ID, "web", "复制工作表", false); err != nil {
+		return nil, err
+	}
+	if err := s.RecordOperation(model.OperationEvent{
+		UserID: userID, SheetID: clone.ID, ResourceType: "sheet", ResourceID: clone.ID,
+		Action: "sheet.duplicate", Source: "web", Summary: "复制工作表",
+		Metadata: map[string]any{"source_sheet_id": source.ID, "sheet_name": clone.Name, "workbook_id": clone.WorkbookID},
+	}); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.Sheet) error {
@@ -378,6 +769,14 @@ func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.S
 	if err := s.ensureSheetModificationAllowed(existing, userID); err != nil {
 		return err
 	}
+	if err := s.ensureProtectedStructureMutationAllowed(userID, existing, sheet); err != nil {
+		return err
+	}
+	restoredConfig, err := s.restoreHiddenCellsForUser(existing.ID, userID, existing.Config, sheet.Config, existing.Columns)
+	if err != nil {
+		return err
+	}
+	sheet.Config = restoredConfig
 	if err := s.ensureEditableCellsAuthorized(userID, existing, sheet); err != nil {
 		return err
 	}
@@ -389,9 +788,26 @@ func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.S
 	if err != nil {
 		return err
 	}
+	removedColumns, err := removedColumnKeys(existing.Columns, sheet.Columns)
+	if err != nil {
+		return err
+	}
+	if len(removedColumns) > 0 {
+		mergedConfig, err = removeColumnProtectionState(mergedConfig, removedColumns)
+		if err != nil {
+			return err
+		}
+	}
 	sheet.Config = mergedConfig
+	history, err := s.beginHistory(userID, sheet.ID, "web", "sheet.update", "更新工作表内容或格式", true)
+	if err != nil {
+		return err
+	}
 
-	return s.sheetRepo.UpdateSheet(sheet)
+	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 func (s *SheetService) GetSheet(id int64) (*model.Sheet, error) {
@@ -405,8 +821,169 @@ func (s *SheetService) GetSheet(id int64) (*model.Sheet, error) {
 	return sheet, nil
 }
 
-func (s *SheetService) DeleteSheet(id int64) error {
-	return s.sheetRepo.DeleteSheet(id)
+func (s *SheetService) SyncAssignedSheetGroup(userID, sheetID int64) ([]int64, error) {
+	sourceSheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceWorkbook, err := s.sheetRepo.GetWorkbook(sourceSheet.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceWorkbookID := assignmentSourceWorkbookID(sourceWorkbook)
+	workbooks, err := s.sheetRepo.ListWorkbooksInAssignmentGroup(sourceWorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	if len(workbooks) <= 1 {
+		return nil, nil
+	}
+
+	affectedSheetIDs := make([]int64, 0, len(workbooks)-1)
+	for _, workbook := range workbooks {
+		if workbook.ID == sourceSheet.WorkbookID {
+			continue
+		}
+
+		sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbook.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		targetSheet := findAssignedGroupSheet(sourceSheet, sheets)
+		if targetSheet == nil {
+			continue
+		}
+
+		targetSheet.Name = sourceSheet.Name
+		targetSheet.SortOrder = sourceSheet.SortOrder
+		targetSheet.Columns = sourceSheet.Columns
+		targetSheet.Frozen = sourceSheet.Frozen
+		config, err := mergeAssignedSheetConfig(sourceSheet.Config, targetSheet.Config)
+		if err != nil {
+			return nil, err
+		}
+		targetSheet.Config = config
+		history, err := s.beginHistory(userID, targetSheet.ID, "sync", "sheet.sync", "同步发放工作表结构", true)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.sheetRepo.UpdateSheet(targetSheet); err != nil {
+			return nil, err
+		}
+		if err := s.finishHistory(history); err != nil {
+			return nil, err
+		}
+
+		affectedSheetIDs = append(affectedSheetIDs, targetSheet.ID)
+	}
+
+	return affectedSheetIDs, nil
+}
+
+func assignmentSourceWorkbookID(workbook *model.Workbook) int64 {
+	if workbook == nil {
+		return 0
+	}
+	if len(workbook.Metadata) == 0 {
+		return workbook.ID
+	}
+
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(workbook.Metadata, &metadata); err != nil {
+		return workbook.ID
+	}
+
+	switch value := metadata["source_workbook_id"].(type) {
+	case float64:
+		if value > 0 {
+			return int64(value)
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+
+	return workbook.ID
+}
+
+func mergeAssignedSheetConfig(sourceConfig, targetConfig json.RawMessage) (json.RawMessage, error) {
+	sourcePayload := make(map[string]interface{})
+	if len(sourceConfig) > 0 {
+		if err := json.Unmarshal(sourceConfig, &sourcePayload); err != nil {
+			return nil, fmt.Errorf("parse source assigned sheet config: %w", err)
+		}
+	}
+
+	if len(targetConfig) == 0 {
+		return json.Marshal(sourcePayload)
+	}
+
+	var targetPayload map[string]interface{}
+	if err := json.Unmarshal(targetConfig, &targetPayload); err != nil {
+		return nil, fmt.Errorf("parse target assigned sheet config: %w", err)
+	}
+
+	if sheetState, ok := targetPayload["sheetState"]; ok {
+		sourcePayload["sheetState"] = sheetState
+	} else {
+		delete(sourcePayload, "sheetState")
+	}
+
+	return json.Marshal(sourcePayload)
+}
+
+func findAssignedGroupSheet(sourceSheet *model.Sheet, candidates []model.Sheet) *model.Sheet {
+	for i := range candidates {
+		if candidates[i].SortOrder == sourceSheet.SortOrder {
+			return &candidates[i]
+		}
+	}
+
+	for i := range candidates {
+		if candidates[i].Name == sourceSheet.Name {
+			return &candidates[i]
+		}
+	}
+
+	return nil
+}
+
+func (s *SheetService) DeleteSheetForUser(userID, id int64) error {
+	sheet, err := s.sheetRepo.GetSheet(id)
+	if err != nil {
+		return err
+	}
+	if err := applySheetLifecycleState(sheet); err != nil {
+		return err
+	}
+	if err := s.ensureSheetModificationAllowed(sheet, userID); err != nil {
+		return err
+	}
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if !isAdmin {
+		if err := ensureProtectionOwnership(sheet.Config, userID, "删除工作表"); err != nil {
+			return err
+		}
+	}
+	workbook, _ := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err := s.sheetRepo.DeleteSheet(id); err != nil {
+		return err
+	}
+	metadata := map[string]any{"sheet_name": sheet.Name, "workbook_id": sheet.WorkbookID}
+	if workbook != nil {
+		metadata["workbook_name"] = workbook.Name
+	}
+	return s.RecordOperation(model.OperationEvent{
+		UserID: userID, ResourceType: "sheet", ResourceID: id,
+		Action: "sheet.delete", Source: "web", Summary: "删除工作表", Metadata: metadata,
+	})
 }
 
 func (s *SheetService) AssignWorkbookToUsers(workbookID, adminUserID int64, userIDs []int64) error {
@@ -464,6 +1041,19 @@ func (s *SheetService) AssignWorkbookToUsers(workbookID, adminUserID int64, user
 					return fmt.Errorf("copy row %d for user %d: %w", row.RowIndex, userID, err)
 				}
 			}
+			if _, err := s.CaptureCurrentVersion(adminUserID, clonedSheet.ID, "sync", "发放任务工作表初始版本", false); err != nil {
+				return err
+			}
+		}
+		if err := s.RecordOperation(model.OperationEvent{
+			UserID: adminUserID, ResourceType: "workbook", ResourceID: clone.ID,
+			Action: "workbook.assign", Source: "sync", Summary: "向员工发放工作簿",
+			Metadata: map[string]any{
+				"workbook_id": clone.ID, "workbook_name": clone.Name, "recipient_user_id": userID,
+				"source_workbook_id": workbookID, "source_workbook_name": template.Name,
+			},
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -476,70 +1066,352 @@ func (s *SheetService) GetSheetData(sheetID int64) ([]model.Row, error) {
 	return s.sheetRepo.GetRows(sheetID)
 }
 
-func (s *SheetService) UpdateCells(userID int64, changes []model.CellUpdate) error {
+func (s *SheetService) ValidateCellChangesForUser(userID, sheetID int64, changes []model.CellUpdate) error {
 	if len(changes) == 0 {
 		return nil
 	}
-
-	sheets := make(map[int64]*model.Sheet)
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return err
+	}
+	if err := applySheetLifecycleState(sheet); err != nil {
+		return err
+	}
+	if err := s.ensureSheetModificationAllowed(sheet, userID); err != nil {
+		return err
+	}
+	accessCache, err := newSheetCellAccessCache(s.permService, userID, sheetID, sheet.Config, true)
+	if err != nil {
+		return err
+	}
 	for _, change := range changes {
-		sheet, ok := sheets[change.SheetID]
-		if !ok {
-			loadedSheet, err := s.sheetRepo.GetSheet(change.SheetID)
-			if err != nil {
-				return fmt.Errorf("failed to get sheet: %w", err)
-			}
-			if err := applySheetLifecycleState(loadedSheet); err != nil {
-				return err
-			}
-			if err := s.ensureSheetModificationAllowed(loadedSheet, userID); err != nil {
-				return err
-			}
-			sheets[change.SheetID] = loadedSheet
-			sheet = loadedSheet
+		if change.Row < 0 || strings.TrimSpace(change.Col) == "" {
+			return fmt.Errorf("invalid cell target")
 		}
-		_ = sheet
-
-		// Get existing row data or start fresh
-		existingRows, err := s.sheetRepo.GetRows(change.SheetID)
-		if err != nil {
-			return fmt.Errorf("failed to get rows: %w", err)
+		worksheetRow := change.Row + 1
+		if !accessCache.allowsCell(change.Col, worksheetRow, "write") {
+			return fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, change.Col, change.Row+2)
 		}
-
-		var rowData map[string]interface{}
-		for _, r := range existingRows {
-			if r.RowIndex == change.Row {
-				if err := json.Unmarshal(r.Data, &rowData); err != nil {
-					rowData = make(map[string]interface{})
-				}
-				break
-			}
-		}
-		if rowData == nil {
-			rowData = make(map[string]interface{})
-		}
-
-		// Update the cell value
-		var val interface{}
-		if err := json.Unmarshal(change.Value, &val); err != nil {
-			val = string(change.Value)
-		}
-		rowData[change.Col] = val
-
-		data, err := json.Marshal(rowData)
-		if err != nil {
-			return fmt.Errorf("failed to marshal row data: %w", err)
-		}
-
-		if err := s.sheetRepo.UpsertRow(change.SheetID, change.Row, data, userID); err != nil {
-			return fmt.Errorf("failed to upsert row: %w", err)
+		if protected, reason := accessCache.checkProtection(change.Col, worksheetRow, userID); protected {
+			return fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
 		}
 	}
-
 	return nil
 }
 
+func (s *SheetService) UpdateCells(userID int64, changes []model.CellUpdate) error {
+	_, err := s.UpdateCellsWithSourceDetailed(userID, changes, "web")
+	return err
+}
+
+func (s *SheetService) UpdateCellsWithSource(userID int64, changes []model.CellUpdate, source string) error {
+	_, err := s.UpdateCellsWithSourceDetailed(userID, changes, source)
+	return err
+}
+
+func (s *SheetService) UpdateCellsWithSourceDetailed(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
+	if len(changes) == 0 {
+		return &model.CellUpdateResult{}, nil
+	}
+
+	changes, err := collapseCellChanges(changes)
+	if err != nil {
+		return nil, err
+	}
+
+	trustedTradeMutation := source == "trade_erp"
+	accessCaches := make(map[int64]*sheetCellAccessCache)
+	histories := make(map[int64]*sheetMutationHistory)
+	if !trustedTradeMutation {
+		for _, change := range changes {
+			accessCache, ok := accessCaches[change.SheetID]
+			if !ok {
+				loadedSheet, err := s.sheetRepo.GetSheet(change.SheetID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get sheet: %w", err)
+				}
+				if err := applySheetLifecycleState(loadedSheet); err != nil {
+					return nil, err
+				}
+				if err := s.ensureSheetModificationAllowed(loadedSheet, userID); err != nil {
+					return nil, err
+				}
+				accessCache, err = newSheetCellAccessCache(s.permService, userID, change.SheetID, loadedSheet.Config, true)
+				if err != nil {
+					return nil, err
+				}
+				accessCaches[change.SheetID] = accessCache
+			}
+			worksheetRow := change.Row + 1
+			if !accessCache.allowsCell(change.Col, worksheetRow, "write") {
+				return nil, fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, change.Col, change.Row+2)
+			}
+			if protected, reason := accessCache.checkProtection(change.Col, worksheetRow, userID); protected {
+				return nil, fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
+			}
+		}
+	}
+
+	result := &model.CellUpdateResult{AppliedChanges: changes}
+	if s.cellApprovalInterceptor != nil {
+		result, err = s.cellApprovalInterceptor(userID, changes, source)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			result = &model.CellUpdateResult{AppliedChanges: changes}
+		}
+	}
+	changes = result.AppliedChanges
+	for _, change := range changes {
+		if _, exists := histories[change.SheetID]; exists {
+			continue
+		}
+		history, err := s.beginHistory(userID, change.SheetID, source, "cell.update", fmt.Sprintf("更新 %d 个单元格", len(changes)), true)
+		if err != nil {
+			return nil, err
+		}
+		histories[change.SheetID] = history
+	}
+
+	if len(changes) > 0 {
+		if err := s.sheetRepo.BatchUpdateCells(changes, userID); err != nil {
+			return nil, err
+		}
+		if err := s.syncCellChangesToSnapshots(changes); err != nil {
+			return nil, err
+		}
+	}
+	for _, history := range histories {
+		if err := s.finishHistory(history); err != nil {
+			return nil, err
+		}
+	}
+	s.NotifyCellChanges(userID, changes, source)
+	return result, nil
+}
+
+func (s *SheetService) syncCellChangesToSnapshots(changes []model.CellUpdate) error {
+	bySheet := make(map[int64][]model.CellUpdate)
+	for _, change := range changes {
+		bySheet[change.SheetID] = append(bySheet[change.SheetID], change)
+	}
+	for sheetID, sheetChanges := range bySheet {
+		sheet, err := s.sheetRepo.GetSheet(sheetID)
+		if err != nil {
+			return err
+		}
+		if len(sheet.Config) == 0 {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(sheet.Config, &payload); err != nil {
+			continue
+		}
+		sheetData, ok := payload["univerSheetData"].(map[string]interface{})
+		if !ok || sheetData == nil {
+			continue
+		}
+		cellData, _ := sheetData["cellData"].(map[string]interface{})
+		if cellData == nil {
+			cellData = make(map[string]interface{})
+			sheetData["cellData"] = cellData
+		}
+		columnKeys, err := parseColumnKeys(sheet.Columns)
+		if err != nil {
+			return err
+		}
+		columnIndexes := make(map[string]int, len(columnKeys))
+		for index, key := range columnKeys {
+			columnIndexes[key] = index
+		}
+		for _, change := range sheetChanges {
+			columnIndex, exists := columnIndexes[change.Col]
+			if !exists || change.Row < 0 {
+				continue
+			}
+			rowKey := strconv.Itoa(change.Row + 1)
+			columnKey := strconv.Itoa(columnIndex)
+			rowMap, _ := cellData[rowKey].(map[string]interface{})
+			if rowMap == nil {
+				rowMap = make(map[string]interface{})
+				cellData[rowKey] = rowMap
+			}
+			cell, _ := rowMap[columnKey].(map[string]interface{})
+			if cell == nil {
+				cell = make(map[string]interface{})
+			}
+			var value any
+			if len(change.Value) > 0 {
+				if err := json.Unmarshal(change.Value, &value); err != nil {
+					return err
+				}
+			}
+			if formula, ok := value.(string); ok && strings.HasPrefix(strings.TrimSpace(formula), "=") {
+				cell["f"] = formula
+				delete(cell, "v")
+			} else {
+				cell["v"] = value
+				delete(cell, "f")
+			}
+			rowMap[columnKey] = cell
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		sheet.Config = encoded
+		if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SheetService) PrepareSheetCellChanges(userID int64, existing, next *model.Sheet, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
+	if existing == nil || next == nil || len(changes) == 0 {
+		return &model.CellUpdateResult{AppliedChanges: changes}, nil
+	}
+	collapsed, err := collapseCellChanges(changes)
+	if err != nil {
+		return nil, err
+	}
+	result := &model.CellUpdateResult{AppliedChanges: collapsed}
+	if s.cellApprovalInterceptor != nil {
+		result, err = s.cellApprovalInterceptor(userID, collapsed, source)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			result = &model.CellUpdateResult{AppliedChanges: collapsed}
+		}
+	}
+	if len(result.RevertedChanges) > 0 {
+		next.Config, err = restoreWorksheetCellValues(existing.Config, next.Config, next.Columns, result.RevertedChanges)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func restoreWorksheetCellValues(existingConfig, nextConfig, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, error) {
+	if len(changes) == 0 {
+		return nextConfig, nil
+	}
+	var existingPayload, nextPayload map[string]interface{}
+	if len(existingConfig) > 0 {
+		if err := json.Unmarshal(existingConfig, &existingPayload); err != nil {
+			return nil, fmt.Errorf("parse existing sheet config: %w", err)
+		}
+	}
+	if len(nextConfig) > 0 {
+		if err := json.Unmarshal(nextConfig, &nextPayload); err != nil {
+			return nil, fmt.Errorf("parse next sheet config: %w", err)
+		}
+	}
+	if existingPayload == nil {
+		existingPayload = make(map[string]interface{})
+	}
+	if nextPayload == nil {
+		nextPayload = make(map[string]interface{})
+	}
+	columnKeys, err := parseColumnKeys(columns)
+	if err != nil {
+		return nil, err
+	}
+	columnIndexes := make(map[string]int, len(columnKeys))
+	for index, key := range columnKeys {
+		columnIndexes[key] = index
+	}
+	ensureCellData := func(payload map[string]interface{}) map[string]interface{} {
+		sheetData, _ := payload["univerSheetData"].(map[string]interface{})
+		if sheetData == nil {
+			sheetData = make(map[string]interface{})
+			payload["univerSheetData"] = sheetData
+		}
+		cellData, _ := sheetData["cellData"].(map[string]interface{})
+		if cellData == nil {
+			cellData = make(map[string]interface{})
+			sheetData["cellData"] = cellData
+		}
+		return cellData
+	}
+	existingCells := ensureCellData(existingPayload)
+	nextCells := ensureCellData(nextPayload)
+	for _, change := range changes {
+		columnIndex, exists := columnIndexes[change.Col]
+		if !exists || change.Row < 0 {
+			continue
+		}
+		rowKey := strconv.Itoa(change.Row + 1)
+		columnKey := strconv.Itoa(columnIndex)
+		existingRow, _ := existingCells[rowKey].(map[string]interface{})
+		nextRow, _ := nextCells[rowKey].(map[string]interface{})
+		if nextRow == nil {
+			nextRow = make(map[string]interface{})
+			nextCells[rowKey] = nextRow
+		}
+		if existingCell, ok := existingRow[columnKey]; ok {
+			nextRow[columnKey] = existingCell
+		} else {
+			delete(nextRow, columnKey)
+		}
+	}
+	encoded, err := json.Marshal(nextPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal restored sheet config: %w", err)
+	}
+	return encoded, nil
+}
+
+type cellUpdateKey struct {
+	SheetID int64
+	Row     int
+	Col     string
+}
+
+func collapseCellChanges(changes []model.CellUpdate) ([]model.CellUpdate, error) {
+	collapsed := make([]model.CellUpdate, 0, len(changes))
+	indexes := make(map[cellUpdateKey]int, len(changes))
+	for _, change := range changes {
+		change.Col = strings.TrimSpace(change.Col)
+		if change.SheetID <= 0 || change.Row < 0 || change.Col == "" {
+			return nil, fmt.Errorf("invalid cell target")
+		}
+		if len(change.Value) == 0 {
+			change.Value = json.RawMessage("null")
+		}
+		if !json.Valid(change.Value) {
+			return nil, fmt.Errorf("invalid JSON value for %s%d", change.Col, change.Row+1)
+		}
+
+		key := cellUpdateKey{SheetID: change.SheetID, Row: change.Row, Col: change.Col}
+		if index, exists := indexes[key]; exists {
+			collapsed[index] = change
+			continue
+		}
+		indexes[key] = len(collapsed)
+		collapsed = append(collapsed, change)
+	}
+
+	sort.Slice(collapsed, func(i, j int) bool {
+		if collapsed[i].SheetID != collapsed[j].SheetID {
+			return collapsed[i].SheetID < collapsed[j].SheetID
+		}
+		if collapsed[i].Row != collapsed[j].Row {
+			return collapsed[i].Row < collapsed[j].Row
+		}
+		return collapsed[i].Col < collapsed[j].Col
+	})
+	return collapsed, nil
+}
+
 func (s *SheetService) InsertRow(userID, sheetID int64, rowIndex int) error {
+	return s.InsertRowWithSource(userID, sheetID, rowIndex, "web")
+}
+
+func (s *SheetService) InsertRowWithSource(userID, sheetID int64, rowIndex int, source string) error {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return err
@@ -556,10 +1428,21 @@ func (s *SheetService) InsertRow(userID, sheetID int64, rowIndex int) error {
 		return err
 	}
 
-	return s.sheetRepo.InsertRowWithConfig(sheetID, rowIndex, nextConfig)
+	history, err := s.beginHistory(userID, sheetID, source, "row.insert", fmt.Sprintf("插入第 %d 行", rowIndex+2), false)
+	if err != nil {
+		return err
+	}
+	if err := s.sheetRepo.InsertRowWithConfig(sheetID, rowIndex, nextConfig); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
 func (s *SheetService) DeleteRow(userID, sheetID int64, rowIndex int) error {
+	return s.DeleteRowWithSource(userID, sheetID, rowIndex, "web")
+}
+
+func (s *SheetService) DeleteRowWithSource(userID, sheetID int64, rowIndex int, source string) error {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return err
@@ -570,16 +1453,26 @@ func (s *SheetService) DeleteRow(userID, sheetID int64, rowIndex int) error {
 	if err := s.ensureSheetModificationAllowed(sheet, userID); err != nil {
 		return err
 	}
+	if err := s.ensureRowDeletionAllowed(userID, sheet, rowIndex); err != nil {
+		return err
+	}
 
 	nextConfig, err := shiftProtectionRowsInConfig(sheet.Config, rowIndex, false)
 	if err != nil {
 		return err
 	}
 
-	return s.sheetRepo.DeleteRowWithConfig(sheetID, rowIndex, nextConfig)
+	history, err := s.beginHistory(userID, sheetID, source, "row.delete", fmt.Sprintf("删除第 %d 行", rowIndex+2), false)
+	if err != nil {
+		return err
+	}
+	if err := s.sheetRepo.DeleteRowWithConfig(sheetID, rowIndex, nextConfig); err != nil {
+		return err
+	}
+	return s.finishHistory(history)
 }
 
-func (s *SheetService) GetProtectionSnapshot(sheetID int64) (*model.ProtectionSnapshot, error) {
+func (s *SheetService) GetProtectionSnapshot(sheetID, userID int64) (*model.ProtectionSnapshot, error) {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return nil, err
@@ -593,12 +1486,7 @@ func (s *SheetService) GetProtectionSnapshot(sheetID int64) (*model.ProtectionSn
 		return nil, err
 	}
 
-	snapshot := &model.ProtectionSnapshot{
-		Rows:    flattenProtectionMap("row", protections.Rows),
-		Columns: flattenProtectionMap("column", protections.Columns),
-		Cells:   flattenProtectionMap("cell", protections.Cells),
-	}
-	return snapshot, nil
+	return s.buildProtectionSnapshot(protections, userID)
 }
 
 func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, req *model.UpdateProtectionRequest) (*model.Sheet, *model.ProtectionSnapshot, error) {
@@ -622,11 +1510,23 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 	if err != nil {
 		return nil, nil, err
 	}
+	if req.Action == "lock" {
+		if err := s.permService.ValidateEditableUsers(protectionRequestUserIDs(*req)); err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
+		}
+		if err := s.permService.ValidateDepartments(protectionRequestDepartmentIDs(*req)); err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
+		}
+	}
 
 	if err := applyProtectionRequest(&protections, payload, legacyLocks, req, userID, username, isAdmin); err != nil {
 		return nil, nil, err
 	}
 	finalizeProtectionPayload(payload, protections, legacyLocks)
+	history, err := s.beginHistory(userID, sheetID, "web", "protection.update", protectionActionSummary(req.Action), false)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	nextConfig, err := json.Marshal(payload)
 	if err != nil {
@@ -637,11 +1537,13 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
 		return nil, nil, err
 	}
+	if err := s.finishHistory(history); err != nil {
+		return nil, nil, err
+	}
 
-	snapshot := &model.ProtectionSnapshot{
-		Rows:    flattenProtectionMap("row", protections.Rows),
-		Columns: flattenProtectionMap("column", protections.Columns),
-		Cells:   flattenProtectionMap("cell", protections.Cells),
+	snapshot, err := s.buildProtectionSnapshot(protections, userID)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	updatedSheet, err := s.sheetRepo.GetSheet(sheetID)
@@ -649,6 +1551,10 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 		return nil, nil, err
 	}
 	if err := applySheetLifecycleState(updatedSheet); err != nil {
+		return nil, nil, err
+	}
+	updatedSheet, err = s.maskSheetForUser(updatedSheet, userID)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -677,12 +1583,46 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 		return nil, nil, err
 	}
 
-	for i := range items {
-		if err := applyProtectionRequest(&protections, payload, legacyLocks, &items[i], userID, username, isAdmin); err != nil {
+	whitelistUserIDs := make([]int64, 0)
+	whitelistDepartmentIDs := make([]int64, 0)
+	seenWhitelistUserIDs := make(map[int64]struct{})
+	seenWhitelistDepartmentIDs := make(map[int64]struct{})
+	for index := range items {
+		if items[index].Action != "lock" {
+			continue
+		}
+		for _, userID := range protectionRequestUserIDs(items[index]) {
+			if _, exists := seenWhitelistUserIDs[userID]; exists {
+				continue
+			}
+			seenWhitelistUserIDs[userID] = struct{}{}
+			whitelistUserIDs = append(whitelistUserIDs, userID)
+		}
+		for _, departmentID := range protectionRequestDepartmentIDs(items[index]) {
+			if _, exists := seenWhitelistDepartmentIDs[departmentID]; exists {
+				continue
+			}
+			seenWhitelistDepartmentIDs[departmentID] = struct{}{}
+			whitelistDepartmentIDs = append(whitelistDepartmentIDs, departmentID)
+		}
+	}
+	if err := s.permService.ValidateEditableUsers(whitelistUserIDs); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
+	}
+	if err := s.permService.ValidateDepartments(whitelistDepartmentIDs); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrProtectionDenied, err)
+	}
+
+	for index := range items {
+		if err := applyProtectionRequest(&protections, payload, legacyLocks, &items[index], userID, username, isAdmin); err != nil {
 			return nil, nil, err
 		}
 	}
 	finalizeProtectionPayload(payload, protections, legacyLocks)
+	history, err := s.beginHistory(userID, sheetID, "web", "protection.batch_update", fmt.Sprintf("批量更新 %d 个保护区域", len(items)), false)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	nextConfig, err := json.Marshal(payload)
 	if err != nil {
@@ -693,11 +1633,13 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
 		return nil, nil, err
 	}
+	if err := s.finishHistory(history); err != nil {
+		return nil, nil, err
+	}
 
-	snapshot := &model.ProtectionSnapshot{
-		Rows:    flattenProtectionMap("row", protections.Rows),
-		Columns: flattenProtectionMap("column", protections.Columns),
-		Cells:   flattenProtectionMap("cell", protections.Cells),
+	snapshot, err := s.buildProtectionSnapshot(protections, userID)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	updatedSheet, err := s.sheetRepo.GetSheet(sheetID)
@@ -707,22 +1649,29 @@ func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username str
 	if err := applySheetLifecycleState(updatedSheet); err != nil {
 		return nil, nil, err
 	}
+	updatedSheet, err = s.maskSheetForUser(updatedSheet, userID)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	return updatedSheet, snapshot, nil
 }
 
 func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action string) (*model.Sheet, error) {
-	isAdmin, err := s.permService.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	if !isAdmin {
-		return nil, fmt.Errorf("%w: only admins can change locked/archive state", ErrSheetStateDenied)
-	}
-
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return nil, err
+	}
+	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
+	if err != nil {
+		return nil, err
+	}
+	canManage, err := s.CanManageWorkbook(userID, workbook)
+	if err != nil {
+		return nil, err
+	}
+	if !canManage {
+		return nil, fmt.Errorf("%w: only workbook managers can change locked/archive state", ErrSheetStateDenied)
 	}
 	payload, state, err := parseSheetLifecycleState(sheet.Config)
 	if err != nil {
@@ -739,11 +1688,19 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 		state.Archived = actor
 	case "unarchive":
 		state.Archived = nil
+	case "hide":
+		state.Hidden = actor
+	case "unhide":
+		state.Hidden = nil
 	default:
 		return nil, fmt.Errorf("unsupported sheet state action")
 	}
+	history, err := s.beginHistory(userID, sheetID, "web", "sheet.state.update", sheetStateActionSummary(action), false)
+	if err != nil {
+		return nil, err
+	}
 
-	if state.Locked == nil && state.Archived == nil {
+	if state.Locked == nil && state.Archived == nil && state.Hidden == nil {
 		delete(payload, "sheetState")
 	} else {
 		payload["sheetState"] = state
@@ -758,6 +1715,9 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
 		return nil, err
 	}
+	if err := s.finishHistory(history); err != nil {
+		return nil, err
+	}
 
 	updatedSheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
@@ -770,6 +1730,25 @@ func (s *SheetService) UpdateSheetState(sheetID, userID int64, username, action 
 	return updatedSheet, nil
 }
 
+func protectionActionSummary(action string) string {
+	if action == "unlock" {
+		return "解除工作表区域保护"
+	}
+	return "设置工作表区域保护"
+}
+
+func sheetStateActionSummary(action string) string {
+	labels := map[string]string{
+		"lock": "锁定工作表", "unlock": "解除工作表锁定",
+		"archive": "归档工作表", "unarchive": "取消工作表归档",
+		"hide": "隐藏工作表", "unhide": "恢复工作表可见",
+	}
+	if label := labels[action]; label != "" {
+		return label
+	}
+	return "更新工作表状态"
+}
+
 func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey string, userID int64) (bool, string, error) {
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
@@ -778,6 +1757,11 @@ func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey strin
 	if isAdmin {
 		return false, "", nil
 	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return false, "", err
+	}
+	departmentSet := int64Set(departmentIDs)
 
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
@@ -799,10 +1783,31 @@ func (s *SheetService) CheckProtection(sheetID int64, rowIndex int, colKey strin
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID {
+		if !protectionLocksEditing(check.info) || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, departmentSet) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, rowIndex, colKey), nil
+	}
+	if strings.TrimSpace(colKey) == "" {
+		for protectedColumn, info := range protections.Columns {
+			if !protectionLocksEditing(info) || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentSet) {
+				continue
+			}
+			return true, buildProtectionMessage("column", info.OwnerName, rowIndex, protectedColumn), nil
+		}
+		rowPrefix := fmt.Sprintf("%d:", rowIndex)
+		for key, info := range protections.Cells {
+			if !strings.HasPrefix(key, rowPrefix) || !protectionLocksEditing(info) || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentSet) {
+				continue
+			}
+			protectedColumn := strings.TrimPrefix(key, rowPrefix)
+			return true, buildProtectionMessage("cell", info.OwnerName, rowIndex, protectedColumn), nil
+		}
+		for key, locked := range legacyLocks {
+			if locked && strings.HasPrefix(key, rowPrefix) {
+				return true, fmt.Sprintf("第 %d 行包含受保护的单元格", rowIndex+2), nil
+			}
+		}
 	}
 
 	legacyKey := fmt.Sprintf("%d:%s", rowIndex, colKey)
@@ -883,6 +1888,145 @@ func resolveProtectionTarget(scope string, rowIndex *int, columnKey *string, pro
 	}
 }
 
+func normalizeProtectionEditableUsers(userIDs []int64, ownerID int64) []int64 {
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	seen := map[int64]bool{}
+	result := make([]int64, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 || userID == ownerID || seen[userID] {
+			continue
+		}
+		seen[userID] = true
+		result = append(result, userID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+type normalizedProtectionAccess struct {
+	ReadonlyUserIDs         []int64
+	ReadonlyDepartmentIDs   []int64
+	EditableUserIDs         []int64
+	EditableDepartmentIDs   []int64
+	ViewHiddenUserIDs       []int64
+	ViewHiddenDepartmentIDs []int64
+}
+
+func protectionRequestUserIDs(req model.UpdateProtectionRequest) []int64 {
+	result := make([]int64, 0, len(req.ReadonlyUserIDs)+len(req.EditableUserIDs)+len(req.ViewHiddenUserIDs))
+	result = append(result, req.ReadonlyUserIDs...)
+	result = append(result, req.EditableUserIDs...)
+	result = append(result, req.ViewHiddenUserIDs...)
+	return result
+}
+
+func protectionRequestDepartmentIDs(req model.UpdateProtectionRequest) []int64 {
+	result := make([]int64, 0, len(req.ReadonlyDepartmentIDs)+len(req.EditableDepartmentIDs)+len(req.ViewHiddenDepartmentIDs))
+	result = append(result, req.ReadonlyDepartmentIDs...)
+	result = append(result, req.EditableDepartmentIDs...)
+	result = append(result, req.ViewHiddenDepartmentIDs...)
+	return result
+}
+
+func normalizeProtectionAccess(req *model.UpdateProtectionRequest, ownerID int64) normalizedProtectionAccess {
+	editableUserIDs := normalizeProtectionEditableUsers(req.EditableUserIDs, ownerID)
+	viewHiddenUserIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ViewHiddenUserIDs, ownerID),
+		editableUserIDs,
+	)
+	readonlyUserIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ReadonlyUserIDs, ownerID),
+		editableUserIDs,
+		viewHiddenUserIDs,
+	)
+
+	editableDepartmentIDs := normalizeProtectionEditableUsers(req.EditableDepartmentIDs, 0)
+	viewHiddenDepartmentIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ViewHiddenDepartmentIDs, 0),
+		editableDepartmentIDs,
+	)
+	readonlyDepartmentIDs := excludeProtectionIDs(
+		normalizeProtectionEditableUsers(req.ReadonlyDepartmentIDs, 0),
+		editableDepartmentIDs,
+		viewHiddenDepartmentIDs,
+	)
+
+	return normalizedProtectionAccess{
+		ReadonlyUserIDs:         readonlyUserIDs,
+		ReadonlyDepartmentIDs:   readonlyDepartmentIDs,
+		EditableUserIDs:         editableUserIDs,
+		EditableDepartmentIDs:   editableDepartmentIDs,
+		ViewHiddenUserIDs:       viewHiddenUserIDs,
+		ViewHiddenDepartmentIDs: viewHiddenDepartmentIDs,
+	}
+}
+
+func excludeProtectionIDs(values []int64, excluded ...[]int64) []int64 {
+	blocked := make(map[int64]struct{})
+	for _, list := range excluded {
+		for _, value := range list {
+			blocked[value] = struct{}{}
+		}
+	}
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if _, exists := blocked[value]; exists {
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
+}
+
+func protectionListAllows(userIDs []int64, departmentIDs []int64, userID int64, userDepartmentIDs map[int64]struct{}) bool {
+	for _, listedUserID := range userIDs {
+		if listedUserID == userID {
+			return true
+		}
+	}
+	for _, departmentID := range departmentIDs {
+		if _, exists := userDepartmentIDs[departmentID]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func protectionAllowsUser(info protectionOwner, userID int64, departmentIDs map[int64]struct{}) bool {
+	return protectionListAllows(info.EditableUserIDs, info.EditableDepartmentIDs, userID, departmentIDs)
+}
+
+func protectionAllowsViewHidden(info protectionOwner, userID int64, departmentIDs map[int64]struct{}) bool {
+	return protectionAllowsUser(info, userID, departmentIDs) ||
+		protectionListAllows(info.ViewHiddenUserIDs, info.ViewHiddenDepartmentIDs, userID, departmentIDs)
+}
+
+func protectionLocksEditing(info protectionOwner) bool {
+	return info.OwnerID != 0 && (info.LockEditing == nil || *info.LockEditing)
+}
+
+func resolveProtectionLockEditing(requested, current *bool) *bool {
+	value := true
+	if current != nil {
+		value = *current
+	}
+	if requested != nil {
+		value = *requested
+	}
+	return &value
+}
+
+func int64Set(values []int64) map[int64]struct{} {
+	result := make(map[int64]struct{}, len(values))
+	for _, value := range values {
+		result[value] = struct{}{}
+	}
+	return result
+}
+
 func applyProtectionRequest(protections *protectionMaps, payload map[string]interface{}, legacyLocks map[string]bool, req *model.UpdateProtectionRequest, userID int64, username string, isAdmin bool) error {
 	mapRef, key, info, err := resolveProtectionTarget(req.Scope, req.RowIndex, req.ColumnKey, *protections)
 	if err != nil {
@@ -893,10 +2037,35 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 		if info.OwnerID != 0 && info.OwnerID != userID && !isAdmin {
 			return fmt.Errorf("%w: 此保护已由 %s 添加", ErrProtectionDenied, info.OwnerName)
 		}
+		lockEditing := resolveProtectionLockEditing(req.LockEditing, info.LockEditing)
+		hidden := resolveProtectionHidden(req.Hidden, info.Hidden)
+		if !*lockEditing && !hidden {
+			return fmt.Errorf("%w: 请至少开启锁定编辑或数据遮罩", ErrProtectionDenied)
+		}
+		ownerID := userID
+		ownerName := username
+		protectedAt := time.Now().Format(time.RFC3339)
+		if info.OwnerID != 0 {
+			ownerID = info.OwnerID
+			ownerName = info.OwnerName
+			protectedAt = info.ProtectedAt
+			if protectedAt == "" {
+				protectedAt = time.Now().Format(time.RFC3339)
+			}
+		}
+		access := normalizeProtectionAccess(req, ownerID)
 		(*mapRef)[key] = protectionOwner{
-			OwnerID:     userID,
-			OwnerName:   username,
-			ProtectedAt: time.Now().Format(time.RFC3339),
+			OwnerID:                 ownerID,
+			OwnerName:               ownerName,
+			ReadonlyUserIDs:         access.ReadonlyUserIDs,
+			ReadonlyDepartmentIDs:   access.ReadonlyDepartmentIDs,
+			EditableUserIDs:         access.EditableUserIDs,
+			EditableDepartmentIDs:   access.EditableDepartmentIDs,
+			ViewHiddenUserIDs:       access.ViewHiddenUserIDs,
+			ViewHiddenDepartmentIDs: access.ViewHiddenDepartmentIDs,
+			LockEditing:             lockEditing,
+			Hidden:                  hidden,
+			ProtectedAt:             protectedAt,
 		}
 		return nil
 	}
@@ -917,6 +2086,13 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 	return nil
 }
 
+func resolveProtectionHidden(requested *bool, current bool) bool {
+	if requested == nil {
+		return current
+	}
+	return *requested
+}
+
 func finalizeProtectionPayload(payload map[string]interface{}, protections protectionMaps, legacyLocks map[string]bool) {
 	if !hasAnyProtection(protections) {
 		delete(payload, "protections")
@@ -931,7 +2107,27 @@ func finalizeProtectionPayload(payload map[string]interface{}, protections prote
 	}
 }
 
-func flattenProtectionMap(scope string, items map[string]protectionOwner) []model.ProtectionInfo {
+func (s *SheetService) buildProtectionSnapshot(protections protectionMaps, userID int64) (*model.ProtectionSnapshot, error) {
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	departmentSet := map[int64]struct{}{}
+	if !isAdmin {
+		departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+		if err != nil {
+			return nil, err
+		}
+		departmentSet = int64Set(departmentIDs)
+	}
+	return &model.ProtectionSnapshot{
+		Rows:    flattenProtectionMap("row", protections.Rows, userID, isAdmin, departmentSet),
+		Columns: flattenProtectionMap("column", protections.Columns, userID, isAdmin, departmentSet),
+		Cells:   flattenProtectionMap("cell", protections.Cells, userID, isAdmin, departmentSet),
+	}, nil
+}
+
+func flattenProtectionMap(scope string, items map[string]protectionOwner, userID int64, isAdmin bool, departmentIDs map[int64]struct{}) []model.ProtectionInfo {
 	result := make([]model.ProtectionInfo, 0, len(items))
 	for key, info := range items {
 		if info.OwnerID == 0 {
@@ -939,10 +2135,20 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner) []mode
 		}
 
 		entry := model.ProtectionInfo{
-			Scope:     scope,
-			Key:       key,
-			OwnerID:   info.OwnerID,
-			OwnerName: info.OwnerName,
+			Scope:                   scope,
+			Key:                     key,
+			OwnerID:                 info.OwnerID,
+			OwnerName:               info.OwnerName,
+			ReadonlyUserIDs:         append([]int64(nil), info.ReadonlyUserIDs...),
+			ReadonlyDepartmentIDs:   append([]int64(nil), info.ReadonlyDepartmentIDs...),
+			EditableUserIDs:         append([]int64(nil), info.EditableUserIDs...),
+			EditableDepartmentIDs:   append([]int64(nil), info.EditableDepartmentIDs...),
+			ViewHiddenUserIDs:       append([]int64(nil), info.ViewHiddenUserIDs...),
+			ViewHiddenDepartmentIDs: append([]int64(nil), info.ViewHiddenDepartmentIDs...),
+			LockEditing:             protectionLocksEditing(info),
+			Hidden:                  info.Hidden,
+			CanEdit:                 !protectionLocksEditing(info) || isAdmin || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs),
+			MaskedForCurrentUser:    info.Hidden && !isAdmin && info.OwnerID != userID && !protectionAllowsViewHidden(info, userID, departmentIDs),
 		}
 		if parsedTime, err := time.Parse(time.RFC3339, info.ProtectedAt); err == nil {
 			entry.ProtectedAt = parsedTime
@@ -982,6 +2188,266 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner) []mode
 
 func hasAnyProtection(protections protectionMaps) bool {
 	return len(protections.Rows) > 0 || len(protections.Columns) > 0 || len(protections.Cells) > 0
+}
+
+func ensureProtectionOwnership(config json.RawMessage, userID int64, action string) error {
+	_, protections, legacyLocks, err := parseSheetConfigProtection(config)
+	if err != nil {
+		return err
+	}
+	for _, items := range []map[string]protectionOwner{protections.Rows, protections.Columns, protections.Cells} {
+		for _, info := range items {
+			if info.OwnerID > 0 && info.OwnerID == userID {
+				continue
+			}
+			return fmt.Errorf("%w: %s前请先由保护创建者解除保护或隐藏设置", ErrProtectionDenied, action)
+		}
+	}
+	for _, locked := range legacyLocks {
+		if locked {
+			return fmt.Errorf("%w: %s前请先解除旧版单元格保护", ErrProtectionDenied, action)
+		}
+	}
+	return nil
+}
+
+func (s *SheetService) ensureRowDeletionAllowed(userID int64, sheet *model.Sheet, rowIndex int) error {
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if isAdmin {
+		return nil
+	}
+
+	matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
+	if err != nil {
+		return err
+	}
+	columnKeys, err := parseColumnKeys(sheet.Columns)
+	if err != nil {
+		return err
+	}
+	columnSet := make(map[string]struct{}, len(columnKeys))
+	for _, columnKey := range columnKeys {
+		if columnKey != "" {
+			columnSet[columnKey] = struct{}{}
+		}
+	}
+	if matrix != nil {
+		for _, layer := range permissionMatrixScopedLayers(matrix) {
+			for columnKey := range layer.Columns {
+				if columnKey != "" {
+					columnSet[columnKey] = struct{}{}
+				}
+			}
+			rowPrefix := fmt.Sprintf("%d:", rowIndex)
+			for key := range layer.Cells {
+				if strings.HasPrefix(key, rowPrefix) {
+					columnSet[strings.TrimPrefix(key, rowPrefix)] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(columnSet) == 0 {
+		if !permissionMatrixAllowsCell(matrix, "", rowIndex, "write") {
+			return fmt.Errorf("%w: 第 %d 行包含无权删除的数据", ErrSheetPermissionDenied, rowIndex+2)
+		}
+	} else {
+		for columnKey := range columnSet {
+			if !permissionMatrixAllowsCell(matrix, columnKey, rowIndex, "write") {
+				return fmt.Errorf("%w: 第 %d 行的列 %s 包含无权删除或不可见的数据", ErrSheetPermissionDenied, rowIndex+2, columnKey)
+			}
+		}
+	}
+
+	_, protections, legacyLocks, err := parseSheetConfigProtection(sheet.Config)
+	if err != nil {
+		return err
+	}
+	affected := make([]protectionOwner, 0, len(protections.Columns)+1)
+	if info, exists := protections.Rows[strconv.Itoa(rowIndex)]; exists {
+		affected = append(affected, info)
+	}
+	for _, info := range protections.Columns {
+		affected = append(affected, info)
+	}
+	rowPrefix := fmt.Sprintf("%d:", rowIndex)
+	for key, info := range protections.Cells {
+		if strings.HasPrefix(key, rowPrefix) {
+			affected = append(affected, info)
+		}
+	}
+	for _, info := range affected {
+		if info.OwnerID > 0 && info.OwnerID == userID {
+			continue
+		}
+		return fmt.Errorf("%w: 第 %d 行包含其他人设置的保护或隐藏区域，不能删除", ErrProtectionDenied, rowIndex+2)
+	}
+	for key, locked := range legacyLocks {
+		if locked && strings.HasPrefix(key, rowPrefix) {
+			return fmt.Errorf("%w: 第 %d 行包含受保护的单元格，不能删除", ErrProtectionDenied, rowIndex+2)
+		}
+	}
+	return nil
+}
+
+func (s *SheetService) EnsureRowDeletionAllowed(userID, sheetID int64, rowIndex int) error {
+	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	if err != nil {
+		return err
+	}
+	if err := applySheetLifecycleState(sheet); err != nil {
+		return err
+	}
+	if err := s.ensureSheetModificationAllowed(sheet, userID); err != nil {
+		return err
+	}
+	return s.ensureRowDeletionAllowed(userID, sheet, rowIndex)
+}
+
+func (s *SheetService) ensureProtectedStructureMutationAllowed(userID int64, existing, next *model.Sheet) error {
+	currentColumns, err := parseColumnKeys(existing.Columns)
+	if err != nil {
+		return err
+	}
+	nextColumns, err := parseColumnKeys(next.Columns)
+	if err != nil {
+		return err
+	}
+	columnLayoutChanged := columnLayoutRequiresStructureGate(currentColumns, nextColumns)
+	currentRows, currentColumnCount := univerSheetDimensions(existing.Config)
+	nextRows, nextColumnCount := univerSheetDimensions(next.Config)
+	rowCountReduced := currentRows > 0 && nextRows < currentRows
+	columnCountReduced := currentColumnCount > 0 && nextColumnCount < currentColumnCount
+	if !columnLayoutChanged && !rowCountReduced && !columnCountReduced {
+		return nil
+	}
+
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if !isAdmin {
+		matrix, err := s.permService.GetPermissionMatrix(existing.ID, userID)
+		if err != nil {
+			return err
+		}
+		if !permissionMatrixAllowsStructureMutation(matrix) {
+			return fmt.Errorf("%w: 当前账号存在不可见或只读区域，不能删除、移动行列或调整表格结构", ErrSheetPermissionDenied)
+		}
+	}
+
+	_, protections, legacyLocks, err := parseSheetConfigProtection(existing.Config)
+	if err != nil {
+		return err
+	}
+	if !hasAnyProtection(protections) && len(legacyLocks) == 0 {
+		return nil
+	}
+	if rowCountReduced && (len(protections.Rows) > 0 || len(protections.Cells) > 0 || len(legacyLocks) > 0) {
+		return fmt.Errorf("%w: 工作表包含行或单元格保护，请先解除对应保护再通过整表操作删除行", ErrProtectionDenied)
+	}
+	if columnCountReduced {
+		removedColumns := removedColumnKeysFromLists(currentColumns, nextColumns)
+		if len(removedColumns) == 0 && (len(protections.Columns) > 0 || len(protections.Cells) > 0 || len(legacyLocks) > 0) {
+			return fmt.Errorf("%w: 无法确认被删除列的保护范围，已阻止本次结构变更", ErrProtectionDenied)
+		}
+	}
+	if isAdmin {
+		return nil
+	}
+	return ensureProtectionOwnership(existing.Config, userID, "调整工作表结构")
+}
+
+func permissionMatrixAllowsStructureMutation(matrix *model.PermissionMatrix) bool {
+	if matrix == nil || !matrix.Sheet.CanEdit {
+		return false
+	}
+	if matrix.DefaultPermission != "" && !permissionSatisfies(matrix.DefaultPermission, "write") {
+		return false
+	}
+	for _, items := range permissionMatrixMaps(matrix) {
+		for _, permission := range items {
+			if !permissionSatisfies(permission, "write") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func columnLayoutRequiresStructureGate(current, next []string) bool {
+	if len(current) == len(next) {
+		equal := true
+		for index := range current {
+			if current[index] != next[index] {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			return false
+		}
+	}
+	if len(next) >= len(current) {
+		prefix := true
+		for index := range current {
+			if current[index] != next[index] {
+				prefix = false
+				break
+			}
+		}
+		if prefix {
+			return false
+		}
+	}
+	return true
+}
+
+func univerSheetDimensions(config json.RawMessage) (int, int) {
+	if len(config) == 0 {
+		return 0, 0
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return 0, 0
+	}
+	sheetData, _ := payload["univerSheetData"].(map[string]interface{})
+	if sheetData == nil {
+		return 0, 0
+	}
+	rowCount := numericDimension(sheetData["rowCount"])
+	columnCount := numericDimension(sheetData["columnCount"])
+	if cellData, ok := sheetData["cellData"].(map[string]interface{}); ok {
+		for rowKey, rowValue := range cellData {
+			if rowIndex, err := strconv.Atoi(rowKey); err == nil && rowIndex+1 > rowCount {
+				rowCount = rowIndex + 1
+			}
+			if row, ok := rowValue.(map[string]interface{}); ok {
+				for columnKey := range row {
+					if columnIndex, err := strconv.Atoi(columnKey); err == nil && columnIndex+1 > columnCount {
+						columnCount = columnIndex + 1
+					}
+				}
+			}
+		}
+	}
+	return rowCount, columnCount
+}
+
+func numericDimension(value interface{}) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case json.Number:
+		parsed, _ := strconv.Atoi(typed.String())
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func buildProtectionMessage(scope, ownerName string, rowIndex int, colKey string) string {
@@ -1126,6 +2592,11 @@ func (s *SheetService) checkProtectionByWorksheetRow(config json.RawMessage, wor
 	if isAdmin {
 		return false, "", nil
 	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return false, "", err
+	}
+	departmentSet := int64Set(departmentIDs)
 
 	_, protections, legacyLocks, err := parseSheetConfigProtection(config)
 	if err != nil {
@@ -1147,7 +2618,7 @@ func (s *SheetService) checkProtectionByWorksheetRow(config json.RawMessage, wor
 	}
 
 	for _, check := range checks {
-		if check.info.OwnerID == 0 || check.info.OwnerID == userID {
+		if !protectionLocksEditing(check.info) || check.info.OwnerID == userID || protectionAllowsUser(check.info, userID, departmentSet) {
 			continue
 		}
 		return true, buildProtectionMessage(check.scope, check.info.OwnerName, dataRowIndex, colKey), nil
@@ -1216,6 +2687,67 @@ func parseColumnKeys(raw json.RawMessage) ([]string, error) {
 		keys = append(keys, column.Key)
 	}
 	return keys, nil
+}
+
+func removedColumnKeys(currentRaw, nextRaw json.RawMessage) (map[string]struct{}, error) {
+	current, err := parseColumnKeys(currentRaw)
+	if err != nil {
+		return nil, err
+	}
+	next, err := parseColumnKeys(nextRaw)
+	if err != nil {
+		return nil, err
+	}
+	return removedColumnKeysFromLists(current, next), nil
+}
+
+func removedColumnKeysFromLists(current, next []string) map[string]struct{} {
+	nextSet := make(map[string]struct{}, len(next))
+	for _, columnKey := range next {
+		nextSet[columnKey] = struct{}{}
+	}
+	removed := make(map[string]struct{})
+	for _, columnKey := range current {
+		if _, exists := nextSet[columnKey]; !exists {
+			removed[columnKey] = struct{}{}
+		}
+	}
+	return removed
+}
+
+func removeColumnProtectionState(config json.RawMessage, removedColumns map[string]struct{}) (json.RawMessage, error) {
+	if len(removedColumns) == 0 {
+		return config, nil
+	}
+	payload, protections, legacyLocks, err := parseSheetConfigProtection(config)
+	if err != nil {
+		return nil, err
+	}
+	for columnKey := range removedColumns {
+		delete(protections.Columns, columnKey)
+	}
+	for key := range protections.Cells {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) == 2 {
+			if _, removed := removedColumns[parts[1]]; removed {
+				delete(protections.Cells, key)
+			}
+		}
+	}
+	for key := range legacyLocks {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) == 2 {
+			if _, removed := removedColumns[parts[1]]; removed {
+				delete(legacyLocks, key)
+			}
+		}
+	}
+	finalizeProtectionPayload(payload, protections, legacyLocks)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pruned protection config: %w", err)
+	}
+	return encoded, nil
 }
 
 func mergeProtectionState(existingConfig, nextConfig json.RawMessage) (json.RawMessage, error) {

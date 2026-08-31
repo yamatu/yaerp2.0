@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { Sheet, Row, Workbook } from '@/types'
 import { api } from '@/lib/api'
+import { subscribeDataChanged } from '@/lib/dataEvents'
 
 function normalizeRows(rows: Row[]): Row[] {
   return rows
@@ -15,8 +16,8 @@ export function useWorkbooks() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const fetchWorkbooks = useCallback(async () => {
-    setLoading(true)
+  const fetchWorkbooks = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     setError(null)
     try {
       const res = await api.get<Workbook[]>('/workbooks')
@@ -28,14 +29,22 @@ export function useWorkbooks() {
     } catch {
       setError('网络错误')
     }
-    setLoading(false)
+    if (!silent) setLoading(false)
   }, [])
 
   useEffect(() => {
     fetchWorkbooks()
   }, [fetchWorkbooks])
 
-  return { workbooks, loading, error, refresh: fetchWorkbooks }
+  useEffect(() => subscribeDataChanged((detail) => {
+    if (!detail.resourcesChanged) return
+    void fetchWorkbooks(true)
+  }), [fetchWorkbooks])
+
+  const refresh = useCallback(() => fetchWorkbooks(false), [fetchWorkbooks])
+  const refreshSilently = useCallback(() => fetchWorkbooks(true), [fetchWorkbooks])
+
+  return { workbooks, loading, error, refresh, refreshSilently }
 }
 
 export function useWorkbook(id: string | number) {
@@ -43,9 +52,9 @@ export function useWorkbook(id: string | number) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const fetchWorkbook = useCallback(async () => {
+  const fetchWorkbook = useCallback(async (silent = false) => {
     if (!id) return
-    setLoading(true)
+    if (!silent) setLoading(true)
     setError(null)
     try {
       const res = await api.get<Workbook>(`/workbooks/${id}`)
@@ -57,14 +66,22 @@ export function useWorkbook(id: string | number) {
     } catch {
       setError('网络错误')
     }
-    setLoading(false)
+    if (!silent) setLoading(false)
   }, [id])
 
   useEffect(() => {
     fetchWorkbook()
   }, [fetchWorkbook])
 
-  return { workbook, loading, error, refresh: fetchWorkbook }
+  useEffect(() => subscribeDataChanged((detail) => {
+    if (!detail.resourcesChanged) return
+    void fetchWorkbook(true)
+  }), [fetchWorkbook])
+
+  const refresh = useCallback(() => fetchWorkbook(false), [fetchWorkbook])
+  const refreshSilently = useCallback(() => fetchWorkbook(true), [fetchWorkbook])
+
+  return { workbook, loading, error, refresh, refreshSilently }
 }
 
 export function useSheetData(sheetId: number, initialSheet?: Sheet | null) {

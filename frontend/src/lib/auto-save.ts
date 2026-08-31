@@ -1,4 +1,4 @@
-import type { CellUpdate } from '@/types'
+import type { CellUpdate, CellUpdateResult } from '@/types'
 import { api } from './api'
 import { wsClient } from './ws'
 
@@ -44,15 +44,16 @@ class AutoSave {
       }
 
       for (const [sheetId, sheetChanges] of bySheet) {
-        const res = await api.post(`/sheets/${sheetId}/cells`, {
+        const res = await api.post<CellUpdateResult>(`/sheets/${sheetId}/cells`, {
           changes: sheetChanges,
         })
         if (res.code !== 0) {
           throw new Error(res.message)
         }
         // Broadcast via WebSocket
-        wsClient.sendBatchUpdate(
-          sheetChanges.map((c) => ({
+        const appliedChanges = Array.isArray(res.data?.applied_changes) ? res.data.applied_changes : sheetChanges
+        if (appliedChanges.length > 0) wsClient.sendBatchUpdate(
+          appliedChanges.map((c) => ({
             sheet_id: c.sheet_id,
             row: c.row,
             col: c.col,

@@ -1,0 +1,547 @@
+package service
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/emersion/go-imap"
+
+	"yaerp/internal/model"
+)
+
+func TestMailSecretEncryptionRoundTrip(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	encrypted, err := service.encryptSecret("mail-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encrypted == "mail-password" || encrypted == "" {
+		t.Fatalf("password was not encrypted: %q", encrypted)
+	}
+	plain, err := service.decryptSecret(encrypted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain != "mail-password" {
+		t.Fatalf("unexpected decrypted password: %q", plain)
+	}
+}
+
+func TestMailMessageRoundTrip(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	session := &mailSession{
+		settings: &model.MailServerSettings{DefaultDomain: "example.com"},
+		account: &model.MailAccount{
+			EmailAddress: "sales@example.com", DisplayName: "Sales", SignatureHTML: "<strong>YAERP</strong>",
+		},
+	}
+	input := &model.MailSendInput{
+		Subject: "采购询价", TextBody: "请确认报价", SaveToSent: true,
+		Priority: "high", RequestReadReceipt: true,
+	}
+	raw, messageID, _, err := service.buildOutgoingMessage(
+		session, input,
+		nil, nil, nil, nil,
+		[]MailOutgoingAttachment{{Filename: "quote.txt", ContentType: "text/plain", Data: []byte("USD 100")}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageID == "" {
+		t.Fatal("message id was not generated")
+	}
+	parsed, err := service.parseMailData(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Subject != input.Subject || !strings.Contains(parsed.TextBody, input.TextBody) {
+		t.Fatalf("message content did not round trip: %#v", parsed)
+	}
+	if !strings.Contains(parsed.HTMLBody, "YAERP") {
+		t.Fatalf("signature missing from HTML body: %q", parsed.HTMLBody)
+	}
+	if len(parsed.Attachments) != 1 || string(parsed.Attachments[0].Data) != "USD 100" {
+		t.Fatalf("attachment did not round trip: %#v", parsed.Attachments)
+	}
+	messageSource := strings.ToLower(string(raw))
+	if !strings.Contains(messageSource, "x-priority: 1") || !strings.Contains(messageSource, "disposition-notification-to:") {
+		t.Fatalf("priority or read receipt headers missing: %s", raw)
+	}
+}
+
+func TestMailMessageSignatureOverride(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	session := &mailSession{
+		settings: &model.MailServerSettings{DefaultDomain: "example.com"},
+		account: &model.MailAccount{
+			EmailAddress: "sales@example.com", SignatureHTML: "<strong>Legacy signature</strong>",
+		},
+	}
+	override := "<strong>Selected signature</strong>"
+	input := &model.MailSendInput{Subject: "test", TextBody: "body", SignatureHTML: &override}
+	raw, _, _, err := service.buildOutgoingMessage(session, input, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := string(raw)
+	if !strings.Contains(message, "Selected signature") || strings.Contains(message, "Legacy signature") {
+		t.Fatalf("selected signature did not override legacy account signature: %s", message)
+	}
+
+	disabled := ""
+	input.SignatureHTML = &disabled
+	raw, _, _, err = service.buildOutgoingMessage(session, input, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "Legacy signature") {
+		t.Fatalf("explicitly disabled signature fell back to legacy signature: %s", raw)
+	}
+}
+
+func TestMailSignatureRichHTMLSanitizer(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	signature, err := service.mailSignatureFromInput(7, 0, &model.MailSignatureInput{
+		Title:       "外贸签名",
+		HTMLContent: `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;border-collapse:collapse"><tbody><tr><td style="padding:0 16px 0 0;vertical-align:top"><strong style="font-size:18px;color:#0f172a">Janice</strong><br><img src="https://erp.example.com/api/files/1/content?signature=test" width="180" style="display:inline-block;max-width:100%;height:auto;margin:6px 0" onerror="alert(1)"></td></tr></tbody></table><script>alert(1)</script><a href="javascript:alert(1)">bad</a>`,
+		ApplyToNew:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := signature.HTMLContent
+	for _, expected := range []string{"<table", `role="presentation"`, "max-width: 600px", "font-size: 18px", "color: #0f172a", "<img", `width="180"`} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("safe rich signature markup %q was removed: %s", expected, content)
+		}
+	}
+	for _, forbidden := range []string{"<script", "onerror", "javascript:"} {
+		if strings.Contains(strings.ToLower(content), forbidden) {
+			t.Fatalf("unsafe signature markup %q was retained: %s", forbidden, content)
+		}
+	}
+}
+
+func TestMailFolderRoles(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes []string
+		want       string
+	}{
+		{name: "INBOX", want: "inbox"},
+		{name: "Posteingang/Sent", attributes: []string{imap.SentAttr}, want: "sent"},
+		{name: "Deleted Items", want: "trash"},
+		{name: "Projects", want: "folder"},
+	}
+	for _, test := range tests {
+		if got := mailFolderRole(test.name, test.attributes); got != test.want {
+			t.Errorf("mailFolderRole(%q) = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+func TestAliMailProviderHelpers(t *testing.T) {
+	for _, value := range []string{
+		"https://alimail-cn.aliyuncs.com",
+		"https://alimail-personal.aliyuncs.com/",
+		"https://alimail-sg.aliyuncs.com",
+	} {
+		if _, err := normalizeAliMailBaseURL(value); err != nil {
+			t.Fatalf("supported AliMail base URL %q was rejected: %v", value, err)
+		}
+	}
+	if _, err := normalizeAliMailBaseURL("https://example.com"); err == nil {
+		t.Fatal("untrusted AliMail API base URL was accepted")
+	}
+
+	roles := []struct {
+		name        string
+		wantRole    string
+		wantDisplay string
+	}{
+		{name: "收件箱", wantRole: "inbox", wantDisplay: "收件箱"},
+		{name: "Sent Items", wantRole: "sent", wantDisplay: "已发送"},
+		{name: "draft", wantRole: "drafts", wantDisplay: "草稿箱"},
+		{name: "deleted", wantRole: "trash", wantDisplay: "已删除"},
+		{name: "spam", wantRole: "junk", wantDisplay: "垃圾邮件"},
+		{name: "客户项目", wantRole: "folder", wantDisplay: "客户项目"},
+	}
+	for _, test := range roles {
+		role := aliMailFolderRole(aliMailFolder{DisplayName: test.name})
+		if role != test.wantRole {
+			t.Errorf("aliMailFolderRole(%q) = %q, want %q", test.name, role, test.wantRole)
+		}
+		if got := mailFolderDisplayNameByRole(role, test.name); got != test.wantDisplay {
+			t.Errorf("mail folder display name for %q = %q, want %q", test.name, got, test.wantDisplay)
+		}
+	}
+	if got := aliMailFolderAliasRole("INBOX"); got != "inbox" {
+		t.Fatalf("aliMailFolderAliasRole(INBOX) = %q, want inbox", got)
+	}
+}
+
+func TestAliMailSearchQuery(t *testing.T) {
+	if got := aliMailSearchQuery("inbox-id", MailMessageListOptions{}); got != "" {
+		t.Fatalf("folder-only query should use the list API, got %q", got)
+	}
+	query := aliMailSearchQuery("inbox-id", MailMessageListOptions{
+		Query:       `quote "A"`,
+		Filter:      "attachment",
+		UnreadOnly:  true,
+		Participant: "buyer@example.com",
+	})
+	for _, expected := range []string{
+		`folderId:"inbox-id"`,
+		`isRead:false`,
+		`hasAttachments:true`,
+		`fromEmail:"buyer@example.com"`,
+		`quote ""A""`,
+	} {
+		if !strings.Contains(query, expected) {
+			t.Fatalf("AliMail query is missing %q: %s", expected, query)
+		}
+	}
+}
+
+func TestAliMailListSelectIncludesSummaryFields(t *testing.T) {
+	for _, field := range []string{
+		"subject", "from", "sender", "toRecipients", "hasAttachments", "isRead", "sentDateTime", "size",
+	} {
+		if !strings.Contains(","+aliMailListSelect+",", ","+field+",") {
+			t.Fatalf("AliMail list select is missing %q: %s", field, aliMailListSelect)
+		}
+	}
+}
+
+func TestAliMailMessageFromFallbacks(t *testing.T) {
+	tests := []struct {
+		name    string
+		message aliMailMessage
+		want    string
+	}{
+		{
+			name: "from", message: aliMailMessage{
+				From:   aliMailRecipient{Name: "Owner", Email: "owner@example.com"},
+				Sender: aliMailRecipient{Name: "Sender", Email: "sender@example.com"},
+			}, want: "owner@example.com",
+		},
+		{
+			name: "sender", message: aliMailMessage{
+				Sender: aliMailRecipient{Name: "Sender", Email: "sender@example.com"},
+			}, want: "sender@example.com",
+		},
+		{
+			name: "header", message: aliMailMessage{
+				InternetMessageHeaders: map[string]string{"fRoM": "Header Sender <header@example.com>"},
+			}, want: "header@example.com",
+		},
+	}
+	for _, test := range tests {
+		addresses := aliMailMessageFrom(test.message)
+		if len(addresses) != 1 || addresses[0].Address != test.want {
+			t.Fatalf("%s fallback = %#v, want %s", test.name, addresses, test.want)
+		}
+	}
+}
+
+func TestNormalizeBulkRecipients(t *testing.T) {
+	recipients, err := normalizeBulkRecipients([]string{
+		`"Doe, Jane" <JANE@example.com>; buyer@example.com`,
+		"jane@example.com；Second <second@example.com>",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recipients) != 3 {
+		t.Fatalf("unexpected recipients: %#v", recipients)
+	}
+	if recipients[0].Name != "Doe, Jane" || recipients[0].Email != "jane@example.com" {
+		t.Fatalf("quoted recipient was not normalized: %#v", recipients[0])
+	}
+	if _, err := normalizeBulkRecipients([]string{"only@example.com"}); err == nil {
+		t.Fatal("single-recipient bulk job was accepted")
+	}
+}
+
+func TestPersonalizeBulkMessage(t *testing.T) {
+	message := personalizeBulkMessage(model.MailSendInput{
+		To: []string{"leaked@example.com"}, CC: []string{"hidden@example.com"}, BCC: []string{"secret@example.com"},
+		Subject: "Hello {{name}}", TextBody: "Account: {{email}}", InReplyTo: "previous@example.com",
+		References: []string{"previous@example.com"},
+	}, model.MailBulkRecipient{Name: "Jane", Email: "jane@example.com"})
+	if message.Subject != "Hello Jane" || message.TextBody != "Account: jane@example.com" {
+		t.Fatalf("unexpected personalized message: %#v", message)
+	}
+	if len(message.To) != 1 || len(message.CC) != 0 || len(message.BCC) != 0 ||
+		message.InReplyTo != "" || len(message.References) != 0 || !strings.Contains(message.To[0], "jane@example.com") {
+		t.Fatalf("bulk recipient isolation failed: %#v", message)
+	}
+	if err := validateBulkRecipientMessage(&message, "jane@example.com"); err != nil {
+		t.Fatalf("isolated bulk message was rejected: %v", err)
+	}
+	leaked := message
+	leaked.To = append(leaked.To, "other@example.com")
+	if err := validateBulkRecipientMessage(&leaked, "jane@example.com"); err == nil {
+		t.Fatal("bulk message with multiple visible recipients was accepted")
+	}
+}
+
+func TestBulkMessagesExposeOnlyCurrentRecipient(t *testing.T) {
+	service := NewMailService(nil, nil, "test-secret")
+	session := &mailSession{
+		settings: &model.MailServerSettings{DefaultDomain: "example.com"},
+		account:  &model.MailAccount{EmailAddress: "sales@example.com", DisplayName: "Sales"},
+	}
+	template := model.MailSendInput{
+		To: []string{"first@example.com", "second@example.com"}, CC: []string{"copy@example.com"},
+		BCC: []string{"blind@example.com"}, Subject: "Private offer", TextBody: "body", SaveToSent: true,
+	}
+	recipients := []model.MailBulkRecipient{
+		{Name: "First", Email: "first@example.com"},
+		{Name: "Second", Email: "second@example.com"},
+	}
+	messageIDs := make(map[string]struct{}, len(recipients))
+	for index, recipient := range recipients {
+		message := personalizeBulkMessage(template, recipient)
+		if err := validateBulkRecipientMessage(&message, recipient.Email); err != nil {
+			t.Fatalf("recipient %d failed isolation: %v", index, err)
+		}
+		to, _, err := parseMailAddresses(message.To)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, messageID, _, err := service.buildOutgoingMessage(session, &message, nil, to, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := service.parseMailData(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(parsed.To) != 1 || parsed.To[0].Address != recipient.Email || len(parsed.CC) != 0 || len(parsed.BCC) != 0 {
+			t.Fatalf("SMTP message exposed another recipient: %#v", parsed)
+		}
+		otherEmail := recipients[(index+1)%len(recipients)].Email
+		if strings.Contains(strings.ToLower(string(raw)), otherEmail) {
+			t.Fatalf("SMTP message for %s contains %s", recipient.Email, otherEmail)
+		}
+		aliTo, err := aliMailRecipients(message.To)
+		if err != nil || len(aliTo) != 1 || aliTo[0].Email != recipient.Email {
+			t.Fatalf("AliMail message exposed another recipient: %#v, %v", aliTo, err)
+		}
+		if _, exists := messageIDs[messageID]; exists {
+			t.Fatalf("bulk recipients shared message id %q", messageID)
+		}
+		messageIDs[messageID] = struct{}{}
+	}
+}
+
+func TestAliMailInt64AcceptsNumberAndString(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want int64
+	}{
+		{raw: `1024`, want: 1024},
+		{raw: `"2048"`, want: 2048},
+		{raw: `""`, want: 0},
+		{raw: `null`, want: 0},
+	} {
+		var value aliMailInt64
+		if err := json.Unmarshal([]byte(test.raw), &value); err != nil {
+			t.Fatalf("failed to decode %s: %v", test.raw, err)
+		}
+		if int64(value) != test.want {
+			t.Fatalf("decoded %s as %d, want %d", test.raw, value, test.want)
+		}
+	}
+}
+
+func TestMailAccountInputIsEmpty(t *testing.T) {
+	if !mailAccountInputIsEmpty(nil) || !mailAccountInputIsEmpty(&model.MailAccountInput{}) {
+		t.Fatal("empty account input was not recognized")
+	}
+	if mailAccountInputIsEmpty(&model.MailAccountInput{EmailAddress: "sales@example.com"}) {
+		t.Fatal("new account input was treated as an existing-account test")
+	}
+}
+
+func TestValidateMailSettings(t *testing.T) {
+	settings := &model.MailServerSettings{
+		IMAPHost: "mail.example.com", IMAPPort: 993, IMAPSecurity: "tls",
+		SMTPHost: "mail.example.com", SMTPPort: 465, SMTPSecurity: "tls", MaxAttachmentMB: 25,
+	}
+	if err := validateMailSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	settings.SMTPPort = 0
+	if err := validateMailSettings(settings); err == nil {
+		t.Fatal("invalid SMTP port was accepted")
+	}
+	settings.SMTPPort = 465
+	settings.ProxyType = "socks5"
+	settings.ProxyHost = "127.0.0.1"
+	settings.ProxyPort = 1080
+	if err := validateMailSettings(settings); err != nil {
+		t.Fatalf("valid SOCKS5 settings rejected: %v", err)
+	}
+	settings.ProxyPort = 0
+	if err := validateMailSettings(settings); err == nil {
+		t.Fatal("invalid SOCKS5 port was accepted")
+	}
+}
+
+func TestNormalizeMailForwardAddresses(t *testing.T) {
+	addresses, err := normalizeMailForwardAddresses("sales@example.com", []string{
+		"Manager <manager@example.com>; notify@example.com",
+		"MANAGER@example.com\nfinance@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"manager@example.com", "notify@example.com", "finance@example.com"}
+	if len(addresses) != len(want) {
+		t.Fatalf("unexpected addresses: %#v", addresses)
+	}
+	for index := range want {
+		if addresses[index] != want[index] {
+			t.Fatalf("addresses[%d] = %q, want %q", index, addresses[index], want[index])
+		}
+	}
+	if _, err := normalizeMailForwardAddresses("sales@example.com", []string{"sales@example.com"}); err == nil {
+		t.Fatal("forwarding to the same mailbox was accepted")
+	}
+}
+
+func TestAITranslationResultJSONAndAlignment(t *testing.T) {
+	result := AITranslationResult{
+		AssistantID: 3, AssistantName: "Translator", Model: "test-model", Content: "你好",
+		Segments: []AITranslationSegment{{Source: "Hello", Translation: "你好"}},
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := string(encoded)
+	for _, key := range []string{`"assistant_id"`, `"assistant_name"`, `"content"`, `"segments"`} {
+		if !strings.Contains(value, key) {
+			t.Fatalf("translation JSON is missing %s: %s", key, value)
+		}
+	}
+
+	source := splitTranslationSegments("Hello\r\n\r\nWorld")
+	if len(source) != 2 || source[0] != "Hello" || source[1] != "World" {
+		t.Fatalf("unexpected source segments: %#v", source)
+	}
+	aligned := alignTranslationSegments(source, "你好\n世界")
+	if len(aligned) != 2 || aligned[1].Translation != "世界" {
+		t.Fatalf("unexpected aligned translation: %#v", aligned)
+	}
+}
+
+func TestDecodeMailHeaderValue(t *testing.T) {
+	if got := decodeMailHeaderValue("=?UTF-8?B?WWFtYXR1?="); got != "Yamatu" {
+		t.Fatalf("decoded mail header = %q, want Yamatu", got)
+	}
+	if got := decodeMailHeaderValue("Normal Sender"); got != "Normal Sender" {
+		t.Fatalf("plain mail header changed: %q", got)
+	}
+}
+
+func TestExtractMailSenderAvatar(t *testing.T) {
+	htmlValue := `<div><a>Yamatu</a><br><a>yamatu@qq.com</a></div><p><img src="cid:qq-avatar" alt="profile"></p><p>邮件正文</p>`
+	cleaned, avatar, contentID := extractMailSenderAvatar(htmlValue, "Yamatu", "yamatu@qq.com", map[string]string{
+		"qq-avatar": "data:image/png;base64,YXZhdGFy",
+	})
+	if avatar != "data:image/png;base64,YXZhdGFy" || contentID != "qq-avatar" {
+		t.Fatalf("avatar was not extracted: avatar=%q contentID=%q", avatar, contentID)
+	}
+	if strings.Contains(cleaned, "qq-avatar") || strings.Contains(cleaned, "yamatu@qq.com") || !strings.Contains(cleaned, "邮件正文") {
+		t.Fatalf("unexpected cleaned HTML: %s", cleaned)
+	}
+
+	ordinary := `<p>产品图片</p><img src="https://example.com/product.png">`
+	cleaned, avatar, _ = extractMailSenderAvatar(ordinary, "Yamatu", "yamatu@qq.com", nil)
+	if avatar != "" || cleaned != ordinary {
+		t.Fatalf("ordinary body image was incorrectly extracted: avatar=%q html=%q", avatar, cleaned)
+	}
+
+	tableSignature := `<table><tr><td><img src="cid:table-avatar"></td><td><a>Yamatu</a><br><a>yamatu@qq.com</a></td></tr></table><p>正文</p>`
+	cleaned, avatar, contentID = extractMailSenderAvatar(tableSignature, "Yamatu", "yamatu@qq.com", map[string]string{
+		"table-avatar": "data:image/png;base64,dGFibGU=",
+	})
+	if avatar == "" || contentID != "table-avatar" || strings.Contains(cleaned, "table-avatar") || strings.Contains(cleaned, "yamatu@qq.com") {
+		t.Fatalf("table signature avatar was not extracted: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+
+	inlineSignature := `<p>正文保留</p><div class="signature"><img src="cid:inline-avatar"><a>Yamatu</a><a>yamatu@qq.com</a></div>`
+	cleaned, avatar, contentID = extractMailSenderAvatar(inlineSignature, "Yamatu", "yamatu@qq.com", map[string]string{
+		"inline-avatar": "data:image/png;base64,aW5saW5l",
+	})
+	if avatar == "" || contentID != "inline-avatar" || strings.Contains(cleaned, "yamatu@qq.com") || !strings.Contains(cleaned, "正文保留") {
+		t.Fatalf("inline signature was not removed: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+
+	brandHeader := `<table><tr><td><img src="cid:facebook-logo" alt="Facebook logo" width="80" height="80"></td></tr></table><h2>验证你的邮箱</h2>`
+	cleaned, avatar, contentID = extractMailSenderAvatar(brandHeader, "Facebook", "security@facebookmail.com", map[string]string{
+		"facebook-logo": "data:image/png;base64,ZmFjZWJvb2s=",
+	})
+	if avatar == "" || contentID != "facebook-logo" || strings.Contains(cleaned, "facebook-logo") || !strings.Contains(cleaned, "验证你的邮箱") {
+		t.Fatalf("sender brand logo was not extracted: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+
+	trackingAndLogo := `<img src="https://www.facebook.com/email_open_log_pic.php?mid=1" width="1" height="1"><img src="cid:visible-brand" width="32" height="32"><h2>验证码</h2>`
+	cleaned, avatar, contentID = extractMailSenderAvatar(trackingAndLogo, "Facebook", "security@facebookmail.com", map[string]string{
+		"visible-brand": "data:image/png;base64,dmlzaWJsZQ==",
+	})
+	if avatar != "data:image/png;base64,dmlzaWJsZQ==" || contentID != "visible-brand" || strings.Contains(cleaned, "email_open_log") || strings.Contains(cleaned, "visible-brand") {
+		t.Fatalf("visible brand logo did not win over tracking pixel: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
+	}
+}
+
+func TestForceMailExternalLinksNewTab(t *testing.T) {
+	htmlValue := forceMailExternalLinksNewTab(`<p><a href="https://example.com/verify" target="_self">验证</a><a href="mailto:sales@example.com">写信</a></p>`)
+	for _, expected := range []string{`href="https://example.com/verify"`, `target="_blank"`, `rel="noopener noreferrer"`} {
+		if !strings.Contains(htmlValue, expected) {
+			t.Fatalf("external mail link is missing %q: %s", expected, htmlValue)
+		}
+	}
+	if strings.Contains(htmlValue, `href="mailto:sales@example.com" target="_blank"`) {
+		t.Fatalf("mailto link was forced into a browser tab: %s", htmlValue)
+	}
+}
+
+func TestSortMailSummaries(t *testing.T) {
+	now := time.Now()
+	messages := []model.MailMessageSummary{
+		{UID: 1, Size: 300, Date: now.Add(-time.Hour)},
+		{UID: 2, Size: 100, Date: now},
+		{UID: 3, Size: 200, Date: now.Add(-2 * time.Hour)},
+	}
+	sortMailSummaries(messages, "size", "asc")
+	if messages[0].UID != 2 || messages[2].UID != 1 {
+		t.Fatalf("unexpected size order: %#v", messages)
+	}
+	sortMailSummaries(messages, "date", "desc")
+	if messages[0].UID != 2 || messages[2].UID != 3 {
+		t.Fatalf("unexpected date order: %#v", messages)
+	}
+}
+
+func TestMailBodyHasAttachmentIgnoresInlineCIDImage(t *testing.T) {
+	inlineAvatar := &imap.BodyStructure{
+		MIMEType: "image", MIMESubType: "png", Id: "avatar",
+		Params: map[string]string{"name": "avatar.png"},
+	}
+	if mailBodyHasAttachment(inlineAvatar) {
+		t.Fatal("inline CID avatar was reported as a downloadable attachment")
+	}
+	attachment := &imap.BodyStructure{
+		MIMEType: "application", MIMESubType: "pdf", Disposition: "attachment",
+		DispositionParams: map[string]string{"filename": "quote.pdf"},
+	}
+	if !mailBodyHasAttachment(attachment) {
+		t.Fatal("regular attachment was not detected")
+	}
+}

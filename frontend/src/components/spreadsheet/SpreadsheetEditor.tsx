@@ -79,7 +79,7 @@ interface CellRange {
   endCol: string
 }
 
-const COLUMN_TYPES: ColumnDef['type'][] = ['text', 'number', 'currency', 'formula', 'date', 'select']
+const COLUMN_TYPES: ColumnDef['type'][] = ['text', 'number', 'currency', 'percentage', 'formula', 'date', 'select']
 const DEFAULT_TEXT_COLOR = '#0f172a'
 const QUICK_TEXT_COLORS = ['#0f172a', '#2563eb', '#059669', '#dc2626', '#d97706', '#7c3aed']
 const QUICK_FILL_COLORS = ['#ffffff', '#fef3c7', '#dcfce7', '#dbeafe', '#fee2e2', '#ede9fe']
@@ -191,6 +191,11 @@ function formatCellValue(
 
   if (column.type === 'currency') {
     return formatCurrencyValue(value, column, rowData, columns)
+  }
+
+  if (column.type === 'percentage') {
+    const numeric = Number(value)
+    return Number.isFinite(numeric) ? `${(numeric * 100).toFixed(2)}%` : String(value)
   }
 
   if (column.type === 'date') {

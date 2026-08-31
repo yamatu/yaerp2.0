@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -10,9 +11,11 @@ type Config struct {
 	Redis    RedisConfig
 	MinIO    MinIOConfig
 	JWT      JWTConfig
+	Auth     AuthConfig
 	Server   ServerConfig
 	AI       AIConfig
 	Backup   BackupConfig
+	WhatsApp WhatsAppConfig
 	Debug    DebugConfig
 }
 
@@ -25,9 +28,11 @@ type PostgresConfig struct {
 }
 
 type RedisConfig struct {
-	Host     string
-	Port     int
-	Password string
+	Host         string
+	Port         int
+	Password     string
+	PoolSize     int
+	MinIdleConns int
 }
 
 type MinIOConfig struct {
@@ -45,9 +50,14 @@ type JWTConfig struct {
 	RefreshHours int
 }
 
+type AuthConfig struct {
+	AllowPublicRegistration bool
+}
+
 type ServerConfig struct {
-	Port string
-	Mode string
+	Port           string
+	Mode           string
+	AllowedOrigins []string
 }
 
 type AIConfig struct {
@@ -60,6 +70,11 @@ type BackupConfig struct {
 	IncludeObjectStorage bool
 	ObjectPrefix         string
 	PublicBaseURL        string
+	AutomaticEnabled     bool
+	Directory            string
+	HostDirectory        string
+	IntervalHours        int
+	RetentionDays        int
 	MaxBytes             int64
 }
 
@@ -67,6 +82,11 @@ type DebugConfig struct {
 	PprofEnabled    bool
 	PprofToken      string
 	MaxRequestBytes int64
+}
+
+type WhatsAppConfig struct {
+	ServiceURL     string
+	InternalSecret string
 }
 
 func Load() *Config {
@@ -79,9 +99,11 @@ func Load() *Config {
 			Password: getEnv("POSTGRES_PASSWORD", "yaerp_secret_2024"),
 		},
 		Redis: RedisConfig{
-			Host:     getEnv("REDIS_HOST", "localhost"),
-			Port:     getEnvInt("REDIS_PORT", 6379),
-			Password: getEnv("REDIS_PASSWORD", "redis_secret_2024"),
+			Host:         getEnv("REDIS_HOST", "localhost"),
+			Port:         getEnvInt("REDIS_PORT", 6379),
+			Password:     getEnv("REDIS_PASSWORD", "redis_secret_2024"),
+			PoolSize:     getPositiveEnvInt("REDIS_POOL_SIZE", 64),
+			MinIdleConns: getPositiveEnvInt("REDIS_MIN_IDLE_CONNS", 8),
 		},
 		MinIO: MinIOConfig{
 			Endpoint:       getEnv("MINIO_ENDPOINT", "localhost:9000"),
@@ -96,9 +118,13 @@ func Load() *Config {
 			ExpireHours:  getEnvInt("JWT_EXPIRE_HOURS", 24),
 			RefreshHours: getEnvInt("JWT_REFRESH_HOURS", 168),
 		},
+		Auth: AuthConfig{
+			AllowPublicRegistration: getEnv("ALLOW_PUBLIC_REGISTRATION", "false") == "true",
+		},
 		Server: ServerConfig{
-			Port: getEnv("BACKEND_PORT", "8080"),
-			Mode: getEnv("GIN_MODE", "debug"),
+			Port:           getEnv("BACKEND_PORT", "8080"),
+			Mode:           getEnv("GIN_MODE", "debug"),
+			AllowedOrigins: getEnvList("CORS_ALLOWED_ORIGINS", []string{"*"}),
 		},
 		AI: AIConfig{
 			Endpoint: getEnv("AI_API_ENDPOINT", ""),
@@ -109,7 +135,18 @@ func Load() *Config {
 			IncludeObjectStorage: getEnv("BACKUP_INCLUDE_OBJECT_STORAGE", "true") == "true",
 			ObjectPrefix:         getEnv("BACKUP_OBJECT_PREFIX", "uploads/"),
 			PublicBaseURL:        getEnv("BACKUP_PUBLIC_BASE_URL", ""),
-			MaxBytes:             getEnvInt64("BACKUP_MAX_BYTES", 256*1024*1024),
+			// Automatic backups are opt-in. A service restart must not
+			// unexpectedly launch a potentially multi-gigabyte pg_dump.
+			AutomaticEnabled: getEnv("BACKUP_AUTO_ENABLED", "false") == "true",
+			Directory:        getEnv("BACKUP_DIRECTORY", "/backups"),
+			HostDirectory:    getEnv("BACKUP_HOST_DIR", "./backups"),
+			IntervalHours:    getPositiveEnvInt("BACKUP_INTERVAL_HOURS", 24),
+			RetentionDays:    getPositiveEnvInt("BACKUP_RETENTION_DAYS", 30),
+			MaxBytes:         getEnvInt64("BACKUP_MAX_BYTES", 256*1024*1024),
+		},
+		WhatsApp: WhatsAppConfig{
+			ServiceURL:     getEnv("WHATSAPP_SERVICE_URL", "http://whatsapp:3010"),
+			InternalSecret: getEnv("WHATSAPP_INTERNAL_SECRET", ""),
 		},
 		Debug: DebugConfig{
 			PprofEnabled:    getEnv("PPROF_ENABLED", "false") == "true",
@@ -135,6 +172,14 @@ func getEnvInt(key string, fallback int) int {
 	return fallback
 }
 
+func getPositiveEnvInt(key string, fallback int) int {
+	value := getEnvInt(key, fallback)
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
 func getEnvInt64(key string, fallback int64) int64 {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil && i > 0 {
@@ -142,4 +187,22 @@ func getEnvInt64(key string, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+func getEnvList(key string, fallback []string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	values := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		value := strings.TrimSpace(item)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	if len(values) == 0 {
+		return fallback
+	}
+	return values
 }

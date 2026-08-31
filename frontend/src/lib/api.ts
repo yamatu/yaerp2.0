@@ -1,4 +1,5 @@
 import type { ApiResponse, TokenResponse } from '@/types'
+import { getRealtimeClientId } from './realtimeClient'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -11,6 +12,10 @@ class ApiClient {
   private buildHeaders(options: RequestInit = {}): Record<string, string> {
     const headers: Record<string, string> = {
       ...((options.headers as Record<string, string>) || {}),
+    }
+    const clientId = getRealtimeClientId()
+    if (clientId && !headers['X-Client-Id']) {
+      headers['X-Client-Id'] = clientId
     }
     if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) {
       headers['Content-Type'] = 'application/json'
@@ -108,6 +113,10 @@ class ApiClient {
 
   delete<T>(endpoint: string) {
     return this.request<T>(endpoint, { method: 'DELETE' })
+  }
+
+  form<T>(endpoint: string, body: FormData, method: 'POST' | 'PUT' = 'POST') {
+    return this.request<T>(endpoint, { method, body })
   }
 
   download(endpoint: string, options: RequestInit = {}) {

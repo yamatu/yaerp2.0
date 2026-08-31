@@ -9,20 +9,28 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@univerjs/preset-sheets-conditional-formatting": "^0.6.10",
     "@univerjs/preset-sheets-core": "^0.6.2",
+    "@univerjs/preset-sheets-data-validation": "^0.6.10",
     "@univerjs/preset-sheets-drawing": "^0.6.10",
     "@univerjs/preset-sheets-find-replace": "^0.6.10",
     "@univerjs/presets": "^0.6.2",
     "@univerjs/sheets-drawing-ui": "^0.6.10",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
+    "katex": "^0.17.0",
     "lucide-react": "^0.460.0",
     "next": "^15.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
     "rxjs": "^7.8.0",
     "tailwind-merge": "^2.6.0",
-    "tailwindcss-animate": "^1.0.7"
+    "tailwindcss-animate": "^1.0.7",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0",

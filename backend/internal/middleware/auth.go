@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -31,27 +31,42 @@ func AuthMiddleware(jwtUtil *jwtpkg.JWTUtil, rdb *redis.Client) gin.HandlerFunc 
 		tokenString := parts[1]
 
 		// Parse and validate the token.
-		claims, err := jwtUtil.ParseToken(tokenString)
+		claims, err := jwtUtil.ParseAccessToken(tokenString)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 			return
 		}
 
-		// Check whether the token has been blacklisted (e.g. after logout).
-		blacklistKey := "token:blacklist:" + tokenString
-		exists, err := rdb.Exists(context.Background(), blacklistKey).Result()
-		if err != nil {
+		// Fetch both revocation signals in one network round trip. This middleware
+		// runs on every authenticated request, so pipelining materially reduces
+		// Redis connection pressure under concurrency.
+		pipe := rdb.Pipeline()
+		revokedToken := pipe.Exists(c.Request.Context(), jwtpkg.BlacklistKey(tokenString), "token:blacklist:"+tokenString)
+		revokedBeforeCommand := pipe.Get(c.Request.Context(), jwtpkg.UserRevokedBeforeKey(claims.UserID))
+		_, err = pipe.Exec(c.Request.Context())
+		if err != nil && !errors.Is(err, redis.Nil) {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check token status"})
 			return
 		}
-		if exists > 0 {
+		if revokedToken.Err() != nil || revokedToken.Val() > 0 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "token has been revoked"})
+			return
+		}
+
+		revokedBefore, err := revokedBeforeCommand.Int64()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "failed to check account session status"})
+			return
+		}
+		if err == nil && claims.IssuedAt != nil && claims.IssuedAt.Time.Unix() <= revokedBefore {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "account session has been revoked"})
 			return
 		}
 
 		// Inject user information into the context.
 		c.Set("user_id", claims.UserID)
 		c.Set("username", claims.Username)
+		c.Set("access_token", tokenString)
 
 		c.Next()
 	}

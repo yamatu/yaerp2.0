@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,7 +13,6 @@ import (
 
 	"yaerp/internal/model"
 	"yaerp/internal/service"
-	jwtpkg "yaerp/pkg/jwt"
 )
 
 var upgrader = websocket.Upgrader{
@@ -31,26 +31,38 @@ const (
 )
 
 type WSHandler struct {
-	Hub          *Hub
-	JWTUtil      *jwtpkg.JWTUtil
-	PermService  *service.PermissionService
-	SheetService *service.SheetService
+	Hub            *Hub
+	AuthService    *service.AuthService
+	PermService    *service.PermissionService
+	SheetService   *service.SheetService
+	AllowedOrigins []string
 }
 
-func NewWSHandler(hub *Hub, jwtUtil *jwtpkg.JWTUtil, permService *service.PermissionService, sheetService *service.SheetService) *WSHandler {
-	return &WSHandler{Hub: hub, JWTUtil: jwtUtil, PermService: permService, SheetService: sheetService}
+func NewWSHandler(
+	hub *Hub,
+	authService *service.AuthService,
+	permService *service.PermissionService,
+	sheetService *service.SheetService,
+	allowedOrigins []string,
+) *WSHandler {
+	return &WSHandler{
+		Hub:            hub,
+		AuthService:    authService,
+		PermService:    permService,
+		SheetService:   sheetService,
+		AllowedOrigins: allowedOrigins,
+	}
 }
 
 func (h *WSHandler) HandleWS(c *gin.Context) {
-	token := c.Query("token")
-	if token == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "token required"})
+	if !originAllowed(c.GetHeader("Origin"), h.AllowedOrigins) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "websocket origin is not allowed"})
 		return
 	}
 
-	claims, err := h.JWTUtil.ParseToken(token)
+	claims, err := h.AuthService.ConsumeWebSocketTicket(c.Request.Context(), c.Query("ticket"))
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -60,7 +72,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		return
 	}
 
-	client := NewClient(h.Hub, claims.UserID, claims.Username)
+	client := NewClient(h.Hub, claims.UserID, claims.Username, c.Query("client_id"))
 	if !h.Hub.Register(client) {
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "server shutting down"),
@@ -71,6 +83,20 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 
 	go h.writePump(conn, client)
 	go h.readPump(conn, client)
+}
+
+func originAllowed(origin string, allowedOrigins []string) bool {
+	origin = strings.TrimSuffix(strings.TrimSpace(origin), "/")
+	if origin == "" {
+		return true
+	}
+	for _, allowedOrigin := range allowedOrigins {
+		allowedOrigin = strings.TrimSuffix(strings.TrimSpace(allowedOrigin), "/")
+		if allowedOrigin == "*" || strings.EqualFold(origin, allowedOrigin) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
@@ -102,6 +128,8 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 		}
 
 		msg.UserID = client.UserID
+		msg.Username = client.Username
+		msg.ClientID = client.ClientID
 
 		switch msg.Type {
 		case "join_sheet":
@@ -116,13 +144,44 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 			}
 			h.Hub.JoinSheet(client, msg.SheetID)
 
+		case "leave_sheet":
+			h.Hub.LeaveSheet(client)
+
+		case "cell_presence":
+			currentSheetID := h.Hub.CurrentSheetID(client)
+			if currentSheetID == 0 || msg.SheetID != currentSheetID {
+				continue
+			}
+			state := msg.State
+			if state != "viewing" && state != "selected" && state != "editing" {
+				continue
+			}
+			var row *int
+			if state != "viewing" && msg.Row >= 0 && msg.Col != "" {
+				value := msg.Row
+				row = &value
+			} else {
+				state = "viewing"
+				msg.Col = ""
+			}
+			if state == "editing" {
+				if row == nil || h.validateCellChange(client, *row, msg.Col) != nil {
+					continue
+				}
+			}
+			h.Hub.UpdatePresence(client, state, row, msg.Col)
+
 		case "cell_update", "batch_update", "row_insert", "row_delete":
 			if err := h.validateMutationMessage(client, &msg); err != nil {
 				log.Printf("blocked websocket mutation for user %d on sheet %d: %v", client.UserID, h.Hub.CurrentSheetID(client), err)
 				continue
 			}
 
-			// Broadcast to other users viewing same sheet
+			if msg.Type == "cell_update" || msg.Type == "batch_update" {
+				h.broadcastCellMutation(client, &msg)
+				continue
+			}
+
 			broadcastData, _ := json.Marshal(msg)
 			sheetID := h.Hub.CurrentSheetID(client)
 			if !h.Hub.BroadcastToSheet(sheetID, broadcastData, client) {
@@ -130,6 +189,55 @@ func (h *WSHandler) readPump(conn *websocket.Conn, client *Client) {
 			}
 		}
 	}
+}
+
+func (h *WSHandler) broadcastCellMutation(client *Client, msg *Message) {
+	sheetID := h.Hub.CurrentSheetID(client)
+	if sheetID <= 0 {
+		return
+	}
+	changes := make([]model.CellUpdate, 0, 1)
+	switch msg.Type {
+	case "cell_update":
+		changes = append(changes, model.CellUpdate{
+			SheetID: sheetID,
+			Row:     msg.Row,
+			Col:     msg.Col,
+			Value:   msg.Value,
+		})
+	case "batch_update":
+		if err := json.Unmarshal(msg.Changes, &changes); err != nil {
+			log.Printf("failed to decode websocket cell changes for sheet %d: %v", sheetID, err)
+			return
+		}
+	}
+
+	h.Hub.BroadcastToSheetByUser(sheetID, client.ClientID, func(recipientUserID int64) []byte {
+		filteredChanges, err := h.SheetService.RealtimeCellChangesForUser(sheetID, recipientUserID, changes)
+		if err != nil {
+			log.Printf("failed to build websocket cell changes for sheet %d user %d: %v", sheetID, recipientUserID, err)
+			return nil
+		}
+		if len(filteredChanges) == 0 {
+			return nil
+		}
+		rawChanges, err := json.Marshal(filteredChanges)
+		if err != nil {
+			return nil
+		}
+		payload, err := json.Marshal(Message{
+			Type:     "batch_update",
+			SheetID:  sheetID,
+			Changes:  rawChanges,
+			UserID:   client.UserID,
+			Username: client.Username,
+			ClientID: client.ClientID,
+		})
+		if err != nil {
+			return nil
+		}
+		return payload
+	})
 }
 
 func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error {
@@ -165,7 +273,10 @@ func (h *WSHandler) validateMutationMessage(client *Client, msg *Message) error 
 	case "row_insert":
 		return h.validateRowMutation(client, msg.AfterRow)
 	case "row_delete":
-		return h.validateRowMutation(client, msg.Row)
+		if err := h.validateRowMutation(client, msg.Row); err != nil {
+			return err
+		}
+		return h.SheetService.EnsureRowDeletionAllowed(client.UserID, sheetID, msg.Row)
 	}
 
 	return nil
@@ -217,7 +328,6 @@ func (h *WSHandler) writePump(conn *websocket.Conn, client *Client) {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		h.Hub.Unregister(client)
 		conn.Close()
 	}()
 
@@ -235,13 +345,6 @@ func (h *WSHandler) writePump(conn *websocket.Conn, client *Client) {
 				return
 			}
 			w.Write(message)
-
-			// Drain queued messages
-			n := len(client.Send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte("\n"))
-				w.Write(<-client.Send)
-			}
 
 			if err := w.Close(); err != nil {
 				return

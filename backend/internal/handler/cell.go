@@ -1,9 +1,10 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
-	"fmt"
 	"strconv"
+	"strings"
 
 	"yaerp/internal/model"
 	"yaerp/internal/service"
@@ -17,65 +18,54 @@ type CellHandler struct {
 	permService  *service.PermissionService
 }
 
-const maxBatchCellUpdates = 10000
-
 func NewCellHandler(sheetService *service.SheetService, permService *service.PermissionService) *CellHandler {
 	return &CellHandler{sheetService: sheetService, permService: permService}
 }
 
 func (h *CellHandler) BatchUpdate(c *gin.Context) {
 	userID := c.GetInt64("user_id")
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
 
 	var req model.BatchUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "invalid request body")
 		return
 	}
-	if len(req.Changes) > maxBatchCellUpdates {
-		response.BadRequest(c, fmt.Sprintf("changes cannot exceed %d items", maxBatchCellUpdates))
+	if len(req.Changes) > 5000 {
+		response.BadRequest(c, "a batch can update at most 5000 cells")
 		return
 	}
-
-	isAdmin, err := h.permService.IsAdmin(userID)
-	if err != nil {
-		response.ServerError(c, err.Error())
-		return
-	}
-
 	for _, change := range req.Changes {
-		allowed, err := h.permService.CheckCellPermission(change.SheetID, userID, change.Col, change.Row, "write")
-		if err != nil {
-			response.ServerError(c, err.Error())
+		if change.SheetID != sheetID {
+			response.BadRequest(c, "batch contains a mismatched sheet id")
 			return
 		}
-		if !allowed {
-			response.Forbidden(c, fmt.Sprintf("no write permission for %s%d", change.Col, change.Row+1))
+		if change.Row < 0 || strings.TrimSpace(change.Col) == "" || (len(change.Value) > 0 && !json.Valid(change.Value)) {
+			response.BadRequest(c, "batch contains an invalid cell update")
 			return
-		}
-
-		if !isAdmin {
-			protected, reason, err := h.sheetService.CheckProtection(change.SheetID, change.Row, change.Col, userID)
-			if err != nil {
-				response.ServerError(c, err.Error())
-				return
-			}
-			if protected {
-				response.Forbidden(c, reason)
-				return
-			}
 		}
 	}
 
-	if err := h.sheetService.UpdateCells(userID, req.Changes); err != nil {
-		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+	result, err := h.sheetService.UpdateCellsWithSourceDetailed(userID, req.Changes, "web")
+	if err != nil {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
 			response.Forbidden(c, err.Error())
 			return
 		}
+		if errors.Is(err, service.ErrAutomationInvalid) {
+			response.BadRequest(c, err.Error())
+			return
+		}
 		response.ServerError(c, err.Error())
 		return
 	}
 
-	response.OKMsg(c, "cells updated")
+	response.OK(c, result)
 }
 
 func (h *CellHandler) InsertRow(c *gin.Context) {
@@ -161,7 +151,8 @@ func (h *CellHandler) DeleteRow(c *gin.Context) {
 	}
 
 	if err := h.sheetService.DeleteRow(userID, sheetID, rowIndex); err != nil {
-		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
 			response.Forbidden(c, err.Error())
 			return
 		}

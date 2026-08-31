@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"yaerp/internal/model"
@@ -47,13 +48,121 @@ func (r *SheetRepo) CreateWorkbook(wb *model.Workbook) error {
 	return nil
 }
 
+func (r *SheetRepo) ListWorkbookNames(ownerID int64, folderID *int64) ([]string, error) {
+	rows, err := r.db.Query(
+		`SELECT name
+		 FROM workbooks
+		 WHERE owner_id = $1 AND folder_id IS NOT DISTINCT FROM $2 AND deleted_at IS NULL
+		 ORDER BY id`,
+		ownerID, folderID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list workbook names: %w", err)
+	}
+	defer rows.Close()
+
+	names := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan workbook name: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workbook names: %w", err)
+	}
+	return names, nil
+}
+
+func (r *SheetRepo) DuplicateWorkbook(sourceWorkbookID int64, clone *model.Workbook, actorID int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin duplicate workbook: %w", err)
+	}
+	defer tx.Rollback()
+
+	var sourceExists int
+	if err := tx.QueryRow(`SELECT 1 FROM workbooks WHERE id = $1 AND deleted_at IS NULL FOR SHARE`, sourceWorkbookID).Scan(&sourceExists); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("workbook %d not found", sourceWorkbookID)
+		}
+		return fmt.Errorf("lock source workbook: %w", err)
+	}
+
+	now := time.Now()
+	metadata := clone.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage(`{}`)
+	}
+	status := clone.Status
+	if status == 0 {
+		status = 1
+	}
+	if err := tx.QueryRow(
+		`INSERT INTO workbooks (name, description, owner_id, folder_id, metadata, is_template, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+		 RETURNING id`,
+		clone.Name, clone.Description, clone.OwnerID, clone.FolderID, metadata, clone.IsTemplate, status, now,
+	).Scan(&clone.ID); err != nil {
+		return fmt.Errorf("create duplicated workbook: %w", err)
+	}
+
+	type sourceSheet struct {
+		id        int64
+		name      string
+		sortOrder int
+	}
+	sourceRows, err := tx.Query(
+		`SELECT id, name, sort_order
+		 FROM sheets
+		 WHERE workbook_id = $1
+		 ORDER BY sort_order, id`,
+		sourceWorkbookID,
+	)
+	if err != nil {
+		return fmt.Errorf("list source workbook sheets: %w", err)
+	}
+	sourceSheets := make([]sourceSheet, 0)
+	for sourceRows.Next() {
+		var item sourceSheet
+		if err := sourceRows.Scan(&item.id, &item.name, &item.sortOrder); err != nil {
+			sourceRows.Close()
+			return fmt.Errorf("scan source workbook sheet: %w", err)
+		}
+		sourceSheets = append(sourceSheets, item)
+	}
+	if err := sourceRows.Err(); err != nil {
+		sourceRows.Close()
+		return fmt.Errorf("iterate source workbook sheets: %w", err)
+	}
+	if err := sourceRows.Close(); err != nil {
+		return fmt.Errorf("close source workbook sheets: %w", err)
+	}
+
+	for _, source := range sourceSheets {
+		if _, err := duplicateSheetTx(tx, source.id, clone.ID, source.name, source.sortOrder, actorID, now); err != nil {
+			return fmt.Errorf("duplicate sheet %d: %w", source.id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit duplicate workbook: %w", err)
+	}
+	clone.Metadata = metadata
+	clone.Status = status
+	clone.CreatedAt = now
+	clone.UpdatedAt = now
+	return nil
+}
+
 func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	var wb model.Workbook
 	err := r.db.QueryRow(
 		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id
-		 WHERE w.id = $1`, id,
+		 WHERE w.id = $1 AND w.deleted_at IS NULL`, id,
 	).Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("workbook %d not found", id)
@@ -64,12 +173,23 @@ func (r *SheetRepo) GetWorkbook(id int64) (*model.Workbook, error) {
 	return &wb, nil
 }
 
+func (r *SheetRepo) ActiveWorkbookExists(id int64) (bool, error) {
+	if id <= 0 {
+		return false, nil
+	}
+	var exists bool
+	err := r.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM workbooks WHERE id=$1 AND deleted_at IS NULL)`, id,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workbook, int64, error) {
 	var total int64
-	countQuery := `SELECT COUNT(*) FROM workbooks`
+	countQuery := `SELECT COUNT(*) FROM workbooks WHERE deleted_at IS NULL`
 	countArgs := make([]interface{}, 0, 1)
 	if ownerID != nil {
-		countQuery += ` WHERE owner_id = $1`
+		countQuery += ` AND owner_id = $1`
 		countArgs = append(countArgs, *ownerID)
 	}
 	err := r.db.QueryRow(countQuery, countArgs...).Scan(&total)
@@ -82,8 +202,9 @@ func (r *SheetRepo) ListWorkbooks(ownerID *int64, page, size int) ([]model.Workb
 		 FROM workbooks w
 		 LEFT JOIN users u ON u.id = w.owner_id`
 	args := make([]interface{}, 0, 3)
+	query += ` WHERE w.deleted_at IS NULL`
 	if ownerID != nil {
-		query += ` WHERE w.owner_id = $1`
+		query += ` AND w.owner_id = $1`
 		args = append(args, *ownerID)
 		query += ` ORDER BY w.updated_at DESC, w.id DESC LIMIT $2 OFFSET $3`
 		args = append(args, size, offset)
@@ -115,7 +236,7 @@ func (r *SheetRepo) UpdateWorkbook(wb *model.Workbook) error {
 	wb.UpdatedAt = time.Now()
 	result, err := r.db.Exec(
 		`UPDATE workbooks SET name = $1, description = $2, metadata = $3, updated_at = $4
-		 WHERE id = $5`,
+		 WHERE id = $5 AND deleted_at IS NULL`,
 		wb.Name, wb.Description, wb.Metadata, wb.UpdatedAt, wb.ID,
 	)
 	if err != nil {
@@ -128,10 +249,55 @@ func (r *SheetRepo) UpdateWorkbook(wb *model.Workbook) error {
 	return nil
 }
 
+func (r *SheetRepo) ListWorkbooksInAssignmentGroup(sourceWorkbookID int64) ([]model.Workbook, error) {
+	rows, err := r.db.Query(
+		`SELECT w.id, w.name, w.description, w.owner_id, u.username, w.folder_id, w.metadata, w.is_template, w.status, w.created_at, w.updated_at
+		 FROM workbooks w
+		 LEFT JOIN users u ON u.id = w.owner_id
+		 WHERE w.deleted_at IS NULL AND (w.id = $1 OR w.metadata->>'source_workbook_id' = $2)
+		 ORDER BY CASE WHEN w.id = $1 THEN 0 ELSE 1 END, w.id`,
+		sourceWorkbookID, strconv.FormatInt(sourceWorkbookID, 10),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list assignment workbooks: %w", err)
+	}
+	defer rows.Close()
+
+	workbooks := make([]model.Workbook, 0)
+	for rows.Next() {
+		var wb model.Workbook
+		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Description, &wb.OwnerID, &wb.OwnerName, &wb.FolderID, &wb.Metadata, &wb.IsTemplate, &wb.Status, &wb.CreatedAt, &wb.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan assignment workbook: %w", err)
+		}
+		workbooks = append(workbooks, wb)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate assignment workbooks: %w", err)
+	}
+	return workbooks, nil
+}
+
 func (r *SheetRepo) DeleteWorkbook(id int64) error {
 	result, err := r.db.Exec(`DELETE FROM workbooks WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("delete workbook: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("workbook %d not found", id)
+	}
+	return nil
+}
+
+func (r *SheetRepo) SoftDeleteWorkbook(id, userID int64) error {
+	result, err := r.db.Exec(
+		`UPDATE workbooks
+		 SET deleted_at = NOW(), deleted_by = $2, updated_at = NOW()
+		 WHERE id = $1 AND deleted_at IS NULL`,
+		id, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("move workbook to recycle bin: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
@@ -168,6 +334,104 @@ func (r *SheetRepo) CreateSheet(s *model.Sheet) error {
 	s.CreatedAt = now
 	s.UpdatedAt = now
 	return nil
+}
+
+func (r *SheetRepo) DuplicateSheet(sourceSheetID, workbookID int64, name string, sortOrder int, actorID int64) (*model.Sheet, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin duplicate sheet: %w", err)
+	}
+	defer tx.Rollback()
+
+	clone, err := duplicateSheetTx(tx, sourceSheetID, workbookID, name, sortOrder, actorID, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit duplicate sheet: %w", err)
+	}
+	return clone, nil
+}
+
+func duplicateSheetTx(tx *sql.Tx, sourceSheetID, workbookID int64, name string, sortOrder int, actorID int64, now time.Time) (*model.Sheet, error) {
+	clone := &model.Sheet{}
+	err := tx.QueryRow(
+		`INSERT INTO sheets (workbook_id, name, sort_order, columns, frozen, config, created_at, updated_at)
+		 SELECT $2, $3, $4, columns, frozen, config, $5, $5
+		 FROM sheets
+		 WHERE id = $1
+		 RETURNING id, workbook_id, name, sort_order, columns, frozen, config, created_at, updated_at`,
+		sourceSheetID, workbookID, name, sortOrder, now,
+	).Scan(
+		&clone.ID,
+		&clone.WorkbookID,
+		&clone.Name,
+		&clone.SortOrder,
+		&clone.Columns,
+		&clone.Frozen,
+		&clone.Config,
+		&clone.CreatedAt,
+		&clone.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("sheet %d not found", sourceSheetID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create duplicated sheet: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		`INSERT INTO rows (sheet_id, row_index, data, created_by, updated_by, created_at, updated_at)
+		 SELECT $2, row_index, data, $3, $3, $4, $4
+		 FROM rows
+		 WHERE sheet_id = $1`,
+		sourceSheetID, clone.ID, actorID, now,
+	); err != nil {
+		return nil, fmt.Errorf("copy sheet rows: %w", err)
+	}
+
+	permissionCopies := []struct {
+		name  string
+		query string
+	}{
+		{
+			name: "role sheet permissions",
+			query: `INSERT INTO sheet_permissions (sheet_id, role_id, can_view, can_edit, can_delete, can_export)
+				SELECT $2, role_id, can_view, can_edit, can_delete, can_export
+				FROM sheet_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "role cell permissions",
+			query: `INSERT INTO cell_permissions (sheet_id, role_id, column_key, row_index, permission)
+				SELECT $2, role_id, column_key, row_index, permission
+				FROM cell_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "user sheet permissions",
+			query: `INSERT INTO user_sheet_permissions (sheet_id, user_id, can_view, can_edit, can_delete, can_export)
+				SELECT $2, user_id, can_view, can_edit, can_delete, can_export
+				FROM user_sheet_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "principal sheet permissions",
+			query: `INSERT INTO principal_sheet_permissions (sheet_id, principal_type, principal_id, can_view, can_edit, can_delete, can_export, created_at, updated_at)
+				SELECT $2, principal_type, principal_id, can_view, can_edit, can_delete, can_export, created_at, updated_at
+				FROM principal_sheet_permissions WHERE sheet_id = $1`,
+		},
+		{
+			name: "principal cell permissions",
+			query: `INSERT INTO principal_cell_permissions (sheet_id, principal_type, principal_id, column_key, row_index, permission, created_at, updated_at)
+				SELECT $2, principal_type, principal_id, column_key, row_index, permission, created_at, updated_at
+				FROM principal_cell_permissions WHERE sheet_id = $1`,
+		},
+	}
+	for _, permissionCopy := range permissionCopies {
+		if _, err := tx.Exec(permissionCopy.query, sourceSheetID, clone.ID); err != nil {
+			return nil, fmt.Errorf("copy %s: %w", permissionCopy.name, err)
+		}
+	}
+
+	return clone, nil
 }
 
 func (r *SheetRepo) GetNextSheetSortOrder(workbookID int64) (int, error) {
@@ -266,6 +530,43 @@ func (r *SheetRepo) UpsertRow(sheetID int64, rowIndex int, data json.RawMessage,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert row: %w", err)
+	}
+	return nil
+}
+
+func (r *SheetRepo) BatchUpdateCells(changes []model.CellUpdate, userID int64) error {
+	if len(changes) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin cell update transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(
+		`INSERT INTO rows (sheet_id, row_index, data, created_by, updated_by, created_at, updated_at)
+		 VALUES ($1, $2, jsonb_build_object($3::text, $4::jsonb), $5, $5, NOW(), NOW())
+		 ON CONFLICT (sheet_id, row_index)
+		 DO UPDATE SET
+			data = jsonb_set(COALESCE(rows.data, '{}'::jsonb), ARRAY[$3::text], $4::jsonb, true),
+			updated_by = $5,
+			updated_at = NOW()`,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare cell update: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, change := range changes {
+		if _, err := stmt.Exec(change.SheetID, change.Row, change.Col, string(change.Value), userID); err != nil {
+			return fmt.Errorf("update cell %s%d on sheet %d: %w", change.Col, change.Row+1, change.SheetID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cell updates: %w", err)
 	}
 	return nil
 }

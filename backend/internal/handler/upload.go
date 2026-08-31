@@ -2,7 +2,7 @@ package handler
 
 import (
 	"errors"
-	"fmt"
+	"mime"
 	"net/http"
 	"strconv"
 
@@ -13,11 +13,20 @@ import (
 )
 
 type UploadHandler struct {
-	uploadService *service.UploadService
+	uploadService               *service.UploadService
+	paymentAttachmentAuthorizer PaymentAttachmentAuthorizer
 }
 
-func NewUploadHandler(uploadService *service.UploadService) *UploadHandler {
-	return &UploadHandler{uploadService: uploadService}
+type PaymentAttachmentAuthorizer interface {
+	AuthorizePaymentAttachment(userID, attachmentID int64) (protected, allowed bool, err error)
+}
+
+func NewUploadHandler(uploadService *service.UploadService, authorizers ...PaymentAttachmentAuthorizer) *UploadHandler {
+	handler := &UploadHandler{uploadService: uploadService}
+	if len(authorizers) > 0 {
+		handler.paymentAttachmentAuthorizer = authorizers[0]
+	}
+	return handler
 }
 
 func (h *UploadHandler) Upload(c *gin.Context) {
@@ -44,6 +53,17 @@ func (h *UploadHandler) GetFile(c *gin.Context) {
 	if err != nil {
 		response.BadRequest(c, "invalid file id")
 		return
+	}
+	if h.paymentAttachmentAuthorizer != nil {
+		protected, allowed, accessErr := h.paymentAttachmentAuthorizer.AuthorizePaymentAttachment(c.GetInt64("user_id"), id)
+		if accessErr != nil {
+			response.ServerError(c, accessErr.Error())
+			return
+		}
+		if protected && !allowed {
+			response.Forbidden(c, "没有查看该付款凭证的权限")
+			return
+		}
 	}
 
 	url, err := h.uploadService.GetFileURL(id)
@@ -74,8 +94,36 @@ func (h *UploadHandler) ServeFile(c *gin.Context) {
 	}
 	defer reader.Close()
 
-	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", attachment.Filename))
+	disposition := "inline"
+	if c.Query("download") == "1" || c.Query("download") == "true" {
+		disposition = "attachment"
+	}
+	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": attachment.Filename}))
+	if c.Query("v") != "" {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	}
 	c.DataFromReader(http.StatusOK, attachment.Size, attachment.MimeType, reader, nil)
+}
+
+func (h *UploadHandler) ServeThumbnail(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid file id")
+		return
+	}
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "320"))
+	data, contentType, err := h.uploadService.OpenThumbnail(id, c.Query("signature"), size)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidFileSignature):
+			response.Forbidden(c, "invalid file signature")
+		default:
+			response.NotFound(c, err.Error())
+		}
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Data(http.StatusOK, contentType, data)
 }
 
 func (h *UploadHandler) ListImages(c *gin.Context) {
@@ -88,7 +136,7 @@ func (h *UploadHandler) ListImages(c *gin.Context) {
 		size = 20
 	}
 
-	list, total, err := h.uploadService.ListImages(page, size)
+	list, total, err := h.uploadService.ListImagesFiltered(c.GetInt64("user_id"), page, size, parseOptionalQueryInt64(c, "directory_id"), parseOptionalQueryInt64(c, "channel_id"))
 	if err != nil {
 		response.ServerError(c, err.Error())
 		return

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import api from '@/lib/api'
+import { subscribeDataChanged } from '@/lib/dataEvents'
 import type { Folder, FolderContents } from '@/types'
 
 export function useFileManager() {
@@ -11,8 +12,8 @@ export function useFileManager() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  const loadContents = useCallback(async (folderId: number | null) => {
-    setLoading(true)
+  const loadContents = useCallback(async (folderId: number | null, silent = false) => {
+    if (!silent) setLoading(true)
     setError('')
     try {
       const params = folderId !== null ? `?parent_id=${folderId}` : ''
@@ -23,7 +24,7 @@ export function useFileManager() {
       setContents({ folders: [], workbooks: [] })
       setError('加载文件夹内容失败')
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [])
 
@@ -56,12 +57,20 @@ export function useFileManager() {
     navigateTo(null)
   }, [navigateTo])
 
+  useEffect(() => subscribeDataChanged((detail) => {
+    if (!detail.resourcesChanged) return
+    void loadContents(currentFolderId, true)
+  }), [currentFolderId, loadContents])
+
   const createFolder = useCallback(
     async (name: string) => {
-      await api.post('/folders', {
+      const response = await api.post('/folders', {
         name,
         parent_id: currentFolderId,
       })
+      if (response.code !== 0) {
+        throw new Error(response.message || '新建文件夹失败')
+      }
       await refresh()
     },
     [currentFolderId, refresh]
@@ -69,7 +78,10 @@ export function useFileManager() {
 
   const renameFolder = useCallback(
     async (folderId: number, newName: string) => {
-      await api.put(`/folders/${folderId}`, { name: newName })
+      const response = await api.put(`/folders/${folderId}`, { name: newName })
+      if (response.code !== 0) {
+        throw new Error(response.message || '重命名文件夹失败')
+      }
       await refresh()
     },
     [refresh]
@@ -77,7 +89,10 @@ export function useFileManager() {
 
   const deleteFolder = useCallback(
     async (folderId: number) => {
-      await api.delete(`/folders/${folderId}`)
+      const response = await api.delete(`/folders/${folderId}`)
+      if (response.code !== 0) {
+        throw new Error(response.message || '删除文件夹失败')
+      }
       await refresh()
     },
     [refresh]
@@ -85,9 +100,12 @@ export function useFileManager() {
 
   const moveWorkbook = useCallback(
     async (workbookId: number, targetFolderId: number | null) => {
-      await api.put(`/workbooks/${workbookId}/move`, {
+      const response = await api.put(`/workbooks/${workbookId}/move`, {
         folder_id: targetFolderId,
       })
+      if (response.code !== 0) {
+        throw new Error(response.message || '移动工作簿失败')
+      }
       await refresh()
     },
     [refresh]

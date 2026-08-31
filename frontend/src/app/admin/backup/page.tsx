@@ -1,9 +1,8 @@
 'use client'
 
-import { AlertTriangle, Archive, ArrowLeft, Database, Download, FileJson, Upload } from 'lucide-react'
-import { useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
-import { AuthGuard } from '@/components/auth/AuthGuard'
+import { AlertTriangle, Archive, Clock3, Database, Download, FileJson, HardDrive, RefreshCw, Upload } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { AdminShell } from '@/components/admin/AdminShell'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
@@ -16,6 +15,23 @@ interface BackupCard {
   description: string
   endpoint: string
   filename: string
+}
+
+interface AutomaticBackupStatus {
+  enabled: boolean
+  directory: string
+  host_directory: string
+  interval_hours: number
+  retention_days: number
+  latest_file?: string
+  latest_at?: string
+  latest_size?: number
+}
+
+function formatFileSize(size = 0) {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
 const backupCards: BackupCard[] = [
@@ -52,16 +68,60 @@ const backupCards: BackupCard[] = [
 ]
 
 export default function BackupPage() {
-  const router = useRouter()
   const [loadingKey, setLoadingKey] = useState<string | null>(null)
   const [restoreFile, setRestoreFile] = useState<File | null>(null)
   const [restoreConfirmed, setRestoreConfirmed] = useState(false)
   const [restoring, setRestoring] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [automaticStatus, setAutomaticStatus] = useState<AutomaticBackupStatus | null>(null)
+  const [loadingAutomaticStatus, setLoadingAutomaticStatus] = useState(true)
+  const [runningAutomaticBackup, setRunningAutomaticBackup] = useState(false)
   const restoreInputRef = useRef<HTMLInputElement>(null)
 
   const getToken = () => (typeof window !== 'undefined' ? localStorage.getItem('access_token') : null)
+
+  const loadAutomaticStatus = useCallback(async () => {
+    setLoadingAutomaticStatus(true)
+    try {
+      const token = getToken()
+      const response = await fetch(`${API_BASE}/admin/backup/automatic`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      const payload = await response.json() as { code?: number; message?: string; data?: AutomaticBackupStatus }
+      if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || '读取自动备份状态失败')
+      setAutomaticStatus(payload.data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '读取自动备份状态失败')
+    } finally {
+      setLoadingAutomaticStatus(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadAutomaticStatus()
+  }, [loadAutomaticStatus])
+
+  const runAutomaticBackup = async () => {
+    setRunningAutomaticBackup(true)
+    setError('')
+    setSuccess('')
+    try {
+      const token = getToken()
+      const response = await fetch(`${API_BASE}/admin/backup/automatic/run`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      const payload = await response.json() as { code?: number; message?: string; data?: AutomaticBackupStatus }
+      if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || '自动备份执行失败')
+      setAutomaticStatus(payload.data)
+      setSuccess('数据库备份已写入宿主机备份目录。')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '自动备份执行失败')
+    } finally {
+      setRunningAutomaticBackup(false)
+    }
+  }
 
   const handleDownload = async (card: BackupCard) => {
     setLoadingKey(card.key)
@@ -160,35 +220,7 @@ export default function BackupPage() {
   }
 
   return (
-    <AuthGuard requireRole="admin">
-      <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(56,189,248,0.16),_transparent_30%),radial-gradient(circle_at_top_right,_rgba(251,191,36,0.18),_transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
-        <div className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-4 p-3 md:p-6">
-          <header className="overflow-hidden rounded-[32px] border border-white/70 bg-white/80 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.7)] backdrop-blur">
-            <div className="flex flex-col gap-6 px-4 py-5 md:px-6 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-4">
-                <button
-                  type="button"
-                  onClick={() => router.push('/')}
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-900"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  返回工作台
-                </button>
-                <div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-sky-100 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700">
-                    <Database className="h-3.5 w-3.5" />
-                    Admin Backup
-                  </div>
-                  <h1 className="mt-4 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
-                    数据库与配置备份
-                  </h1>
-                  <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-600">
-                    管理员可以在这里下载数据库备份、系统配置导出文件或完整备份包，确保数据安全和系统可恢复性。
-                  </p>
-                </div>
-              </div>
-            </div>
-          </header>
+    <AdminShell title="数据备份与还原" description="下载数据库、配置和完整备份，并执行受控还原">
 
           {error && (
             <div className="rounded-[28px] border border-rose-200 bg-rose-50/90 px-5 py-4 text-sm font-medium text-rose-700 backdrop-blur">
@@ -202,7 +234,36 @@ export default function BackupPage() {
             </div>
           )}
 
-          <section className="rounded-[28px] border border-slate-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-700"><HardDrive className="h-5 w-5" /></div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-base font-semibold text-slate-950">宿主机自动数据库备份</h2>
+                    <span className={`rounded-lg px-2 py-1 text-xs font-medium ${automaticStatus?.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{automaticStatus?.enabled ? '已启用' : '未启用'}</span>
+                  </div>
+                  {loadingAutomaticStatus ? (
+                    <div className="mt-2 flex items-center gap-2 text-sm text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" />正在读取备份状态</div>
+                  ) : automaticStatus ? (
+                    <div className="mt-2 grid gap-x-6 gap-y-1 text-sm text-slate-500 sm:grid-cols-2">
+                      <span>宿主机目录：<strong className="font-medium text-slate-700">{automaticStatus.host_directory}</strong></span>
+                      <span>周期：每 {automaticStatus.interval_hours} 小时</span>
+                      <span>保留：{automaticStatus.retention_days} 天</span>
+                      <span>容器目录：{automaticStatus.directory}</span>
+                      <span className="sm:col-span-2">最近备份：{automaticStatus.latest_at ? `${new Date(automaticStatus.latest_at).toLocaleString('zh-CN')} · ${automaticStatus.latest_file} · ${formatFileSize(automaticStatus.latest_size)}` : '尚未生成'}</span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button type="button" onClick={() => void loadAutomaticStatus()} disabled={loadingAutomaticStatus || runningAutomaticBackup} className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-50" title="刷新状态" aria-label="刷新状态" data-tooltip="刷新状态"><RefreshCw className={`h-4 w-4 ${loadingAutomaticStatus ? 'animate-spin' : ''}`} /></button>
+                <button type="button" onClick={() => void runAutomaticBackup()} disabled={runningAutomaticBackup} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-3 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"><Clock3 className="h-4 w-4" />{runningAutomaticBackup ? '备份中...' : '立即备份'}</button>
+              </div>
+            </div>
+          </section>
+
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-6">
               <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
                 Download Center
@@ -247,7 +308,7 @@ export default function BackupPage() {
             </div>
           </section>
 
-          <section className="rounded-[28px] border border-rose-200/80 bg-white/85 p-4 shadow-[0_20px_60px_-40px_rgba(15,23,42,0.55)] backdrop-blur md:p-6">
+          <section className="rounded-lg border border-rose-200 bg-white p-4 shadow-sm md:p-5">
             <div className="mb-6">
               <div className="inline-flex items-center gap-2 rounded-full border border-rose-100 bg-rose-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-rose-700">
                 <AlertTriangle className="h-3.5 w-3.5" />
@@ -322,8 +383,6 @@ export default function BackupPage() {
               </div>
             </div>
           </section>
-        </div>
-      </div>
-    </AuthGuard>
+    </AdminShell>
   )
 }

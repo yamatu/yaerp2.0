@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +28,7 @@ type BackupService struct {
 	db        *sql.DB
 	minio     *miniopkg.Client
 	restoreMu sync.Mutex
-	exportMu  sync.Mutex
+	backupMu  sync.Mutex
 }
 
 var ErrBackupTooLarge = errors.New("backup exceeds configured size limit")
@@ -48,6 +49,19 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
+const automaticBackupPrefix = "yaerp_database_"
+
+type AutomaticBackupStatus struct {
+	Enabled       bool       `json:"enabled"`
+	Directory     string     `json:"directory"`
+	HostDirectory string     `json:"host_directory"`
+	IntervalHours int        `json:"interval_hours"`
+	RetentionDays int        `json:"retention_days"`
+	LatestFile    string     `json:"latest_file,omitempty"`
+	LatestAt      *time.Time `json:"latest_at,omitempty"`
+	LatestSize    int64      `json:"latest_size,omitempty"`
+}
+
 type backupManifest struct {
 	Version            int      `json:"version"`
 	ExportedAt         string   `json:"exported_at"`
@@ -65,35 +79,186 @@ func NewBackupService(cfg *config.Config, db *sql.DB, minioClient *miniopkg.Clie
 	return &BackupService{cfg: cfg, db: db, minio: minioClient}
 }
 
-// DumpDatabase runs pg_dump and returns the SQL dump as bytes.
-func (s *BackupService) DumpDatabase() ([]byte, error) {
-	s.exportMu.Lock()
-	defer s.exportMu.Unlock()
-	return s.dumpDatabase()
+func (s *BackupService) CreateAutomaticDatabaseBackup() (*AutomaticBackupStatus, error) {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+
+	if err := os.MkdirAll(s.cfg.Backup.Directory, 0750); err != nil {
+		return nil, fmt.Errorf("create backup directory: %w", err)
+	}
+
+	filename := automaticBackupPrefix + time.Now().Format("20060102_150405_000") + ".sql.gz"
+	targetPath := filepath.Join(s.cfg.Backup.Directory, filename)
+	temporaryFile, err := os.CreateTemp(s.cfg.Backup.Directory, ".yaerp-backup-*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("create temporary backup: %w", err)
+	}
+	temporaryPath := temporaryFile.Name()
+	committed := false
+	defer func() {
+		_ = temporaryFile.Close()
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
+	gzipWriter := gzip.NewWriter(temporaryFile)
+	if err := s.streamDatabaseDump(context.Background(), gzipWriter); err != nil {
+		_ = gzipWriter.Close()
+		return nil, fmt.Errorf("write automatic backup: %w", err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return nil, fmt.Errorf("finish automatic backup compression: %w", err)
+	}
+	if err := temporaryFile.Sync(); err != nil {
+		return nil, fmt.Errorf("sync automatic backup: %w", err)
+	}
+	if err := temporaryFile.Close(); err != nil {
+		return nil, fmt.Errorf("close automatic backup: %w", err)
+	}
+	if err := os.Chmod(temporaryPath, 0640); err != nil {
+		return nil, fmt.Errorf("set automatic backup permissions: %w", err)
+	}
+	if err := os.Rename(temporaryPath, targetPath); err != nil {
+		return nil, fmt.Errorf("commit automatic backup: %w", err)
+	}
+	committed = true
+
+	if err := s.pruneAutomaticBackups(); err != nil {
+		return nil, err
+	}
+	return s.GetAutomaticBackupStatus()
 }
 
-// StreamDatabaseDump runs pg_dump directly into dst. It deliberately does not
-// return a byte slice: a large database dump must never be accumulated in the
-// yaerp-server heap before being sent to the caller.
+func (s *BackupService) GetAutomaticBackupStatus() (*AutomaticBackupStatus, error) {
+	status := &AutomaticBackupStatus{
+		Enabled:       s.cfg.Backup.AutomaticEnabled,
+		Directory:     s.cfg.Backup.Directory,
+		HostDirectory: s.cfg.Backup.HostDirectory,
+		IntervalHours: s.cfg.Backup.IntervalHours,
+		RetentionDays: s.cfg.Backup.RetentionDays,
+	}
+
+	entries, err := os.ReadDir(s.cfg.Backup.Directory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return status, nil
+		}
+		return nil, fmt.Errorf("read automatic backup directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !isAutomaticBackupFilename(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if status.LatestAt == nil || info.ModTime().After(*status.LatestAt) {
+			modifiedAt := info.ModTime()
+			status.LatestFile = entry.Name()
+			status.LatestAt = &modifiedAt
+			status.LatestSize = info.Size()
+		}
+	}
+	return status, nil
+}
+
+func (s *BackupService) StartAutomaticBackups(ctx context.Context) {
+	if !s.cfg.Backup.AutomaticEnabled {
+		return
+	}
+	interval := time.Duration(s.cfg.Backup.IntervalHours) * time.Hour
+	for {
+		status, err := s.GetAutomaticBackupStatus()
+		if err != nil {
+			log.Printf("inspect automatic database backups: %v", err)
+			if !waitForBackupSchedule(ctx, 15*time.Minute) {
+				return
+			}
+			continue
+		}
+		if status.LatestAt != nil && time.Since(*status.LatestAt) < interval {
+			if !waitForBackupSchedule(ctx, interval-time.Since(*status.LatestAt)) {
+				return
+			}
+			continue
+		}
+		created, err := s.CreateAutomaticDatabaseBackup()
+		if err != nil {
+			log.Printf("automatic database backup failed: %v", err)
+			retryDelay := 15 * time.Minute
+			if interval < retryDelay {
+				retryDelay = interval
+			}
+			if !waitForBackupSchedule(ctx, retryDelay) {
+				return
+			}
+			continue
+		}
+		log.Printf("automatic database backup created: %s", created.LatestFile)
+	}
+}
+
+func waitForBackupSchedule(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (s *BackupService) pruneAutomaticBackups() error {
+	entries, err := os.ReadDir(s.cfg.Backup.Directory)
+	if err != nil {
+		return fmt.Errorf("read automatic backup directory: %w", err)
+	}
+	cutoff := time.Now().AddDate(0, 0, -s.cfg.Backup.RetentionDays)
+	for _, entry := range entries {
+		if entry.IsDir() || !isAutomaticBackupFilename(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.cfg.Backup.Directory, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove expired automatic backup %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+func isAutomaticBackupFilename(name string) bool {
+	return strings.HasPrefix(name, automaticBackupPrefix) && strings.HasSuffix(name, ".sql.gz")
+}
+
+// StreamDatabaseDump runs pg_dump directly into dst. It does not accumulate
+// the SQL dump in memory, which is essential for large automatic backups.
 func (s *BackupService) StreamDatabaseDump(ctx context.Context, dst io.Writer) error {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	return s.streamDatabaseDump(ctx, dst)
+}
+
+func (s *BackupService) streamDatabaseDump(ctx context.Context, dst io.Writer) error {
 	if dst == nil {
 		return errors.New("backup destination is nil")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	s.exportMu.Lock()
-	defer s.exportMu.Unlock()
-
 	ctx, cancel := context.WithTimeout(ctx, backupCommandTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "pg_dump", s.baseCommandArgs("--no-password")...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
-
-	// Use an io.Pipe so a client disconnect/write error cancels pg_dump instead
-	// of leaving a child process running after the HTTP handler has returned.
 	pipeReader, pipeWriter := io.Pipe()
 	cmd.Stdout = pipeWriter
 	var stderr boundedBuffer
@@ -126,6 +291,15 @@ func (s *BackupService) StreamDatabaseDump(ctx context.Context, dst io.Writer) e
 		return fmt.Errorf("pg_dump failed: %s: %w", stderr.String(), commandErr)
 	}
 	return nil
+}
+
+// DumpDatabase runs pg_dump and returns the SQL dump as bytes. It remains for
+// the in-memory combined-backup API, but automatic and direct downloads use
+// StreamDatabaseDump instead.
+func (s *BackupService) DumpDatabase() ([]byte, error) {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	return s.dumpDatabase()
 }
 
 func (s *BackupService) dumpDatabase() ([]byte, error) {
@@ -217,10 +391,7 @@ func (s *BackupService) ExportConfig() ([]byte, error) {
 
 // CombinedBackup creates a tar.gz bundle containing both the SQL dump and config JSON.
 func (s *BackupService) CombinedBackup() ([]byte, error) {
-	s.exportMu.Lock()
-	defer s.exportMu.Unlock()
-
-	sqlDump, err := s.dumpDatabase()
+	sqlDump, err := s.DumpDatabase()
 	if err != nil {
 		return nil, fmt.Errorf("database dump failed: %w", err)
 	}
@@ -294,12 +465,7 @@ func addReaderToTar(tw *tar.Writer, name string, reader io.Reader, size int64) e
 	if size < 0 {
 		return fmt.Errorf("invalid size for %s", name)
 	}
-	header := &tar.Header{
-		Name:    name,
-		Size:    size,
-		Mode:    0644,
-		ModTime: time.Now(),
-	}
+	header := &tar.Header{Name: name, Size: size, Mode: 0644, ModTime: time.Now()}
 	if err := tw.WriteHeader(header); err != nil {
 		return fmt.Errorf("write tar header for %s: %w", name, err)
 	}
@@ -393,9 +559,7 @@ func (s *BackupService) baseCommandArgs(extraArgs ...string) []string {
 }
 
 func (s *BackupService) runPSQL(input []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "psql", s.baseCommandArgs("--no-password", "-v", "ON_ERROR_STOP=1", "-f", "-")...)
+	cmd := exec.Command("psql", s.baseCommandArgs("--no-password", "-v", "ON_ERROR_STOP=1", "-f", "-")...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", s.cfg.Postgres.Password))
 	cmd.Stdin = bytes.NewReader(input)
 
@@ -403,9 +567,6 @@ func (s *BackupService) runPSQL(input []byte) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("psql timed out: %w", ctx.Err())
-		}
 		return fmt.Errorf("psql failed: %s: %w", stderr.String(), err)
 	}
 

@@ -51,7 +51,7 @@ func NewSheetImportService(sheetRepo *repo.SheetRepo, sheetService *SheetService
 	return &SheetImportService{sheetRepo: sheetRepo, sheetService: sheetService, uploadSvc: uploadSvc}
 }
 
-func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart.File, filename, requestedSheetName string) (*SheetImportResult, error) {
+func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart.File, filename, requestedSheetName string, source *SpreadsheetImportSource) (*SheetImportResult, error) {
 	data, err := io.ReadAll(file)
 	if err != nil {
 		return nil, fmt.Errorf("读取导入文件失败: %w", err)
@@ -60,9 +60,9 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 		return nil, fmt.Errorf("导入文件为空")
 	}
 
-	xlsx, err := excelize.OpenReader(bytes.NewReader(data))
+	xlsx, err := openNativeExcelImportFile(data, filename)
 	if err != nil {
-		return nil, fmt.Errorf("解析 XLSX 失败: %w", err)
+		return nil, err
 	}
 	defer func() { _ = xlsx.Close() }()
 
@@ -115,14 +115,20 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 		rowPayloads = append(rowPayloads, payload)
 	}
 
-	config, attachmentID, attachmentURL := s.buildImportSheetConfig(userID, filename, data)
+	sourceFilename := filename
+	sourceData := data
+	if source != nil {
+		sourceFilename = source.Filename
+		sourceData = source.Data
+	}
+	config, attachmentID, attachmentURL := s.buildImportSheetConfig(userID, sourceFilename, sourceData)
 	sheet := &model.Sheet{
 		WorkbookID: workbookID,
-		Name:       resolveImportedSheetName(requestedSheetName, filename, firstSheetName),
+		Name:       resolveImportedSheetName(requestedSheetName, sourceFilename, firstSheetName),
 		Columns:    columnJSON,
 		Config:     config,
 	}
-	if err := s.sheetService.CreateSheetForUser(userID, sheet); err != nil {
+	if err := s.sheetService.CreateSheetForUserWithSource(userID, sheet, "import", "导入 Excel 工作表"); err != nil {
 		return nil, err
 	}
 
@@ -131,6 +137,9 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 			_ = s.sheetRepo.DeleteSheet(sheet.ID)
 			return nil, fmt.Errorf("写入第 %d 行数据失败: %w", excelRowNumbers[index], err)
 		}
+	}
+	if _, err := s.sheetService.CaptureCurrentVersion(userID, sheet.ID, "import", fmt.Sprintf("导入 Excel，共 %d 行", len(rowPayloads)), false); err != nil {
+		return nil, err
 	}
 
 	return &SheetImportResult{
@@ -203,7 +212,7 @@ func (s *SheetImportService) buildImportSheetConfig(userID int64, filename strin
 	var attachmentID *int64
 	attachmentURL := ""
 	if s.uploadSvc != nil {
-		attachment, url, err := s.uploadSvc.UploadBytes(filename, sheetExportContentType, data, userID)
+		attachment, url, err := s.uploadSvc.UploadBytes(filename, excelImportContentType(filename), data, userID)
 		if err == nil {
 			attachmentID = &attachment.ID
 			attachmentURL = url

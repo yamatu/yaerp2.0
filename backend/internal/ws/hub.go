@@ -10,72 +10,95 @@ import (
 const (
 	hubBroadcastBuffer = 256
 	clientSendBuffer   = 64
+	maxBroadcastBytes  = 1 << 20
 )
 
 type Message struct {
-	Type     string          `json:"type"`
-	SheetID  int64           `json:"sheetId,omitempty"`
-	Row      int             `json:"row,omitempty"`
-	Col      string          `json:"col,omitempty"`
-	Value    json.RawMessage `json:"value,omitempty"`
-	Changes  json.RawMessage `json:"changes,omitempty"`
-	AfterRow int             `json:"afterRow,omitempty"`
-	UserID   int64           `json:"userId,omitempty"`
+	Type      string          `json:"type"`
+	SheetID   int64           `json:"sheetId,omitempty"`
+	ChannelID int64           `json:"channelId,omitempty"`
+	MessageID int64           `json:"messageId,omitempty"`
+	OrderID   int64           `json:"orderId,omitempty"`
+	Row       int             `json:"row,omitempty"`
+	Col       string          `json:"col,omitempty"`
+	Value     json.RawMessage `json:"value,omitempty"`
+	Changes   json.RawMessage `json:"changes,omitempty"`
+	AfterRow  int             `json:"afterRow,omitempty"`
+	UserID    int64           `json:"userId,omitempty"`
+	Username  string          `json:"username,omitempty"`
+	ClientID  string          `json:"clientId,omitempty"`
+	State     string          `json:"state,omitempty"`
+	Presence  []PresenceEntry `json:"presence,omitempty"`
+}
+
+type PresenceEntry struct {
+	UserID   int64  `json:"userId"`
+	Username string `json:"username"`
+	ClientID string `json:"clientId"`
+	State    string `json:"state"`
+	Row      *int   `json:"row,omitempty"`
+	Col      string `json:"col,omitempty"`
 }
 
 type Client struct {
 	Hub      *Hub
 	UserID   int64
 	Username string
+	ClientID string
 	SheetID  int64
+	State    string
+	Row      *int
+	Col      string
 	Send     chan []byte
 
 	closeOnce sync.Once
 	closed    bool // guarded by Hub.mu
 }
 
-// NewClient gives every connection a bounded outbound queue. Keeping this
-// constructor in the ws package also makes it harder for handlers to
-// accidentally create an unbounded or nil channel.
-func NewClient(hub *Hub, userID int64, username string) *Client {
+func NewClient(hub *Hub, userID int64, username, clientID string) *Client {
 	return &Client{
 		Hub:      hub,
 		UserID:   userID,
 		Username: username,
+		ClientID: clientID,
 		Send:     make(chan []byte, clientSendBuffer),
 	}
 }
 
 type Hub struct {
-	clients   map[*Client]bool
-	sheets    map[int64]map[*Client]bool // sheetID -> clients
-	broadcast chan *BroadcastMsg
-	done      chan struct{}
-	stopOnce  sync.Once
-	mu        sync.RWMutex
+	clients    map[*Client]bool
+	sheets     map[int64]map[*Client]bool // sheetID -> clients
+	broadcast  chan *BroadcastMsg
+	register   chan *Client // retained for compatibility with older callers
+	unregister chan *Client // retained for compatibility with older callers
+	done       chan struct{}
+	stopOnce   sync.Once
+	mu         sync.RWMutex
 
 	droppedBroadcasts atomic.Uint64
 	slowClients       atomic.Uint64
 }
 
 type BroadcastMsg struct {
-	SheetID int64
-	Data    []byte
-	Sender  *Client
+	SheetID         int64
+	Data            []byte
+	Sender          *Client
+	ExcludeClientID string
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		clients:   make(map[*Client]bool),
-		sheets:    make(map[int64]map[*Client]bool),
-		broadcast: make(chan *BroadcastMsg, hubBroadcastBuffer),
-		done:      make(chan struct{}),
+		clients:    make(map[*Client]bool),
+		sheets:     make(map[int64]map[*Client]bool),
+		broadcast:  make(chan *BroadcastMsg, hubBroadcastBuffer),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		done:       make(chan struct{}),
 	}
 }
 
-// Register hands ownership of the client lifecycle to the hub synchronously.
-// Synchronous registration closes the race where a connection can disconnect
-// before an event-loop registration is processed.
+// Register is synchronous so a connection cannot disconnect before its
+// registration event is processed by the hub loop.
 func (h *Hub) Register(client *Client) bool {
 	if h == nil || client == nil {
 		return false
@@ -100,9 +123,7 @@ func (h *Hub) Register(client *Client) bool {
 	return true
 }
 
-// Unregister is safe to call from both read and write pumps. Removing directly
-// avoids leaving a pump goroutine blocked on an event channel when the hub is
-// shutting down; removeClient is idempotent, so duplicate calls are harmless.
+// Unregister is idempotent and never blocks a read/write pump during shutdown.
 func (h *Hub) Unregister(client *Client) {
 	if h == nil || client == nil {
 		return
@@ -116,7 +137,10 @@ func (h *Hub) Run() {
 		case <-h.done:
 			h.closeAll()
 			return
-
+		case client := <-h.register:
+			h.Register(client)
+		case client := <-h.unregister:
+			h.removeClient(client)
 		case msg := <-h.broadcast:
 			h.broadcastMessage(msg)
 		}
@@ -132,48 +156,23 @@ func (h *Hub) removeClient(client *Client) {
 		h.mu.Unlock()
 		return
 	}
+	oldSheetID := client.SheetID
 	delete(h.clients, client)
 	client.closed = true
-	for sheetID, clients := range h.sheets {
-		delete(clients, client)
-		if len(clients) == 0 {
-			delete(h.sheets, sheetID)
+	if oldSheetID > 0 {
+		if clients, ok := h.sheets[oldSheetID]; ok {
+			delete(clients, client)
+			if len(clients) == 0 {
+				delete(h.sheets, oldSheetID)
+			}
 		}
 	}
 	client.SheetID = 0
 	client.closeSend()
 	h.mu.Unlock()
-}
 
-func (h *Hub) broadcastMessage(msg *BroadcastMsg) {
-	if msg == nil || len(msg.Data) == 0 {
-		return
-	}
-
-	// Keep the read lock while delivering. removeClient/Close take the write
-	// lock before closing a channel, which prevents a concurrent send-on-closed
-	// panic. Delivery is non-blocking, so the lock is held only briefly.
-	h.mu.RLock()
-	slow := make([]*Client, 0)
-	if clients, ok := h.sheets[msg.SheetID]; ok {
-		for client := range clients {
-			if client == msg.Sender {
-				continue
-			}
-			select {
-			case client.Send <- msg.Data:
-			default:
-				slow = append(slow, client)
-			}
-		}
-	}
-	h.mu.RUnlock()
-
-	for _, client := range slow {
-		// Do not start a goroutine per dropped message. Remove the slow
-		// client synchronously; removeClient is idempotent.
-		h.slowClients.Add(1)
-		h.removeClient(client)
+	if oldSheetID > 0 {
+		h.publishPresence(oldSheetID)
 	}
 }
 
@@ -182,40 +181,123 @@ func (h *Hub) JoinSheet(client *Client, sheetID int64) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, ok := h.clients[client]; !ok {
+	if _, ok := h.clients[client]; !ok || client.closed {
+		h.mu.Unlock()
 		return
 	}
-
-	// Leave previous sheet.
-	if client.SheetID > 0 {
-		if clients, ok := h.sheets[client.SheetID]; ok {
+	oldSheetID := client.SheetID
+	if oldSheetID > 0 {
+		if clients, ok := h.sheets[oldSheetID]; ok {
 			delete(clients, client)
 			if len(clients) == 0 {
-				delete(h.sheets, client.SheetID)
+				delete(h.sheets, oldSheetID)
 			}
 		}
 	}
-
 	client.SheetID = sheetID
+	client.State = "viewing"
+	client.Row = nil
+	client.Col = ""
 	if _, ok := h.sheets[sheetID]; !ok {
 		h.sheets[sheetID] = make(map[*Client]bool)
 	}
 	h.sheets[sheetID][client] = true
+	h.mu.Unlock()
 
 	log.Printf("User %s joined sheet %d", client.Username, sheetID)
+	if oldSheetID > 0 && oldSheetID != sheetID {
+		h.publishPresence(oldSheetID)
+	}
+	h.publishPresence(sheetID)
+}
+
+func (h *Hub) LeaveSheet(client *Client) {
+	if h == nil || client == nil {
+		return
+	}
+	h.mu.Lock()
+	oldSheetID := client.SheetID
+	if oldSheetID > 0 {
+		if clients, ok := h.sheets[oldSheetID]; ok {
+			delete(clients, client)
+			if len(clients) == 0 {
+				delete(h.sheets, oldSheetID)
+			}
+		}
+	}
+	client.SheetID = 0
+	client.State = "viewing"
+	client.Row = nil
+	client.Col = ""
+	h.mu.Unlock()
+	if oldSheetID > 0 {
+		h.publishPresence(oldSheetID)
+	}
+}
+
+func (h *Hub) UpdatePresence(client *Client, state string, row *int, col string) {
+	if h == nil || client == nil {
+		return
+	}
+	h.mu.Lock()
+	sheetID := client.SheetID
+	client.State = state
+	client.Row = row
+	client.Col = col
+	h.mu.Unlock()
+	if sheetID > 0 {
+		h.publishPresence(sheetID)
+	}
+}
+
+func (h *Hub) publishPresence(sheetID int64) {
+	h.mu.RLock()
+	clients := h.sheets[sheetID]
+	entries := make([]PresenceEntry, 0, len(clients))
+	for client := range clients {
+		entry := PresenceEntry{
+			UserID:   client.UserID,
+			Username: client.Username,
+			ClientID: client.ClientID,
+			State:    client.State,
+			Col:      client.Col,
+		}
+		if client.Row != nil {
+			row := *client.Row
+			entry.Row = &row
+		}
+		entries = append(entries, entry)
+	}
+	data, err := json.Marshal(Message{Type: "sheet_presence", SheetID: sheetID, Presence: entries})
+	if err != nil {
+		h.mu.RUnlock()
+		return
+	}
+	slow := make([]*Client, 0)
+	for client := range clients {
+		if !trySendLocked(client, data) {
+			slow = append(slow, client)
+		}
+	}
+	h.mu.RUnlock()
+	h.removeSlowClients(slow)
 }
 
 // BroadcastToSheet never blocks a request goroutine when the hub queue is
-// full. The caller can use the return value to record a dropped update.
+// full. The return value lets callers record or log a dropped update.
 func (h *Hub) BroadcastToSheet(sheetID int64, data []byte, sender *Client) bool {
-	if h == nil || sheetID <= 0 || len(data) == 0 {
+	return h.enqueueBroadcast(&BroadcastMsg{SheetID: sheetID, Data: data, Sender: sender})
+}
+
+func (h *Hub) BroadcastToSheetExceptClientID(sheetID int64, data []byte, excludeClientID string) {
+	_ = h.enqueueBroadcast(&BroadcastMsg{SheetID: sheetID, Data: data, ExcludeClientID: excludeClientID})
+}
+
+func (h *Hub) enqueueBroadcast(msg *BroadcastMsg) bool {
+	if h == nil || msg == nil || msg.SheetID <= 0 || len(msg.Data) == 0 || len(msg.Data) > maxBroadcastBytes {
 		return false
 	}
-	// Make ownership explicit: callers frequently reuse a JSON buffer after
-	// enqueueing it.
-	payload := append([]byte(nil), data...)
-	msg := &BroadcastMsg{SheetID: sheetID, Data: payload, Sender: sender}
+	msg.Data = append([]byte(nil), msg.Data...)
 	select {
 	case <-h.done:
 		return false
@@ -224,6 +306,120 @@ func (h *Hub) BroadcastToSheet(sheetID int64, data []byte, sender *Client) bool 
 	default:
 		h.droppedBroadcasts.Add(1)
 		return false
+	}
+}
+
+func (h *Hub) broadcastMessage(msg *BroadcastMsg) {
+	if msg == nil || len(msg.Data) == 0 {
+		return
+	}
+	h.mu.RLock()
+	slow := make([]*Client, 0)
+	if clients, ok := h.sheets[msg.SheetID]; ok {
+		for client := range clients {
+			if client == msg.Sender || (msg.ExcludeClientID != "" && client.ClientID == msg.ExcludeClientID) {
+				continue
+			}
+			if !trySendLocked(client, msg.Data) {
+				slow = append(slow, client)
+			}
+		}
+	}
+	h.mu.RUnlock()
+	h.removeSlowClients(slow)
+}
+
+// BroadcastToSheetByUser builds one permission-aware payload per recipient
+// user. Multiple tabs owned by the same user reuse the same payload.
+func (h *Hub) BroadcastToSheetByUser(sheetID int64, excludeClientID string, payloadForUser func(userID int64) []byte) {
+	if h == nil || payloadForUser == nil {
+		return
+	}
+	h.mu.RLock()
+	clients := h.sheets[sheetID]
+	userIDs := make(map[int64]struct{}, len(clients))
+	for client := range clients {
+		if excludeClientID == "" || client.ClientID != excludeClientID {
+			userIDs[client.UserID] = struct{}{}
+		}
+	}
+	h.mu.RUnlock()
+
+	payloads := make(map[int64][]byte, len(userIDs))
+	for userID := range userIDs {
+		if payload := payloadForUser(userID); len(payload) > 0 && len(payload) <= maxBroadcastBytes {
+			payloads[userID] = append([]byte(nil), payload...)
+		}
+	}
+
+	h.mu.RLock()
+	slow := make([]*Client, 0)
+	for client := range h.sheets[sheetID] {
+		if excludeClientID != "" && client.ClientID == excludeClientID {
+			continue
+		}
+		if payload := payloads[client.UserID]; len(payload) > 0 && !trySendLocked(client, payload) {
+			slow = append(slow, client)
+		}
+	}
+	h.mu.RUnlock()
+	h.removeSlowClients(slow)
+}
+
+func (h *Hub) BroadcastAll(data []byte) {
+	if h == nil || len(data) == 0 || len(data) > maxBroadcastBytes {
+		return
+	}
+	payload := append([]byte(nil), data...)
+	h.mu.RLock()
+	slow := make([]*Client, 0)
+	for client := range h.clients {
+		if !trySendLocked(client, payload) {
+			slow = append(slow, client)
+		}
+	}
+	h.mu.RUnlock()
+	h.removeSlowClients(slow)
+}
+
+func (h *Hub) BroadcastToUsers(userIDs []int64, data []byte) {
+	if h == nil || len(userIDs) == 0 || len(data) == 0 || len(data) > maxBroadcastBytes {
+		return
+	}
+	allowed := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID > 0 {
+			allowed[userID] = struct{}{}
+		}
+	}
+	payload := append([]byte(nil), data...)
+	h.mu.RLock()
+	slow := make([]*Client, 0)
+	for client := range h.clients {
+		if _, ok := allowed[client.UserID]; ok && !trySendLocked(client, payload) {
+			slow = append(slow, client)
+		}
+	}
+	h.mu.RUnlock()
+	h.removeSlowClients(slow)
+}
+
+func trySendLocked(client *Client, data []byte) bool {
+	if client == nil || client.closed || client.Send == nil {
+		return false
+	}
+	select {
+	case client.Send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Hub) removeSlowClients(clients []*Client) {
+	for _, client := range clients {
+		h.slowClients.Add(1)
+		h.removeClient(client)
 	}
 }
 
