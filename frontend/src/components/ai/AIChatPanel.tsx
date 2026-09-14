@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
+import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useFloatingDrag } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
@@ -634,6 +634,15 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     false,
     isBooleanPreference
   )
+  // Agent mode keeps a multi-step task running: after the employee approves a
+  // prepared spreadsheet plan or ERP step, the assistant is asked to continue
+  // on its own instead of waiting for another typed instruction.
+  const [agentMode, setAgentMode] = useUserPreference(
+    userId,
+    'ai.agent-mode',
+    true,
+    isBooleanPreference
+  )
   const [isDesktopViewport, setIsDesktopViewport] = useState(false)
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
@@ -647,6 +656,11 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
   const historyReadyRef = useRef(false)
+  // The apply handlers run from callbacks that must not re-create on every
+  // keystroke, so keep the values they need for a follow-up agent turn in refs.
+  const messagesRef = useRef<PersistedMessage[]>([])
+  const loadingRef = useRef(false)
+  const agentTurnRef = useRef<(prompt: string) => Promise<void>>(async () => {})
   const storageKey = userId ? `yaerp_ai_chat_history_${userId}` : 'yaerp_ai_chat_history_guest'
   const panelSizeStorageKey = userId ? `yaerp_ai_panel_size_${userId}` : 'yaerp_ai_panel_size_guest'
   const panelDrag = useFloatingDrag({ elementRef: panelRef, enabled: isDesktopViewport })
@@ -659,13 +673,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     return () => media.removeEventListener('change', sync)
   }, [])
 
-  const requestMessages = useMemo(
-	() => messages.slice(-MAX_CHAT_CONTEXT_MESSAGES).map((item) => ({
-	  role: item.role,
-	  content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
-	})),
-    [messages]
-  )
+  messagesRef.current = messages
+  loadingRef.current = loading
 
   const filteredContextWorkbooks = useMemo(() => {
     const keyword = normalizeSearchText(contextWorkbookSearch)
@@ -857,36 +866,40 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
 	}
   }, [messages, storageKey])
 
-  const handleSend = async () => {
-	const trimmed = inputValue.trim().slice(0, MAX_CHAT_INPUT_CHARS)
-    if (!trimmed || loading) return
+  const runChatTurn = useCallback(async (prompt: string) => {
+    if (loadingRef.current) return
 
     const userMessage: PersistedMessage = {
       id: makeId(),
       role: 'user',
-      content: trimmed,
+      content: prompt,
       createdAt: Date.now(),
     }
 
-	const nextMessages = compactChatMessages([...messages, userMessage])
-    setMessages(nextMessages)
-    setInputValue('')
+    const history = compactChatMessages([...messagesRef.current, userMessage])
+    const historyMessages = history.slice(-MAX_CHAT_CONTEXT_MESSAGES).map((item) => ({
+      role: item.role,
+      content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
+    }))
+
+    loadingRef.current = true
+    setMessages(history)
     setLoading(true)
 
     try {
       await prepareDataMutation()
       const res = await api.post<AIChatResponse>('/ai/chat', {
         assistant_id: assistantId,
-        messages: [...requestMessages, { role: 'user', content: trimmed }],
+        messages: historyMessages,
         context: contextWorkbook ? {
           workbook_id: contextWorkbook.id,
           sheet_ids: contextSheetIds,
           selection: contextSelection || undefined,
         } : undefined,
       })
-	  if (res.code !== 0 || !res.data) {
-		throw new Error(res.message || 'AI 请求失败')
-	  }
+      if (res.code !== 0 || !res.data) {
+        throw new Error(res.message || 'AI 请求失败')
+      }
 
       const assistantMessage: PersistedMessage = {
         id: makeId(),
@@ -900,7 +913,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         applyState: 'idle',
         erpApplyState: 'idle',
       }
-	  setMessages((prev) => compactChatMessages([...prev, assistantMessage]))
+      setMessages((prev) => compactChatMessages([...prev, assistantMessage]))
 
       if (res.data.resources_changed || (res.data.changed_sheet_ids?.length ?? 0) > 0) {
         notifyDataChanged({
@@ -909,20 +922,43 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           resourcesChanged: Boolean(res.data.resources_changed),
         })
       }
-	} catch (error) {
-	  setMessages((prev) => compactChatMessages([
-		...prev,
+    } catch (error) {
+      setMessages((prev) => compactChatMessages([
+        ...prev,
         {
           id: makeId(),
           role: 'assistant',
-		  content: error instanceof Error ? error.message : '请求失败，请稍后重试。',
+          content: error instanceof Error ? error.message : '请求失败，请稍后重试。',
           createdAt: Date.now(),
         },
-	  ]))
+      ]))
     } finally {
+      loadingRef.current = false
       setLoading(false)
     }
+  }, [assistantId, contextSelection, contextSheetIds, contextWorkbook])
+
+  agentTurnRef.current = runChatTurn
+
+  const handleSend = async () => {
+    const trimmed = inputValue.trim().slice(0, MAX_CHAT_INPUT_CHARS)
+    if (!trimmed || loading) return
+
+    setInputValue('')
+    await runChatTurn(trimmed)
   }
+
+  /**
+   * Agent mode: once an employee approves a prepared step, hand control back to
+   * the assistant so it can carry on with the rest of the task instead of
+   * waiting for the next typed instruction.
+   */
+  const continueAgentTask = useCallback((completedStep: string) => {
+    if (!agentMode) return
+    void agentTurnRef.current(
+      `已确认执行上一步方案（${completedStep}）。请继续完成整个任务：如果需要下一步操作，请直接给出方案；如果任务已经全部完成，请说明结果和后续建议。`
+    )
+  }, [agentMode])
 
   const handleApplyPending = useCallback(async (messageId: string, operations: AISpreadsheetOperation[]) => {
     setMessages((prev) => prev.map((message) => (
@@ -953,6 +989,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         sheetIds: Array.from(new Set(operations.map((operation) => operation.sheet_id).filter((sheetId) => sheetId > 0))),
         resourcesChanged: false,
       })
+      continueAgentTask(`已写入 ${operations.length} 项表格修改`)
     } catch {
       setMessages((prev) => prev.map((message) => (
         message.id === messageId
@@ -960,7 +997,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           : message
       )))
     }
-  }, [])
+  }, [continueAgentTask])
 
   const handleApplyERPPlan = useCallback(async (messageId: string, plan: AIERPPendingPlan) => {
     setMessages((prev) => prev.map((message) => (
@@ -997,6 +1034,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         followUp,
       ])
       notifyDataChanged({ source: 'ai', sheetIds: [], resourcesChanged: true })
+      continueAgentTask(result.message || 'ERP 步骤已执行')
     } catch (error) {
       setMessages((prev) => prev.map((message) => (
         message.id === messageId
@@ -1004,7 +1042,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           : message
       )))
     }
-  }, [])
+  }, [continueAgentTask])
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -1146,6 +1184,18 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         <div className="flex items-center gap-1">
           <button
             type="button"
+            onClick={() => setAgentMode(!agentMode)}
+            aria-pressed={agentMode}
+            className={`mr-1 hidden items-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] font-medium transition md:inline-flex ${
+              agentMode ? 'bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30' : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+            }`}
+            title={agentMode ? '智能体模式：确认方案后自动继续执行后续步骤' : '智能体模式已关闭：每次都需要手动发起下一步'}
+          >
+            <Workflow className="h-3.5 w-3.5" />
+            {agentMode ? '智能体已开启' : '智能体已关闭'}
+          </button>
+          <button
+            type="button"
             onClick={resetPanelSize}
             className="hidden rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white md:inline-flex"
             aria-label="恢复默认对话框大小"
@@ -1184,6 +1234,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               <div>“根据客户、询价主题和 SKU 准备一条 ERP 询价”</div>
               <div>“把库存表数量加 50，先给我确认方案”</div>
               <div>“检查我负责的订单还缺什么，再引导我进入下一步”</div>
+              <div>“我有哪些权限？可以编辑哪些表？”</div>
             </div>
           </div>
         )}
@@ -1191,6 +1242,14 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         {messages.map((message) => (
           <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
             <div className={`max-w-[94%] ${message.role === 'user' ? 'items-end' : 'items-start'} flex flex-col gap-3`}>
+              {message.role === 'assistant' && (message.toolTraces?.length ?? 0) > 0 && (
+                <div className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500">
+                  <Bot className="h-3.5 w-3.5" />
+                  智能体执行了 {message.toolTraces?.length} 个动作
+                  {message.pendingOperations && message.pendingOperations.length > 0 ? ' · 等待你确认表格修改' : ''}
+                  {message.pendingERPPlan ? ' · 等待你确认 ERP 步骤' : ''}
+                </div>
+              )}
               <div
                 className={`min-w-0 max-w-full rounded-2xl px-4 py-3 text-sm leading-7 ${
                   message.role === 'user'
