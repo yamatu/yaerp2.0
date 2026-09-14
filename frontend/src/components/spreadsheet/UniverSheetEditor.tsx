@@ -23,6 +23,7 @@ import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import { CellAlertType, ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
+import { useFloatingDrag } from '@/hooks/useFloatingDrag'
 import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl } from '@/lib/imageTransform'
@@ -1410,6 +1411,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [protectionFocusNotice, setProtectionFocusNotice] = useState('')
   const [sheetPresence, setSheetPresence] = useState<SheetPresenceEntry[]>([])
   const [presenceExpanded, setPresenceExpanded] = useState(false)
+  const presenceWidgetRef = useRef<HTMLDivElement>(null)
+  const presenceDrag = useFloatingDrag({ elementRef: presenceWidgetRef, containerRef, ignoreInteractive: false })
   const [exportAction, setExportAction] = useState<'' | 'download' | 'workbook' | 'print' | 'pdf' | 'source'>('')
   const [pdfPreview, setPdfPreview] = useState<PDFPreviewState | null>(null)
   const [showPdfExportPanel, setShowPdfExportPanel] = useState(false)
@@ -4367,8 +4370,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
       {onlineCollaborators.length > 0 && (
-        <div className="absolute right-4 top-14 z-[22] w-auto max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100">
-          <button type="button" onClick={() => setPresenceExpanded((current) => !current)} className="ml-auto flex min-h-10 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
+        <div
+          ref={presenceWidgetRef}
+          {...presenceDrag.handleProps}
+          style={presenceDrag.style}
+          className={`absolute right-4 top-14 z-[22] w-auto max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 ${presenceDrag.dragging ? 'cursor-grabbing opacity-100 select-none' : 'cursor-grab'}`}
+        >
+          <button type="button" onClick={() => setPresenceExpanded((current) => !current)} className="ml-auto flex min-h-10 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员（可拖动）' : '查看在线协作人员（可拖动）'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
             <UserRoundCheck className="h-4 w-4 shrink-0 text-emerald-600" />
             <div className="flex -space-x-1.5">
               {displayedCollaborators.slice(0, 4).map((entry) => {
@@ -4437,7 +4445,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
       {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
-        <div className={`pointer-events-none fixed bottom-32 z-[70] flex flex-col items-end gap-2 opacity-70 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 [&_button]:pointer-events-auto md:bottom-6 ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
+        <div className={`sheet-floating-stack pointer-events-none fixed bottom-36 z-[70] flex flex-col items-end gap-2 opacity-70 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 [&_button]:pointer-events-auto md:bottom-20 ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
             <div className="pointer-events-auto flex max-h-[min(62vh,32rem)] flex-col items-end gap-2 overflow-y-auto overscroll-contain pr-0.5 animate-in fade-in slide-in-from-bottom-2 duration-150">

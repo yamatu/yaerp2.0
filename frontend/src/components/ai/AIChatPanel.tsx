@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
 import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
+import { useFloatingDrag } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
@@ -633,6 +634,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     false,
     isBooleanPreference
   )
+  const [isDesktopViewport, setIsDesktopViewport] = useState(false)
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
   const [contextSelection, setContextSelection] = useState<AIComposeSelection | null>(null)
@@ -647,6 +649,15 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const historyReadyRef = useRef(false)
   const storageKey = userId ? `yaerp_ai_chat_history_${userId}` : 'yaerp_ai_chat_history_guest'
   const panelSizeStorageKey = userId ? `yaerp_ai_panel_size_${userId}` : 'yaerp_ai_panel_size_guest'
+  const panelDrag = useFloatingDrag({ elementRef: panelRef, enabled: isDesktopViewport })
+
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 768px)')
+    const sync = () => setIsDesktopViewport(media.matches)
+    sync()
+    media.addEventListener('change', sync)
+    return () => media.removeEventListener('change', sync)
+  }, [])
 
   const requestMessages = useMemo(
 	() => messages.slice(-MAX_CHAT_CONTEXT_MESSAGES).map((item) => ({
@@ -1100,10 +1111,11 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   return (
     <div
       ref={panelRef}
-      className={`fixed inset-x-2 bottom-2 z-50 flex h-[min(82vh,720px)] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl md:inset-x-auto md:bottom-5 md:right-[76px] md:h-[var(--ai-panel-height)] md:max-h-[calc(100vh-40px)] md:w-[var(--ai-panel-width)] ${resizing ? 'select-none' : ''}`}
+      className={`fixed inset-x-2 bottom-2 z-50 flex h-[min(82vh,720px)] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl md:inset-x-auto md:bottom-5 md:right-[76px] md:h-[var(--ai-panel-height)] md:max-h-[calc(100vh-40px)] md:w-[var(--ai-panel-width)] ${resizing || panelDrag.dragging ? 'select-none' : ''}`}
       style={{
         '--ai-panel-width': `${panelSize.width}px`,
         '--ai-panel-height': `${panelSize.height}px`,
+        ...(isDesktopViewport && panelDrag.style ? panelDrag.style : {}),
       } as React.CSSProperties}
     >
       <button
@@ -1115,13 +1127,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       >
         <MoveDiagonal2 className="h-3.5 w-3.5" />
       </button>
-      <div className="flex items-center justify-between bg-slate-900 px-4 py-3">
+      <div
+        {...(isDesktopViewport ? panelDrag.handleProps : {})}
+        className={`flex items-center justify-between bg-slate-900 px-4 py-3 md:cursor-move ${panelDrag.dragging ? 'cursor-grabbing' : ''}`}
+      >
         <div className="flex min-w-0 items-center gap-3 md:pl-4">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/10 text-white">
             <Bot className="h-5 w-5" />
           </div>
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-white">AI 工作助手</h2>
+            <h2 className="text-sm font-semibold text-white" title="按住标题栏可拖动对话框">AI 工作助手</h2>
             <select value={assistantId ?? ''} onChange={(event) => setAssistantId(Number(event.target.value) || null)} className="mt-0.5 max-w-[220px] bg-transparent text-[11px] text-slate-300 outline-none">
               {assistants.length === 0 && <option value="">默认助手</option>}
               {assistants.map((assistant) => <option key={assistant.id} value={assistant.id} className="text-slate-900">{assistant.name} · {assistant.model}</option>)}
