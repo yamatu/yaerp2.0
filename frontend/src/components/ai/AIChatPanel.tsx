@@ -2,9 +2,9 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, MoveDiagonal2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
+import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
-import { useFloatingDrag } from '@/hooks/useFloatingDrag'
+import { useFloatingDrag, computeTopLeftResize } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
@@ -1082,13 +1082,34 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     const startX = event.clientX
     const startY = event.clientY
     const startSize = panelSize
+    const startPosition = panelDrag.position
+    const moveTo = panelDrag.moveTo
     setResizing(true)
     document.body.style.userSelect = 'none'
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
+      const next = computeTopLeftResize({
+        startSize,
+        startPosition,
+        startClientX: startX,
+        startClientY: startY,
+        clientX: moveEvent.clientX,
+        clientY: moveEvent.clientY,
+        clampSize: clampPanelSize,
+      })
+      if (!next.position || !startPosition) {
+        setPanelSize(next.size)
+        return
+      }
+      // Once the panel has been moved off its anchored position the size alone
+      // is not enough: the explicit left/top has to travel with the corner.
+      // When the corner hits a viewport edge the size is derived from the
+      // position that was actually applied, so the panel stops growing instead
+      // of extending away from the cursor.
+      const applied = moveTo(next.position.x, next.position.y)
       setPanelSize(clampPanelSize({
-        width: startSize.width + startX - moveEvent.clientX,
-        height: startSize.height + startY - moveEvent.clientY,
+        width: startSize.width + startPosition.x - applied.x,
+        height: startSize.height + startPosition.y - applied.y,
       }))
     }
 
@@ -1114,13 +1135,14 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     window.addEventListener('pointermove', handlePointerMove)
     window.addEventListener('pointerup', handlePointerUp)
     window.addEventListener('pointercancel', cleanup)
-  }, [panelSize, panelSizeStorageKey])
+  }, [panelSize, panelSizeStorageKey, panelDrag.position, panelDrag.moveTo])
 
   const resetPanelSize = useCallback(() => {
     const nextSize = clampPanelSize(DEFAULT_PANEL_SIZE)
     setPanelSize(nextSize)
     localStorage.setItem(panelSizeStorageKey, JSON.stringify(nextSize))
-  }, [panelSizeStorageKey])
+    panelDrag.reset()
+  }, [panelSizeStorageKey, panelDrag])
 
   const selectContextWorkbook = useCallback(async (workbook: Workbook) => {
     setLoadingContextWorkbookId(workbook.id)
@@ -1159,17 +1181,29 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       <button
         type="button"
         onPointerDown={handleResizeStart}
-        className="absolute left-0 top-0 z-10 hidden h-8 w-8 cursor-nwse-resize items-center justify-center text-slate-400 transition hover:text-white md:flex"
-        aria-label="拖动调整 AI 对话框大小"
-        title="拖动调整大小"
+        onDoubleClick={resetPanelSize}
+        className="group absolute left-0 top-0 z-20 hidden h-9 w-9 cursor-nwse-resize items-start justify-start md:flex"
+        aria-label="拖动左上角调整 AI 对话框大小"
+        title="拖动左上角调整大小 · 双击恢复默认"
       >
-        <MoveDiagonal2 className="h-3.5 w-3.5" />
+        <span
+          className={`h-9 w-9 rounded-tl-lg transition ${resizing ? 'opacity-90' : 'opacity-40 group-hover:opacity-90'}`}
+          style={{
+            backgroundImage: 'repeating-linear-gradient(135deg, rgba(255,255,255,0.9) 0 2px, transparent 2px 7px)',
+            clipPath: 'polygon(0 0, 100% 0, 0 100%)',
+          }}
+        />
       </button>
+      {resizing && (
+        <div className="pointer-events-none absolute left-11 top-2.5 z-30 rounded-md border border-white/20 bg-white/95 px-2 py-1 text-[11px] font-semibold tabular-nums text-slate-900 shadow-lg">
+          {panelSize.width} × {panelSize.height}
+        </div>
+      )}
       <div
         {...(isDesktopViewport ? panelDrag.handleProps : {})}
         className={`flex items-center justify-between bg-slate-900 px-4 py-3 md:cursor-move ${panelDrag.dragging ? 'cursor-grabbing' : ''}`}
       >
-        <div className="flex min-w-0 items-center gap-3 md:pl-4">
+        <div className="flex min-w-0 items-center gap-3 md:pl-6">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/10 text-white">
             <Bot className="h-5 w-5" />
           </div>
@@ -1250,6 +1284,18 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                   {message.pendingERPPlan ? ' · 等待你确认 ERP 步骤' : ''}
                 </div>
               )}
+
+              {/* Execution steps come first, the answer they produced below them. */}
+              {message.role === 'assistant' && Array.isArray(message.toolTraces) && message.toolTraces.some((trace) => !(message.pendingERPPlan && trace.name === 'preview_erp_action' && trace.status === 'success')) && (
+                <div className="w-full space-y-2">
+                  {groupToolTraces(message.toolTraces.filter((trace) => !(message.pendingERPPlan && trace.name === 'preview_erp_action' && trace.status === 'success'))).map((item) => item.kind === 'query-sheet-group'
+                    ? <QuerySheetTraceGroup key={`${message.id}-query-sheet-group-${item.sourceIndex}`} traces={item.traces} />
+                    : item.kind === 'erp-read-group'
+                      ? <ERPReadTraceGroup key={`${message.id}-erp-read-group-${item.sourceIndex}`} traces={item.traces} />
+                      : <ToolTraceCard key={`${message.id}-trace-${item.sourceIndex}`} trace={item.trace} />)}
+                </div>
+              )}
+
               <div
                 className={`min-w-0 max-w-full rounded-2xl px-4 py-3 text-sm leading-7 ${
                   message.role === 'user'
@@ -1261,16 +1307,6 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                   ? <AIMessageContent content={message.content} />
                   : message.content}
               </div>
-
-              {message.role === 'assistant' && Array.isArray(message.toolTraces) && message.toolTraces.some((trace) => !(message.pendingERPPlan && trace.name === 'preview_erp_action' && trace.status === 'success')) && (
-                <div className="w-full space-y-2">
-                  {groupToolTraces(message.toolTraces.filter((trace) => !(message.pendingERPPlan && trace.name === 'preview_erp_action' && trace.status === 'success'))).map((item) => item.kind === 'query-sheet-group'
-                    ? <QuerySheetTraceGroup key={`${message.id}-query-sheet-group-${item.sourceIndex}`} traces={item.traces} />
-                    : item.kind === 'erp-read-group'
-                      ? <ERPReadTraceGroup key={`${message.id}-erp-read-group-${item.sourceIndex}`} traces={item.traces} />
-                      : <ToolTraceCard key={`${message.id}-trace-${item.sourceIndex}`} trace={item.trace} />)}
-                </div>
-              )}
 
               {message.role === 'assistant' && Array.isArray(message.pendingOperations) && message.pendingOperations.length > 0 && (
                 <div className="w-full rounded-[24px] border border-amber-200 bg-amber-50/80 p-4 shadow-sm">
