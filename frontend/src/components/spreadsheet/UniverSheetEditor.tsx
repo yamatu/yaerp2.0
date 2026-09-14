@@ -688,31 +688,59 @@ function cloneJsonSnapshot<T>(value: T): T {
  * result a worksheet-level vertical alignment never reaches the editor and the
  * draft text ended up at the bottom of the cell. This interceptor mirrors the
  * worksheet default into the cell style used by the editor so both stay in
- * sync. Cells that already pin their own alignment are left untouched.
+ * sync. Cells that already pin their own alignment are left untouched, and
+ * empty cells receive a synthetic style because they have no style to mirror.
  */
-function registerEditorVerticalAlignInterceptor(univer: unknown) {
+function registerEditorVerticalAlignInterceptor(univer: unknown, attempt = 0) {
+  const injector = (univer as { __getInjector?: () => { get: <T>(token: unknown) => T } } | null)?.__getInjector?.()
+  if (!injector) return
+
   try {
-    const injector = (univer as { __getInjector?: () => { get: <T>(token: unknown) => T } } | null)?.__getInjector?.()
-    const service = injector?.get<SheetInterceptorService | undefined>(SheetInterceptorService)
-    service?.writeCellInterceptor.intercept(BEFORE_CELL_EDIT, {
+    const service = injector.get<SheetInterceptorService | undefined>(SheetInterceptorService)
+    if (!service?.writeCellInterceptor) {
+      throw new Error('SheetInterceptorService is not available yet')
+    }
+
+    service.writeCellInterceptor.intercept(BEFORE_CELL_EDIT, {
       priority: 100,
       handler: (cell, context) => {
-        if (!cell) return cell
+        const vt = VerticalAlign.MIDDLE
+        try {
+          // Empty cells carry no style at all, so the inline editor would fall
+          // back to Univer's bottom alignment while the committed (rendered)
+          // cell is middle aligned. Hand the editor a synthetic style so the
+          // draft text is aligned exactly like the final cell content.
+          if (!cell) return { s: { vt } } as ICellData
 
-        const rawStyle = cell.s
-        let base: Record<string, unknown> | undefined
-        if (typeof rawStyle === 'string') {
-          base = context.worksheet.getStyleDataByHash(rawStyle) as unknown as Record<string, unknown> | undefined
-        } else if (rawStyle && typeof rawStyle === 'object') {
-          base = rawStyle as Record<string, unknown>
+          const rawStyle = cell.s
+          let base: Record<string, unknown> | undefined
+          if (typeof rawStyle === 'string') {
+            const getStyleDataByHash = context?.worksheet?.getStyleDataByHash
+            const styleData = typeof getStyleDataByHash === 'function'
+              ? getStyleDataByHash.call(context.worksheet, rawStyle)
+              : undefined
+            base = (styleData || undefined) as unknown as Record<string, unknown> | undefined
+          } else if (rawStyle && typeof rawStyle === 'object') {
+            base = rawStyle as Record<string, unknown>
+          }
+
+          if (base && base.vt !== undefined && base.vt !== null) return cell
+
+          return { ...cell, s: { ...(base || {}), vt } as ICellData['s'] }
+        } catch {
+          return cell
         }
-
-        if (base && base.vt !== undefined && base.vt !== null) return cell
-
-        return { ...cell, s: { ...(base || {}), vt: VerticalAlign.MIDDLE } as ICellData['s'] }
       },
     })
   } catch (error) {
+    // Univer instantiates its plugins - and therefore registers
+    // SheetInterceptorService - lazily, during the first unit creation. If the
+    // interceptor is wired up before that, the service is missing. Retry on a
+    // short timer so the alignment fix is never silently dropped.
+    if (attempt < 40) {
+      setTimeout(() => registerEditorVerticalAlignInterceptor(univer, attempt + 1), 50)
+      return
+    }
     console.warn('Failed to register the sheet editor vertical alignment interceptor:', error)
   }
 }
@@ -3363,12 +3391,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 		  disposeCreatedUniver()
 		  return
 		}
-		registerEditorVerticalAlignInterceptor(univerResult.univer)
 
 		const { univerAPI } = univerResult
         univerApiRef.current = univerResult
 
         const workbookApi = univerAPI.createUniverSheet(workbookData)
+        // The sheets plugin (which owns SheetInterceptorService) is only
+        // instantiated while the first unit is created, so register the cell
+        // editor alignment interceptor only once the workbook exists.
+        registerEditorVerticalAlignInterceptor(univerResult.univer)
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
