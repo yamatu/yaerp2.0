@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
 import { AlertCircle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
-import { RANGE_TYPE, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
+import { RANGE_TYPE, CommandType, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
@@ -11,6 +11,10 @@ import { UniverSheetsFilterPreset } from '@univerjs/preset-sheets-filter'
 import UniverPresetSheetsFilterZhCN from '@univerjs/preset-sheets-filter/locales/zh-CN'
 import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-replace'
 import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
+import { UniverSheetsSortPreset } from '@univerjs/preset-sheets-sort'
+import UniverPresetSheetsSortZhCN from '@univerjs/preset-sheets-sort/locales/zh-CN'
+import { UniverSheetsHyperLinkPreset } from '@univerjs/preset-sheets-hyper-link'
+import UniverPresetSheetsHyperLinkZhCN from '@univerjs/preset-sheets-hyper-link/locales/zh-CN'
 import { UniverSheetsDataValidationPreset } from '@univerjs/preset-sheets-data-validation'
 import UniverPresetSheetsDataValidationZhCN from '@univerjs/preset-sheets-data-validation/locales/zh-CN'
 import { UniverSheetsConditionalFormattingPreset } from '@univerjs/preset-sheets-conditional-formatting'
@@ -1332,6 +1336,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     blocks: ProtectionHighlightBlock[]
   } | null>(null)
   const sheetPresenceRef = useRef<SheetPresenceEntry[]>([])
+  const presenceSendRef = useRef<{ signature: string; sentAt: number }>({ signature: '', sentAt: 0 })
+  const pendingPresenceRef = useRef<SheetPresenceEntry[] | null>(null)
+  const presenceFrameRef = useRef<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showImagePicker, setShowImagePicker] = useState(false)
@@ -2775,15 +2782,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           : cloneJsonSnapshot(localSnapshot)
         const localChanges = buildRealtimeCellChanges(sheetId, baselineSnapshot, localSnapshot, previousColumns)
 
-        const [sheetResponse, rowsResponse] = await Promise.all([
-          api.get<Sheet>(`/sheets/${sheetId}`),
-          api.get<Row[]>(`/sheets/${sheetId}/data`),
-        ])
+        const sheetResponse = await api.get<Sheet>(`/sheets/${sheetId}`)
         if (sheetResponse.code !== 0 || !sheetResponse.data) {
           throw new Error(sheetResponse.message || '同步工作表信息失败')
-        }
-        if (rowsResponse.code !== 0) {
-          throw new Error(rowsResponse.message || '同步工作表数据失败')
         }
         if (sheetEditorActiveRef.current || imeComposingRef.current) {
           deferredSilentSyncRef.current = true
@@ -2795,8 +2796,18 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         const nextConfig = parseSheetConfig(nextSheet.config)
         let serverSnapshot: Partial<IWorksheetData>
         if (nextConfig.univerSheetData && typeof nextConfig.univerSheetData === 'object') {
+          // Snapshots are the source of truth; only fall back to the legacy row
+          // API for worksheets that have not been migrated yet.
           serverSnapshot = cloneJsonSnapshot(nextConfig.univerSheetData as Partial<IWorksheetData>)
         } else {
+          const rowsResponse = await api.get<Row[]>(`/sheets/${sheetId}/data`)
+          if (rowsResponse.code !== 0) {
+            throw new Error(rowsResponse.message || '同步工作表数据失败')
+          }
+          if (sheetEditorActiveRef.current || imeComposingRef.current) {
+            deferredSilentSyncRef.current = true
+            return
+          }
           const nextWorkbook = buildUniverWorkbookData(
             workbookId,
             nextSheet,
@@ -2998,7 +3009,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     const unsubscribePresence = wsClient.on('sheet_presence', (msg) => {
       if (msg.sheetId !== sheetId || !Array.isArray(msg.presence)) return
-      setSheetPresence(msg.presence)
+      // Coalesce bursts of presence updates into a single render per frame so a
+      // busy collaboration session does not re-render the whole editor repeatedly.
+      pendingPresenceRef.current = msg.presence
+      if (presenceFrameRef.current !== null) return
+      presenceFrameRef.current = window.requestAnimationFrame(() => {
+        presenceFrameRef.current = null
+        if (pendingPresenceRef.current) setSheetPresence(pendingPresenceRef.current)
+        pendingPresenceRef.current = null
+      })
     })
 
     const unsubscribeProtection = wsClient.on('protection_updated', (msg) => {
@@ -3023,6 +3042,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       unsubscribeProtection()
       unsubscribeApproval()
       unsubscribeSheetSync()
+      if (presenceFrameRef.current !== null) {
+        window.cancelAnimationFrame(presenceFrameRef.current)
+        presenceFrameRef.current = null
+      }
+      pendingPresenceRef.current = null
       wsClient.leaveSheet(sheetId)
       setSheetPresence([])
     }
@@ -3268,6 +3292,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             [localeKey]: mergeLocaleBundles(
               UniverPresetSheetsCoreZhCN,
               UniverPresetSheetsFindReplaceZhCN,
+              UniverPresetSheetsSortZhCN,
+              UniverPresetSheetsHyperLinkZhCN,
               UniverPresetSheetsFilterZhCN,
               UniverSheetsDrawingZhCN,
               UniverPresetSheetsDataValidationZhCN,
@@ -3287,6 +3313,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             UniverSheetsDrawingPreset(),
             UniverSheetsFilterPreset(),
             UniverSheetsFindReplacePreset(),
+            UniverSheetsSortPreset(),
+            UniverSheetsHyperLinkPreset(),
             UniverSheetsDataValidationPreset({ showEditOnDropdown: true }),
             UniverSheetsConditionalFormattingPreset(),
           ],
@@ -3528,8 +3556,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
         const disposable = workbookApi.onCommandExecuted((command) => {
           const refreshProtectionLayout = commandChangesProtectionHighlightLayout(command.id)
+          // OPERATION commands (selection, scroll, zoom, sidebar toggles, ...) never
+          // mutate the saved snapshot, so they must not trigger the expensive
+          // save/diff/persist pipeline.
+          const mutatesSnapshot = command.type !== CommandType.OPERATION
           if (sheetEditorActiveRef.current || imeComposingRef.current) {
-            pendingLocalPersistRef.current = true
+            if (mutatesSnapshot) pendingLocalPersistRef.current = true
             return
           }
           if (applyingRemotePatchRef.current) {
@@ -3537,20 +3569,34 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             return
           }
 
-          schedulePersist()
           syncFilterState()
           syncSelectionState()
           if (refreshProtectionLayout) requestProtectionHighlightRefresh()
+          if (mutatesSnapshot) schedulePersist()
         })
 
         const sendPresenceForCell = (state: 'selected' | 'editing', row: number, column: number) => {
           const columnKey = latestSheetRef.current.columns?.[column]?.key
           const dataRow = row - 1
-          if (!columnKey || dataRow < 0) {
+          const nextState = !columnKey || dataRow < 0 ? 'viewing' : state
+          const signature = nextState === 'viewing' ? 'viewing' : `${nextState}:${dataRow}:${columnKey}`
+          const now = Date.now()
+          const previous = presenceSendRef.current
+          const previousState = previous.signature ? previous.signature.split(':')[0] : ''
+          // Skip duplicate selections; throttle rapid cursor movement, but always
+          // deliver state transitions (selected/editing/viewing) immediately so
+          // conflict detection stays reliable.
+          if (signature === previous.signature) {
+            if (now - previous.sentAt < 4000) return
+          } else if (nextState === previousState && now - previous.sentAt < 120) {
+            return
+          }
+          presenceSendRef.current = { signature, sentAt: now }
+          if (nextState === 'viewing') {
             wsClient.sendCellPresence(sheetId, 'viewing')
             return
           }
-          wsClient.sendCellPresence(sheetId, state, dataRow, columnKey)
+          wsClient.sendCellPresence(sheetId, nextState, dataRow, columnKey)
         }
 
         const selectionPresenceDisposable = univerAPI.addEvent(univerAPI.Event.SelectionChanged, () => {
@@ -3666,6 +3712,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           if (remotePatchResetTimerRef.current) { clearTimeout(remotePatchResetTimerRef.current); remotePatchResetTimerRef.current = null }
           applyingRemotePatchRef.current = false
           persistedWorksheetDataRef.current = null
+          presenceSendRef.current = { signature: '', sentAt: 0 }
           univerApiRef.current = null
           setHasFilter(false)
           setSelectionState(null)
@@ -4320,7 +4367,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
       {onlineCollaborators.length > 0 && (
-        <div className="absolute right-14 top-14 z-[22] w-[min(20rem,calc(100%-4.5rem))]">
+        <div className="absolute right-4 top-14 z-[22] w-auto max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100">
           <button type="button" onClick={() => setPresenceExpanded((current) => !current)} className="ml-auto flex min-h-10 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
             <UserRoundCheck className="h-4 w-4 shrink-0 text-emerald-600" />
             <div className="flex -space-x-1.5">
@@ -4329,7 +4376,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 return <span key={entry.userId} className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white text-[10px] font-semibold" style={{ backgroundColor: visual.soft, color: visual.stroke }} title={`${entry.username} · ${entry.state === 'editing' ? '正在编辑' : entry.state === 'selected' ? '已选中单元格' : '在线查看'}`}>{entry.username.slice(0, 2).toUpperCase()}</span>
               })}
             </div>
-            <div className="min-w-0 flex-1">
+            <div className="hidden min-w-0 flex-1 sm:block">
               <div className="truncate text-xs font-semibold text-slate-800">{onlineCollaborators.length} 人在线</div>
               <div className="truncate text-[10px] text-slate-400">{onlineCollaborators.filter((entry) => entry.state === 'editing').length > 0 ? `${onlineCollaborators.filter((entry) => entry.state === 'editing').length} 人正在编辑` : '当前无编辑冲突'}</div>
             </div>
@@ -4390,10 +4437,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
       {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
-        <div className={`fixed bottom-32 z-[70] flex flex-col items-end gap-2 md:bottom-28 ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
+        <div className={`pointer-events-none fixed bottom-32 z-[70] flex flex-col items-end gap-2 opacity-70 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 [&_button]:pointer-events-auto md:bottom-6 ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
-            <div className="flex flex-col items-end gap-2 animate-in fade-in slide-in-from-bottom-2 duration-150">
+            <div className="pointer-events-auto flex max-h-[min(62vh,32rem)] flex-col items-end gap-2 overflow-y-auto overscroll-contain pr-0.5 animate-in fade-in slide-in-from-bottom-2 duration-150">
               <FloatingToolHint label="数字与默认格式">
                 <button
                   type="button"
@@ -5230,7 +5277,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {currentApprovalStates.length > 0 && (
-        <div className={`absolute left-3 z-20 flex max-w-[65%] flex-wrap gap-2 ${(currentProtectionItems.length > 0 || showSelectionRestriction) ? 'top-12' : 'top-3'}`}>
+        <div className={`pointer-events-none absolute left-3 z-20 flex max-w-[65%] flex-wrap gap-2 [&_button]:pointer-events-auto ${(currentProtectionItems.length > 0 || showSelectionRestriction) ? 'top-[5.5rem]' : 'top-12'}`}>
           {currentApprovalStates.map((item) => (
             <button key={`approval-${item.id}`} type="button" onClick={() => focusApprovalState(item)} className={`inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm ${item.status === 'pending' ? 'border-amber-300 text-amber-800' : item.status === 'approved' ? 'border-emerald-300 text-emerald-700' : 'border-rose-300 text-rose-700'}`} title={item.status === 'pending' ? `原值：${formatApprovalValue(item.original_value)} → 待审值：${formatApprovalValue(item.proposed_value)}` : item.rule_name}>
               <ClipboardCheck className="h-3 w-3" />
@@ -5241,7 +5288,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {(currentProtectionItems.length > 0 || showSelectionRestriction) && (
-        <div className="absolute left-3 top-3 z-20 flex max-w-[60%] flex-wrap gap-2">
+        <div className="pointer-events-none absolute left-3 top-12 z-20 flex max-w-[60%] flex-wrap gap-2 [&_button]:pointer-events-auto">
             {showSelectionRestriction && (
               <span className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white/95 px-2.5 py-1 text-[11px] font-semibold text-slate-700 shadow-sm" title={selectedCellMasked && selectedCellCannotEdit ? '当前单元格内容已遮罩，且当前账号没有修改权限' : selectedCellMasked ? '当前单元格内容已遮罩' : '当前账号不能修改此单元格'}>
                 {selectedCellMasked && <EyeOff className="h-3 w-3" />}

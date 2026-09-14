@@ -3,6 +3,7 @@ package ws
 import (
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -77,6 +78,9 @@ type Hub struct {
 
 	droppedBroadcasts atomic.Uint64
 	slowClients       atomic.Uint64
+
+	presenceMu    sync.Mutex
+	presenceCache map[int64]string
 }
 
 type BroadcastMsg struct {
@@ -94,6 +98,8 @@ func NewHub() *Hub {
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		done:       make(chan struct{}),
+
+		presenceCache: make(map[int64]string),
 	}
 }
 
@@ -241,11 +247,13 @@ func (h *Hub) UpdatePresence(client *Client, state string, row *int, col string)
 	}
 	h.mu.Lock()
 	sheetID := client.SheetID
+	rowChanged := (client.Row == nil) != (row == nil) || (client.Row != nil && row != nil && *client.Row != *row)
+	changed := client.State != state || rowChanged || client.Col != col
 	client.State = state
 	client.Row = row
 	client.Col = col
 	h.mu.Unlock()
-	if sheetID > 0 {
+	if sheetID > 0 && changed {
 		h.publishPresence(sheetID)
 	}
 }
@@ -253,6 +261,13 @@ func (h *Hub) UpdatePresence(client *Client, state string, row *int, col string)
 func (h *Hub) publishPresence(sheetID int64) {
 	h.mu.RLock()
 	clients := h.sheets[sheetID]
+	if len(clients) == 0 {
+		h.mu.RUnlock()
+		h.presenceMu.Lock()
+		delete(h.presenceCache, sheetID)
+		h.presenceMu.Unlock()
+		return
+	}
 	entries := make([]PresenceEntry, 0, len(clients))
 	for client := range clients {
 		entry := PresenceEntry{
@@ -268,11 +283,29 @@ func (h *Hub) publishPresence(sheetID int64) {
 		}
 		entries = append(entries, entry)
 	}
+	// Map iteration order is random; sort so identical presence sets always
+	// produce the same signature for the dedupe check below.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ClientID < entries[j].ClientID })
 	data, err := json.Marshal(Message{Type: "sheet_presence", SheetID: sheetID, Presence: entries})
 	if err != nil {
 		h.mu.RUnlock()
 		return
 	}
+	// Skip broadcasting identical presence snapshots. Cell selection broadcasts
+	// fire very frequently; without this dedupe every client re-renders on each
+	// duplicate update.
+	signature := string(data)
+	h.presenceMu.Lock()
+	if h.presenceCache == nil {
+		h.presenceCache = make(map[int64]string)
+	}
+	if h.presenceCache[sheetID] == signature {
+		h.presenceMu.Unlock()
+		h.mu.RUnlock()
+		return
+	}
+	h.presenceCache[sheetID] = signature
+	h.presenceMu.Unlock()
 	slow := make([]*Client, 0)
 	for client := range clients {
 		if !trySendLocked(client, data) {
