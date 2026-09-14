@@ -6,6 +6,7 @@ import { AuthGuard } from '@/components/auth/AuthGuard'
 import api from '@/lib/api'
 import { fetchCurrentUser, getStoredUser, saveCurrentUser } from '@/lib/auth'
 import type { AuthUser } from '@/types'
+import MyPermissionsCard from '@/components/settings/MyPermissionsCard'
 
 export default function SettingsPage() {
   const [profile, setProfile] = useState<AuthUser | null>(getStoredUser())
@@ -160,6 +161,8 @@ export default function SettingsPage() {
                   </div>
                 </div>
               </div>
+
+              <MyPermissionsCard />
 
               <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm sm:p-6">
                 <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold text-gray-900"><KeyRound className="h-5 w-5 text-sky-600" />登录密码</h2>

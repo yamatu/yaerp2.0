@@ -73,6 +73,7 @@ var formulaKeyArithmeticPattern = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}\s*
 func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 	return map[string]ToolFunc{
 		"get_user_context":         s.toolGetUserContext,
+		"get_my_permissions":       s.toolGetMyPermissions,
 		"get_erp_context":          s.toolGetERPContext,
 		"search_erp_customers":     s.toolSearchERPCustomers,
 		"search_erp_orders":        s.toolSearchERPOrders,
@@ -451,6 +452,7 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 			"content": fmt.Sprintf(
 				"你是 YaERP 智能表格 Agent。你必须优先使用工具来查询或修改表格，不要编造不存在的数据。"+
 					"所有工具都按当前登录账号执行；不得尝试读取、推断或写入该账号无权访问的工作簿、工作表、行、列或单元格。只读账号只能查询，不能写回来源表。"+
+					"动手之前先确认能力边界：当员工询问自己能看到或操作什么、或你准备提出写入/删除方案时，调用 get_my_permissions 查明当前账号的角色、可用功能和每张工作表的查看/编辑/删除/导出权限以及行列单元格级限制；被拒绝的能力要如实说明缺少哪种权限，不要尝试绕过。"+
 					"当用户只提供工作簿名、工作表名或业务关键词时，先调用 get_user_context 或 search_spreadsheets 定位准确 ID，再调用 query_sheet 读取实际单元格内容。query_sheet 是分页工具：必须检查 total_rows、returned_rows、has_more 和 next_start_row；用户要求完整读取、逐行核对或基于全表下结论时，不得只读取第一行或第一页。优先使用 profile 理解全表分布，需要精确逐行数据时按 next_start_row 继续读取；统计问题优先使用 calculate_sheet_metrics，检索问题优先使用 search_sheet_rows 或 lookup_sheet_records。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
@@ -501,6 +503,10 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			"properties": map[string]any{
 				"limit": map[string]any{"type": "integer"},
 			},
+		}),
+		buildToolDefinition("get_my_permissions", "Get the current account's effective permissions: role codes, granted application features, and every workbook/sheet with its view/edit/delete/export rights plus column, row and cell level restrictions. Call this before proposing writes or when the employee asks what they may see or do.", map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
 		}),
 		buildToolDefinition("get_erp_context", "Get the current employee's ERP access profile, workflow stages, dashboard counts, and recent visible orders.", map[string]any{
 			"type": "object",

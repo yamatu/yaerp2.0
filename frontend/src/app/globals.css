@@ -263,24 +263,6 @@ video {
   overscroll-behavior: contain;
 }
 
-.univer-editor-container {
-  box-sizing: border-box !important;
-  align-items: center !important;
-}
-
-.univer-editor-container .univer-editor-input,
-.univer-editor-container .univer-sheet-embedding-formula-editor-wrap,
-.univer-editor-container .univer-sheet-embedding-formula-editor-text {
-  height: 100% !important;
-  min-height: 100% !important;
-}
-
-.univer-editor-container .univer-sheet-embedding-formula-editor-wrap {
-  align-items: center !important;
-  padding-top: 0 !important;
-  padding-bottom: 0 !important;
-}
-
 /*
  * The AI assistant panel docks to the bottom-right corner. While it is open it
  * would sit underneath the spreadsheet's floating tool stack, so hide the stack
