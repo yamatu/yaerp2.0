@@ -990,6 +990,7 @@ export default function TradeWorkspacePage() {
   const detailOrderIDRef = useRef<number | null>(null);
   const realtimeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restoredRef = useRef(false);
+  const pendingOrderRef = useRef(false);
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
 
   const [dashboard, setDashboard] = useState<TradeDashboard | null>(null);
@@ -1426,6 +1427,38 @@ export default function TradeWorkspacePage() {
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  // Quick action from the global command palette: open the new-inquiry modal.
+  // The request may arrive before this page mounts, so it is also persisted.
+  useEffect(() => {
+    try {
+      if (
+        window.sessionStorage.getItem("yaerp:pending-create-trade-order") ===
+        "1"
+      ) {
+        pendingOrderRef.current = true;
+        window.sessionStorage.removeItem("yaerp:pending-create-trade-order");
+      }
+    } catch {
+      // Ignore storage failures.
+    }
+
+    const handleCreateRequest = () => {
+      pendingOrderRef.current = true;
+      try {
+        window.sessionStorage.removeItem("yaerp:pending-create-trade-order");
+      } catch {
+        // Ignore storage failures.
+      }
+    };
+
+    window.addEventListener("yaerp:create-trade-order", handleCreateRequest);
+    return () =>
+      window.removeEventListener(
+        "yaerp:create-trade-order",
+        handleCreateRequest,
+      );
+  }, []);
 
   useEffect(
     () => () => {
@@ -1939,6 +1972,14 @@ export default function TradeWorkspacePage() {
     setOrderModalOpen(true);
     setError("");
   };
+
+  // Quick action from the palette: open the modal once access is confirmed.
+  useEffect(() => {
+    if (!pendingOrderRef.current) return;
+    if (!tradeAccess?.can_create_orders) return;
+    pendingOrderRef.current = false;
+    openOrderModal();
+  }, [tradeAccess?.can_create_orders, openOrderModal]);
 
   const openAIImport = async () => {
     setAIImportOpen(true);

@@ -281,11 +281,6 @@ video {
   padding-bottom: 0 !important;
 }
 
-.univer-editor-container .univer-render-canvas {
-  top: 50% !important;
-  transform: translateY(-50%) !important;
-}
-
 /*
  * The AI assistant panel docks to the bottom-right corner. While it is open it
  * would sit underneath the spreadsheet's floating tool stack, so hide the stack

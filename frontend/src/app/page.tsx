@@ -275,6 +275,7 @@ export default function HomePage() {
   const [editWorkbookName, setEditWorkbookName] = useState("");
   const workbookImportInputRef = useRef<HTMLInputElement | null>(null);
   const workbookFolderImportInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingCreateRef = useRef<"workbook" | "folder" | null>(null);
   const workbookDropDepthRef = useRef(0);
   const [importingWorkbook, setImportingWorkbook] = useState(false);
   const [importingWorkbookFolder, setImportingWorkbookFolder] = useState(false);
@@ -650,6 +651,50 @@ export default function HomePage() {
   useEffect(() => {
     setWorkbookPage(1);
   }, [showOnlyOwnResources]);
+
+  // Quick actions coming from the global command palette. The request can
+  // arrive before this page mounts (navigating from another route), so it is
+  // also persisted in sessionStorage; both paths funnel into pendingCreateRef.
+  useEffect(() => {
+    try {
+      const pending = window.sessionStorage.getItem(
+        "yaerp:pending-create-sheet-item",
+      );
+      if (pending === "workbook" || pending === "folder") {
+        pendingCreateRef.current = pending;
+        window.sessionStorage.removeItem("yaerp:pending-create-sheet-item");
+      }
+    } catch {
+      // Ignore storage failures.
+    }
+
+    const handleCreateRequest = (event: Event) => {
+      const detail = (event as CustomEvent<{ kind?: string }>).detail;
+      const kind = detail?.kind;
+      if (kind === "workbook" || kind === "folder") {
+        pendingCreateRef.current = kind;
+      }
+      try {
+        window.sessionStorage.removeItem("yaerp:pending-create-sheet-item");
+      } catch {
+        // Ignore storage failures.
+      }
+    };
+
+    window.addEventListener("yaerp:create-sheet-item", handleCreateRequest);
+    return () =>
+      window.removeEventListener("yaerp:create-sheet-item", handleCreateRequest);
+  }, []);
+
+  // Apply the pending create request once the folder is known to be writable.
+  useEffect(() => {
+    if (!canWriteCurrentFolder) return;
+    const kind = pendingCreateRef.current;
+    if (!kind) return;
+    pendingCreateRef.current = null;
+    if (kind === "workbook") setCreating(true);
+    else setCreatingFolder(true);
+  }, [canWriteCurrentFolder]);
   useEffect(() => {
     if (!profile?.id || !adminMode) return;
     localStorage.setItem(
@@ -2604,6 +2649,20 @@ export default function HomePage() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      window.dispatchEvent(new Event("yaerp:open-command-palette"))
+                    }
+                    className="inline-flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:border-sky-200 hover:text-sky-700"
+                    title="搜索全部模块与工作簿（Ctrl / ⌘ + K）"
+                  >
+                    <Search className="h-4 w-4" />
+                    全库搜索
+                    <kbd className="hidden rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 md:inline">
+                      Ctrl / ⌘ K
+                    </kbd>
+                  </button>
                   <select
                     value={workbookSortBy}
                     onChange={(event) =>

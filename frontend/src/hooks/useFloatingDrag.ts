@@ -28,6 +28,8 @@ interface FloatingDragOptions {
   enabled?: boolean
   /** Skip drags that start on an interactive child such as a button. */
   ignoreInteractive?: boolean
+  /** Restored position (e.g. from storage). Falls back to the CSS default. */
+  initialPosition?: FloatingDragPosition | null
 }
 
 interface FloatingDragState {
@@ -56,8 +58,9 @@ export function useFloatingDrag({
   containerRef,
   enabled = true,
   ignoreInteractive = true,
+  initialPosition = null,
 }: FloatingDragOptions) {
-  const [position, setPosition] = useState<FloatingDragPosition | null>(null)
+  const [position, setPosition] = useState<FloatingDragPosition | null>(initialPosition)
   const [dragging, setDragging] = useState(false)
   const stateRef = useRef<FloatingDragState | null>(null)
   const suppressClickRef = useRef(false)
@@ -157,6 +160,13 @@ export function useFloatingDrag({
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
   }, [clampPosition, position])
+
+  // Clamp a restored position so a widget saved on a larger screen stays visible.
+  useEffect(() => {
+    setPosition((current) =>
+      current ? clampPosition(current.x, current.y) : current,
+    )
+  }, [clampPosition])
 
   const handleClickCapture = useCallback((event: ReactMouseEvent) => {
     if (!suppressClickRef.current) return

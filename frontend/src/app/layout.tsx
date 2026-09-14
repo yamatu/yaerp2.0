@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import 'katex/dist/katex.min.css'
 import './globals.css'
 import AIChatWrapper from '@/components/ai/AIChatWrapper'
+import GlobalQuickNav from '@/components/nav/GlobalQuickNav'
 
 export const metadata: Metadata = {
   title: 'YaERP 2.0',
@@ -17,6 +18,7 @@ export default function RootLayout({
     <html lang="zh-CN">
       <body className="h-full bg-gray-50 text-gray-900 antialiased">
         {children}
+        <GlobalQuickNav />
         <AIChatWrapper />
       </body>
     </html>
