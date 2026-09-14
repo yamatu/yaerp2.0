@@ -88,6 +88,29 @@ func (s *SheetService) maskSheetForUser(sheet *model.Sheet, userID int64) (*mode
 	if err != nil {
 		return nil, err
 	}
+	return applySheetVisibilityMask(sheet, userID, matrix, departmentIDs)
+}
+
+// maskSheetForUserScoped behaves like maskSheetForUser, but reuses the
+// permission matrix and the department list the caller already resolved through
+// the scope, so opening a workbook does not resolve them a second time for
+// every sheet it contains.
+func (s *SheetService) maskSheetForUserScoped(sheet *model.Sheet, userID int64, matrix *model.PermissionMatrix, scope *AccessScope) (*model.Sheet, error) {
+	isAdmin, err := scope.IsAdmin(userID)
+	if err != nil {
+		return nil, err
+	}
+	if isAdmin {
+		return sheet, nil
+	}
+	departmentIDs, err := scope.DepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
+	return applySheetVisibilityMask(sheet, userID, matrix, departmentIDs)
+}
+
+func applySheetVisibilityMask(sheet *model.Sheet, userID int64, matrix *model.PermissionMatrix, departmentIDs []int64) (*model.Sheet, error) {
 	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
 	if err != nil {
 		return nil, err

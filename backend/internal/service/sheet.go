@@ -317,7 +317,8 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 		return nil, err
 	}
 	wb.CanManage = canManageWorkbook
-	isAdmin, err := s.permService.IsAdmin(userID)
+	scope := s.permService.NewAccessScope()
+	isAdmin, err := scope.IsAdmin(userID)
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +330,7 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 		return wb, nil
 	}
 
-	canViewWorkbook, err := s.permService.CanViewWorkbook(wb, userID)
+	canViewWorkbook, err := scope.CanViewWorkbook(wb, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +347,7 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 		if sheet.IsHidden {
 			continue
 		}
-		matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
+		matrix, err := scope.PermissionMatrix(sheet.ID, userID)
 		if err != nil {
 			return nil, fmt.Errorf("check sheet %d permission: %w", sheet.ID, err)
 		}
@@ -356,7 +357,7 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 			} else {
 				sheet.AccessLevel = "read"
 			}
-			masked, err := s.maskSheetForUser(&sheet, userID)
+			masked, err := s.maskSheetForUserScoped(&sheet, userID, matrix, scope)
 			if err != nil {
 				return nil, err
 			}
@@ -397,9 +398,12 @@ func (s *SheetService) ListWorkbooks(userID int64, page, size int) ([]model.Work
 		return nil, 0, err
 	}
 
+	// One access scope for the whole page: role, folder visibility and ancestor
+	// path lookups are shared instead of repeated for every workbook.
+	scope := s.permService.NewAccessScope()
 	accessible := make([]model.Workbook, 0, len(allWorkbooks))
 	for _, workbook := range allWorkbooks {
-		canView, err := s.permService.CanViewWorkbook(&workbook, userID)
+		canView, err := scope.CanViewWorkbook(&workbook, userID)
 		if err != nil {
 			return nil, 0, err
 		}

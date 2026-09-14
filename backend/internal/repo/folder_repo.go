@@ -389,17 +389,44 @@ func (r *FolderRepo) HasVisibilityRules(folderID int64) (bool, error) {
 }
 
 // GetAncestorPath returns folder ancestors from root to given folder.
+// A single recursive query replaces the previous walk that issued one lookup
+// per level, and the depth guard keeps a corrupt parent cycle from looping.
 func (r *FolderRepo) GetAncestorPath(folderID int64) ([]model.Folder, error) {
-	var path []model.Folder
-	currentID := &folderID
+	rows, err := r.db.Query(
+		`WITH RECURSIVE chain AS (
+		     SELECT f.id, f.name, f.parent_id, f.owner_id, f.created_at, f.updated_at, 0 AS depth
+		     FROM folders f
+		     WHERE f.id = $1 AND f.deleted_at IS NULL
+		   UNION ALL
+		     SELECT p.id, p.name, p.parent_id, p.owner_id, p.created_at, p.updated_at, c.depth + 1
+		     FROM folders p
+		     JOIN chain c ON p.id = c.parent_id
+		     WHERE p.deleted_at IS NULL AND c.depth < 64
+		   )
+		 SELECT c.id, c.name, c.parent_id, c.owner_id, u.username, c.created_at, c.updated_at
+		 FROM chain c
+		 LEFT JOIN users u ON u.id = c.owner_id
+		 ORDER BY c.depth DESC`,
+		folderID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get folder ancestors: %w", err)
+	}
+	defer rows.Close()
 
-	for currentID != nil {
-		f, err := r.GetByID(*currentID)
-		if err != nil {
-			return nil, err
+	path := make([]model.Folder, 0, 4)
+	for rows.Next() {
+		var f model.Folder
+		if err := rows.Scan(&f.ID, &f.Name, &f.ParentID, &f.OwnerID, &f.OwnerName, &f.CreatedAt, &f.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan folder ancestor: %w", err)
 		}
-		path = append([]model.Folder{*f}, path...)
-		currentID = f.ParentID
+		path = append(path, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate folder ancestors: %w", err)
+	}
+	if len(path) == 0 {
+		return nil, fmt.Errorf("folder %d not found", folderID)
 	}
 
 	return path, nil
