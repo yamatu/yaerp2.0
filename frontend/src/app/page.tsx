@@ -2649,6 +2649,20 @@ export default function HomePage() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      window.dispatchEvent(new Event("yaerp:open-command-palette"))
+                    }
+                    className="inline-flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:border-sky-200 hover:text-sky-700"
+                    title="搜索全部模块与工作簿（Ctrl / ⌘ + K）"
+                  >
+                    <Search className="h-4 w-4" />
+                    全库搜索
+                    <kbd className="hidden rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 md:inline">
+                      Ctrl / ⌘ K
+                    </kbd>
+                  </button>
                   <select
                     value={workbookSortBy}
                     onChange={(event) =>
