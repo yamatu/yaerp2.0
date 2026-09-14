@@ -183,6 +183,21 @@ func (s *SheetService) ensureWorkbookVisible(workbook *model.Workbook, userID in
 	if err != nil {
 		return err
 	}
+	return checkWorkbookVisible(workbook, isAdmin)
+}
+
+// ensureWorkbookVisibleScoped is ensureWorkbookVisible for callers that already
+// hold an access scope, so the role lookup is shared with the rest of the
+// operation.
+func (s *SheetService) ensureWorkbookVisibleScoped(workbook *model.Workbook, userID int64, scope *AccessScope) error {
+	isAdmin, err := scope.IsAdmin(userID)
+	if err != nil {
+		return err
+	}
+	return checkWorkbookVisible(workbook, isAdmin)
+}
+
+func checkWorkbookVisible(workbook *model.Workbook, isAdmin bool) error {
 	if isAdmin {
 		return nil
 	}

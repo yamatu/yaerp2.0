@@ -252,6 +252,12 @@ func (sc *AccessScope) CanManageWorkbook(workbook *model.Workbook, userID int64)
 	return sc.service.canManageWorkbookCached(workbook, userID, &sc.cache)
 }
 
+// Workbook returns the workbook row, sharing the scope cache so a caller that
+// already touched it does not read it again.
+func (sc *AccessScope) Workbook(workbookID int64) (*model.Workbook, error) {
+	return sc.service.getWorkbookCached(workbookID, &sc.cache)
+}
+
 // DepartmentIDs returns the departments of the user, sharing the scope cache
 // with the permission checks that already ran.
 func (sc *AccessScope) DepartmentIDs(userID int64) ([]int64, error) {

@@ -202,7 +202,15 @@ func applySheetExportWorkbookProps(file *excelize.File) error {
 }
 
 func (s *SheetService) loadSheetExportContext(userID, sheetID int64, requireExport bool) (*sheetExportContext, error) {
-	matrix, err := s.permService.GetPermissionMatrix(sheetID, userID)
+	return s.loadSheetExportContextScoped(userID, sheetID, requireExport, s.permService.NewAccessScope(), nil)
+}
+
+// loadSheetExportContextScoped resolves one sheet for an export. Exports of
+// several sheets of the same workbook pass one shared scope and the workbook
+// they already loaded, so the workbook row, the role and the sheet rules are
+// read once for the whole export instead of once per sheet.
+func (s *SheetService) loadSheetExportContextScoped(userID, sheetID int64, requireExport bool, scope *AccessScope, workbook *model.Workbook) (*sheetExportContext, error) {
+	matrix, err := scope.PermissionMatrix(sheetID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -221,17 +229,19 @@ func (s *SheetService) loadSheetExportContext(userID, sheetID int64, requireExpo
 		return nil, err
 	}
 
-	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
-	if err != nil {
+	if workbook == nil {
+		workbook, err = scope.Workbook(sheet.WorkbookID)
+		if err != nil {
+			return nil, err
+		}
+		if err := applyWorkbookLifecycleState(workbook); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.ensureWorkbookVisibleScoped(workbook, userID, scope); err != nil {
 		return nil, err
 	}
-	if err := applyWorkbookLifecycleState(workbook); err != nil {
-		return nil, err
-	}
-	if err := s.ensureWorkbookVisible(workbook, userID); err != nil {
-		return nil, err
-	}
-	sheet, err = s.maskSheetForUser(sheet, userID)
+	sheet, err = s.maskSheetForUserScoped(sheet, userID, matrix, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +279,8 @@ func (s *SheetService) loadWorkbookExportContexts(userID, workbookID int64, shee
 		return nil, nil, err
 	}
 
+	scope := s.permService.NewAccessScope()
+
 	requestedIDs := normalizeExportSheetIDs(sheetIDs)
 	requestedIDSet := make(map[int64]struct{}, len(requestedIDs))
 	for _, id := range requestedIDs {
@@ -284,7 +296,7 @@ func (s *SheetService) loadWorkbookExportContexts(userID, workbookID int64, shee
 			}
 		}
 
-		ctx, err := s.loadSheetExportContext(userID, sheet.ID, requireExport)
+		ctx, err := s.loadSheetExportContextScoped(userID, sheet.ID, requireExport, scope, workbook)
 		if err != nil {
 			return nil, nil, err
 		}

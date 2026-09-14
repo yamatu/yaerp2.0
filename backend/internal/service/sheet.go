@@ -294,14 +294,22 @@ func (s *SheetService) DuplicateWorkbookForUser(userID, workbookID int64) (*mode
 }
 
 func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, error) {
-	wb, err := s.sheetRepo.GetWorkbook(id)
+	return s.getWorkbook(id, userID, s.permService.NewAccessScope())
+}
+
+// getWorkbook resolves the workbook, its visible sheets and the access level of
+// each of them, sharing the permission lookups through the scope. Callers that
+// resolve several workbooks in one request pass the same scope so the role,
+// folder and workbook rows are read once.
+func (s *SheetService) getWorkbook(id int64, userID int64, scope *AccessScope) (*model.Workbook, error) {
+	wb, err := scope.Workbook(id)
 	if err != nil {
 		return nil, err
 	}
 	if err := applyWorkbookLifecycleState(wb); err != nil {
 		return nil, err
 	}
-	if err := s.ensureWorkbookVisible(wb, userID); err != nil {
+	if err := s.ensureWorkbookVisibleScoped(wb, userID, scope); err != nil {
 		return nil, err
 	}
 	sheets, err := s.sheetRepo.GetSheetsByWorkbook(id)
@@ -312,12 +320,11 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 		return nil, err
 	}
 
-	canManageWorkbook, err := s.CanManageWorkbook(userID, wb)
+	canManageWorkbook, err := scope.CanManageWorkbook(wb, userID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("check workbook manage permission: %w", err)
 	}
 	wb.CanManage = canManageWorkbook
-	scope := s.permService.NewAccessScope()
 	isAdmin, err := scope.IsAdmin(userID)
 	if err != nil {
 		return nil, err
