@@ -12,9 +12,12 @@ import { usePathname, useRouter } from 'next/navigation'
 import {
   ArrowDown,
   ArrowUp,
+  ClipboardPlus,
   Command,
   CornerDownLeft,
+  FilePlus2,
   FileSpreadsheet,
+  FolderPlus,
   Search,
   X,
   type LucideIcon,
@@ -31,6 +34,10 @@ import {
 } from './appModules'
 
 const OPEN_EVENT = 'yaerp:open-command-palette'
+const CREATE_EVENT = 'yaerp:create-sheet-item'
+const PENDING_CREATE_KEY = 'yaerp:pending-create-sheet-item'
+const TRADE_ORDER_EVENT = 'yaerp:create-trade-order'
+const PENDING_TRADE_ORDER_KEY = 'yaerp:pending-create-trade-order'
 const LAUNCHER_POSITION_KEY = 'yaerp:command-launcher-position'
 const RECENT_KEY = 'yaerp:command-recent'
 const MAX_RECENT = 6
@@ -51,7 +58,12 @@ interface PaletteItem {
   href: string
   icon: LucideIcon
   meta?: string
-  recent: RecentEntry
+  /** Extra search tokens for non-module entries (quick actions). */
+  keywords?: string[]
+  /** Recorded as a recent destination (not set for one-shot actions). */
+  recent?: RecentEntry
+  /** Runs instead of navigating. */
+  onRun?: () => void
 }
 
 type PaletteRow =
@@ -297,13 +309,86 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
     })
   }, [])
 
+  const runCreate = useCallback(
+    (kind: 'workbook' | 'folder') => {
+      // The home page reads this flag on mount, which covers the case where the
+      // palette is used from another route. The event covers the case where the
+      // home page is already mounted and will not remount.
+      try {
+        window.sessionStorage.setItem(PENDING_CREATE_KEY, kind)
+      } catch {
+        // Ignore storage failures; the event still works on the home page.
+      }
+      window.dispatchEvent(new CustomEvent(CREATE_EVENT, { detail: { kind } }))
+      if (pathname !== '/') router.push('/')
+    },
+    [pathname, router],
+  )
+
+  const runTradeOrder = useCallback(() => {
+    try {
+      window.sessionStorage.setItem(PENDING_TRADE_ORDER_KEY, '1')
+    } catch {
+      // Ignore storage failures.
+    }
+    window.dispatchEvent(new CustomEvent(TRADE_ORDER_EVENT))
+    if (pathname !== '/trade') router.push('/trade')
+  }, [pathname, router])
+
   const select = useCallback(
     (item: PaletteItem) => {
-      recordRecent(item.recent)
       setOpen(false)
-      if (item.href !== pathname) router.push(item.href)
+      if (item.onRun) {
+        item.onRun()
+        return
+      }
+      if (item.recent) recordRecent(item.recent)
+      if (item.href && item.href !== pathname) router.push(item.href)
     },
     [pathname, recordRecent, router],
+  )
+
+  const quickActions = useMemo<PaletteItem[]>(
+    () => [
+      {
+        key: 'action:new-workbook',
+        label: '新建工作簿',
+        description: '在工作台创建新的工作簿并开始编辑',
+        href: '/',
+        icon: FilePlus2,
+        keywords: ['新建', '创建', '工作簿', 'create', 'new', 'workbook'],
+        onRun: () => runCreate('workbook'),
+      },
+      {
+        key: 'action:new-folder',
+        label: '新建文件夹',
+        description: '在工作台创建分类文件夹',
+        href: '/',
+        icon: FolderPlus,
+        keywords: ['新建', '创建', '文件夹', '目录', 'create', 'new', 'folder'],
+        onRun: () => runCreate('folder'),
+      },
+      {
+        key: 'action:new-trade-order',
+        label: '新建询价',
+        description: '在外贸业务中心创建询价业务单',
+        href: '/trade',
+        icon: ClipboardPlus,
+        keywords: [
+          '新建',
+          '创建',
+          '询价',
+          '报价',
+          '订单',
+          '外贸',
+          'trade',
+          'order',
+          'inquiry',
+        ],
+        onRun: runTradeOrder,
+      },
+    ],
+    [runCreate, runTradeOrder],
   )
 
   const groups = useMemo(() => {
@@ -528,6 +613,23 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
                   ),
                 )
               )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-2">
+              <span className="text-[11px] font-semibold text-slate-400">
+                快捷操作
+              </span>
+              {quickActions.map((action) => (
+                <button
+                  key={action.key}
+                  type="button"
+                  onClick={() => select(action)}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:border-sky-200 hover:text-sky-700"
+                >
+                  <action.icon className="h-3.5 w-3.5" />
+                  {action.label}
+                </button>
+              ))}
             </div>
 
             <div className="flex items-center justify-between border-t border-slate-200 px-4 py-2 text-[11px] text-slate-400">
