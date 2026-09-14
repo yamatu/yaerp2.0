@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
 import { AlertCircle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
-import { RANGE_TYPE, CommandType, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
+import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
@@ -21,13 +21,14 @@ import { UniverSheetsConditionalFormattingPreset } from '@univerjs/preset-sheets
 import UniverPresetSheetsConditionalFormattingZhCN from '@univerjs/preset-sheets-conditional-formatting/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import { CellAlertType, ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
+import { BEFORE_CELL_EDIT, SheetInterceptorService } from '@univerjs/sheets'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
 import { useFloatingDrag } from '@/hooks/useFloatingDrag'
 import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl } from '@/lib/imageTransform'
-import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
+import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { wsClient } from '@/lib/ws'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
@@ -681,6 +682,41 @@ function cloneJsonSnapshot<T>(value: T): T {
   }
 }
 
+/**
+ * Univer's inline cell editor reads the cell's own style only, while the cell
+ * renderer composes the worksheet default style with the cell style. As a
+ * result a worksheet-level vertical alignment never reaches the editor and the
+ * draft text ended up at the bottom of the cell. This interceptor mirrors the
+ * worksheet default into the cell style used by the editor so both stay in
+ * sync. Cells that already pin their own alignment are left untouched.
+ */
+function registerEditorVerticalAlignInterceptor(univer: unknown) {
+  try {
+    const injector = (univer as { __getInjector?: () => { get: <T>(token: unknown) => T } } | null)?.__getInjector?.()
+    const service = injector?.get<SheetInterceptorService | undefined>(SheetInterceptorService)
+    service?.writeCellInterceptor.intercept(BEFORE_CELL_EDIT, {
+      priority: 100,
+      handler: (cell, context) => {
+        if (!cell) return cell
+
+        const rawStyle = cell.s
+        let base: Record<string, unknown> | undefined
+        if (typeof rawStyle === 'string') {
+          base = context.worksheet.getStyleDataByHash(rawStyle) as unknown as Record<string, unknown> | undefined
+        } else if (rawStyle && typeof rawStyle === 'object') {
+          base = rawStyle as Record<string, unknown>
+        }
+
+        if (base && base.vt !== undefined && base.vt !== null) return cell
+
+        return { ...cell, s: { ...(base || {}), vt: VerticalAlign.MIDDLE } as ICellData['s'] }
+      },
+    })
+  } catch (error) {
+    console.warn('Failed to register the sheet editor vertical alignment interceptor:', error)
+  }
+}
+
 function wrapWorksheetData(
   workbookId: string | number,
   sheet: Sheet,
@@ -714,11 +750,11 @@ function wrapWorksheetData(
     styles: cloneJsonSnapshot(normalizeUniverStyleMap(savedStyles) as IWorkbookData['styles']),
     sheetOrder: [sheetKey],
     sheets: {
-      [sheetKey]: {
+      [sheetKey]: ensureWorksheetVerticalAlign({
         ...worksheetSnapshot,
         id: sheetKey,
         name: sheet.name || worksheetSnapshot.name || 'Sheet1',
-      },
+      }),
     },
   }
 }
@@ -3327,6 +3363,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 		  disposeCreatedUniver()
 		  return
 		}
+		registerEditorVerticalAlignInterceptor(univerResult.univer)
 
 		const { univerAPI } = univerResult
         univerApiRef.current = univerResult

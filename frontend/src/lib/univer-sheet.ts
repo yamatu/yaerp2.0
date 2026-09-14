@@ -1,6 +1,31 @@
-import type { ICellData, IWorkbookData, IWorksheetData } from '@univerjs/core'
+import { VerticalAlign, type ICellData, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import type { ColumnDef, Row, Sheet } from '@/types'
 import { columnIndexToLetter } from './spreadsheet'
+
+/**
+ * Univer renders cell content bottom-aligned by default, and its inline cell
+ * editor inherits the same fallback. Pinning the worksheet default style to
+ * middle vertical alignment keeps cell text and the inline editor visually
+ * consistent (the editor previously looked misaligned because it does not read
+ * the worksheet default style the same way the cell renderer does).
+ *
+ * A default alignment explicitly configured by the user is preserved.
+ */
+export function ensureWorksheetVerticalAlign<T extends Partial<IWorksheetData>>(worksheet: T): T {
+  const current = worksheet.defaultStyle
+  if (typeof current === 'string') return worksheet
+  if (current && typeof current === 'object' && (current as Record<string, unknown>).vt !== undefined) {
+    return worksheet
+  }
+
+  return {
+    ...worksheet,
+    defaultStyle: {
+      ...(current && typeof current === 'object' ? (current as Record<string, unknown>) : {}),
+      vt: VerticalAlign.MIDDLE,
+    },
+  }
+}
 
 function normalizeRowsForUniver(rows: Row[]): Row[] {
   const normalized = rows
@@ -182,7 +207,7 @@ export function buildUniverWorkbookData(
     })
   })
 
-  const worksheetData: Partial<IWorksheetData> = {
+  const worksheetData: Partial<IWorksheetData> = ensureWorksheetVerticalAlign({
     id: sheetKey,
     name: sheet.name || 'Sheet1',
     tabColor: '',
@@ -215,7 +240,7 @@ export function buildUniverWorkbookData(
     columnHeader: { height: 30 },
     showGridlines: 1,
     rightToLeft: 0,
-  }
+  })
 
   return {
     id: `workbook-${workbookId}-sheet-${sheet.id}`,
