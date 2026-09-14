@@ -14,6 +14,8 @@
     "@univerjs/preset-sheets-data-validation": "^0.6.10",
     "@univerjs/preset-sheets-drawing": "^0.6.10",
     "@univerjs/preset-sheets-find-replace": "^0.6.10",
+    "@univerjs/preset-sheets-hyper-link": "^0.6.10",
+    "@univerjs/preset-sheets-sort": "^0.6.10",
     "@univerjs/presets": "^0.6.2",
     "@univerjs/sheets-drawing-ui": "^0.6.10",
     "class-variance-authority": "^0.7.0",

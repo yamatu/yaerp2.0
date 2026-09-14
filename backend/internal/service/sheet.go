@@ -1269,30 +1269,152 @@ func (s *SheetService) syncCellChangesToSnapshots(changes []model.CellUpdate) er
 }
 
 func (s *SheetService) PrepareSheetCellChanges(userID int64, existing, next *model.Sheet, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
-	if existing == nil || next == nil || len(changes) == 0 {
+	if existing == nil || next == nil {
 		return &model.CellUpdateResult{AppliedChanges: changes}, nil
 	}
-	collapsed, err := collapseCellChanges(changes)
+	result := &model.CellUpdateResult{AppliedChanges: changes}
+	if len(changes) > 0 {
+		collapsed, err := collapseCellChanges(changes)
+		if err != nil {
+			return nil, err
+		}
+		result = &model.CellUpdateResult{AppliedChanges: collapsed}
+		if s.cellApprovalInterceptor != nil {
+			result, err = s.cellApprovalInterceptor(userID, collapsed, source)
+			if err != nil {
+				return nil, err
+			}
+			if result == nil {
+				result = &model.CellUpdateResult{AppliedChanges: collapsed}
+			}
+		}
+		if len(result.RevertedChanges) > 0 {
+			next.Config, err = restoreWorksheetCellValues(existing.Config, next.Config, next.Columns, result.RevertedChanges)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	// The client sends a full worksheet snapshot, but only cells listed in the
+	// change set were actually edited locally. Preserve the server's value for
+	// every other cell so that a stale snapshot cannot overwrite concurrent
+	// edits made by other collaborators (last-write-wins on the whole sheet).
+	// This also covers style-only saves that carry no cell changes at all.
+	mergedConfig, err := mergeConcurrentCellValues(existing.Config, next.Config, next.Columns, result.AppliedChanges)
 	if err != nil {
 		return nil, err
 	}
-	result := &model.CellUpdateResult{AppliedChanges: collapsed}
-	if s.cellApprovalInterceptor != nil {
-		result, err = s.cellApprovalInterceptor(userID, collapsed, source)
-		if err != nil {
-			return nil, err
-		}
-		if result == nil {
-			result = &model.CellUpdateResult{AppliedChanges: collapsed}
-		}
-	}
-	if len(result.RevertedChanges) > 0 {
-		next.Config, err = restoreWorksheetCellValues(existing.Config, next.Config, next.Columns, result.RevertedChanges)
-		if err != nil {
-			return nil, err
-		}
-	}
+	next.Config = mergedConfig
 	return result, nil
+}
+
+// mergeConcurrentCellValues keeps the value of every cell that was not part of
+// the local change set, while still applying presentation changes (styles and
+// other non-value fields) from the incoming snapshot. Cells that were edited
+// locally keep the incoming value.
+func mergeConcurrentCellValues(existingConfig, nextConfig, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, error) {
+	if len(existingConfig) == 0 || len(nextConfig) == 0 {
+		return nextConfig, nil
+	}
+	var existingPayload, nextPayload map[string]interface{}
+	if err := json.Unmarshal(existingConfig, &existingPayload); err != nil {
+		return nil, fmt.Errorf("parse existing sheet config: %w", err)
+	}
+	if err := json.Unmarshal(nextConfig, &nextPayload); err != nil {
+		return nil, fmt.Errorf("parse next sheet config: %w", err)
+	}
+	existingCells := ensureCellDataMap(existingPayload)
+	nextCells := ensureCellDataMap(nextPayload)
+	if existingCells == nil || nextCells == nil {
+		return nextConfig, nil
+	}
+	columnKeys, err := parseColumnKeys(columns)
+	if err != nil {
+		return nil, err
+	}
+	columnIndexes := make(map[string]int, len(columnKeys))
+	for index, key := range columnKeys {
+		columnIndexes[key] = index
+	}
+	localChanges := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		columnIndex, exists := columnIndexes[change.Col]
+		if !exists || change.Row < 0 {
+			continue
+		}
+		localChanges[strconv.Itoa(change.Row+1)+":"+strconv.Itoa(columnIndex)] = struct{}{}
+	}
+	for rowKey, existingRow := range existingCells {
+		existingRowMap, ok := existingRow.(map[string]interface{})
+		if !ok || existingRowMap == nil {
+			continue
+		}
+		nextRow, _ := nextCells[rowKey].(map[string]interface{})
+		for columnKey, existingCell := range existingRowMap {
+			if _, changed := localChanges[rowKey+":"+columnKey]; changed {
+				continue
+			}
+			existingCellMap, existingIsMap := existingCell.(map[string]interface{})
+			if !existingIsMap || existingCellMap == nil {
+				continue
+			}
+			var nextCell map[string]interface{}
+			if nextRow != nil {
+				nextCell, _ = nextRow[columnKey].(map[string]interface{})
+			}
+			if nextCell == nil {
+				// The client dropped the cell even though it never edited it.
+				// Restore the server value so concurrent edits are not erased.
+				if nextRow == nil {
+					nextRow = make(map[string]interface{})
+					nextCells[rowKey] = nextRow
+				}
+				nextRow[columnKey] = existingCell
+				continue
+			}
+			if valuesEqual(nextCell["v"], existingCellMap["v"]) && valuesEqual(nextCell["f"], existingCellMap["f"]) {
+				continue
+			}
+			// Keep the local presentation (e.g. style) but restore the server value.
+			copyCellValueFields(nextCell, existingCellMap)
+			if nextRow == nil {
+				nextRow = make(map[string]interface{})
+				nextCells[rowKey] = nextRow
+			}
+			nextRow[columnKey] = nextCell
+		}
+	}
+	encoded, err := json.Marshal(nextPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged sheet config: %w", err)
+	}
+	return encoded, nil
+}
+
+func ensureCellDataMap(payload map[string]interface{}) map[string]interface{} {
+	if payload == nil {
+		return nil
+	}
+	sheetData, _ := payload["univerSheetData"].(map[string]interface{})
+	if sheetData == nil {
+		return nil
+	}
+	cellData, _ := sheetData["cellData"].(map[string]interface{})
+	if cellData == nil {
+		cellData = make(map[string]interface{})
+		sheetData["cellData"] = cellData
+	}
+	return cellData
+}
+
+func copyCellValueFields(target, source map[string]interface{}) {
+	for _, key := range []string{"v", "f"} {
+		if value, ok := source[key]; ok {
+			target[key] = value
+		} else {
+			delete(target, key)
+		}
+	}
 }
 
 func restoreWorksheetCellValues(existingConfig, nextConfig, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, error) {
