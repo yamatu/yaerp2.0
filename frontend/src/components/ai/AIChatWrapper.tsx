@@ -37,6 +37,13 @@ export default function AIChatWrapper() {
     return () => window.removeEventListener('yaerp:ai-compose', openComposer)
   }, [setChatOpen])
 
+  // Let page-level floating widgets (e.g. the spreadsheet tool stack) react to
+  // the panel so they never fight for the same corner of the screen.
+  useEffect(() => {
+    document.body.classList.toggle('ai-panel-open', chatOpen)
+    return () => document.body.classList.remove('ai-panel-open')
+  }, [chatOpen])
+
   if (!mounted || !chatPreferenceReady) return null
   if (!isAuthenticated()) return null
   if (hidden && !chatOpen) return null
