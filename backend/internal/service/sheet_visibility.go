@@ -215,22 +215,28 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 	if isAdmin || len(nextConfig) == 0 {
 		return nextConfig, nil
 	}
-	_, protections, _, err := parseSheetConfigProtection(existingConfig)
-	if err != nil {
-		return nil, err
-	}
 	matrix, err := s.permService.GetPermissionMatrix(sheetID, userID)
 	if err != nil {
 		return nil, err
+	}
+	// Only decode protection state when the config actually carries any, which
+	// lets the common unprotected sheet skip a full snapshot decode.
+	var protections protectionMaps
+	if configHasProtectionFields(existingConfig) {
+		if _, parsed, _, err := parseSheetConfigProtection(existingConfig); err != nil {
+			return nil, err
+		} else {
+			protections = parsed
+		}
+	}
+	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
+		return nextConfig, nil
 	}
 	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
 	if err != nil {
 		return nil, err
 	}
 	departmentSet := int64Set(departmentIDs)
-	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
-		return nextConfig, nil
-	}
 	columnKeys, err := parseColumnKeys(columns)
 	if err != nil {
 		return nil, err

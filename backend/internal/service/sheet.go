@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -777,10 +778,7 @@ func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.S
 		return err
 	}
 	sheet.Config = restoredConfig
-	if err := s.ensureEditableCellsAuthorized(userID, existing, sheet); err != nil {
-		return err
-	}
-	if err := s.ensureProtectedCellsUnchanged(userID, existing, sheet); err != nil {
+	if err := s.ensureCellMutationsAuthorized(userID, existing, sheet); err != nil {
 		return err
 	}
 
@@ -1312,22 +1310,40 @@ func (s *SheetService) PrepareSheetCellChanges(userID int64, existing, next *mod
 // the local change set, while still applying presentation changes (styles and
 // other non-value fields) from the incoming snapshot. Cells that were edited
 // locally keep the incoming value.
+//
+// Only raw JSON is inspected, so untouched cells are forwarded verbatim instead
+// of being decoded and re-encoded, and the config is re-marshalled only when a
+// cell actually had to be restored.
 func mergeConcurrentCellValues(existingConfig, nextConfig, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, error) {
 	if len(existingConfig) == 0 || len(nextConfig) == 0 {
 		return nextConfig, nil
 	}
-	var existingPayload, nextPayload map[string]interface{}
-	if err := json.Unmarshal(existingConfig, &existingPayload); err != nil {
+	existingCells, err := decodeRawCellData(existingConfig)
+	if err != nil {
 		return nil, fmt.Errorf("parse existing sheet config: %w", err)
 	}
+	if existingCells == nil {
+		return nextConfig, nil
+	}
+	var nextPayload map[string]json.RawMessage
 	if err := json.Unmarshal(nextConfig, &nextPayload); err != nil {
 		return nil, fmt.Errorf("parse next sheet config: %w", err)
 	}
-	existingCells := ensureCellDataMap(existingPayload)
-	nextCells := ensureCellDataMap(nextPayload)
-	if existingCells == nil || nextCells == nil {
+	nextSheetRaw, hasSheet := nextPayload["univerSheetData"]
+	if !hasSheet || len(nextSheetRaw) == 0 {
 		return nextConfig, nil
 	}
+	var nextSheet map[string]json.RawMessage
+	if err := json.Unmarshal(nextSheetRaw, &nextSheet); err != nil {
+		return nextConfig, nil
+	}
+	nextCells := map[string]map[string]json.RawMessage{}
+	if rawCells, ok := nextSheet["cellData"]; ok && len(rawCells) > 0 {
+		if err := json.Unmarshal(rawCells, &nextCells); err != nil {
+			return nextConfig, nil
+		}
+	}
+
 	columnKeys, err := parseColumnKeys(columns)
 	if err != nil {
 		return nil, err
@@ -1344,77 +1360,137 @@ func mergeConcurrentCellValues(existingConfig, nextConfig, columns json.RawMessa
 		}
 		localChanges[strconv.Itoa(change.Row+1)+":"+strconv.Itoa(columnIndex)] = struct{}{}
 	}
+
+	mutated := false
 	for rowKey, existingRow := range existingCells {
-		existingRowMap, ok := existingRow.(map[string]interface{})
-		if !ok || existingRowMap == nil {
-			continue
-		}
-		nextRow, _ := nextCells[rowKey].(map[string]interface{})
-		for columnKey, existingCell := range existingRowMap {
+		nextRow := nextCells[rowKey]
+		for columnKey, existingCellRaw := range existingRow {
 			if _, changed := localChanges[rowKey+":"+columnKey]; changed {
 				continue
 			}
-			existingCellMap, existingIsMap := existingCell.(map[string]interface{})
-			if !existingIsMap || existingCellMap == nil {
+			existingFields, ok := decodeCellValueFields(existingCellRaw)
+			if !ok {
 				continue
 			}
-			var nextCell map[string]interface{}
-			if nextRow != nil {
-				nextCell, _ = nextRow[columnKey].(map[string]interface{})
-			}
-			if nextCell == nil {
+			nextCellRaw, hasNextCell := nextRow[columnKey]
+			if !hasNextCell {
 				// The client dropped the cell even though it never edited it.
 				// Restore the server value so concurrent edits are not erased.
 				if nextRow == nil {
-					nextRow = make(map[string]interface{})
+					nextRow = map[string]json.RawMessage{}
 					nextCells[rowKey] = nextRow
 				}
-				nextRow[columnKey] = existingCell
+				nextRow[columnKey] = existingCellRaw
+				mutated = true
 				continue
 			}
-			if valuesEqual(nextCell["v"], existingCellMap["v"]) && valuesEqual(nextCell["f"], existingCellMap["f"]) {
+			nextFields, ok := decodeCellValueFields(nextCellRaw)
+			if !ok {
+				continue
+			}
+			if bytes.Equal(nextFields.V, existingFields.V) && bytes.Equal(nextFields.F, existingFields.F) {
 				continue
 			}
 			// Keep the local presentation (e.g. style) but restore the server value.
-			copyCellValueFields(nextCell, existingCellMap)
+			mergedCell, err := mergeCellValueFieldsJSON(nextCellRaw, existingFields)
+			if err != nil {
+				return nil, err
+			}
 			if nextRow == nil {
-				nextRow = make(map[string]interface{})
+				nextRow = map[string]json.RawMessage{}
 				nextCells[rowKey] = nextRow
 			}
-			nextRow[columnKey] = nextCell
+			nextRow[columnKey] = mergedCell
+			mutated = true
 		}
 	}
-	encoded, err := json.Marshal(nextPayload)
+	if !mutated {
+		return nextConfig, nil
+	}
+
+	encodedCells, err := json.Marshal(nextCells)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged cell data: %w", err)
+	}
+	nextSheet["cellData"] = encodedCells
+	encodedSheet, err := json.Marshal(nextSheet)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged worksheet: %w", err)
+	}
+	nextPayload["univerSheetData"] = encodedSheet
+	encodedConfig, err := json.Marshal(nextPayload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal merged sheet config: %w", err)
 	}
-	return encoded, nil
+	return encodedConfig, nil
 }
 
-func ensureCellDataMap(payload map[string]interface{}) map[string]interface{} {
-	if payload == nil {
-		return nil
-	}
-	sheetData, _ := payload["univerSheetData"].(map[string]interface{})
-	if sheetData == nil {
-		return nil
-	}
-	cellData, _ := sheetData["cellData"].(map[string]interface{})
-	if cellData == nil {
-		cellData = make(map[string]interface{})
-		sheetData["cellData"] = cellData
-	}
-	return cellData
+// rawCellValueFields captures only the value bearing fields of a cell.
+type rawCellValueFields struct {
+	V json.RawMessage `json:"v"`
+	F json.RawMessage `json:"f"`
 }
 
-func copyCellValueFields(target, source map[string]interface{}) {
-	for _, key := range []string{"v", "f"} {
-		if value, ok := source[key]; ok {
-			target[key] = value
-		} else {
-			delete(target, key)
+// decodeRawCellData extracts the worksheet cell map while keeping every cell as
+// raw JSON. Cell payloads are never materialised into Go values, which makes
+// this an order of magnitude cheaper than decoding the whole config into
+// map[string]interface{}.
+func decodeRawCellData(config json.RawMessage) (map[string]map[string]json.RawMessage, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return nil, err
+	}
+	sheetRaw, ok := payload["univerSheetData"]
+	if !ok || len(sheetRaw) == 0 {
+		return nil, nil
+	}
+	var sheet map[string]json.RawMessage
+	if err := json.Unmarshal(sheetRaw, &sheet); err != nil {
+		return nil, nil
+	}
+	cellRaw, ok := sheet["cellData"]
+	if !ok || len(cellRaw) == 0 {
+		return nil, nil
+	}
+	var cells map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(cellRaw, &cells); err != nil {
+		return nil, nil
+	}
+	return cells, nil
+}
+
+func decodeCellValueFields(raw json.RawMessage) (rawCellValueFields, bool) {
+	var fields rawCellValueFields
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fields, false
+	}
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
+		return fields, false
+	}
+	return fields, true
+}
+
+// mergeCellValueFieldsJSON overwrites the value fields of a locally held cell
+// with the server's values while preserving every other field (style, rich text
+// and so on).
+func mergeCellValueFieldsJSON(localRaw json.RawMessage, serverFields rawCellValueFields) (json.RawMessage, error) {
+	var local map[string]json.RawMessage
+	if err := json.Unmarshal(localRaw, &local); err != nil {
+		return nil, fmt.Errorf("parse cell data: %w", err)
+	}
+	for key, value := range map[string]json.RawMessage{"v": serverFields.V, "f": serverFields.F} {
+		if len(value) == 0 {
+			delete(local, key)
+			continue
 		}
+		local[key] = value
 	}
+	encoded, err := json.Marshal(local)
+	if err != nil {
+		return nil, fmt.Errorf("marshal cell data: %w", err)
+	}
+	return encoded, nil
 }
 
 func restoreWorksheetCellValues(existingConfig, nextConfig, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, error) {
@@ -2583,7 +2659,11 @@ func buildProtectionMessage(scope, ownerName string, rowIndex int, colKey string
 	}
 }
 
-func (s *SheetService) ensureProtectedCellsUnchanged(userID int64, existing, next *model.Sheet) error {
+// ensureCellMutationsAuthorized validates every cell the client actually
+// changed in one pass: each modified cell must be writable for this user and
+// must not be protected. Permission lookups and config decoding are shared
+// between both checks so a save does not pay for the same work twice.
+func (s *SheetService) ensureCellMutationsAuthorized(userID int64, existing, next *model.Sheet) error {
 	accessCache, err := newSheetCellAccessCache(s.permService, userID, existing.ID, existing.Config, true)
 	if err != nil {
 		return err
@@ -2635,71 +2715,12 @@ func (s *SheetService) ensureProtectedCellsUnchanged(userID int64, existing, nex
 			continue
 		}
 
-		protected, reason := accessCache.checkProtection(columnKeys[columnIndex], worksheetRow, userID)
-		if protected {
-			return fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
-		}
-	}
-
-	return nil
-}
-
-func (s *SheetService) ensureEditableCellsAuthorized(userID int64, existing, next *model.Sheet) error {
-	accessCache, err := newSheetCellAccessCache(s.permService, userID, existing.ID, existing.Config, false)
-	if err != nil {
-		return err
-	}
-	if accessCache.isAdmin {
-		return nil
-	}
-
-	currentCells := extractUniverCellData(existing.Config)
-	nextCells := extractUniverCellData(next.Config)
-	if len(currentCells) == 0 && len(nextCells) == 0 {
-		return nil
-	}
-
-	columnKeys, err := parseColumnKeys(next.Columns)
-	if err != nil {
-		return err
-	}
-	if len(columnKeys) == 0 {
-		columnKeys, err = parseColumnKeys(existing.Columns)
-		if err != nil {
-			return err
-		}
-	}
-
-	keys := make(map[string]struct{}, len(currentCells)+len(nextCells))
-	for key := range currentCells {
-		keys[key] = struct{}{}
-	}
-	for key := range nextCells {
-		keys[key] = struct{}{}
-	}
-
-	for key := range keys {
-		if currentCells[key] == nextCells[key] {
-			continue
-		}
-
-		parts := strings.SplitN(key, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		worksheetRow, err := strconv.Atoi(parts[0])
-		if err != nil || worksheetRow < 0 {
-			continue
-		}
-		columnIndex, err := strconv.Atoi(parts[1])
-		if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) {
-			continue
-		}
-
 		columnKey := columnKeys[columnIndex]
-		allowed := accessCache.allowsCell(columnKey, worksheetRow, "write")
-		if !allowed {
+		if !accessCache.allowsCell(columnKey, worksheetRow, "write") {
 			return fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, columnKey, worksheetRow+1)
+		}
+		if protected, reason := accessCache.checkProtection(columnKey, worksheetRow, userID); protected {
+			return fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
 		}
 	}
 
@@ -2872,7 +2893,38 @@ func removeColumnProtectionState(config json.RawMessage, removedColumns map[stri
 	return encoded, nil
 }
 
+// configHasProtectionFields reports whether a sheet config carries any cell or
+// row protection state. It only scans the two relevant top level fields, which
+// is dramatically cheaper than decoding the whole worksheet snapshot.
+func configHasProtectionFields(config json.RawMessage) bool {
+	if len(config) == 0 {
+		return false
+	}
+	var meta struct {
+		Protections json.RawMessage `json:"protections"`
+		LockedCells json.RawMessage `json:"lockedCells"`
+	}
+	if err := json.Unmarshal(config, &meta); err != nil {
+		return true
+	}
+	return hasRawJSONContent(meta.Protections) || hasRawJSONContent(meta.LockedCells)
+}
+
+func hasRawJSONContent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return !bytes.Equal(trimmed, []byte("null")) && !bytes.Equal(trimmed, []byte("{}"))
+}
+
 func mergeProtectionState(existingConfig, nextConfig json.RawMessage) (json.RawMessage, error) {
+	// Fast path: with no protection state on either side there is nothing to
+	// merge, so the snapshot can be forwarded untouched instead of being fully
+	// decoded and re-encoded.
+	if !configHasProtectionFields(existingConfig) && !configHasProtectionFields(nextConfig) {
+		return nextConfig, nil
+	}
 	nextPayload, _, _, err := parseSheetConfigProtection(nextConfig)
 	if err != nil {
 		return nil, err
