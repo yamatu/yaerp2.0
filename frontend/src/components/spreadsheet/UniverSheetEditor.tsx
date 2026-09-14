@@ -3434,7 +3434,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               const snap = latestSheetRef.current
               const saved = workbookApi.save()
               const savedSheetId = saved.sheetOrder[0]
-              let savedSheet = cloneJsonSnapshot(saved.sheets[savedSheetId] as Partial<IWorksheetData>)
+              // Workbook.save() already returns a deep clone of the live sheet, so
+              // the snapshot is used directly instead of being cloned a second time.
+              let savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData> | undefined
               if (!savedSheet) continue
 
               const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [], saved.styles as Record<string, unknown> | undefined)
@@ -3449,26 +3451,29 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 univerSheetData: savedSheet,
                 univerStyles: mergeUniverStyleMap(
                   currentConfig.univerStyles as Record<string, unknown> | undefined,
-                  cloneJsonSnapshot(saved.styles as Record<string, unknown> | undefined)
+                  saved.styles as Record<string, unknown> | undefined
                 ),
               }
               const nextSheetName = snap.name || savedSheet.name || 'Sheet1'
               const nextFrozen = snap.frozen || { row: 0, col: 0 }
+              // Cell changes already imply a change, so the expensive whole-config
+              // comparison only runs for saves that carry no tracked cell edits.
               const hasSnapshotChanged =
+                cellChanges.length > 0 ||
                 nextSheetName !== snap.name ||
                 !areJsonSnapshotsEqual(nextColumns, snap.columns || []) ||
                 !areJsonSnapshotsEqual(nextFrozen, snap.frozen || { row: 0, col: 0 }) ||
                 !areJsonSnapshotsEqual(nextConfig, currentConfig)
 
-              if (!hasSnapshotChanged && cellChanges.length === 0) {
+              if (!hasSnapshotChanged) {
                 latestSheetRef.current = {
                   ...snap,
                   name: nextSheetName,
                   columns: nextColumns,
                   frozen: nextFrozen,
-                  config: cloneJsonSnapshot(nextConfig),
+                  config: nextConfig,
                 }
-                persistedWorksheetDataRef.current = cloneJsonSnapshot(savedSheet)
+                persistedWorksheetDataRef.current = savedSheet
                 continue
               }
 
@@ -3522,9 +3527,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 name: nextSheetName,
                 columns: nextColumns,
                 frozen: nextFrozen,
-                config: cloneJsonSnapshot(nextConfig),
+                config: nextConfig,
               }
-              persistedWorksheetDataRef.current = cloneJsonSnapshot(savedSheet)
+              persistedWorksheetDataRef.current = savedSheet
             }
           }
 
