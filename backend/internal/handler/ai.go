@@ -83,6 +83,18 @@ func (h *AIHandler) Chat(c *gin.Context) {
 	response.OK(c, result)
 }
 
+// MyPermissions returns the effective permissions of the calling account so the
+// web client can show every employee exactly which features and data they may
+// use (the agent reads the same snapshot through get_my_permissions).
+func (h *AIHandler) MyPermissions(c *gin.Context) {
+	snapshot, err := h.aiService.BuildUserPermissionSnapshot(c.GetInt64("user_id"))
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, snapshot)
+}
+
 func (h *AIHandler) GetConfig(c *gin.Context) {
 	status := h.aiService.GetConfig()
 	response.OK(c, status)

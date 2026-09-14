@@ -111,10 +111,10 @@ export const BUSINESS_MODULES: AppModule[] = [
   {
     id: 'settings',
     label: '个人设置',
-    description: '账号资料、密码与偏好',
+    description: '账号资料、我的权限、密码与偏好',
     href: '/settings',
     icon: UserRound,
-    keywords: ['settings', 'profile', 'shezhi', '设置', '密码', '偏好'],
+    keywords: ['settings', 'profile', 'shezhi', '设置', '密码', '偏好', '权限', 'quanxian', 'permission', '我的权限'],
   },
 ]
 

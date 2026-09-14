@@ -523,6 +523,7 @@ func main() {
 
 		// AI Chat
 		api.GET("/ai/assistants", aiHandler.ListAvailableAssistants)
+		api.GET("/me/permissions", aiHandler.MyPermissions)
 		api.POST("/ai/chat", aiHandler.Chat)
 		api.POST("/ai/spreadsheet/apply", aiHandler.ApplySpreadsheetPlan)
 		api.POST("/ai/erp/apply", aiHandler.ApplyERPPlan)
