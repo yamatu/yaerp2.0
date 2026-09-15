@@ -396,6 +396,13 @@ export default function ChannelsPage() {
 
   const [previewImageMessage, setPreviewImageMessage] = useState<ChannelMessage | null>(null)
   const [imageZoom, setImageZoom] = useState(1)
+  const previewableImages = useMemo(
+    () => messages.filter((message) => !message.recalled_at && isImageMessage(message) && Boolean(message.attachment_url)),
+    [messages],
+  )
+  const previewImageIndex = previewImageMessage
+    ? previewableImages.findIndex((message) => message.id === previewImageMessage.id)
+    : -1
   const [transformingMessageImage, setTransformingMessageImage] = useState<ImageTransform | null>(null)
   const [previewDirectoryId, setPreviewDirectoryId] = useState('')
   const [savingImage, setSavingImage] = useState(false)
@@ -2134,6 +2141,29 @@ export default function ChannelsPage() {
     }
   }
 
+  // Arrow keys walk the images of the current channel, Escape closes the viewer.
+  useEffect(() => {
+    if (!previewImageMessage) return
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (transformingMessageImage) return
+        event.preventDefault()
+        setPreviewImageMessage(null)
+        setImageZoom(1)
+        return
+      }
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+      if (transformingMessageImage || previewableImages.length < 2 || previewImageIndex < 0) return
+      event.preventDefault()
+      const next = previewableImages[(previewImageIndex + (event.key === 'ArrowRight' ? 1 : -1) + previewableImages.length) % previewableImages.length]
+      if (!next) return
+      setPreviewImageMessage(next)
+      setImageZoom(1)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [previewImageIndex, previewImageMessage, previewableImages, transformingMessageImage])
+
   const handleTransformMessageImage = async (transform: ImageTransform) => {
     const message = previewImageMessage
     if (!message?.attachment_url || !message.attachment_id || transformingMessageImage) return
@@ -3696,7 +3726,17 @@ export default function ChannelsPage() {
         {previewImageMessage?.attachment_url && (
           <div className="fixed inset-0 z-[60] flex flex-col bg-slate-950/95" onMouseDown={(event) => { if (event.target === event.currentTarget && !transformingMessageImage) setPreviewImageMessage(null) }}>
             <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-3 text-white md:px-5">
-              <div className="min-w-0 truncate text-sm text-slate-300">{previewImageMessage.attachment_filename || '频道图片'}</div>
+              <div className="flex min-w-0 items-center gap-2">
+                <div className="min-w-0 truncate text-sm text-slate-300">{previewImageMessage.attachment_filename || '频道图片'}</div>
+                {previewableImages.length > 1 && previewImageIndex >= 0 && (
+                  <span className="shrink-0 rounded-full bg-white/10 px-2 py-0.5 text-[11px] tabular-nums text-slate-300">
+                    {previewImageIndex + 1} / {previewableImages.length}
+                  </span>
+                )}
+                {previewImageIndex < 0 && (
+                  <span className="shrink-0 rounded-full bg-white/10 px-2 py-0.5 text-[11px] text-slate-300">独立图片</span>
+                )}
+              </div>
               <div className="flex items-center gap-1">
                 <button type="button" onClick={() => setImageZoom((value) => Math.max(0.5, value - 0.25))} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="缩小"><ZoomOut className="h-4 w-4" /></button>
                 <button type="button" onClick={() => setImageZoom(1)} className="inline-flex h-9 min-w-12 items-center justify-center rounded-lg px-2 text-xs text-slate-300 hover:bg-white/10 hover:text-white" title="恢复原始缩放">{Math.round(imageZoom * 100)}%</button>
@@ -3707,8 +3747,32 @@ export default function ChannelsPage() {
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto p-4" onWheel={(event) => { if (!event.ctrlKey && !event.metaKey) return; event.preventDefault(); setImageZoom((value) => Math.min(3, Math.max(0.5, value + (event.deltaY < 0 ? 0.15 : -0.15)))) }}>
-              <div className="flex min-h-full min-w-full items-center justify-center">
+              <div className="flex min-h-full min-w-full items-center justify-center gap-2">
+                {previewableImages.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => { const index = previewImageIndex; const next = previewableImages[(index - 1 + previewableImages.length) % previewableImages.length]; if (next) { setPreviewImageMessage(next); setImageZoom(1) } }}
+                    disabled={Boolean(transformingMessageImage)}
+                    className="sticky left-0 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-black/50 text-white transition hover:bg-black/70 disabled:opacity-40"
+                    title="上一张（←）"
+                    aria-label="上一张图片"
+                  >
+                    <ChevronLeft className="h-5 w-5" />
+                  </button>
+                )}
                 <img src={previewImageMessage.attachment_url} alt={previewImageMessage.attachment_filename || '频道图片'} className={`max-h-[calc(100vh-9rem)] max-w-[calc(100vw-2rem)] object-contain transition duration-150 ${transformingMessageImage ? 'opacity-60' : ''}`} style={{ transform: `scale(${imageZoom})` }} />
+                {previewableImages.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => { const index = previewImageIndex; const next = previewableImages[(index + 1) % previewableImages.length]; if (next) { setPreviewImageMessage(next); setImageZoom(1) } }}
+                    disabled={Boolean(transformingMessageImage)}
+                    className="sticky right-0 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-black/50 text-white transition hover:bg-black/70 disabled:opacity-40"
+                    title="下一张（→）"
+                    aria-label="下一张图片"
+                  >
+                    <ChevronRight className="h-5 w-5" />
+                  </button>
+                )}
               </div>
             </div>
 

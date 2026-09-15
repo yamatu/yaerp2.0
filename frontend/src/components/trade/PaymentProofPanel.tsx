@@ -2,14 +2,13 @@
 
 import { useRef, useState, type DragEvent, type KeyboardEvent } from "react";
 import {
-  ExternalLink,
   FileText,
   ImagePlus,
   Loader2,
   Trash2,
   Upload,
-  X,
 } from "lucide-react";
+import { FilePreviewModal, type FilePreviewItem } from "@/components/ui/FilePreviewModal";
 import type { TradePaymentProof } from "@/types";
 
 interface PaymentProofPanelProps {
@@ -56,7 +55,19 @@ export function PaymentProofPanel({
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
-  const [preview, setPreview] = useState<TradePaymentProof | null>(null);
+  const [previewKey, setPreviewKey] = useState<string | null>(null);
+
+  // Payment proofs are browsed as one list so the viewer can move between them.
+  const previewItems: FilePreviewItem[] = proofs.map((proof) => ({
+    key: String(proof.id),
+    name: proof.filename || "付款凭证",
+    url: proof.attachment_url,
+    mimeType: proof.mime_type || undefined,
+    size: proof.size,
+    meta: proof.uploaded_by_name || undefined,
+  }));
+  const previewIndex = previewKey ? Math.max(0, previewItems.findIndex((item) => item.key === previewKey)) : -1;
+  const previewProof = previewIndex >= 0 ? proofs[previewIndex] : null;
 
   const submitFiles = (files: File[]) => {
     const supported = files.filter(isSupportedFile);
@@ -89,7 +100,7 @@ export function PaymentProofPanel({
   const deleteProof = async (proof: TradePaymentProof) => {
     if (!canDelete || !onDelete || deletingID) return;
     await onDelete(proof);
-    if (preview?.id === proof.id) setPreview(null);
+    if (previewProof?.id === proof.id) setPreviewKey(null);
   };
 
   return (
@@ -102,7 +113,7 @@ export function PaymentProofPanel({
               <div key={proof.id} className="group relative min-w-0">
                 <button
                   type="button"
-                  onClick={() => setPreview(proof)}
+                  onClick={() => setPreviewKey(String(proof.id))}
                   className="w-full min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white text-left hover:border-emerald-300 hover:shadow-sm"
                   title={`预览 ${proof.filename || "付款凭证"}`}
                 >
@@ -220,77 +231,31 @@ export function PaymentProofPanel({
       )}
       {error && <div className="text-xs text-amber-700">{error}</div>}
 
-      {preview && (
-        <div
-          className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/70 p-3 sm:p-6"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setPreview(null);
-          }}
-        >
-          <div className="flex max-h-[94vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
-            <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-semibold text-slate-900">
-                  {preview.filename || "付款凭证"}
-                </div>
-                <div className="mt-0.5 text-xs text-slate-400">
-                  {[preview.uploaded_by_name, formatFileSize(preview.size)]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-1">
-                {canDelete && onDelete && (
-                  <button
-                    type="button"
-                    onClick={() => void deleteProof(preview)}
-                    disabled={Boolean(deletingID)}
-                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-600 hover:bg-rose-50 disabled:opacity-50"
-                    title="删除付款凭证"
-                  >
-                    {deletingID === preview.id ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-4 w-4" />
-                    )}
-                  </button>
+      {previewProof && previewIndex >= 0 && (
+        <FilePreviewModal
+          items={previewItems}
+          index={previewIndex}
+          onIndexChange={(next) => setPreviewKey(previewItems[next]?.key ?? null)}
+          onClose={() => setPreviewKey(null)}
+          headerActions={
+            canDelete && onDelete ? (
+              <button
+                type="button"
+                onClick={() => void deleteProof(previewProof)}
+                disabled={Boolean(deletingID)}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-rose-300 transition hover:bg-rose-500/20 hover:text-rose-100 disabled:opacity-40"
+                title="删除付款凭证"
+                aria-label="删除付款凭证"
+              >
+                {deletingID === previewProof.id ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Trash2 className="h-4 w-4" />
                 )}
-                <a
-                  href={preview.attachment_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
-                  title="在新窗口打开"
-                >
-                  <ExternalLink className="h-4 w-4" />
-                </a>
-                <button
-                  type="button"
-                  onClick={() => setPreview(null)}
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
-                  title="关闭预览"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            </div>
-            <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-2 sm:p-4">
-              {isImageProof(preview) ? (
-                <img
-                  src={preview.attachment_url}
-                  alt={preview.filename || "付款凭证"}
-                  className="mx-auto max-h-[78vh] max-w-full object-contain"
-                />
-              ) : (
-                <iframe
-                  src={preview.attachment_url}
-                  title={preview.filename || "付款凭证 PDF"}
-                  className="h-[78vh] w-full rounded-md bg-white"
-                />
-              )}
-            </div>
-          </div>
-        </div>
+              </button>
+            ) : null
+          }
+        />
       )}
     </div>
   );

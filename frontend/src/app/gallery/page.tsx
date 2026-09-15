@@ -4,6 +4,8 @@ import { useEffect, useState, useRef, useCallback, useMemo, type MouseEvent as R
 import {
   ArrowLeft,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Download,
   FlipHorizontal2,
   FlipVertical2,
@@ -382,6 +384,41 @@ export default function GalleryPage() {
     } finally {
       setSavingRename(false)
     }
+  }
+
+  // Arrow keys walk the current page while the preview is open, so someone can
+  // review a batch of uploaded images without closing the viewer each time.
+  useEffect(() => {
+    if (!preview) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setPreview(null)
+        setTransformError('')
+        return
+      }
+      if (transformingImage) return
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+      const index = images.findIndex((image) => image.id === preview.id)
+      if (index < 0) return
+      const next = images[(index + (event.key === 'ArrowRight' ? 1 : -1) + images.length) % images.length]
+      if (!next) return
+      event.preventDefault()
+      setPreview(next)
+      setTransformError('')
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [images, preview, transformingImage])
+
+  const stepPreview = (delta: number) => {
+    if (!preview || transformingImage) return
+    const index = images.findIndex((image) => image.id === preview.id)
+    if (index < 0) return
+    const next = images[(index + delta + images.length) % images.length]
+    if (!next) return
+    setPreview(next)
+    setTransformError('')
   }
 
   const handleTransformImage = async (transform: ImageTransform) => {
@@ -779,9 +816,35 @@ export default function GalleryPage() {
                 onClick={() => { setPreview(null); setTransformError('') }}
                 disabled={Boolean(transformingImage)}
                 className="absolute -right-3 -top-3 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-white text-slate-700 shadow-lg transition hover:bg-slate-100 disabled:opacity-40"
+                title="关闭预览（Esc）"
+                aria-label="关闭预览"
               >
                 <X className="h-4 w-4" />
               </button>
+              {images.length > 1 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => stepPreview(-1)}
+                    disabled={Boolean(transformingImage)}
+                    className="absolute left-1 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white transition hover:bg-black/70 disabled:opacity-40 sm:-left-14 sm:bg-white/15"
+                    title="上一张（←）"
+                    aria-label="上一张图片"
+                  >
+                    <ChevronLeft className="h-5 w-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => stepPreview(1)}
+                    disabled={Boolean(transformingImage)}
+                    className="absolute right-1 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white transition hover:bg-black/70 disabled:opacity-40 sm:-right-14 sm:bg-white/15"
+                    title="下一张（→）"
+                    aria-label="下一张图片"
+                  >
+                    <ChevronRight className="h-5 w-5" />
+                  </button>
+                </>
+              )}
               <img
                 src={preview.url}
                 alt={preview.filename}
@@ -789,7 +852,14 @@ export default function GalleryPage() {
               />
               <div className="mt-3 flex w-full max-w-2xl flex-col items-stretch gap-2 rounded-lg bg-black/35 px-3 py-2.5 text-left backdrop-blur-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
                 <div className="min-w-0 sm:flex-1">
-                  <p className="truncate text-sm font-medium text-white">{preview.filename}</p>
+                  <p className="truncate text-sm font-medium text-white">
+                    {preview.filename}
+                    {images.length > 1 && (
+                      <span className="ml-2 text-xs font-normal tabular-nums text-white/60">
+                        {Math.max(1, images.findIndex((image) => image.id === preview.id) + 1)} / {images.length}
+                      </span>
+                    )}
+                  </p>
                   <p className="mt-0.5 truncate text-xs text-white/60">上传者：{preview.uploader_name || `用户 #${preview.uploader_id}`} · {formatSize(preview.size)}</p>
                 </div>
                 <div className="flex w-full items-center justify-between gap-1 sm:w-auto sm:justify-end sm:gap-1.5">
