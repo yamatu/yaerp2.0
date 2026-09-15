@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -29,6 +30,14 @@ import (
 )
 
 const whatsappMaxSendBytes = 25 * 1024 * 1024
+
+// whatsAppStatusTimeout keeps a hung sidecar from blocking the login and
+// account pages, which poll the status every few seconds.
+const whatsAppStatusTimeout = 8 * time.Second
+
+// whatsAppStatusRefreshConcurrency bounds how many employee sessions the admin
+// account list probes at the same time.
+const whatsAppStatusRefreshConcurrency = 4
 
 var whatsappSettingKeys = []string{
 	"whatsapp_enabled", "whatsapp_auto_start", "whatsapp_proxy_type", "whatsapp_proxy_host",
@@ -233,11 +242,35 @@ func (s *WhatsAppService) ListAccounts(requesterID int64) ([]model.WhatsAppAccou
 	if err != nil {
 		return nil, err
 	}
+	s.refreshAccountStatuses(accounts)
 	for index := range accounts {
-		s.refreshAccountStatus(&accounts[index])
 		s.attachAccountAvatarURL(&accounts[index])
 	}
 	return accounts, nil
+}
+
+// refreshAccountStatuses probes every employee session with a bounded number of
+// parallel calls so one slow sidecar cannot serialize the whole admin list.
+func (s *WhatsAppService) refreshAccountStatuses(accounts []model.WhatsAppAccount) {
+	if len(accounts) == 0 {
+		return
+	}
+	if len(accounts) == 1 {
+		s.refreshAccountStatus(&accounts[0])
+		return
+	}
+	semaphore := make(chan struct{}, whatsAppStatusRefreshConcurrency)
+	var group sync.WaitGroup
+	for index := range accounts {
+		group.Add(1)
+		semaphore <- struct{}{}
+		go func(index int) {
+			defer group.Done()
+			defer func() { <-semaphore }()
+			s.refreshAccountStatus(&accounts[index])
+		}(index)
+	}
+	group.Wait()
 }
 
 func (s *WhatsAppService) UpdateAccountPreferences(requesterID, targetUserID int64, enabled, autoStart bool) (*model.WhatsAppAccount, error) {
@@ -635,7 +668,8 @@ func (s *WhatsAppService) UpdateAccountAbout(requesterID, targetUserID int64, ab
 	if err := s.callSidecar(http.MethodPut, s.sessionPath(account.UserID)+"/profile/about", map[string]string{"about": about}, &profile); err != nil {
 		return nil, err
 	}
-	s.applyRuntimeSnapshot(account.UserID, "ready", profile, "")
+	snapshot := whatsAppRuntimeSnapshotFromStatus("ready", profile, "").withIdentityFallback(account)
+	s.applyRuntimeSnapshot(account, snapshot)
 	return s.GetAccount(requesterID, account.UserID)
 }
 
@@ -808,7 +842,10 @@ func (s *WhatsAppService) HandleWebhook(body []byte) error {
 		if err := json.Unmarshal(event.Payload, &status); err != nil {
 			return err
 		}
-		s.applyRuntimeSnapshot(userID, status.Status, status.Account, status.LastError)
+		snapshot := whatsAppRuntimeSnapshotFromStatus(status.Status, status.Account, status.LastError).withIdentityFallback(account)
+		if !snapshot.matches(account) {
+			s.applyRuntimeSnapshot(account, snapshot)
+		}
 		return nil
 	case "message":
 		var incoming whatsAppIncomingMessage
@@ -1357,13 +1394,21 @@ func (s *WhatsAppService) ensureAccountReady(account *model.WhatsAppAccount) err
 
 func (s *WhatsAppService) refreshAccountStatus(account *model.WhatsAppAccount) {
 	var status model.WhatsAppStatus
-	if err := s.callSidecar(http.MethodGet, s.sessionPath(account.UserID)+"/status", nil, &status); err != nil {
+	if err := s.callSidecarWithTimeout(http.MethodGet, s.sessionPath(account.UserID)+"/status", nil, &status, whatsAppStatusTimeout); err != nil {
 		account.LastError = err.Error()
 		return
 	}
+	snapshot := whatsAppRuntimeSnapshotFromStatus(status.Status, status.Account, status.LastError).withIdentityFallback(account)
+	// The account pages poll this every few seconds: only persist (and re-read)
+	// when the session really reported something new. Otherwise every poll wrote
+	// the row and pushed last_connected_at forward.
+	changed := !snapshot.matches(account)
 	account.QRDataURL, account.LoadingPercent, account.LoadingMessage = status.QRDataURL, status.LoadingPercent, status.LoadingMessage
-	account.Status, account.LastError = status.Status, status.LastError
-	s.applyRuntimeSnapshot(account.UserID, status.Status, status.Account, status.LastError)
+	account.Status, account.LastError = snapshot.Status, snapshot.LastError
+	if !changed {
+		return
+	}
+	s.applyRuntimeSnapshot(account, snapshot)
 	if refreshed, err := s.repo.GetAccountByUserID(account.UserID); err == nil {
 		qr, progress, loading := account.QRDataURL, account.LoadingPercent, account.LoadingMessage
 		*account = *refreshed
@@ -1371,16 +1416,82 @@ func (s *WhatsAppService) refreshAccountStatus(account *model.WhatsAppAccount) {
 	}
 }
 
-func (s *WhatsAppService) applyRuntimeSnapshot(userID int64, status string, raw map[string]interface{}, lastError string) {
+// whatsAppRuntimeSnapshot is the set of session facts the sidecar owns and that
+// are mirrored into the account row.
+type whatsAppRuntimeSnapshot struct {
+	Status        string
+	WhatsAppID    string
+	DisplayName   string
+	PhoneNumber   string
+	ProfilePicURL string
+	About         string
+	Platform      string
+	LastError     string
+}
+
+func whatsAppRuntimeSnapshotFromStatus(status string, raw map[string]interface{}, lastError string) whatsAppRuntimeSnapshot {
 	stringValue := func(key string) string {
 		value, _ := raw[key].(string)
 		return strings.TrimSpace(value)
 	}
 	wid := stringValue("wid")
-	phone := strings.Split(wid, "@")[0]
-	if err := s.repo.UpdateAccountRuntime(userID, status, wid, stringValue("pushname"), phone,
-		stringValue("profilePicUrl"), stringValue("about"), stringValue("platform"), lastError); err != nil {
-		fmt.Printf("WhatsApp account runtime update failed for user %d: %v\n", userID, err)
+	return whatsAppRuntimeSnapshot{
+		Status:        strings.TrimSpace(status),
+		WhatsAppID:    wid,
+		DisplayName:   stringValue("pushname"),
+		PhoneNumber:   strings.Split(wid, "@")[0],
+		ProfilePicURL: stringValue("profilePicUrl"),
+		About:         stringValue("about"),
+		Platform:      stringValue("platform"),
+		LastError:     strings.TrimSpace(lastError),
+	}
+}
+
+// matches reports whether the account row already holds this snapshot, so the
+// caller can skip a redundant write.
+func (snapshot whatsAppRuntimeSnapshot) matches(account *model.WhatsAppAccount) bool {
+	if account == nil {
+		return false
+	}
+	return snapshot.Status == strings.TrimSpace(account.Status) &&
+		snapshot.WhatsAppID == strings.TrimSpace(account.WhatsAppID) &&
+		snapshot.DisplayName == strings.TrimSpace(account.DisplayName) &&
+		snapshot.PhoneNumber == strings.TrimSpace(account.PhoneNumber) &&
+		snapshot.ProfilePicURL == strings.TrimSpace(account.ProfilePicURL) &&
+		snapshot.About == strings.TrimSpace(account.About) &&
+		snapshot.Platform == strings.TrimSpace(account.Platform) &&
+		snapshot.LastError == strings.TrimSpace(account.LastError)
+}
+
+// withIdentityFallback keeps the identity already stored when the sidecar reply
+// did not repeat it, so a status pushed without the account payload cannot wipe
+// the WhatsApp number, name or avatar.
+func (snapshot whatsAppRuntimeSnapshot) withIdentityFallback(account *model.WhatsAppAccount) whatsAppRuntimeSnapshot {
+	if account == nil {
+		return snapshot
+	}
+	if snapshot.WhatsAppID == "" {
+		snapshot.WhatsAppID = strings.TrimSpace(account.WhatsAppID)
+	}
+	if snapshot.DisplayName == "" {
+		snapshot.DisplayName = strings.TrimSpace(account.DisplayName)
+	}
+	if snapshot.PhoneNumber == "" {
+		snapshot.PhoneNumber = strings.TrimSpace(account.PhoneNumber)
+	}
+	if snapshot.ProfilePicURL == "" {
+		snapshot.ProfilePicURL = strings.TrimSpace(account.ProfilePicURL)
+	}
+	if snapshot.Platform == "" {
+		snapshot.Platform = strings.TrimSpace(account.Platform)
+	}
+	return snapshot
+}
+
+func (s *WhatsAppService) applyRuntimeSnapshot(account *model.WhatsAppAccount, snapshot whatsAppRuntimeSnapshot) {
+	if err := s.repo.UpdateAccountRuntime(account.UserID, snapshot.Status, snapshot.WhatsAppID, snapshot.DisplayName,
+		snapshot.PhoneNumber, snapshot.ProfilePicURL, snapshot.About, snapshot.Platform, snapshot.LastError); err != nil {
+		fmt.Printf("WhatsApp account runtime update failed for user %d: %v\n", account.UserID, err)
 	}
 }
 
