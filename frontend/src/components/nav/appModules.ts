@@ -148,11 +148,11 @@ export const ADMIN_MODULES: AppModule[] = [
   },
   {
     id: 'admin-permissions',
-    label: '权限矩阵',
-    description: '工作簿、工作表与字段权限',
+    label: '部门与区域权限',
+    description: '部门、工作表、行列与单元格权限',
     href: '/admin/permissions',
     icon: Settings2,
-    keywords: ['permission', '权限', '矩阵'],
+    keywords: ['permission', '权限', '矩阵', '部门', '区域', '单元格'],
     adminOnly: true,
   },
   {
@@ -189,6 +189,15 @@ export const ADMIN_MODULES: AppModule[] = [
     href: '/admin/ai',
     icon: Bot,
     keywords: ['ai', 'model', '模型'],
+    adminOnly: true,
+  },
+  {
+    id: 'admin-mail',
+    label: '邮件服务',
+    description: 'SMTP、收件与发件账号配置',
+    href: '/admin/mail',
+    icon: Mail,
+    keywords: ['mail', 'smtp', '邮件', '邮箱'],
     adminOnly: true,
   },
   {
