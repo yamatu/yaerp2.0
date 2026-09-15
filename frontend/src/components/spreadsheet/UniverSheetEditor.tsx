@@ -30,6 +30,12 @@ import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
+import {
+  collectSharedFormulaCells,
+  createSharedFormulaResolver,
+  registerSharedFormulaEditorInterceptor,
+  type SharedFormulaResolver,
+} from '@/lib/univer-shared-formula'
 import { wsClient } from '@/lib/ws'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
@@ -1295,6 +1301,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const latestSheetRef = useRef(sheet)
   const univerApiRef = useRef<ReturnType<typeof createUniver> | null>(null)
   const workbookApiRef = useRef<{ setEditable: (editable: boolean) => void } | null>(null)
+  // Resolves formulas Univer collapsed into a shared formula group (see
+  // src/lib/univer-shared-formula.ts).
+  const sharedFormulaResolverRef = useRef<SharedFormulaResolver | null>(null)
   const persistRef = useRef<(() => Promise<void>) | null>(null)
   const reloadTokenRef = useRef(reloadToken)
   const pdfPreviewUrlRef = useRef<string | null>(null)
@@ -3339,6 +3348,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // created, so wire up the alignment fixes once the workbook exists.
         registerEditorComposedStyleInterceptor(univerResult.univer)
         installCellEditorAlignmentRecalculation(univerResult.univer)
+        registerSharedFormulaEditorInterceptor(univerResult.univer)
+        const resolveSharedFormula = createSharedFormulaResolver(univerResult.univer)
+        sharedFormulaResolverRef.current = resolveSharedFormula
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
@@ -3427,6 +3439,39 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           if (!disposed) setLoading(false)
         }
 
+        /**
+         * Univer collapses runs of similar formulas into a shared formula group:
+         * only the group owner keeps `f`, the other members carry the shared id
+         * (`si`). The engine still calculates them, but the inline editor,
+         * copy/paste and every export read the raw cell, so those members would
+         * behave like plain values. Restore the resolved formula on the live sheet
+         * (the next save then persists a self contained snapshot too).
+         */
+        const restoreSharedFormulaCells = (sheet: Partial<IWorksheetData>, sheetId: string) => {
+          if (!sheet.cellData || disposed) return
+          const { cells, ranges } = collectSharedFormulaCells(
+            sheet.cellData as Record<string, Record<string, ICellData> | undefined>,
+            sharedFormulaResolverRef.current,
+            sheetId,
+            workbookApi.getId?.()
+          )
+          if (cells.length === 0) return
+          try {
+            const worksheet = workbookApi.getActiveSheet()
+            ranges.forEach((range) => {
+              worksheet.getRange(range.startRow, range.column, range.cells.length, 1).setValues(
+                range.cells.map((cell) => [cell])
+              )
+            })
+          } catch (error) {
+            console.warn('Failed to restore shared formulas on the sheet:', error)
+          }
+          cells.forEach((item) => {
+            const columns = sheet.cellData?.[item.row]
+            if (columns) columns[item.column] = item.cell
+          })
+        }
+
         const persistSnapshot = async () => {
 		  if (disposed) return
           persistQueuedRef.current = true
@@ -3445,6 +3490,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               // the snapshot is used directly instead of being cloned a second time.
               let savedSheet = saved.sheets[savedSheetId] as Partial<IWorksheetData> | undefined
               if (!savedSheet) continue
+
+              restoreSharedFormulaCells(savedSheet, savedSheetId)
 
               const nextColumns = deriveColumnsFromUniverSheet(savedSheet, snap.columns || [], saved.styles as Record<string, unknown> | undefined)
               const currentConfig = parseSheetConfig(snap.config)
