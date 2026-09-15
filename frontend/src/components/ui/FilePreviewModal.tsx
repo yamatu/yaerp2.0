@@ -47,6 +47,10 @@ export interface FilePreviewModalProps {
   footer?: ReactNode;
   /** Dims the stage while the caller runs a blocking action, e.g. rotate + save. */
   dimmed?: boolean;
+  /** Inline error shown above the footer, e.g. a failed rotate/save. */
+  errorMessage?: ReactNode;
+  /** Hide the built in download button when the caller renders its own. */
+  showDownload?: boolean;
   /** Clicking the empty space around the file closes the viewer. */
   closeOnBackdropClick?: boolean;
   emptyHint?: string;
@@ -85,6 +89,8 @@ export function FilePreviewModal({
   headerActions,
   footer,
   dimmed = false,
+  errorMessage,
+  showDownload = true,
   closeOnBackdropClick = true,
   emptyHint = "该文件类型暂不支持在线预览，请下载后查看。",
   zIndexClass = "z-[110]",
@@ -341,7 +347,7 @@ export function FilePreviewModal({
             </>
           )}
           {headerActions}
-          {item.url && (
+          {item.url && showDownload && (
             <a
               href={item.url}
               download={item.name}
@@ -445,6 +451,16 @@ export function FilePreviewModal({
           </div>
         )}
       </div>
+
+      {errorMessage && (
+        <div
+          className="flex shrink-0 items-center gap-2 border-t border-rose-400/20 bg-rose-500/20 px-3 py-2 text-xs text-rose-100 sm:px-4"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0">{errorMessage}</span>
+        </div>
+      )}
 
       {footer && (
         <div

@@ -38,13 +38,21 @@ const (
 	mailMaxRawMessageSize = 64 << 20
 )
 
+// MailAttachmentStore persists attachment bytes in object storage so the
+// browser can load them from a signed URL (with range support) instead of
+// buffering the whole file through the JSON API.
+type MailAttachmentStore interface {
+	StoreOrReuseFile(filename, contentType string, data []byte, userID int64) (*model.Attachment, string, error)
+}
+
 var (
-	ErrMailNotConfigured        = errors.New("邮件服务器尚未配置")
-	ErrMailDisabled             = errors.New("邮件服务尚未启用")
-	ErrMailAccountNotConfigured = errors.New("当前员工尚未绑定邮箱")
-	ErrMailAccessDenied         = errors.New("没有权限管理邮件配置")
-	ErrMailContactAccessDenied  = errors.New("只有管理员可以查看 ERP 客户通讯录")
-	ErrMailMessageNotFound      = errors.New("邮件不存在或已被移动")
+	ErrMailAttachmentStoreUnavailable = errors.New("附件存储尚未配置，无法生成预览链接")
+	ErrMailNotConfigured              = errors.New("邮件服务器尚未配置")
+	ErrMailDisabled                   = errors.New("邮件服务尚未启用")
+	ErrMailAccountNotConfigured       = errors.New("当前员工尚未绑定邮箱")
+	ErrMailAccessDenied               = errors.New("没有权限管理邮件配置")
+	ErrMailContactAccessDenied        = errors.New("只有管理员可以查看 ERP 客户通讯录")
+	ErrMailMessageNotFound            = errors.New("邮件不存在或已被移动")
 )
 
 type MailOutgoingAttachment struct {
@@ -74,7 +82,13 @@ type MailService struct {
 
 	attachmentCacheOnce sync.Once
 	attachmentCache     *mailAttachmentCache
+
+	attachmentStore MailAttachmentStore
 }
+
+// SetAttachmentStore wires the object storage used to hand mail attachments to
+// the browser as signed URLs. Without it the download endpoint still works.
+func (s *MailService) SetAttachmentStore(store MailAttachmentStore) { s.attachmentStore = store }
 
 type mailSession struct {
 	settings *model.MailServerSettings

@@ -526,6 +526,8 @@ export default function MailPage() {
   const [selected, setSelected] = useState<MailMessageDetail | null>(null);
   const [attachmentPreviewKey, setAttachmentPreviewKey] = useState<string | null>(null);
   const [attachmentPreviewUrls, setAttachmentPreviewUrls] = useState<Record<string, string>>({});
+  // Signed object storage URLs, preferred over the buffered blob below.
+  const [attachmentPreviewLinks, setAttachmentPreviewLinks] = useState<Record<string, string>>({});
   const [attachmentPreviewLoading, setAttachmentPreviewLoading] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(1);
@@ -1576,13 +1578,18 @@ export default function MailPage() {
     }
   };
 
+  const mailAttachmentPath = (attachment: MailAttachment) =>
+    `/mail/messages/${selected?.uid}/attachments/${encodeURIComponent(attachment.part_id)}`;
   const attachmentDownloadPath = (attachment: MailAttachment) =>
-    `/mail/messages/${selected?.uid}/attachments/${encodeURIComponent(attachment.part_id)}?folder=${encodeURIComponent(selected?.folder ?? "")}`;
+    `${mailAttachmentPath(attachment)}?folder=${encodeURIComponent(selected?.folder ?? "")}`;
 
-  // Attachment bytes need the auth header, so preview fetches the part we are
-  // about to show and hands the object URL to the shared viewer.
+  // Attachment bytes need the auth header for the buffered path, so preview asks
+  // the backend for a stored signed URL first: the browser then streams the file
+  // itself (range requests, progressive images, no full copy in JS memory). The
+  // buffered download stays as a fallback when object storage is unavailable.
   useEffect(() => {
     if (!attachmentPreviewKey || !selected) return;
+    if (attachmentPreviewLinks[attachmentPreviewKey]) return;
     if (attachmentPreviewUrls[attachmentPreviewKey]) return;
     const attachment = selected.attachments.find(
       (item) => item.part_id === attachmentPreviewKey,
@@ -1591,6 +1598,23 @@ export default function MailPage() {
     let cancelled = false;
     setAttachmentPreviewLoading(true);
     void (async () => {
+      try {
+        const link = await api.get<{ url: string }>(
+          `${mailAttachmentPath(attachment)}/link?folder=${encodeURIComponent(selected.folder ?? "")}`,
+        );
+        if (cancelled) return;
+        if (link.code === 0 && link.data?.url) {
+          setAttachmentPreviewLinks((current) => ({
+            ...current,
+            [attachmentPreviewKey]: link.data!.url,
+          }));
+          setAttachmentPreviewLoading(false);
+          return;
+        }
+      } catch {
+        // Fall through to the buffered download below.
+      }
+      if (cancelled) return;
       try {
         const response = await api.download(attachmentDownloadPath(attachment));
         if (!response.ok) throw new Error("attachment download failed");
@@ -1613,7 +1637,7 @@ export default function MailPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [attachmentPreviewKey, selected, attachmentPreviewUrls]);
+  }, [attachmentPreviewKey, selected, attachmentPreviewLinks, attachmentPreviewUrls]);
 
   // Object URLs must be released when the message changes or the page unmounts.
   const attachmentPreviewUrlsRef = useRef<Record<string, string>>({});
@@ -1627,6 +1651,7 @@ export default function MailPage() {
   }, []);
   useEffect(() => {
     setAttachmentPreviewKey(null);
+    setAttachmentPreviewLinks({});
     setAttachmentPreviewUrls((current) => {
       Object.values(current).forEach((url) => URL.revokeObjectURL(url));
       return {};
@@ -1642,6 +1667,18 @@ export default function MailPage() {
 
   const downloadAttachment = async (attachment: MailAttachment) => {
     if (!selected) return;
+    // Prefer the stored URL: the browser downloads it with native progress and
+    // resume support instead of buffering the file in the page.
+    const link = attachmentPreviewLinks[attachment.part_id];
+    if (link) {
+      const anchor = document.createElement("a");
+      anchor.href = link;
+      anchor.download = attachment.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      return;
+    }
     const response = await api.download(attachmentDownloadPath(attachment));
     if (!response.ok) {
       setError("附件下载失败");
@@ -3159,7 +3196,9 @@ export default function MailPage() {
             .map<FilePreviewItem>((attachment) => ({
               key: attachment.part_id,
               name: attachment.filename,
-              url: attachmentPreviewUrls[attachment.part_id],
+              url:
+                attachmentPreviewLinks[attachment.part_id] ||
+                attachmentPreviewUrls[attachment.part_id],
               mimeType: attachment.content_type,
               size: attachment.size,
               meta: attachment.content_type || undefined,

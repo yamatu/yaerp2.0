@@ -114,3 +114,24 @@ func TestNormalizeGalleryMoveAttachmentIDs(t *testing.T) {
 		t.Fatal("expected invalid attachment ID to be rejected")
 	}
 }
+
+func TestSameBaseContentType(t *testing.T) {
+	cases := []struct {
+		left  string
+		right string
+		want  bool
+	}{
+		{"image/png", "image/png", true},
+		{"IMAGE/PNG", "image/png", true},
+		{" image/png ", "image/png", true},
+		{"text/plain; charset=utf-8", "text/plain", true},
+		{"application/pdf", "image/png", false},
+		{"", "image/png", false},
+		{"application/octet-stream", "application/octet-stream", true},
+	}
+	for _, test := range cases {
+		if got := sameBaseContentType(test.left, test.right); got != test.want {
+			t.Fatalf("sameBaseContentType(%q, %q) = %v, want %v", test.left, test.right, got, test.want)
+		}
+	}
+}

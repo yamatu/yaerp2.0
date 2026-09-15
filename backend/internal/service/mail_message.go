@@ -393,6 +393,34 @@ func (s *MailService) DownloadAttachment(userID int64, folder string, uid uint32
 	return filename, contentType, data, nil
 }
 
+// EnsureAttachmentFile returns a stored copy of one attachment together with a
+// signed URL. The bytes come from the attachment cache or IMAP on the first
+// call; afterwards the browser talks to object storage directly, which means
+// progressive images, seekable PDFs and no full buffering in the page.
+func (s *MailService) EnsureAttachmentFile(userID int64, folder string, uid uint32, partID string) (*model.Attachment, string, error) {
+	if s.attachmentStore == nil {
+		return nil, "", ErrMailAttachmentStoreUnavailable
+	}
+	if strings.TrimSpace(partID) == "" {
+		return nil, "", fmt.Errorf("无效的附件标识")
+	}
+	filename, contentType, data, err := s.DownloadAttachment(userID, folder, uid, partID)
+	if err != nil {
+		return nil, "", err
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	attachment, url, err := s.attachmentStore.StoreOrReuseFile(filename, contentType, data, userID)
+	if err != nil {
+		return nil, "", err
+	}
+	if attachment == nil || url == "" {
+		return nil, "", fmt.Errorf("附件存储失败")
+	}
+	return attachment, url, nil
+}
+
 func (s *MailService) downloadAttachmentUncached(userID int64, folder string, uid uint32, partID string) (string, string, []byte, error) {
 	account, accountErr := s.repo.GetAccount(userID)
 	if accountErr != nil {
