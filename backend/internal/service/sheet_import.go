@@ -86,11 +86,33 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 		return nil, fmt.Errorf("模板中缺少有效表头")
 	}
 
+	// Excel keeps the last computed result of a formula inside the cell value,
+	// so reading values alone silently replaces every formula with a number and
+	// the sheet can never show the original formula again. Read the formulas on
+	// their own and keep them in the imported rows.
+	formulaRows := collectImportedCellFormulas(
+		xlsx,
+		firstSheetName,
+		len(headers),
+		importedFormulaLastRow(xlsx, firstSheetName, len(rows), headerRowIndex),
+	)
+
+	lastRow := len(rows)
+	for rowNumber := range formulaRows {
+		if rowNumber > lastRow {
+			lastRow = rowNumber
+		}
+	}
 	dataRows := make([][]string, 0, len(rows)-headerRowIndex-1)
 	excelRowNumbers := make([]int, 0, len(rows)-headerRowIndex-1)
-	for index := headerRowIndex + 1; index < len(rows); index++ {
-		row := padImportedRow(rows[index], len(headers))
-		if isImportedRowEmpty(row) || isImportedSummaryRow(row) {
+	for index := headerRowIndex + 1; index < lastRow; index++ {
+		var rawRow []string
+		if index < len(rows) {
+			rawRow = rows[index]
+		}
+		row := padImportedRow(rawRow, len(headers))
+		formulas := formulaRows[index+1]
+		if (isImportedRowEmpty(row) && !importedRowKeepsFormula(formulas)) || isImportedSummaryRow(row) {
 			continue
 		}
 		dataRows = append(dataRows, row)
@@ -108,7 +130,7 @@ func (s *SheetImportService) ImportXLSX(userID, workbookID int64, file multipart
 
 	rowPayloads := make([]json.RawMessage, 0, len(dataRows))
 	for index, row := range dataRows {
-		payload, err := buildImportedRowPayload(columns, row)
+		payload, err := buildImportedRowPayload(columns, row, formulaRows[excelRowNumbers[index]])
 		if err != nil {
 			return nil, &SheetImportError{Row: excelRowNumbers[index], Message: err.Error()}
 		}
@@ -584,9 +606,107 @@ func buildImportedColumnKey(header string, index int, seen map[string]int) strin
 	return key
 }
 
-func buildImportedRowPayload(columns []sheetColumnPayload, row []string) (json.RawMessage, error) {
+// collectImportedCellFormulas reads the formulas of the import range keyed by
+// the 1-based Excel row number. Each row slice is aligned with the imported
+// columns and holds an empty string for cells without a formula. The formulas
+// are returned in Univer form (leading "=").
+func collectImportedCellFormulas(xlsx *excelize.File, sheetName string, columnCount, lastRow int) map[int][]string {
+	if xlsx == nil || columnCount <= 0 || lastRow <= 0 {
+		return nil
+	}
+
+	formulas := make(map[int][]string)
+	for row := 1; row <= lastRow; row++ {
+		for column := 1; column <= columnCount; column++ {
+			axis, err := excelize.CoordinatesToCellName(column, row)
+			if err != nil {
+				continue
+			}
+			formula, err := xlsx.GetCellFormula(sheetName, axis)
+			if err != nil {
+				// Keep the cached value when the formula cannot be read instead of
+				// failing the whole import (for example a broken shared formula).
+				continue
+			}
+			normalized := normalizeUniverFormula(formula)
+			if normalized == "" {
+				continue
+			}
+			rowFormulas := formulas[row]
+			if rowFormulas == nil {
+				rowFormulas = make([]string, columnCount)
+				formulas[row] = rowFormulas
+			}
+			rowFormulas[column-1] = normalized
+		}
+	}
+	if len(formulas) == 0 {
+		return nil
+	}
+	return formulas
+}
+
+// importedFormulaLastRow bounds the formula lookup. GetRows already covers every
+// row holding a formula, but a worksheet dimension can reach further (formula
+// only rows). The lookup stays capped so that a stray dimension on a huge sheet
+// cannot slow the import down.
+func importedFormulaLastRow(xlsx *excelize.File, sheetName string, rowCount, headerRowIndex int) int {
+	lastRow := rowCount
+	if xlsx == nil {
+		return lastRow
+	}
+
+	dimension, err := xlsx.GetSheetDimension(sheetName)
+	if err != nil {
+		return lastRow
+	}
+	row, ok := importedDimensionLastRow(dimension)
+	if !ok || row <= lastRow {
+		return lastRow
+	}
+	if limit := headerRowIndex + sheetImportMaxRows + 2; row > limit {
+		row = limit
+	}
+	return row
+}
+
+// importedDimensionLastRow reads the last row of an Excel range reference such
+// as "A1:E6" or "D4".
+func importedDimensionLastRow(dimension string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(dimension), ":")
+	if len(parts) == 0 {
+		return 0, false
+	}
+	_, row, err := excelize.CellNameToCoordinates(strings.TrimSpace(parts[len(parts)-1]))
+	if err != nil || row <= 0 {
+		return 0, false
+	}
+	return row, true
+}
+
+func importedRowKeepsFormula(formulas []string) bool {
+	for _, formula := range formulas {
+		if formula != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func importedCellFormula(formulas []string, index int) string {
+	if index < 0 || index >= len(formulas) {
+		return ""
+	}
+	return formulas[index]
+}
+
+func buildImportedRowPayload(columns []sheetColumnPayload, row []string, formulas []string) (json.RawMessage, error) {
 	data := make(map[string]any, len(columns))
 	for index, column := range columns {
+		if formula := importedCellFormula(formulas, index); formula != "" {
+			data[column.Key] = formula
+			continue
+		}
 		if index >= len(row) {
 			continue
 		}
