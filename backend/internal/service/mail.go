@@ -38,13 +38,21 @@ const (
 	mailMaxRawMessageSize = 64 << 20
 )
 
+// MailAttachmentStore persists attachment bytes in object storage so the
+// browser can load them from a signed URL (with range support) instead of
+// buffering the whole file through the JSON API.
+type MailAttachmentStore interface {
+	StoreOrReuseFile(filename, contentType string, data []byte, userID int64) (*model.Attachment, string, error)
+}
+
 var (
-	ErrMailNotConfigured        = errors.New("邮件服务器尚未配置")
-	ErrMailDisabled             = errors.New("邮件服务尚未启用")
-	ErrMailAccountNotConfigured = errors.New("当前员工尚未绑定邮箱")
-	ErrMailAccessDenied         = errors.New("没有权限管理邮件配置")
-	ErrMailContactAccessDenied  = errors.New("只有管理员可以查看 ERP 客户通讯录")
-	ErrMailMessageNotFound      = errors.New("邮件不存在或已被移动")
+	ErrMailAttachmentStoreUnavailable = errors.New("附件存储尚未配置，无法生成预览链接")
+	ErrMailNotConfigured              = errors.New("邮件服务器尚未配置")
+	ErrMailDisabled                   = errors.New("邮件服务尚未启用")
+	ErrMailAccountNotConfigured       = errors.New("当前员工尚未绑定邮箱")
+	ErrMailAccessDenied               = errors.New("没有权限管理邮件配置")
+	ErrMailContactAccessDenied        = errors.New("只有管理员可以查看 ERP 客户通讯录")
+	ErrMailMessageNotFound            = errors.New("邮件不存在或已被移动")
 )
 
 type MailOutgoingAttachment struct {
@@ -71,7 +79,16 @@ type MailService struct {
 	aliRateNext   time.Time
 	rdb           *redis.Client
 	bulkSendSem   chan struct{}
+
+	attachmentCacheOnce sync.Once
+	attachmentCache     *mailAttachmentCache
+
+	attachmentStore MailAttachmentStore
 }
+
+// SetAttachmentStore wires the object storage used to hand mail attachments to
+// the browser as signed URLs. Without it the download endpoint still works.
+func (s *MailService) SetAttachmentStore(store MailAttachmentStore) { s.attachmentStore = store }
 
 type mailSession struct {
 	settings *model.MailServerSettings
@@ -583,11 +600,16 @@ func (s *MailService) MoveMessage(userID int64, uid uint32, input *model.MailMov
 	if err != nil {
 		return err
 	}
-	return s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
+	if err := s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
 		seqset := new(imap.SeqSet)
 		seqset.AddNum(uid)
 		return conn.UidMove(seqset, destination)
-	})
+	}); err != nil {
+		return err
+	}
+	// The message left this folder, so drop any memoized body of it.
+	s.mailAttachmentCache().invalidate(userID, folder, uid)
+	return nil
 }
 
 func (s *MailService) DeleteMessage(userID int64, uid uint32, folder string) error {
@@ -617,7 +639,7 @@ func (s *MailService) BatchMessages(userID int64, input *model.MailBatchInput) e
 		seqset.AddNum(uid)
 	}
 	action := strings.ToLower(strings.TrimSpace(input.Action))
-	return s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
+	err = s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
 		switch action {
 		case "read":
 			return updateMailFlag(conn, seqset, imap.SeenFlag, true)
@@ -650,6 +672,21 @@ func (s *MailService) BatchMessages(userID int64, input *model.MailBatchInput) e
 			return fmt.Errorf("不支持的批量邮件操作")
 		}
 	})
+	if err != nil {
+		return err
+	}
+	// Attachments of moved or expunged messages must not survive in memory.
+	if action == "move" {
+		for _, uid := range input.UIDs {
+			s.mailAttachmentCache().invalidate(userID, folder, uid)
+		}
+	}
+	if action == "delete" {
+		for _, uid := range input.UIDs {
+			s.mailAttachmentCache().invalidate(userID, "", uid)
+		}
+	}
+	return nil
 }
 
 func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, attachments []MailOutgoingAttachment) (*model.MailSendResult, error) {

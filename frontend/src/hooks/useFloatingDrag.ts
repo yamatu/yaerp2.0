@@ -41,6 +41,64 @@ interface FloatingDragState {
   moved: boolean
 }
 
+interface ResizeSize {
+  width: number
+  height: number
+}
+
+export interface CornerResizeInput {
+  /** Size the widget had when the resize started. */
+  startSize: ResizeSize
+  /**
+   * Explicit position when the widget was already moved away from its CSS
+   * anchor, null while it still uses the default anchored layout.
+   */
+  startPosition: FloatingDragPosition | null
+  startClientX: number
+  startClientY: number
+  clientX: number
+  clientY: number
+  /** Applies the widget's own min/max bounds. */
+  clampSize: (size: ResizeSize) => ResizeSize
+}
+
+export interface CornerResizeResult {
+  size: ResizeSize
+  position: FloatingDragPosition | null
+}
+
+/**
+ * Geometry for dragging the top-left corner of a widget whose bottom-right
+ * corner is anchored to the viewport. The grabbed corner follows the pointer:
+ * the size grows by the pointer delta and, once the widget has an explicit
+ * position (it was dragged somewhere else), that position is shifted by the
+ * same delta. Without the shift the widget would grow away from the cursor -
+ * pinned `left/top` means a larger width extends to the right, so pulling the
+ * corner to the left made it wider on the wrong side.
+ */
+export function computeTopLeftResize({
+  startSize,
+  startPosition,
+  startClientX,
+  startClientY,
+  clientX,
+  clientY,
+  clampSize,
+}: CornerResizeInput): CornerResizeResult {
+  const size = clampSize({
+    width: startSize.width + (startClientX - clientX),
+    height: startSize.height + (startClientY - clientY),
+  })
+  if (!startPosition) return { size, position: null }
+  return {
+    size,
+    position: {
+      x: startPosition.x + (startSize.width - size.width),
+      y: startPosition.y + (startSize.height - size.height),
+    },
+  }
+}
+
 const DRAG_THRESHOLD = 4
 
 function clamp(value: number, min: number, max: number) {
@@ -186,5 +244,20 @@ export function useFloatingDrag({
 
   const reset = useCallback(() => setPosition(null), [])
 
-  return { position, dragging, handleProps, style, reset }
+  /**
+   * Moves a widget that already has explicit coordinates, keeping the same
+   * clamping as a normal drag. Used to keep the grabbed corner under the
+   * pointer while resizing. Returns the position that was actually applied so
+   * the caller can react to clamping at the viewport edge.
+   */
+  const moveTo = useCallback(
+    (x: number, y: number) => {
+      const next = clampPosition(x, y)
+      setPosition(next)
+      return next
+    },
+    [clampPosition]
+  )
+
+  return { position, dragging, handleProps, style, reset, moveTo }
 }

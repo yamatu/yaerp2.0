@@ -30,6 +30,7 @@ import { WhatsAppSendDialog, type WhatsAppSendResource } from '@/components/what
 import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
+import { FilePreviewModal, type FilePreviewItem } from '@/components/ui/FilePreviewModal'
 import type { AuthUser, GalleryDirectory, GalleryDirectoryAccess, GalleryImage, User } from '@/types'
 
 interface GalleryImagesMoveResult {
@@ -415,6 +416,27 @@ export default function GalleryPage() {
 
   const downloadURL = (image: GalleryImage) => `${image.url}${image.url.includes('?') ? '&' : '?'}download=1`
 
+  // The shared viewer works on a plain item list; the open image stays visible
+  // even when a filter removed it from the current page.
+  const previewItems = useMemo<FilePreviewItem[]>(() => {
+    const toItem = (image: GalleryImage): FilePreviewItem => ({
+      key: String(image.id),
+      name: image.filename,
+      url: image.url,
+      mimeType: image.mime_type,
+      size: image.size,
+      meta: `上传者：${image.uploader_name || `用户 #${image.uploader_id}`}`,
+    })
+    if (preview && !images.some((image) => image.id === preview.id)) return [toItem(preview)]
+    return images.map(toItem)
+  }, [images, preview])
+  const previewIndex = preview ? images.findIndex((image) => image.id === preview.id) : -1
+  const closePreview = useCallback(() => {
+    if (transformingImage) return
+    setPreview(null)
+    setTransformError('')
+  }, [transformingImage])
+
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   useEffect(() => {
@@ -762,52 +784,35 @@ export default function GalleryPage() {
 
         {/* Preview Modal */}
         {preview && (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-            onClick={() => {
-              if (transformingImage) return
-              setPreview(null)
-              setTransformError('')
+          <FilePreviewModal
+            items={previewItems}
+            index={previewIndex >= 0 ? previewIndex : 0}
+            onIndexChange={(next) => {
+              if (transformingImage || previewIndex < 0) return
+              const target = images[next]
+              if (target) {
+                setPreview(target)
+                setTransformError('')
+              }
             }}
-          >
-            <div
-              className="relative flex max-h-[92vh] w-[min(94vw,1100px)] flex-col items-center"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <button
-                type="button"
-                onClick={() => { setPreview(null); setTransformError('') }}
-                disabled={Boolean(transformingImage)}
-                className="absolute -right-3 -top-3 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-white text-slate-700 shadow-lg transition hover:bg-slate-100 disabled:opacity-40"
-              >
-                <X className="h-4 w-4" />
-              </button>
-              <img
-                src={preview.url}
-                alt={preview.filename}
-                className="max-h-[72vh] max-w-full rounded-lg object-contain shadow-2xl"
-              />
-              <div className="mt-3 flex w-full max-w-2xl flex-col items-stretch gap-2 rounded-lg bg-black/35 px-3 py-2.5 text-left backdrop-blur-sm sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-                <div className="min-w-0 sm:flex-1">
-                  <p className="truncate text-sm font-medium text-white">{preview.filename}</p>
-                  <p className="mt-0.5 truncate text-xs text-white/60">上传者：{preview.uploader_name || `用户 #${preview.uploader_id}`} · {formatSize(preview.size)}</p>
+            onClose={closePreview}
+            dimmed={Boolean(transformingImage)}
+            errorMessage={transformError || undefined}
+            showDownload={false}
+            zIndexClass="z-50"
+            footer={
+              <>
+                <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
+                  <button type="button" onClick={() => void handleTransformImage('rotate-left')} disabled={Boolean(transformingImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存" aria-label="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformImage('rotate-right')} disabled={Boolean(transformingImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存" aria-label="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformImage('flip-horizontal')} disabled={Boolean(transformingImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存" aria-label="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformImage('flip-vertical')} disabled={Boolean(transformingImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存" aria-label="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
                 </div>
-                <div className="flex w-full items-center justify-between gap-1 sm:w-auto sm:justify-end sm:gap-1.5">
-                  <button type="button" onClick={() => void handleTransformImage('rotate-left')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存" aria-label="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
-                  <button type="button" onClick={() => void handleTransformImage('rotate-right')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存" aria-label="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
-                  <button type="button" onClick={() => void handleTransformImage('flip-horizontal')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存" aria-label="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
-                  <button type="button" onClick={() => void handleTransformImage('flip-vertical')} disabled={Boolean(transformingImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存" aria-label="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
-                  <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"><Download className="h-4 w-4" />下载图片</a>
-                </div>
-              </div>
-              {(transformingImage || transformError) && (
-                <div className={`mt-2 flex min-h-8 items-center gap-2 rounded-lg px-3 text-xs ${transformError ? 'bg-rose-500/20 text-rose-100' : 'bg-white/10 text-white/75'}`}>
-                  {transformingImage && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
-                  {transformError || (transformingImage ? `${imageTransformLabel(transformingImage)}并保存中...` : '')}
-                </div>
-              )}
-            </div>
-          </div>
+                {transformingImage && <span className="inline-flex h-9 items-center gap-2 px-2 text-xs text-white/75"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingImage)}并保存中...</span>}
+                <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"><Download className="h-4 w-4" />下载图片</a>
+              </>
+            }
+          />
         )}
 
         {renaming && (

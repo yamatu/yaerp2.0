@@ -61,6 +61,7 @@ import {
 import { useRouter } from "next/navigation";
 import { AuthGuard } from "@/components/auth/AuthGuard";
 import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
+import { FilePreviewModal, type FilePreviewItem } from "@/components/ui/FilePreviewModal";
 import api from "@/lib/api";
 import { getStoredUser, isAdmin } from "@/lib/auth";
 import type { AuthUser } from "@/types";
@@ -523,6 +524,11 @@ export default function MailPage() {
     has_more: false,
   });
   const [selected, setSelected] = useState<MailMessageDetail | null>(null);
+  const [attachmentPreviewKey, setAttachmentPreviewKey] = useState<string | null>(null);
+  const [attachmentPreviewUrls, setAttachmentPreviewUrls] = useState<Record<string, string>>({});
+  // Signed object storage URLs, preferred over the buffered blob below.
+  const [attachmentPreviewLinks, setAttachmentPreviewLinks] = useState<Record<string, string>>({});
+  const [attachmentPreviewLoading, setAttachmentPreviewLoading] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(1);
   const [searchDraft, setSearchDraft] = useState("");
@@ -1572,11 +1578,108 @@ export default function MailPage() {
     }
   };
 
+  const mailAttachmentPath = (attachment: MailAttachment) =>
+    `/mail/messages/${selected?.uid}/attachments/${encodeURIComponent(attachment.part_id)}`;
+  const attachmentDownloadPath = (attachment: MailAttachment) =>
+    `${mailAttachmentPath(attachment)}?folder=${encodeURIComponent(selected?.folder ?? "")}`;
+
+  // Attachment bytes need the auth header for the buffered path, so preview asks
+  // the backend for a stored signed URL first: the browser then streams the file
+  // itself (range requests, progressive images, no full copy in JS memory). The
+  // buffered download stays as a fallback when object storage is unavailable.
+  useEffect(() => {
+    if (!attachmentPreviewKey || !selected) return;
+    if (attachmentPreviewLinks[attachmentPreviewKey]) return;
+    if (attachmentPreviewUrls[attachmentPreviewKey]) return;
+    const attachment = selected.attachments.find(
+      (item) => item.part_id === attachmentPreviewKey,
+    );
+    if (!attachment) return;
+    let cancelled = false;
+    setAttachmentPreviewLoading(true);
+    void (async () => {
+      try {
+        const link = await api.get<{ url: string }>(
+          `${mailAttachmentPath(attachment)}/link?folder=${encodeURIComponent(selected.folder ?? "")}`,
+        );
+        if (cancelled) return;
+        if (link.code === 0 && link.data?.url) {
+          setAttachmentPreviewLinks((current) => ({
+            ...current,
+            [attachmentPreviewKey]: link.data!.url,
+          }));
+          setAttachmentPreviewLoading(false);
+          return;
+        }
+      } catch {
+        // Fall through to the buffered download below.
+      }
+      if (cancelled) return;
+      try {
+        const response = await api.download(attachmentDownloadPath(attachment));
+        if (!response.ok) throw new Error("attachment download failed");
+        const blob = await response.blob();
+        if (cancelled) return;
+        setAttachmentPreviewUrls((current) => ({
+          ...current,
+          [attachmentPreviewKey]: URL.createObjectURL(blob),
+        }));
+      } catch {
+        if (!cancelled) {
+          setError("附件预览失败，请下载后查看");
+          setAttachmentPreviewKey(null);
+        }
+      } finally {
+        if (!cancelled) setAttachmentPreviewLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attachmentPreviewKey, selected, attachmentPreviewLinks, attachmentPreviewUrls]);
+
+  // Object URLs must be released when the message changes or the page unmounts.
+  const attachmentPreviewUrlsRef = useRef<Record<string, string>>({});
+  attachmentPreviewUrlsRef.current = attachmentPreviewUrls;
+  useEffect(() => {
+    return () => {
+      Object.values(attachmentPreviewUrlsRef.current).forEach((url) =>
+        URL.revokeObjectURL(url),
+      );
+    };
+  }, []);
+  useEffect(() => {
+    setAttachmentPreviewKey(null);
+    setAttachmentPreviewLinks({});
+    setAttachmentPreviewUrls((current) => {
+      Object.values(current).forEach((url) => URL.revokeObjectURL(url));
+      return {};
+    });
+  }, [selected?.uid, selected?.folder]);
+
+  // Closing only hides the viewer: the already fetched bytes stay cached for the
+  // message that is open, so re-opening the same attachment is instant. The URLs
+  // are released when the message changes or the page unmounts.
+  const closeAttachmentPreview = () => {
+    setAttachmentPreviewKey(null);
+  };
+
   const downloadAttachment = async (attachment: MailAttachment) => {
     if (!selected) return;
-    const response = await api.download(
-      `/mail/messages/${selected.uid}/attachments/${encodeURIComponent(attachment.part_id)}?folder=${encodeURIComponent(selected.folder)}`,
-    );
+    // Prefer the stored URL: the browser downloads it with native progress and
+    // resume support instead of buffering the file in the page.
+    const link = attachmentPreviewLinks[attachment.part_id];
+    if (link) {
+      const anchor = document.createElement("a");
+      anchor.href = link;
+      anchor.download = attachment.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      return;
+    }
+    const response = await api.download(attachmentDownloadPath(attachment));
     if (!response.ok) {
       setError("附件下载失败");
       return;
@@ -3037,23 +3140,36 @@ export default function MailPage() {
                       {selected.attachments
                         .filter((attachment) => !attachment.inline)
                         .map((attachment) => (
-                          <button
+                          <div
                             key={attachment.part_id}
-                            type="button"
-                            onClick={() => void downloadAttachment(attachment)}
-                            className="flex max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-left hover:bg-slate-100"
+                            className="flex max-w-full items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 pl-3 pr-1 hover:border-sky-200 hover:bg-sky-50/60"
                           >
-                            <File className="h-4 w-4 shrink-0 text-sky-600" />
-                            <span className="min-w-0">
-                              <span className="block max-w-56 truncate text-xs font-medium text-slate-700">
-                                {attachment.filename}
+                            <button
+                              type="button"
+                              onClick={() => setAttachmentPreviewKey(attachment.part_id)}
+                              className="flex min-w-0 flex-1 items-center gap-2 py-2 text-left"
+                              title={`在线预览 ${attachment.filename}`}
+                            >
+                              <File className="h-4 w-4 shrink-0 text-sky-600" />
+                              <span className="min-w-0">
+                                <span className="block max-w-56 truncate text-xs font-medium text-slate-700">
+                                  {attachment.filename}
+                                </span>
+                                <span className="block text-[10px] text-slate-400">
+                                  {formatBytes(attachment.size)} · 点击预览
+                                </span>
                               </span>
-                              <span className="block text-[10px] text-slate-400">
-                                {formatBytes(attachment.size)}
-                              </span>
-                            </span>
-                            <Download className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                          </button>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void downloadAttachment(attachment)}
+                              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-sky-600"
+                              title={`下载 ${attachment.filename}`}
+                              aria-label={`下载 ${attachment.filename}`}
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         ))}
                     </div>
                   )}
@@ -3072,6 +3188,42 @@ export default function MailPage() {
           </section>
         </main>
       </div>
+
+      {attachmentPreviewKey && selected && (
+        <FilePreviewModal
+          items={selected.attachments
+            .filter((attachment) => !attachment.inline)
+            .map<FilePreviewItem>((attachment) => ({
+              key: attachment.part_id,
+              name: attachment.filename,
+              url:
+                attachmentPreviewLinks[attachment.part_id] ||
+                attachmentPreviewUrls[attachment.part_id],
+              mimeType: attachment.content_type,
+              size: attachment.size,
+              meta: attachment.content_type || undefined,
+            }))}
+          index={Math.max(
+            0,
+            selected.attachments
+              .filter((attachment) => !attachment.inline)
+              .findIndex((attachment) => attachment.part_id === attachmentPreviewKey),
+          )}
+          onIndexChange={(next) => {
+            const list = selected.attachments.filter(
+              (attachment) => !attachment.inline,
+            );
+            setAttachmentPreviewKey(list[next]?.part_id ?? null);
+          }}
+          onClose={closeAttachmentPreview}
+          emptyHint="该附件类型暂不支持在线预览，请下载后查看。"
+        />
+      )}
+      {attachmentPreviewLoading && (
+        <div className="pointer-events-none fixed bottom-5 left-1/2 z-[80] -translate-x-1/2 rounded-full bg-slate-900/90 px-4 py-2 text-xs text-white shadow-lg">
+          正在加载附件预览...
+        </div>
+      )}
 
       {contextMenu && (
         <div

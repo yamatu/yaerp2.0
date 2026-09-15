@@ -38,6 +38,26 @@ func (r *AttachmentRepo) GetByID(id int64) (*model.Attachment, error) {
 	return a, nil
 }
 
+// GetByContentHash looks up an already stored file with the same bytes. It is
+// used to avoid re-uploading identical content (mail attachments for example).
+// The oldest matching row wins so repeated lookups return the same file.
+func (r *AttachmentRepo) GetByContentHash(contentHash string) (*model.Attachment, error) {
+	a := &model.Attachment{}
+	err := r.db.QueryRow(
+		`SELECT a.id, a.filename, a.mime_type, a.size, a.bucket, a.object_key, COALESCE(a.content_hash, ''), a.uploader_id,
+		        COALESCE(u.username, ''), a.created_at
+		 FROM attachments a
+		 LEFT JOIN users u ON u.id = a.uploader_id
+		 WHERE a.content_hash = $1
+		 ORDER BY a.id
+		 LIMIT 1`, contentHash,
+	).Scan(&a.ID, &a.Filename, &a.MimeType, &a.Size, &a.Bucket, &a.ObjectKey, &a.ContentHash, &a.UploaderID, &a.UploaderName, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
 func (r *AttachmentRepo) UpdateContentHash(id int64, contentHash string) error {
 	result, err := r.db.Exec(
 		`UPDATE attachments

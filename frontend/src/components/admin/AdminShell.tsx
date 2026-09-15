@@ -3,34 +3,22 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import type { ReactNode } from 'react'
-import {
-  ArrowLeft,
-  Bot,
-  Building2,
-  Database,
-  LayoutDashboard,
-  Mail,
-  Shield,
-  MessageCircle,
-  Workflow,
-  ScrollText,
-  Users,
-} from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { ADMIN_MODULES } from '@/components/nav/appModules'
 import { getStoredUser } from '@/lib/auth'
 
-const adminModules = [
-  { label: '管理首页', href: '/admin', icon: LayoutDashboard },
-  { label: '员工账号', href: '/admin/users', icon: Users },
-  { label: '角色管理', href: '/admin/roles', icon: Shield },
-  { label: '部门权限', href: '/admin/permissions', icon: Building2 },
-  { label: '数据备份', href: '/admin/backup', icon: Database },
-  { label: '操作审计', href: '/admin/audit', icon: ScrollText },
-  { label: '流程自动化', href: '/admin/automation', icon: Workflow },
-  { label: 'AI 助手', href: '/admin/ai', icon: Bot },
-  { label: 'WhatsApp', href: '/admin/whatsapp', icon: MessageCircle },
-  { label: '邮件服务', href: '/admin/mail', icon: Mail },
-]
+// The admin navigation is derived from the shared module registry so a new admin
+// page only has to be registered once (menu, command palette and shell agree).
+
+/**
+ * A module stays highlighted on its sub-pages, except `/admin` itself which must
+ * not light up for every child route.
+ */
+export function isModuleActive(pathname: string, href: string): boolean {
+  if (pathname === href) return true
+  return href !== '/admin' && pathname.startsWith(`${href}/`)
+}
 
 interface AdminShellProps {
   title: string
@@ -65,11 +53,17 @@ export function AdminShell({ title, description, children, summary }: AdminShell
             </div>
 
             <nav className="flex min-w-0 gap-1 overflow-x-auto border-t border-slate-200 bg-slate-50 px-3 py-2 [scrollbar-width:none] md:px-4">
-              {adminModules.map((module) => {
+              {ADMIN_MODULES.map((module) => {
                 const Icon = module.icon
-                const active = pathname === module.href
+                const active = isModuleActive(pathname, module.href)
                 return (
-                  <Link key={module.href} href={module.href} className={`inline-flex h-9 shrink-0 items-center gap-2 rounded-lg px-3 text-sm font-medium transition ${active ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-white hover:text-slate-950'}`}>
+                  <Link
+                    key={module.href}
+                    href={module.href}
+                    title={module.description}
+                    aria-current={active ? 'page' : undefined}
+                    className={`inline-flex h-9 shrink-0 items-center gap-2 rounded-lg px-3 text-sm font-medium transition ${active ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-white hover:text-slate-950'}`}
+                  >
                     <Icon className="h-4 w-4" />
                     {module.label}
                   </Link>

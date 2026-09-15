@@ -57,8 +57,6 @@ import {
   Volume2,
   Undo2,
   X,
-  ZoomIn,
-  ZoomOut,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppAvatarImage } from '@/components/whatsapp/WhatsAppAvatarImage'
@@ -71,6 +69,7 @@ import { getStoredUser, isAdmin } from '@/lib/auth'
 import { notifyDataChanged } from '@/lib/dataEvents'
 import { consumeReturnTarget } from '@/lib/returnNavigation'
 import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
+import { FilePreviewModal, type FilePreviewItem } from '@/components/ui/FilePreviewModal'
 import { matchesWhatsAppChat, matchesWhatsAppSearch, normalizeWhatsAppSearchText } from '@/lib/whatsappSearch'
 import { wsClient } from '@/lib/ws'
 import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, WhatsAppContactSyncResult, WhatsAppHistorySyncResult, Workbook, WorkbookImportResult } from '@/types'
@@ -395,8 +394,32 @@ export default function ChannelsPage() {
   const [deletingBackupId, setDeletingBackupId] = useState<number | null>(null)
 
   const [previewImageMessage, setPreviewImageMessage] = useState<ChannelMessage | null>(null)
-  const [imageZoom, setImageZoom] = useState(1)
+  const previewableImages = useMemo(
+    () => messages.filter((message) => !message.recalled_at && isImageMessage(message) && Boolean(message.attachment_url)),
+    [messages],
+  )
+  const previewImageIndex = previewImageMessage
+    ? previewableImages.findIndex((message) => message.id === previewImageMessage.id)
+    : -1
+  // The shared viewer works on a plain item list. A recalled or otherwise
+  // filtered message that is still open falls back to a one item list.
+  const previewImageItems = useMemo<FilePreviewItem[]>(() => {
+    const toItem = (message: ChannelMessage): FilePreviewItem => ({
+      key: String(message.id),
+      name: message.attachment_filename || '频道图片',
+      url: message.attachment_url || undefined,
+      mimeType: message.attachment_mime_type || undefined,
+      size: message.attachment_size ?? undefined,
+      meta: message.created_at ? formatTime(message.created_at) : undefined,
+    })
+    if (previewImageMessage && previewImageIndex < 0) return [toItem(previewImageMessage)]
+    return previewableImages.map(toItem)
+  }, [previewImageMessage, previewImageIndex, previewableImages])
   const [transformingMessageImage, setTransformingMessageImage] = useState<ImageTransform | null>(null)
+  const closeImagePreview = useCallback(() => {
+    if (transformingMessageImage) return
+    setPreviewImageMessage(null)
+  }, [transformingMessageImage])
   const [previewDirectoryId, setPreviewDirectoryId] = useState('')
   const [savingImage, setSavingImage] = useState(false)
   const [savedImageIds, setSavedImageIds] = useState<number[]>([])
@@ -1147,7 +1170,6 @@ export default function ChannelsPage() {
 
   useEffect(() => {
     if (!previewImageMessage) return
-    setImageZoom(1)
     setPreviewDirectoryId('')
   }, [previewImageMessage])
 
@@ -2171,7 +2193,6 @@ export default function ChannelsPage() {
         size: updated.attachment_size ?? image.size,
       } : image))
       setPreviewImageMessage(updated)
-      setImageZoom(1)
       setNotice(`${imageTransformLabel(transform)}完成，图片已自动保存`)
     } catch (error) {
       setError(error instanceof Error ? error.message : `${imageTransformLabel(transform)}失败`)
@@ -3694,42 +3715,37 @@ export default function ChannelsPage() {
         )}
 
         {previewImageMessage?.attachment_url && (
-          <div className="fixed inset-0 z-[60] flex flex-col bg-slate-950/95" onMouseDown={(event) => { if (event.target === event.currentTarget && !transformingMessageImage) setPreviewImageMessage(null) }}>
-            <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-3 text-white md:px-5">
-              <div className="min-w-0 truncate text-sm text-slate-300">{previewImageMessage.attachment_filename || '频道图片'}</div>
-              <div className="flex items-center gap-1">
-                <button type="button" onClick={() => setImageZoom((value) => Math.max(0.5, value - 0.25))} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="缩小"><ZoomOut className="h-4 w-4" /></button>
-                <button type="button" onClick={() => setImageZoom(1)} className="inline-flex h-9 min-w-12 items-center justify-center rounded-lg px-2 text-xs text-slate-300 hover:bg-white/10 hover:text-white" title="恢复原始缩放">{Math.round(imageZoom * 100)}%</button>
-                <button type="button" onClick={() => setImageZoom((value) => Math.min(3, value + 0.25))} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="放大"><ZoomIn className="h-4 w-4" /></button>
-                <a href={previewImageMessage.attachment_url} download={previewImageMessage.attachment_filename || 'channel-image'} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white" title="下载图片"><Download className="h-4 w-4" /></a>
-                <button type="button" onClick={() => setPreviewImageMessage(null)} disabled={Boolean(transformingMessageImage)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="关闭"><X className="h-5 w-5" /></button>
-              </div>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-auto p-4" onWheel={(event) => { if (!event.ctrlKey && !event.metaKey) return; event.preventDefault(); setImageZoom((value) => Math.min(3, Math.max(0.5, value + (event.deltaY < 0 ? 0.15 : -0.15)))) }}>
-              <div className="flex min-h-full min-w-full items-center justify-center">
-                <img src={previewImageMessage.attachment_url} alt={previewImageMessage.attachment_filename || '频道图片'} className={`max-h-[calc(100vh-9rem)] max-w-[calc(100vw-2rem)] object-contain transition duration-150 ${transformingMessageImage ? 'opacity-60' : ''}`} style={{ transform: `scale(${imageZoom})` }} />
-              </div>
-            </div>
-
-            <div className="flex shrink-0 flex-wrap items-center justify-center gap-2 border-t border-white/10 bg-slate-950 px-3 py-3">
-              <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
-                <button type="button" onClick={() => void handleTransformMessageImage('rotate-left')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
-                <button type="button" onClick={() => void handleTransformMessageImage('rotate-right')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
-                <button type="button" onClick={() => void handleTransformMessageImage('flip-horizontal')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
-                <button type="button" onClick={() => void handleTransformMessageImage('flip-vertical')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
-              </div>
-              <select value={previewDirectoryId} onChange={(event) => setPreviewDirectoryId(event.target.value)} className="h-9 max-w-56 rounded-lg border border-white/15 bg-slate-900 px-3 text-sm text-slate-200 outline-none">
-                <option value="">频道默认目录</option>
-                {availableDirectories.map((directory) => <option key={directory.id} value={directory.id}>{directory.name}</option>)}
-              </select>
-              <button type="button" onClick={() => void handleSaveImage(previewImageMessage)} disabled={savingImage || savedImageIds.includes(previewImageMessage.id)} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400">
-                <Save className="h-4 w-4" />
-                {savedImageIds.includes(previewImageMessage.id) ? '已保存到图库' : savingImage ? '保存中...' : '保存到图库'}
-              </button>
-              {transformingMessageImage && <span className="inline-flex h-9 items-center gap-2 px-2 text-xs text-slate-300"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingMessageImage)}并保存中...</span>}
-            </div>
-          </div>
+          <FilePreviewModal
+            items={previewImageItems}
+            index={previewImageIndex >= 0 ? previewImageIndex : 0}
+            onIndexChange={(next) => {
+              if (transformingMessageImage || previewImageIndex < 0) return
+              const target = previewableImages[next]
+              if (target) setPreviewImageMessage(target)
+            }}
+            onClose={closeImagePreview}
+            dimmed={Boolean(transformingMessageImage)}
+            zIndexClass="z-[60]"
+            footer={
+              <>
+                <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
+                  <button type="button" onClick={() => void handleTransformMessageImage('rotate-left')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('rotate-right')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('flip-horizontal')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('flip-vertical')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
+                </div>
+                <select value={previewDirectoryId} onChange={(event) => setPreviewDirectoryId(event.target.value)} className="h-9 max-w-56 rounded-lg border border-white/15 bg-slate-900 px-3 text-sm text-slate-200 outline-none">
+                  <option value="">频道默认目录</option>
+                  {availableDirectories.map((directory) => <option key={directory.id} value={directory.id}>{directory.name}</option>)}
+                </select>
+                <button type="button" onClick={() => void handleSaveImage(previewImageMessage)} disabled={savingImage || savedImageIds.includes(previewImageMessage.id)} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400">
+                  <Save className="h-4 w-4" />
+                  {savedImageIds.includes(previewImageMessage.id) ? '已保存到图库' : savingImage ? '保存中...' : '保存到图库'}
+                </button>
+                {transformingMessageImage && <span className="inline-flex h-9 items-center gap-2 px-2 text-xs text-slate-300"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingMessageImage)}并保存中...</span>}
+              </>
+            }
+          />
         )}
 
         {contextMenu && (

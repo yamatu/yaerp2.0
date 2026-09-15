@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/lib/pq"
+
 	"yaerp/internal/model"
 )
 
@@ -267,73 +269,84 @@ func (r *PermissionRepo) GetPrincipalPermissionConfig(sheetID int64, principalTy
 	return config, rows.Err()
 }
 
-func (r *PermissionRepo) GetPrincipalSheetPermissions(sheetID int64, principalType string, principalIDs []int64) ([]model.PrincipalSheetPermission, error) {
-	if len(principalIDs) == 0 {
-		return []model.PrincipalSheetPermission{}, nil
-	}
-	query, args := principalLookupQuery(
+// GetPrincipalSheetPermissionsForAccess loads the employee and department sheet
+// rules of one sheet in a single round trip. Splitting the result by principal
+// type yields exactly the two lists the per-principal queries used to return,
+// without paying one round trip for each of them.
+func (r *PermissionRepo) GetPrincipalSheetPermissionsForAccess(sheetID, userID int64, departmentIDs []int64) ([]model.PrincipalSheetPermission, []model.PrincipalSheetPermission, error) {
+	rows, err := r.db.Query(
 		`SELECT id, sheet_id, principal_type, principal_id, can_view, can_edit, can_delete, can_export
 		 FROM principal_sheet_permissions
-		 WHERE sheet_id = $1 AND principal_type = $2 AND principal_id IN (%s)`,
-		sheetID, principalType, principalIDs,
+		 WHERE sheet_id = $1
+		   AND ((principal_type = 'user' AND principal_id = $2)
+		        OR (principal_type = 'department' AND principal_id = ANY($3::bigint[])))`,
+		sheetID, userID, pq.Array(departmentIDs),
 	)
-	rows, err := r.db.Query(query, args...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	permissions := make([]model.PrincipalSheetPermission, 0)
+
+	userPermissions := make([]model.PrincipalSheetPermission, 0)
+	departmentPermissions := make([]model.PrincipalSheetPermission, 0)
 	for rows.Next() {
 		var permission model.PrincipalSheetPermission
 		if err := rows.Scan(
 			&permission.ID, &permission.SheetID, &permission.PrincipalType, &permission.PrincipalID,
 			&permission.CanView, &permission.CanEdit, &permission.CanDelete, &permission.CanExport,
 		); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		permissions = append(permissions, permission)
+		if permission.PrincipalType == "user" {
+			userPermissions = append(userPermissions, permission)
+			continue
+		}
+		departmentPermissions = append(departmentPermissions, permission)
 	}
-	return permissions, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	return userPermissions, departmentPermissions, nil
 }
 
-func (r *PermissionRepo) GetPrincipalCellPermissions(sheetID int64, principalType string, principalIDs []int64) ([]model.PrincipalCellPermission, error) {
-	if len(principalIDs) == 0 {
-		return []model.PrincipalCellPermission{}, nil
-	}
-	query, args := principalLookupQuery(
+// GetPrincipalCellPermissionsForAccess is the range-rule counterpart of
+// GetPrincipalSheetPermissionsForAccess.
+func (r *PermissionRepo) GetPrincipalCellPermissionsForAccess(sheetID, userID int64, departmentIDs []int64) ([]model.PrincipalCellPermission, []model.PrincipalCellPermission, error) {
+	rows, err := r.db.Query(
 		`SELECT id, sheet_id, principal_type, principal_id, column_key, row_index, permission
 		 FROM principal_cell_permissions
-		 WHERE sheet_id = $1 AND principal_type = $2 AND principal_id IN (%s)`,
-		sheetID, principalType, principalIDs,
+		 WHERE sheet_id = $1
+		   AND ((principal_type = 'user' AND principal_id = $2)
+		        OR (principal_type = 'department' AND principal_id = ANY($3::bigint[])))`,
+		sheetID, userID, pq.Array(departmentIDs),
 	)
-	rows, err := r.db.Query(query, args...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	permissions := make([]model.PrincipalCellPermission, 0)
+
+	userPermissions := make([]model.PrincipalCellPermission, 0)
+	departmentPermissions := make([]model.PrincipalCellPermission, 0)
 	for rows.Next() {
 		var permission model.PrincipalCellPermission
 		if err := rows.Scan(
 			&permission.ID, &permission.SheetID, &permission.PrincipalType, &permission.PrincipalID,
 			&permission.ColumnKey, &permission.RowIndex, &permission.Permission,
 		); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		permissions = append(permissions, permission)
+		if permission.PrincipalType == "user" {
+			userPermissions = append(userPermissions, permission)
+			continue
+		}
+		departmentPermissions = append(departmentPermissions, permission)
 	}
-	return permissions, rows.Err()
-}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
 
-func principalLookupQuery(template string, sheetID int64, principalType string, principalIDs []int64) (string, []interface{}) {
-	placeholders := make([]string, len(principalIDs))
-	args := make([]interface{}, 0, len(principalIDs)+2)
-	args = append(args, sheetID, principalType)
-	for index, principalID := range principalIDs {
-		placeholders[index] = fmt.Sprintf("$%d", index+3)
-		args = append(args, principalID)
-	}
-	return fmt.Sprintf(template, strings.Join(placeholders, ", ")), args
+	return userPermissions, departmentPermissions, nil
 }
 
 func (r *PermissionRepo) SheetHasScopedPermissions(sheetID int64) (bool, error) {

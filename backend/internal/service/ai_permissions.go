@@ -47,11 +47,15 @@ func (s *AIService) buildUserPermissionSnapshot(userID int64) (map[string]any, e
 		return nil, err
 	}
 
+	// One scope for the whole overview: the role, the folder visibility and the
+	// workbook rows are read once instead of once per workbook and sheet.
+	scope := s.permService.NewAccessScope()
+
 	items := make([]map[string]any, 0, len(workbooks))
 	truncatedSheets := false
 	totalSheets := 0
 	for _, workbook := range workbooks {
-		detail, detailErr := s.sheetService.GetWorkbook(workbook.ID, userID)
+		detail, detailErr := s.sheetService.getWorkbook(workbook.ID, userID, scope)
 		if detailErr != nil {
 			continue
 		}
@@ -69,7 +73,7 @@ func (s *AIService) buildUserPermissionSnapshot(userID int64) (map[string]any, e
 				truncatedSheets = true
 				break
 			}
-			sheets = append(sheets, s.buildSheetPermissionEntry(userID, sheet))
+			sheets = append(sheets, s.buildSheetPermissionEntry(userID, sheet, scope))
 		}
 
 		entry := map[string]any{
@@ -108,14 +112,14 @@ func (s *AIService) buildUserPermissionSnapshot(userID int64) (map[string]any, e
 
 // buildSheetPermissionEntry reduces a sheet permission matrix to the facts an
 // agent must respect before proposing a write.
-func (s *AIService) buildSheetPermissionEntry(userID int64, sheet model.Sheet) map[string]any {
+func (s *AIService) buildSheetPermissionEntry(userID int64, sheet model.Sheet, scope *AccessScope) map[string]any {
 	entry := map[string]any{
 		"sheet_id":   sheet.ID,
 		"sheet_name": sheet.Name,
 		"can_view":   false,
 		"can_edit":   false,
 	}
-	matrix, err := s.permService.GetPermissionMatrix(sheet.ID, userID)
+	matrix, err := scope.PermissionMatrix(sheet.ID, userID)
 	if err != nil || matrix == nil {
 		return entry
 	}

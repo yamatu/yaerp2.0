@@ -102,14 +102,18 @@ func (s *FolderService) ListContents(parentID *int64, userID int64) (*model.Fold
 		return nil, err
 	}
 
+	// One access scope for the whole folder listing so the shared role, folder
+	// visibility and ancestor path lookups run once instead of per entry.
+	scope := s.permService.NewAccessScope()
+
 	filteredFolders := make([]model.Folder, 0, len(folders))
 	for _, folder := range folders {
-		hasAccess, err := s.permService.HasFolderViewAccess(folder.ID, userID)
+		hasAccess, err := scope.HasFolderViewAccess(folder.ID, userID)
 		if err != nil {
 			return nil, err
 		}
 		if hasAccess {
-			if err := s.permService.AttachFolderAccess(&folder, userID); err != nil {
+			if err := scope.AttachFolderAccess(&folder, userID); err != nil {
 				return nil, err
 			}
 			filteredFolders = append(filteredFolders, folder)
@@ -118,7 +122,7 @@ func (s *FolderService) ListContents(parentID *int64, userID int64) (*model.Fold
 
 	filteredWorkbooks := make([]model.Workbook, 0, len(workbooks))
 	for _, workbook := range workbooks {
-		canView, err := s.permService.CanViewWorkbook(&workbook, userID)
+		canView, err := scope.CanViewWorkbook(&workbook, userID)
 		if err != nil {
 			return nil, err
 		}
@@ -282,7 +286,9 @@ func (s *FolderService) GetSharesForUser(userID, folderID int64) ([]model.Folder
 }
 
 func (s *FolderService) GetBreadcrumbForUser(userID, folderID int64) ([]model.Folder, error) {
-	hasAccess, err := s.permService.HasFolderViewAccess(folderID, userID)
+	scope := s.permService.NewAccessScope()
+
+	hasAccess, err := scope.HasFolderViewAccess(folderID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +302,7 @@ func (s *FolderService) GetBreadcrumbForUser(userID, folderID int64) ([]model.Fo
 	}
 
 	for i := range path {
-		if err := s.permService.AttachFolderAccess(&path[i], userID); err != nil {
+		if err := scope.AttachFolderAccess(&path[i], userID); err != nil {
 			return nil, err
 		}
 	}
@@ -310,8 +316,9 @@ func (s *FolderService) ListDirectlySharedForUser(userID int64) ([]model.Folder,
 		return nil, err
 	}
 
+	scope := s.permService.NewAccessScope()
 	for i := range folders {
-		if err := s.permService.AttachFolderAccess(&folders[i], userID); err != nil {
+		if err := scope.AttachFolderAccess(&folders[i], userID); err != nil {
 			return nil, err
 		}
 	}

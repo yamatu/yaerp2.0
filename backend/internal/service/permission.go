@@ -172,144 +172,7 @@ func (s *PermissionService) GetUserDepartmentIDs(userID int64) ([]int64, error) 
 }
 
 func (s *PermissionService) GetPermissionMatrix(sheetID int64, userID int64) (*model.PermissionMatrix, error) {
-	roles, roleIDs, err := s.getUserRoles(userID)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, role := range roles {
-		if role.Code == "admin" {
-			return fullAccessMatrix(), nil
-		}
-	}
-	if s.sheetOverride != nil {
-		handled, matrix, err := s.sheetOverride(userID, sheetID)
-		if err != nil {
-			return nil, err
-		}
-		if handled {
-			if matrix == nil {
-				return emptyPermissionMatrix(), nil
-			}
-			ensurePermissionMatrixLayers(matrix)
-			return matrix, nil
-		}
-	}
-
-	sheet, err := s.sheetRepo.GetSheet(sheetID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get sheet: %w", err)
-	}
-	if err := applySheetLifecycleState(sheet); err != nil {
-		return nil, err
-	}
-
-	workbook, err := s.sheetRepo.GetWorkbook(sheet.WorkbookID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get workbook: %w", err)
-	}
-	if err := applyWorkbookLifecycleState(workbook); err != nil {
-		return nil, err
-	}
-	if workbook.IsHidden {
-		return emptyPermissionMatrix(), nil
-	}
-
-	if workbook.OwnerID == userID {
-		matrix := fullAccessMatrix()
-		applyWorkbookStateToPermissionMatrix(workbook, matrix)
-		applySheetStateToPermissionMatrix(sheet, matrix)
-		return matrix, nil
-	}
-
-	matrix, err := s.permRepo.GetPermissionMatrix(sheetID, roleIDs)
-	if err != nil {
-		return nil, err
-	}
-	ensurePermissionMatrixLayers(matrix)
-	departmentIDs, err := s.departmentRepo.GetUserDepartmentIDs(userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load user departments: %w", err)
-	}
-	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load visual protection rules: %w", err)
-	}
-	departmentSet := int64Set(departmentIDs)
-	hasVisualWhitelistAccess := protectionWhitelistHasAccess(protections, userID, departmentSet)
-	departmentSheetPerms, err := s.permRepo.GetPrincipalSheetPermissions(sheetID, "department", departmentIDs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load department sheet permissions: %w", err)
-	}
-	for _, permission := range departmentSheetPerms {
-		mergeSheetPermission(&matrix.Sheet, permission)
-	}
-	departmentCellPerms, err := s.permRepo.GetPrincipalCellPermissions(sheetID, "department", departmentIDs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load department range permissions: %w", err)
-	}
-	userPrincipalSheetPerms, err := s.permRepo.GetPrincipalSheetPermissions(sheetID, "user", []int64{userID})
-	if err != nil {
-		return nil, fmt.Errorf("failed to load employee sheet permission: %w", err)
-	}
-	userPrincipalCellPerms, err := s.permRepo.GetPrincipalCellPermissions(sheetID, "user", []int64{userID})
-	if err != nil {
-		return nil, fmt.Errorf("failed to load employee range permissions: %w", err)
-	}
-	if workbook.IsPublic {
-		matrix.Sheet.CanView = true
-		matrix.Sheet.CanEdit = true
-		matrix.Sheet.CanExport = true
-	}
-
-	userPerm, err := s.permRepo.GetUserSheetPermission(sheetID, userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load direct user permission: %w", err)
-	}
-
-	if workbook.FolderID != nil {
-		access, err := s.resolveFolderAccess(*workbook.FolderID, userID, roleIDs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to check folder access: %w", err)
-		}
-		if !workbook.IsPublic && !access.CanView && !hasAnyDirectUserSheetPermission(userPerm) &&
-			!hasPrincipalAccess(departmentSheetPerms, departmentCellPerms) &&
-			!hasPrincipalAccess(userPrincipalSheetPerms, userPrincipalCellPerms) &&
-			!hasVisualWhitelistAccess {
-			return emptyPermissionMatrix(), nil
-		}
-		if access.CanView {
-			matrix.Sheet.CanView = true
-		}
-	}
-
-	if userPerm != nil {
-		matrix.Sheet.CanView = matrix.Sheet.CanView || userPerm.CanView
-		matrix.Sheet.CanEdit = matrix.Sheet.CanEdit || userPerm.CanEdit
-		matrix.Sheet.CanDelete = matrix.Sheet.CanDelete || userPerm.CanDelete
-		matrix.Sheet.CanExport = matrix.Sheet.CanExport || userPerm.CanExport
-	}
-	if len(userPrincipalSheetPerms) > 0 {
-		permission := userPrincipalSheetPerms[0]
-		matrix.Sheet = model.SheetPerm{
-			CanView: permission.CanView, CanEdit: permission.CanEdit,
-			CanDelete: permission.CanDelete, CanExport: permission.CanExport,
-		}
-		matrix.ExplicitUserSheetRule = true
-	}
-
-	matrix.DefaultPermission = defaultCellPermission(matrix.Sheet)
-	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, departmentCellPerms, false)
-	mergePrincipalCellPermissions(&matrix.UserOverrides, userPrincipalCellPerms, true)
-	mergeProtectionWhitelistPermissions(matrix, protections, userID, departmentSet)
-	if !matrix.ExplicitUserSheetRule {
-		elevateMatrixForScopedPermissions(matrix)
-	}
-
-	applyWorkbookStateToPermissionMatrix(workbook, matrix)
-	applySheetStateToPermissionMatrix(sheet, matrix)
-
-	return matrix, nil
+	return s.getPermissionMatrixCached(sheetID, userID, nil)
 }
 
 func (s *PermissionService) GetPermissionMatrixForRole(sheetID, roleID int64) (*model.PermissionMatrix, error) {
@@ -331,105 +194,15 @@ func (s *PermissionService) ListUserSheetPermissions(sheetID int64) ([]model.Use
 }
 
 func (s *PermissionService) IsAdmin(userID int64) (bool, error) {
-	roles, _, err := s.getUserRoles(userID)
-	if err != nil {
-		return false, err
-	}
-
-	for _, role := range roles {
-		if role.Code == "admin" {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	return s.isAdminCached(userID, nil)
 }
 
 func (s *PermissionService) CanManageWorkbook(workbook *model.Workbook, userID int64) (bool, error) {
-	isAdmin, err := s.IsAdmin(userID)
-	if err != nil {
-		return false, err
-	}
-	if isAdmin {
-		return true, nil
-	}
-	if s.workbookOverride != nil {
-		handled, allowed, overrideErr := s.workbookOverride(userID, workbook.ID, "manage")
-		if overrideErr != nil {
-			return false, overrideErr
-		}
-		if handled {
-			return allowed, nil
-		}
-	}
-	if workbook.OwnerID == userID {
-		return true, nil
-	}
-
-	return false, nil
+	return s.canManageWorkbookCached(workbook, userID, nil)
 }
 
 func (s *PermissionService) CanViewWorkbook(workbook *model.Workbook, userID int64) (bool, error) {
-	if err := applyWorkbookLifecycleState(workbook); err != nil {
-		return false, err
-	}
-	isAdmin, err := s.IsAdmin(userID)
-	if err != nil {
-		return false, err
-	}
-	if isAdmin {
-		return true, nil
-	}
-	if workbook.IsHidden {
-		return false, nil
-	}
-	if s.workbookOverride != nil {
-		handled, allowed, overrideErr := s.workbookOverride(userID, workbook.ID, "view")
-		if overrideErr != nil {
-			return false, overrideErr
-		}
-		if handled {
-			return allowed, nil
-		}
-	}
-	if workbook.IsPublic {
-		return true, nil
-	}
-
-	canManage, err := s.CanManageWorkbook(workbook, userID)
-	if err != nil {
-		return false, err
-	}
-	if canManage {
-		return true, nil
-	}
-
-	if workbook.FolderID != nil {
-		hasFolderAccess, err := s.HasFolderViewAccess(*workbook.FolderID, userID)
-		if err != nil {
-			return false, err
-		}
-		if hasFolderAccess {
-			return true, nil
-		}
-	}
-
-	sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbook.ID)
-	if err != nil {
-		return false, fmt.Errorf("failed to load workbook sheets: %w", err)
-	}
-
-	for _, sheet := range sheets {
-		matrix, err := s.GetPermissionMatrix(sheet.ID, userID)
-		if err != nil {
-			return false, err
-		}
-		if matrix.Sheet.CanView {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	return s.canViewWorkbookCached(workbook, userID, nil)
 }
 
 func (s *PermissionService) CanManageFolder(folder *model.Folder, userID int64) (bool, error) {
@@ -441,48 +214,15 @@ func (s *PermissionService) CanManageFolder(folder *model.Folder, userID int64) 
 }
 
 func (s *PermissionService) CanWriteFolder(folderID, userID int64) (bool, error) {
-	_, roleIDs, err := s.getUserRoles(userID)
-	if err != nil {
-		return false, err
-	}
-
-	access, err := s.resolveFolderAccess(folderID, userID, roleIDs)
-	if err != nil {
-		return false, err
-	}
-
-	return access.CanWrite, nil
+	return s.canWriteFolderCached(folderID, userID, nil)
 }
 
 func (s *PermissionService) HasFolderViewAccess(folderID, userID int64) (bool, error) {
-	_, roleIDs, err := s.getUserRoles(userID)
-	if err != nil {
-		return false, err
-	}
-
-	access, err := s.resolveFolderAccess(folderID, userID, roleIDs)
-	if err != nil {
-		return false, err
-	}
-
-	return access.CanView, nil
+	return s.hasFolderViewAccessCached(folderID, userID, nil)
 }
 
 func (s *PermissionService) AttachFolderAccess(folder *model.Folder, userID int64) error {
-	_, roleIDs, err := s.getUserRoles(userID)
-	if err != nil {
-		return err
-	}
-
-	access, err := s.resolveFolderAccess(folder.ID, userID, roleIDs)
-	if err != nil {
-		return err
-	}
-
-	folder.AccessLevel = access.AccessLevel
-	folder.CanWrite = access.CanWrite
-	folder.CanManage = access.CanManage
-	return nil
+	return s.attachFolderAccessCached(folder, userID, nil)
 }
 
 func (s *PermissionService) CheckCellPermission(sheetID int64, userID int64, col string, row int, requiredPerm string) (bool, error) {
@@ -509,86 +249,11 @@ func (s *PermissionService) validatePrincipal(principalType string, principalID 
 }
 
 func (s *PermissionService) getUserRoles(userID int64) ([]model.Role, []int64, error) {
-	roles, err := s.userRepo.GetUserRoles(userID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get user roles: %w", err)
-	}
-
-	roleIDs := make([]int64, 0, len(roles))
-	for _, role := range roles {
-		roleIDs = append(roleIDs, role.ID)
-	}
-
-	return roles, roleIDs, nil
+	return s.getUserRolesCached(userID, nil)
 }
 
 func (s *PermissionService) resolveFolderAccess(folderID, userID int64, roleIDs []int64) (*folderAccessResult, error) {
-	isAdmin, err := s.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	if isAdmin {
-		return &folderAccessResult{AccessLevel: "admin", CanView: true, CanWrite: true, CanManage: true}, nil
-	}
-
-	path, err := s.folderRepo.GetAncestorPath(folderID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load folder path: %w", err)
-	}
-
-	visibleMap := map[int64]bool{}
-	if len(roleIDs) > 0 {
-		visibleMap, err = s.folderRepo.GetVisibleFolderIDs(roleIDs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load folder visibility: %w", err)
-		}
-	}
-
-	result := &folderAccessResult{AccessLevel: "", CanView: false, CanWrite: false, CanManage: false}
-	for _, folder := range path {
-		if folder.OwnerID == userID {
-			result.CanView = true
-			result.CanWrite = true
-			if folder.ID == folderID {
-				result.CanManage = true
-				result.AccessLevel = "owner"
-			} else if result.AccessLevel == "" || result.AccessLevel == "view" {
-				result.AccessLevel = "edit"
-			}
-			continue
-		}
-
-		shareLevel, err := s.folderRepo.GetShareAccessLevel(folder.ID, userID)
-		if err != nil {
-			return nil, err
-		}
-		switch shareLevel {
-		case "edit":
-			result.CanView = true
-			result.CanWrite = true
-			if result.AccessLevel == "" || result.AccessLevel == "view" {
-				result.AccessLevel = "edit"
-			}
-		case "view":
-			result.CanView = true
-			if result.AccessLevel == "" {
-				result.AccessLevel = "view"
-			}
-		}
-
-		if folder.ID == folderID && visibleMap[folder.ID] {
-			result.CanView = true
-			if result.AccessLevel == "" {
-				result.AccessLevel = "view"
-			}
-		}
-	}
-
-	if !result.CanView {
-		result.AccessLevel = ""
-	}
-
-	return result, nil
+	return s.resolveFolderAccessCached(folderID, userID, roleIDs, nil)
 }
 
 func permissionSatisfies(has, needs string) bool {

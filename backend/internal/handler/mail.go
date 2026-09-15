@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -296,11 +297,41 @@ func (h *MailHandler) DownloadAttachment(c *gin.Context) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
+	disposition := "attachment"
+	if c.Query("inline") == "1" || c.Query("inline") == "true" || c.Query("disposition") == "inline" {
+		disposition = "inline"
+	}
 	c.Header("Content-Type", contentType)
-	c.Header("Content-Disposition", disposition)
+	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
 	c.Header("Cache-Control", "private, no-store")
-	c.Data(http.StatusOK, contentType, data)
+	// ServeContent handles HEAD, range requests and Content-Length; the bytes are
+	// already in memory (and memoized in the mail service), so a PDF viewer can
+	// seek without pulling the whole attachment again.
+	http.ServeContent(c.Writer, c.Request, filename, time.Time{}, bytes.NewReader(data))
+}
+
+// AttachmentLink returns a signed, range capable URL for one attachment. The
+// browser can then render it directly (progressive images, seekable PDFs)
+// instead of downloading every byte through the JSON API.
+func (h *MailHandler) AttachmentLink(c *gin.Context) {
+	uid, ok := mailUID(c)
+	if !ok {
+		return
+	}
+	attachment, url, err := h.service.EnsureAttachmentFile(
+		c.GetInt64("user_id"), c.DefaultQuery("folder", "INBOX"), uid, c.Param("partId"),
+	)
+	if err != nil {
+		handleMailError(c, err)
+		return
+	}
+	response.OK(c, gin.H{
+		"url":           url,
+		"filename":      attachment.Filename,
+		"content_type":  attachment.MimeType,
+		"size":          attachment.Size,
+		"attachment_id": attachment.ID,
+	})
 }
 
 func (h *MailHandler) UpdateFlags(c *gin.Context) {
