@@ -39,6 +39,7 @@ export default function WhatsAppWorkspacePage() {
   const accountRequestRef = useRef(false)
   const chatsRequestRef = useRef(false)
   const lastChatsLoadAtRef = useRef(0)
+  const accountStatusRef = useRef('')
 
   const loadAccount = useCallback(async () => {
     if (accountRequestRef.current) return null
@@ -46,8 +47,17 @@ export default function WhatsAppWorkspacePage() {
     try {
       const response = await api.get<WhatsAppAccount>('/whatsapp/account')
       if (response.code === 0 && response.data) {
+        const previousStatus = accountStatusRef.current
+        accountStatusRef.current = response.data.status
         setAccount(response.data)
         setAbout(response.data.about || '')
+        if (response.data.status === 'ready' && previousStatus && previousStatus !== 'ready') {
+          // Freshly scanned: load the conversation list right away instead of
+          // waiting for the periodic refresh.
+          setError('')
+          setNotice('WhatsApp 已连接，正在同步会话...')
+          lastChatsLoadAtRef.current = 0
+        }
         return response.data
       }
       setError(response.message || '加载 WhatsApp 账号失败')
@@ -100,7 +110,7 @@ export default function WhatsAppWorkspacePage() {
       if (current?.status === 'ready' && Date.now() - lastChatsLoadAtRef.current >= 30000) {
         await loadChats()
       } else if (current && current.status !== 'ready') {
-        setChats([])
+        setChats((existing) => (existing.length === 0 ? existing : []))
         lastChatsLoadAtRef.current = 0
       }
     }, 3000)
@@ -277,10 +287,37 @@ export default function WhatsAppWorkspacePage() {
                   </div>
                 </div>
 
-                {account?.status === 'qr' && account.qr_data_url && (
-                  <div className="mt-5 rounded-lg border border-slate-200 bg-white p-3 text-center"><img src={account.qr_data_url} alt="WhatsApp 登录二维码" className="mx-auto w-full max-w-72" /><p className="mt-2 text-xs leading-5 text-slate-500">使用手机 WhatsApp 的“关联设备”扫描二维码。</p></div>
+                {account?.status === 'qr' && (
+                  <div className="mt-5 rounded-lg border border-slate-200 bg-white p-3 text-center">
+                    {account.qr_data_url ? (
+                      <img src={account.qr_data_url} alt="WhatsApp 登录二维码" className="mx-auto w-full max-w-72" />
+                    ) : (
+                      <div className="flex h-72 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />正在生成登录二维码...</div>
+                    )}
+                    <p className="mt-2 text-xs leading-5 text-slate-500">二维码会自动更新，无需手动刷新。用手机 WhatsApp 的“关联设备”扫描即可。</p>
+                    <ol className="mt-3 space-y-1 rounded-lg bg-slate-50 p-3 text-left text-xs leading-5 text-slate-500">
+                      <li>1. 手机打开 WhatsApp，进入「设置 → 关联设备」</li>
+                      <li>2. 点击「关联设备」，对准左侧二维码扫描</li>
+                      <li>3. 扫码后保持本页打开，等待会话同步完成</li>
+                    </ol>
+                    {account.loading_message && <p className="mt-2 text-xs text-slate-400">{account.loading_message}</p>}
+                  </div>
                 )}
-                {(account?.status === 'loading' || account?.status === 'initializing') && <div className="mt-5"><div className="mb-2 flex justify-between text-xs text-slate-500"><span>{account.loading_message || '正在加载 WhatsApp Web'}</span><span>{account.loading_percent || 0}%</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-[#25d366]" style={{ width: `${account.loading_percent || 0}%` }} /></div></div>}
+                {account?.status === 'authenticated' && (
+                  <div className="mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-3 text-xs leading-5 text-emerald-800">
+                    <div className="flex items-center gap-2 font-semibold"><CheckCircle2 className="h-4 w-4" />已扫码，请在手机上确认登录</div>
+                    <p className="mt-1">确认后会自动同步已有的会话与消息，通常需要 1-2 分钟，请保持本页打开。</p>
+                  </div>
+                )}
+                {(account?.status === 'loading' || account?.status === 'initializing' || (account?.status === 'authenticated' && (account.loading_percent || 0) > 0)) && <div className="mt-5"><div className="mb-2 flex justify-between text-xs text-slate-500"><span>{account.loading_message || '正在加载 WhatsApp Web'}</span><span>{account.loading_percent || 0}%</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-[#25d366]" style={{ width: `${account.loading_percent || 0}%` }} /></div></div>}
+
+                {!connected && account?.last_error && (account.status === 'error' || account.status === 'auth_failure') && (
+                  <div className="mt-5 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-5 text-rose-700">
+                    <div className="font-semibold">上次连接失败</div>
+                    <p className="mt-1 break-words">{account.last_error}</p>
+                    <p className="mt-1 text-rose-600/80">可点击下方「重启」重新生成登录二维码。</p>
+                  </div>
+                )}
 
                 <div className="mt-5 flex flex-wrap gap-2">
                   {canStart && <button type="button" onClick={() => void runAction('start')} disabled={Boolean(acting)} className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-lg bg-[#008069] px-4 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-50"><Smartphone className="h-4 w-4" />绑定账号</button>}
