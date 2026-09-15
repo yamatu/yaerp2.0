@@ -35,6 +35,7 @@ export default function WhatsAppAdminPage() {
   const [loadingChats, setLoadingChats] = useState(false)
   const [saving, setSaving] = useState(false)
   const [acting, setActing] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'ready' | 'pending' | 'attention'>('all')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const chatRequestSequenceRef = useRef(0)
@@ -85,15 +86,49 @@ export default function WhatsAppAdminPage() {
   }, [loadChats, selectedAccount?.status, selectedAccount?.user_id])
 
   useEffect(() => {
-    const timer = window.setInterval(() => void loadAccounts(true), 3000)
-    return () => window.clearInterval(timer)
+    const timer = window.setInterval(() => {
+      // Skip the poll while the tab is hidden: the status request fans out to the
+      // WhatsApp sidecar for every account.
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      void loadAccounts(true)
+    }, 3000)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void loadAccounts(true)
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [loadAccounts])
+
+  const accountCounts = useMemo(() => {
+    const counts = { ready: 0, pending: 0, attention: 0, disconnected: 0 }
+    accounts.forEach((account) => {
+      if (account.status === 'ready') counts.ready += 1
+      else if (['qr', 'authenticated', 'loading', 'initializing'].includes(account.status)) counts.pending += 1
+      else if (['error', 'auth_failure'].includes(account.status)) counts.attention += 1
+      else counts.disconnected += 1
+    })
+    return counts
+  }, [accounts])
 
   const filteredAccounts = useMemo(() => {
     const keyword = accountSearch.trim().toLowerCase()
-    if (!keyword) return accounts
-    return accounts.filter((account) => [account.username, account.email, account.display_name, account.phone_number].some((value) => value?.toLowerCase().includes(keyword)))
-  }, [accountSearch, accounts])
+    return accounts
+      .filter((account) => {
+        if (statusFilter === 'ready') return account.status === 'ready'
+        if (statusFilter === 'pending') return ['qr', 'authenticated', 'loading', 'initializing'].includes(account.status)
+        if (statusFilter === 'attention') return ['error', 'auth_failure'].includes(account.status)
+        return true
+      })
+      .filter((account) => !keyword || [account.username, account.email, account.display_name, account.phone_number].some((value) => value?.toLowerCase().includes(keyword)))
+      .sort((left, right) => {
+        // Connected accounts first so the ones needing attention are easy to spot.
+        const weight = (status: string) => (status === 'ready' ? 0 : ['qr', 'authenticated', 'loading', 'initializing'].includes(status) ? 1 : 2)
+        return weight(left.status) - weight(right.status) || left.username.localeCompare(right.username, 'zh-CN')
+      })
+  }, [accountSearch, accounts, statusFilter])
 
   const filteredChats = useMemo(() => {
     const keyword = chatSearch.trim().toLowerCase()
@@ -127,9 +162,30 @@ export default function WhatsAppAdminPage() {
       <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
         <div className="grid min-h-[620px] xl:grid-cols-[330px_390px_minmax(0,1fr)]">
           <aside className="border-r border-slate-200 bg-[#f7f8fa]">
-            <div className="border-b border-slate-200 p-3"><label className="flex h-10 items-center gap-2 rounded-lg bg-white px-3 text-sm text-slate-500 shadow-sm"><Search className="h-4 w-4" /><input value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} placeholder="搜索员工或 WhatsApp 号码" className="min-w-0 flex-1 outline-none" /></label></div>
+            <div className="border-b border-slate-200 p-3">
+              <label className="flex h-10 items-center gap-2 rounded-lg bg-white px-3 text-sm text-slate-500 shadow-sm"><Search className="h-4 w-4" /><input value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} placeholder="搜索员工或 WhatsApp 号码" className="min-w-0 flex-1 outline-none" /></label>
+              <div className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+                {([
+                  ['all', '全部', accounts.length],
+                  ['ready', '已连接', accountCounts.ready],
+                  ['pending', '进行中', accountCounts.pending],
+                  ['attention', '异常', accountCounts.attention],
+                ] as const).map(([value, label, count]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setStatusFilter(value)}
+                    aria-pressed={statusFilter === value}
+                    className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 font-medium transition ${statusFilter === value ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 hover:bg-slate-100'}`}
+                  >
+                    {label}
+                    <span className={statusFilter === value ? 'text-white/70' : 'text-slate-400'}>{count}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="max-h-[720px] overflow-y-auto">
-              {loading ? <div className="flex h-40 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />加载员工账号...</div> : filteredAccounts.map((account) => (
+              {loading ? <div className="flex h-40 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />加载员工账号...</div> : filteredAccounts.length === 0 ? <div className="p-8 text-center text-sm text-slate-400">{accounts.length === 0 ? '还没有员工绑定 WhatsApp 账号' : '没有符合条件的账号'}</div> : filteredAccounts.map((account) => (
                 <button key={account.id} type="button" onClick={() => { setSelectedUserId(account.user_id); setChatSearch('') }} className={`flex w-full items-center gap-3 border-b border-slate-100 px-3 py-3 text-left ${selectedUserId === account.user_id ? 'bg-emerald-50' : 'bg-white hover:bg-slate-50'}`}>
                   <div className="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500">{account.profile_pic_url ? <img src={account.profile_pic_url} alt="" className="h-full w-full object-cover" /> : <Smartphone className="h-5 w-5" />}<span className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white ${account.status === 'ready' ? 'bg-[#25d366]' : 'bg-slate-400'}`} /></div>
                   <div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-900">{account.username}</div><div className="mt-0.5 truncate text-xs text-slate-500">{account.display_name || account.phone_number || account.email}</div></div>
