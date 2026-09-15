@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -296,11 +297,17 @@ func (h *MailHandler) DownloadAttachment(c *gin.Context) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": filename})
+	disposition := "attachment"
+	if c.Query("inline") == "1" || c.Query("inline") == "true" || c.Query("disposition") == "inline" {
+		disposition = "inline"
+	}
 	c.Header("Content-Type", contentType)
-	c.Header("Content-Disposition", disposition)
+	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
 	c.Header("Cache-Control", "private, no-store")
-	c.Data(http.StatusOK, contentType, data)
+	// ServeContent handles HEAD, range requests and Content-Length; the bytes are
+	// already in memory (and memoized in the mail service), so a PDF viewer can
+	// seek without pulling the whole attachment again.
+	http.ServeContent(c.Writer, c.Request, filename, time.Time{}, bytes.NewReader(data))
 }
 
 func (h *MailHandler) UpdateFlags(c *gin.Context) {

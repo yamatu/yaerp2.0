@@ -2,9 +2,11 @@ package handler
 
 import (
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"strconv"
+	"time"
 
 	"yaerp/internal/service"
 	"yaerp/pkg/response"
@@ -101,6 +103,16 @@ func (h *UploadHandler) ServeFile(c *gin.Context) {
 	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": attachment.Filename}))
 	if c.Query("v") != "" {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	if attachment.MimeType != "" {
+		c.Header("Content-Type", attachment.MimeType)
+	}
+	// Object storage supports seeking, so serve the file through ServeContent:
+	// that enables HTTP range requests and lets PDF viewers (and large images)
+	// fetch only the bytes they need instead of the whole attachment.
+	if seeker, ok := reader.(io.ReadSeeker); ok {
+		http.ServeContent(c.Writer, c.Request, attachment.Filename, time.Time{}, seeker)
+		return
 	}
 	c.DataFromReader(http.StatusOK, attachment.Size, attachment.MimeType, reader, nil)
 }

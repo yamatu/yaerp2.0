@@ -372,10 +372,28 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 	return detail, nil
 }
 
+// DownloadAttachment returns the bytes of one part. The result is memoized for a
+// few minutes because every uncached call refetches and reparses the message
+// over IMAP, and the preview pane asks for the same part repeatedly.
 func (s *MailService) DownloadAttachment(userID int64, folder string, uid uint32, partID string) (string, string, []byte, error) {
 	if uid == 0 {
 		return "", "", nil, fmt.Errorf("无效的邮件标识")
 	}
+	cacheKey := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: partID}
+	if entry, ok := s.mailAttachmentCache().get(cacheKey); ok {
+		return entry.filename, entry.contentType, entry.data, nil
+	}
+	filename, contentType, data, err := s.downloadAttachmentUncached(userID, folder, uid, partID)
+	if err != nil {
+		return "", "", nil, err
+	}
+	s.mailAttachmentCache().put(cacheKey, mailAttachmentCacheEntry{
+		filename: filename, contentType: contentType, data: data,
+	})
+	return filename, contentType, data, nil
+}
+
+func (s *MailService) downloadAttachmentUncached(userID int64, folder string, uid uint32, partID string) (string, string, []byte, error) {
 	account, accountErr := s.repo.GetAccount(userID)
 	if accountErr != nil {
 		return "", "", nil, accountErr

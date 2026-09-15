@@ -43,6 +43,12 @@ export interface FilePreviewModalProps {
   onClose: () => void;
   /** Extra buttons rendered before the shared actions, e.g. delete. */
   headerActions?: ReactNode;
+  /** Extra file specific actions rendered in a bar under the stage. */
+  footer?: ReactNode;
+  /** Dims the stage while the caller runs a blocking action, e.g. rotate + save. */
+  dimmed?: boolean;
+  /** Clicking the empty space around the file closes the viewer. */
+  closeOnBackdropClick?: boolean;
   emptyHint?: string;
   /** Overlay stacking class; raise it when the viewer opens above a dialog. */
   zIndexClass?: string;
@@ -77,6 +83,9 @@ export function FilePreviewModal({
   onIndexChange,
   onClose,
   headerActions,
+  footer,
+  dimmed = false,
+  closeOnBackdropClick = true,
   emptyHint = "该文件类型暂不支持在线预览，请下载后查看。",
   zIndexClass = "z-[110]",
 }: FilePreviewModalProps) {
@@ -85,6 +94,8 @@ export function FilePreviewModal({
   const [imageState, setImageState] = useState<"loading" | "ready" | "error">("loading");
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+  // A pan gesture ends with a click event; that click must not close the viewer.
+  const dragMovedRef = useRef(false);
   const stageRef = useRef<HTMLDivElement>(null);
   // Held in a ref as well so repeated arrow presses (key repeat, or two keys in
   // the same frame) never navigate from a stale index.
@@ -197,6 +208,7 @@ export function FilePreviewModal({
 
   const startDrag = (event: React.PointerEvent<HTMLDivElement>) => {
     if (kind !== "image" || zoom <= MIN_ZOOM) return;
+    dragMovedRef.current = false;
     dragRef.current = { startX: event.clientX, startY: event.clientY, originX: pan.x, originY: pan.y };
     setDragging(true);
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -205,7 +217,10 @@ export function FilePreviewModal({
   const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag) return;
-    setPan({ x: drag.originX + (event.clientX - drag.startX), y: drag.originY + (event.clientY - drag.startY) });
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragMovedRef.current = true;
+    setPan({ x: drag.originX + dx, y: drag.originY + dy });
   };
 
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -366,7 +381,19 @@ export function FilePreviewModal({
       <div
         ref={stageRef}
         className="relative min-h-0 flex-1 overflow-hidden"
-        onClick={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation();
+          if (!closeOnBackdropClick) return;
+          if (dragMovedRef.current) {
+            dragMovedRef.current = false;
+            return;
+          }
+          // Clicks that land on the image, the PDF frame or the toolbar keep the
+          // viewer open; clicks on the surrounding space close it.
+          const target = event.target as HTMLElement | null;
+          if (target && target.closest("img,iframe,a,button,video")) return;
+          onClose();
+        }}
         onPointerDown={startDrag}
         onPointerMove={moveDrag}
         onPointerUp={endDrag}
@@ -388,10 +415,16 @@ export function FilePreviewModal({
               draggable={false}
               onLoad={() => setImageState("ready")}
               onError={() => setImageState("error")}
-              className="max-h-full max-w-full select-none object-contain transition-transform duration-75"
+              className={`max-h-full max-w-full select-none object-contain ${
+                dimmed ? "opacity-60" : ""
+              } ${
+                // No transform transition while panning, otherwise the drag lags
+                // behind the pointer.
+                dragging ? "transition-opacity duration-150" : "transition-[transform,opacity] duration-100"
+              }`}
               style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
             />
-            {imageState === "loading" && (
+            {(imageState === "loading" || dimmed) && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
                 <Loader2 className="h-6 w-6 animate-spin text-white/70" />
               </div>
@@ -412,6 +445,15 @@ export function FilePreviewModal({
           </div>
         )}
       </div>
+
+      {footer && (
+        <div
+          className="flex shrink-0 flex-wrap items-center gap-2 border-t border-white/10 px-3 py-2 text-white sm:px-4"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {footer}
+        </div>
+      )}
     </div>
   );
 }

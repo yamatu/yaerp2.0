@@ -71,6 +71,9 @@ type MailService struct {
 	aliRateNext   time.Time
 	rdb           *redis.Client
 	bulkSendSem   chan struct{}
+
+	attachmentCacheOnce sync.Once
+	attachmentCache     *mailAttachmentCache
 }
 
 type mailSession struct {
@@ -583,11 +586,16 @@ func (s *MailService) MoveMessage(userID int64, uid uint32, input *model.MailMov
 	if err != nil {
 		return err
 	}
-	return s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
+	if err := s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
 		seqset := new(imap.SeqSet)
 		seqset.AddNum(uid)
 		return conn.UidMove(seqset, destination)
-	})
+	}); err != nil {
+		return err
+	}
+	// The message left this folder, so drop any memoized body of it.
+	s.mailAttachmentCache().invalidate(userID, folder, uid)
+	return nil
 }
 
 func (s *MailService) DeleteMessage(userID int64, uid uint32, folder string) error {
@@ -617,7 +625,7 @@ func (s *MailService) BatchMessages(userID int64, input *model.MailBatchInput) e
 		seqset.AddNum(uid)
 	}
 	action := strings.ToLower(strings.TrimSpace(input.Action))
-	return s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
+	err = s.withSelectedMailbox(userID, folder, false, func(conn *imapclient.Client) error {
 		switch action {
 		case "read":
 			return updateMailFlag(conn, seqset, imap.SeenFlag, true)
@@ -650,6 +658,21 @@ func (s *MailService) BatchMessages(userID int64, input *model.MailBatchInput) e
 			return fmt.Errorf("不支持的批量邮件操作")
 		}
 	})
+	if err != nil {
+		return err
+	}
+	// Attachments of moved or expunged messages must not survive in memory.
+	if action == "move" {
+		for _, uid := range input.UIDs {
+			s.mailAttachmentCache().invalidate(userID, folder, uid)
+		}
+	}
+	if action == "delete" {
+		for _, uid := range input.UIDs {
+			s.mailAttachmentCache().invalidate(userID, "", uid)
+		}
+	}
+	return nil
 }
 
 func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, attachments []MailOutgoingAttachment) (*model.MailSendResult, error) {

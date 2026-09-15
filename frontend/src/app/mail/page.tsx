@@ -1615,7 +1615,7 @@ export default function MailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attachmentPreviewKey, selected, attachmentPreviewUrls]);
 
-  // Object URLs must be released when the viewer closes or the message changes.
+  // Object URLs must be released when the message changes or the page unmounts.
   const attachmentPreviewUrlsRef = useRef<Record<string, string>>({});
   attachmentPreviewUrlsRef.current = attachmentPreviewUrls;
   useEffect(() => {
@@ -1633,12 +1633,11 @@ export default function MailPage() {
     });
   }, [selected?.uid, selected?.folder]);
 
+  // Closing only hides the viewer: the already fetched bytes stay cached for the
+  // message that is open, so re-opening the same attachment is instant. The URLs
+  // are released when the message changes or the page unmounts.
   const closeAttachmentPreview = () => {
     setAttachmentPreviewKey(null);
-    setAttachmentPreviewUrls((current) => {
-      Object.values(current).forEach((url) => URL.revokeObjectURL(url));
-      return {};
-    });
   };
 
   const downloadAttachment = async (attachment: MailAttachment) => {
