@@ -1072,6 +1072,21 @@ function getUniverPatchCellValue(cell: unknown): unknown {
   return ''
 }
 
+// A formula cell stores both the formula text and the cached result. Structural
+// edits (insert/delete of a row, a cell or a column) move a formula to a new row
+// while the formula text often stays identical, so only the cached result marks
+// the changed sheet. Comparing the whole value payload keeps such cells inside
+// the change set; otherwise the server still holds the previous snapshot value
+// for that coordinate and restores it, which is what makes a formula show the
+// result of the row that used to live there.
+function getUniverPatchCellSignature(cell: unknown): string {
+  if (!cell || typeof cell !== 'object') return ''
+  const data = cell as { f?: unknown; v?: unknown }
+  const formula = typeof data.f === 'string' && data.f.trim() ? data.f : ''
+  const value = typeof data.v === 'string' || typeof data.v === 'number' || typeof data.v === 'boolean' ? data.v : ''
+  return JSON.stringify([formula, value])
+}
+
 function getWorksheetCell(sheetData: Partial<IWorksheetData> | undefined, worksheetRow: number, columnIndex: number) {
   const cellData = sheetData?.cellData as Record<string, Record<string, unknown> | undefined> | undefined
   return cellData?.[String(worksheetRow)]?.[String(columnIndex)]
@@ -1113,9 +1128,11 @@ function buildRealtimeCellChanges(
     const column = columns[columnIndex]
     if (!Number.isInteger(worksheetRow) || !Number.isInteger(columnIndex) || !column?.key) return
 
-    const previousValue = getUniverPatchCellValue(getWorksheetCell(previousSheet, worksheetRow, columnIndex))
-    const nextValue = getUniverPatchCellValue(getWorksheetCell(nextSheet, worksheetRow, columnIndex))
-    if (areJsonSnapshotsEqual(previousValue, nextValue)) return
+    const previousCell = getWorksheetCell(previousSheet, worksheetRow, columnIndex)
+    const nextCell = getWorksheetCell(nextSheet, worksheetRow, columnIndex)
+    if (getUniverPatchCellSignature(previousCell) === getUniverPatchCellSignature(nextCell)) return
+
+    const nextValue = getUniverPatchCellValue(nextCell)
 
     changes.push({
       sheet_id: sheetId,
