@@ -30,6 +30,7 @@ import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
+import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
 import {
   collectSharedFormulaCells,
   createSharedFormulaResolver,
@@ -3368,6 +3369,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         registerSharedFormulaEditorInterceptor(univerResult.univer)
         const resolveSharedFormula = createSharedFormulaResolver(univerResult.univer)
         sharedFormulaResolverRef.current = resolveSharedFormula
+        // `下移` / `右移` move selected cells only; for uniform formula columns the
+        // moved formula must keep computing its own row (see the module docs).
+        const cellShiftRepair = registerCellShiftFormulaRepair(
+          univerResult.univer,
+          () => workbookApi.getActiveSheet(),
+          (count) => {
+            console.info(`[sheet] realigned ${count} formula cell(s) after inserting cells`)
+            schedulePersistRef.current?.()
+          }
+        )
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
@@ -3763,6 +3774,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 		  disposed = true
           persistSheetViewMemory()
           disposable.dispose()
+          cellShiftRepair?.dispose()
           selectionPresenceDisposable.dispose()
           searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
