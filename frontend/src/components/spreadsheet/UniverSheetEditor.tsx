@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
-import { AlertCircle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -20,7 +20,7 @@ import UniverPresetSheetsDataValidationZhCN from '@univerjs/preset-sheets-data-v
 import { UniverSheetsConditionalFormattingPreset } from '@univerjs/preset-sheets-conditional-formatting'
 import UniverPresetSheetsConditionalFormattingZhCN from '@univerjs/preset-sheets-conditional-formatting/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
-import { ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
+import { ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand, SheetPasteCommand, SheetPasteShortKeyCommand } from '@univerjs/sheets-ui'
 import { BEFORE_CELL_EDIT, SheetInterceptorService } from '@univerjs/sheets'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
@@ -31,7 +31,18 @@ import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
 import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
-import { registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
+import { registerPasteNotifier, registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
+import {
+  addPlainTextBadge,
+  collectNonPlainTextMarkers,
+  convertMarkerToPlainText,
+  createWorksheetCellReader,
+  PLAIN_TEXT_BADGE_COMPONENT_KEY,
+  resolveScanArea,
+  type NonPlainTextMarker,
+  type PlainRect,
+  type PlainTextBadgeData,
+} from '@/lib/univer-plain-text'
 import {
   collectSharedFormulaCells,
   createSharedFormulaResolver,
@@ -637,6 +648,51 @@ function commandChangesProtectionHighlightLayout(commandId: string) {
     commandId.startsWith('sheet.command.insert-multi-') ||
     commandId.endsWith('-row-by-range') ||
     commandId.endsWith('-col-by-range')
+}
+
+const PLAIN_TEXT_PASTE_COMMANDS = new Set<string>([SheetPasteCommand.id, SheetPasteShortKeyCommand.id])
+/** Width of the hover card, used to decide which side of the badge it opens on. */
+const PLAIN_TEXT_TOOLTIP_WIDTH = 256
+/** Grace period that lets the pointer travel from the badge into the hover card. */
+const PLAIN_TEXT_TOOLTIP_DELAY = 220
+
+/**
+ * The corner badge itself. Univer keeps this DOM anchored to its cell, so the
+ * component only renders the marker and reports hover, while the tooltip is
+ * drawn by the editor because the float DOM layer clips its own overflow.
+ */
+function PlainTextBadgeComponent({ data }: { data?: PlainTextBadgeData }) {
+  if (!data) return null
+  return (
+    <button
+      type="button"
+      data-plain-text-badge={`${data.row}:${data.column}`}
+      title="数据不是纯文本结构"
+      aria-label="数据不是纯文本结构"
+      className="yaerp-plain-text-badge block h-full w-full cursor-help border-0 bg-transparent p-0 outline-none"
+      onMouseDown={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+      onClick={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        data.onConvert?.()
+      }}
+      onMouseEnter={(event) => {
+        const rect = event.currentTarget.getBoundingClientRect()
+        data.onHover?.({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+      }}
+      onMouseLeave={() => data.onHover?.(null)}
+      onFocus={(event) => {
+        const rect = event.currentTarget.getBoundingClientRect()
+        data.onHover?.({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+      }}
+      onBlur={() => data.onHover?.(null)}
+    >
+      <span className="block h-0 w-0 border-r-[11px] border-t-[11px] border-r-transparent border-t-amber-500" />
+    </button>
+  )
 }
 
 function clampUniverZoom(zoomRatio: number) {
@@ -1370,6 +1426,29 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const presenceSendRef = useRef<{ signature: string; sentAt: number }>({ signature: '', sentAt: 0 })
   const pendingPresenceRef = useRef<SheetPresenceEntry[] | null>(null)
   const presenceFrameRef = useRef<number | null>(null)
+  // Cells that are not plain text (rich text or an embedded line break) get a
+  // corner badge; the marker list is kept in a ref so the scan stays cheap.
+  const plainTextOverlayRef = useRef<HTMLDivElement>(null)
+  const plainTextMarkersRef = useRef<NonPlainTextMarker[]>([])
+  const plainTextBadgeHandlesRef = useRef<Map<string, { id: string; dispose: () => void; signature: string }>>(new Map())
+  const plainTextRefreshFrameRef = useRef<number | null>(null)
+  const plainTextRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const plainTextRetryCountRef = useRef(0)
+  const plainTextTooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refreshPlainTextBadgesRef = useRef<(options?: { scan?: boolean; notify?: boolean }) => void>(() => {})
+  const pendingPlainTextScanRef = useRef(false)
+  const pendingPlainTextNotifyRef = useRef(false)
+  const [plainTextNotice, setPlainTextNotice] = useState<{ markers: NonPlainTextMarker[]; total: number; truncated: boolean } | null>(null)
+  const [plainTextTooltip, setPlainTextTooltip] = useState<{
+    signature: string
+    row: number
+    column: number
+    kind: NonPlainTextMarker['kind']
+    preview: string
+    left: number
+    top: number
+    flip: boolean
+  } | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showImagePicker, setShowImagePicker] = useState(false)
@@ -1747,6 +1826,187 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     presenceDisposablesRef.current.forEach((item) => item.dispose())
     presenceDisposablesRef.current = []
   }, [])
+
+  const hidePlainTextTooltip = useCallback((immediately?: boolean) => {
+    if (plainTextTooltipTimerRef.current) {
+      clearTimeout(plainTextTooltipTimerRef.current)
+      plainTextTooltipTimerRef.current = null
+    }
+    if (immediately) {
+      setPlainTextTooltip(null)
+      return
+    }
+    // The pointer has to cross the gap between the badge and the card.
+    plainTextTooltipTimerRef.current = setTimeout(() => {
+      plainTextTooltipTimerRef.current = null
+      setPlainTextTooltip(null)
+    }, PLAIN_TEXT_TOOLTIP_DELAY)
+  }, [])
+
+  const showPlainTextTooltip = useCallback((row: number, column: number, rect: PlainRect) => {
+    const marker = plainTextMarkersRef.current.find((item) => item.row === row && item.column === column)
+    if (!marker) return
+    const overlayRect = plainTextOverlayRef.current?.getBoundingClientRect()
+    if (!overlayRect) return
+    if (plainTextTooltipTimerRef.current) {
+      clearTimeout(plainTextTooltipTimerRef.current)
+      plainTextTooltipTimerRef.current = null
+    }
+    const flip = rect.x + rect.width + PLAIN_TEXT_TOOLTIP_WIDTH > window.innerWidth
+    setPlainTextTooltip({
+      signature: marker.signature,
+      row: marker.row,
+      column: marker.column,
+      kind: marker.kind,
+      preview: marker.preview,
+      left: rect.x - overlayRect.left + (flip ? -PLAIN_TEXT_TOOLTIP_WIDTH - 4 : rect.width + 4),
+      top: rect.y - overlayRect.top - 4,
+      flip,
+    })
+  }, [])
+
+  const clearPlainTextBadges = useCallback(() => {
+    plainTextMarkersRef.current = []
+    plainTextBadgeHandlesRef.current.forEach((handle) => handle.dispose())
+    plainTextBadgeHandlesRef.current.clear()
+    if (plainTextRetryTimerRef.current) {
+      clearTimeout(plainTextRetryTimerRef.current)
+      plainTextRetryTimerRef.current = null
+    }
+    if (plainTextTooltipTimerRef.current) {
+      clearTimeout(plainTextTooltipTimerRef.current)
+      plainTextTooltipTimerRef.current = null
+    }
+    plainTextRetryCountRef.current = 0
+    pendingPlainTextScanRef.current = false
+    pendingPlainTextNotifyRef.current = false
+    setPlainTextNotice(null)
+    setPlainTextTooltip(null)
+  }, [])
+
+  const convertPlainTextMarkers = useCallback(
+    (markers: NonPlainTextMarker[]) => {
+      /* eslint-disable-next-line no-use-before-define */
+      const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook?.()?.getActiveSheet?.()
+      if (!worksheet || markers.length === 0) return 0
+      let converted = 0
+      markers.forEach((marker) => {
+        if (convertMarkerToPlainText(worksheet, marker)) converted += 1
+      })
+      if (converted > 0) {
+        setPlainTextNotice(null)
+        hidePlainTextTooltip(true)
+        refreshPlainTextBadgesRef.current({ scan: true })
+      }
+      return converted
+    },
+    [hidePlainTextTooltip]
+  )
+
+  const convertPlainTextCell = useCallback(
+    (row: number, column: number) => {
+      const marker = plainTextMarkersRef.current.find((item) => item.row === row && item.column === column)
+      if (marker) convertPlainTextMarkers([marker])
+    },
+    [convertPlainTextMarkers]
+  )
+
+  /**
+   * Creates, keeps or drops the floating badges of the marked cells. Univer owns
+   * the positioning, so only the marker set matters here, and a marker whose
+   * content changed is rebuilt while untouched ones are left alone.
+   */
+  const syncPlainTextBadges = useCallback(
+    (worksheet: unknown, markers: NonPlainTextMarker[]) => {
+      const handles = plainTextBadgeHandlesRef.current
+      const wanted = new Map<string, NonPlainTextMarker>()
+      markers.forEach((marker) => wanted.set(`${marker.row}:${marker.column}`, marker))
+      handles.forEach((handle, key) => {
+        const marker = wanted.get(key)
+        if (!marker || handle.signature !== marker.signature) {
+          handle.dispose()
+          handles.delete(key)
+        }
+      })
+      if (!worksheet) return
+      wanted.forEach((marker, key) => {
+        if (handles.has(key)) return
+        const handle = addPlainTextBadge(worksheet as Parameters<typeof addPlainTextBadge>[0], marker, {
+          row: marker.row,
+          column: marker.column,
+          kind: marker.kind,
+          preview: marker.preview,
+          onConvert: () => convertPlainTextCell(marker.row, marker.column),
+          onHover: (rect) => {
+            if (rect) showPlainTextTooltip(marker.row, marker.column, rect)
+            else hidePlainTextTooltip()
+          },
+        })
+        if (handle) handles.set(key, { ...handle, signature: marker.signature })
+      })
+    },
+    [convertPlainTextCell, hidePlainTextTooltip, showPlainTextTooltip]
+  )
+
+  /**
+   * Finds the cells that are not plain text and gives each one a corner badge.
+   * Scanning is the expensive half, so it runs once per animation frame at most
+   * and only when the sheet content actually changed: Univer keeps the badge DOM
+   * anchored while the sheet scrolls or zooms.
+   */
+  const refreshPlainTextBadges = useCallback(
+    (options?: { scan?: boolean; notify?: boolean }) => {
+      if (options?.scan) pendingPlainTextScanRef.current = true
+      if (options?.notify) pendingPlainTextNotifyRef.current = true
+      if (plainTextRefreshFrameRef.current !== null) return
+      plainTextRefreshFrameRef.current = window.requestAnimationFrame(() => {
+        plainTextRefreshFrameRef.current = null
+        const shouldScan = pendingPlainTextScanRef.current
+        const shouldNotify = pendingPlainTextNotifyRef.current
+        pendingPlainTextScanRef.current = false
+        pendingPlainTextNotifyRef.current = false
+        if (!shouldScan) return
+
+        const retryLater = () => {
+          if (plainTextRetryTimerRef.current || plainTextRetryCountRef.current >= 25) return
+          plainTextRetryCountRef.current += 1
+          plainTextRetryTimerRef.current = setTimeout(() => {
+            plainTextRetryTimerRef.current = null
+            refreshPlainTextBadgesRef.current({ scan: true })
+          }, 120)
+        }
+
+        // The workbook is created asynchronously, so the first attempts may not
+        // be able to read the worksheet yet: retry shortly.
+        const univerResult = univerApiRef.current
+        const workbook = univerResult?.univerAPI.getActiveWorkbook?.()
+        const worksheet = workbook?.getActiveSheet?.()
+        if (!univerResult || !workbook || !worksheet) {
+          retryLater()
+          return
+        }
+        const reader = createWorksheetCellReader(univerResult.univer, workbook.getId(), worksheet.getSheetId())
+        if (!reader) {
+          retryLater()
+          return
+        }
+        const area = resolveScanArea(worksheet, {
+          rowCount: Math.max(worksheet.getMaxRows?.() || 1, 1),
+          columnCount: Math.max(worksheet.getMaxColumns?.() || 1, 1),
+        })
+        const markers = collectNonPlainTextMarkers(reader, area.range)
+        const previousKeys = new Set(plainTextMarkersRef.current.map((marker) => `${marker.row}:${marker.column}`))
+        plainTextMarkersRef.current = markers
+        plainTextRetryCountRef.current = 0
+        syncPlainTextBadges(worksheet, markers)
+        if (shouldNotify) {
+          const fresh = markers.filter((marker) => !previousKeys.has(`${marker.row}:${marker.column}`))
+          if (fresh.length > 0) setPlainTextNotice({ markers: fresh, total: markers.length, truncated: area.truncated })
+        }
+      })
+    },
+    [syncPlainTextBadges]
+  )
 
   const getProtectionRange = useCallback((item: ProtectionInfo) => {
     const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
@@ -3359,6 +3619,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 		}
 
 		const { univerAPI } = univerResult
+        // The corner badges of non plain text cells are float DOMs: register the
+        // component once, then anchor one per marked cell.
+        univerAPI.registerComponent(PLAIN_TEXT_BADGE_COMPONENT_KEY, PlainTextBadgeComponent)
         univerApiRef.current = univerResult
 
         const workbookApi = univerAPI.createUniverSheet(workbookData)
@@ -3383,6 +3646,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // Quoted clipboard text (Excel style) may carry line breaks inside a
         // cell; handled by Univer's own paste path, that turns one row into two.
         const quotedClipboardFix = registerQuotedClipboardFixes(univerResult.univer, () => workbookApi.getActiveSheet())
+        // A paste is the moment a non plain text cell usually appears, and the
+        // paste command never reaches the facade callback, so it is reported
+        // separately: rescan and tell the user what just landed in the sheet.
+        const pasteNotifier = registerPasteNotifier(univerResult.univer, () => {
+          // The paste already queued a scan of its own mutations, so flagging the
+          // notice here (instead of only on the follow up scan) makes the notice
+          // describe exactly the cells this paste added.
+          pendingPlainTextNotifyRef.current = true
+          window.setTimeout(() => refreshPlainTextBadgesRef.current({ scan: true, notify: true }), 250)
+        })
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
@@ -3660,12 +3933,21 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           }
           if (applyingRemotePatchRef.current) {
             if (refreshProtectionLayout) requestProtectionHighlightRefresh()
+            if (mutatesSnapshot) refreshPlainTextBadges({ scan: true })
             return
           }
 
           syncFilterState()
           syncSelectionState()
           if (refreshProtectionLayout) requestProtectionHighlightRefresh()
+          if (mutatesSnapshot) {
+            // Only a content change needs a new scan: Univer keeps the badge DOM
+            // of every marker anchored through scrolling, zooming and resizing.
+            refreshPlainTextBadges({
+              scan: true,
+              notify: PLAIN_TEXT_PASTE_COMMANDS.has(command.id),
+            })
+          }
           if (mutatesSnapshot) schedulePersist()
         })
 
@@ -3783,6 +4065,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           disposable.dispose()
           cellShiftRepair?.dispose()
           quotedClipboardFix?.dispose()
+          pasteNotifier?.dispose?.()
           selectionPresenceDisposable.dispose()
           searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
@@ -3837,10 +4120,26 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 	  disposed = true
 	  cancelHeightWait?.()
 	  cleanup?.()
+	  if (plainTextRefreshFrameRef.current !== null) {
+	    window.cancelAnimationFrame(plainTextRefreshFrameRef.current)
+	    plainTextRefreshFrameRef.current = null
+	  }
+	  if (plainTextRetryTimerRef.current) {
+	    clearTimeout(plainTextRetryTimerRef.current)
+	    plainTextRetryTimerRef.current = null
+	  }
+	  plainTextRetryCountRef.current = 0
+	  plainTextMarkersRef.current = []
 	  disposeCreatedUniver()
 	}
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
-  }, [sheetId, workbookId, reloadToken, canInitializeEditor, persistSheetViewMemory, requestProtectionHighlightRefresh, scheduleSheetViewMemoryPersist])
+  }, [sheetId, workbookId, reloadToken, canInitializeEditor, persistSheetViewMemory, refreshPlainTextBadges, requestProtectionHighlightRefresh, scheduleSheetViewMemoryPersist])
+
+  useEffect(() => {
+    clearPlainTextBadges()
+    if (loading) return
+    refreshPlainTextBadges({ scan: true })
+  }, [clearPlainTextBadges, loading, refreshPlainTextBadges, reloadToken, sheetId])
 
   useEffect(() => {
     try {
@@ -4468,6 +4767,61 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       onContextMenu={handleSheetContextMenu}
     >
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
+
+      {/* Hover card of a non plain text badge. The badges themselves are float
+          DOMs anchored by Univer; this layer only draws the card, so it stays
+          click through and pointer events never leak onto the grid. */}
+      <div ref={plainTextOverlayRef} className="pointer-events-none absolute inset-0 z-[19]">
+        {plainTextTooltip && (
+          <div
+            data-plain-text-tooltip={`${plainTextTooltip.row}:${plainTextTooltip.column}`}
+            data-plain-text-tooltip-kind={plainTextTooltip.kind}
+            className="pointer-events-auto absolute w-64"
+            style={{ left: `${plainTextTooltip.left}px`, top: `${plainTextTooltip.top}px` }}
+            onMouseEnter={() => {
+              if (plainTextTooltipTimerRef.current) {
+                clearTimeout(plainTextTooltipTimerRef.current)
+                plainTextTooltipTimerRef.current = null
+              }
+            }}
+            onMouseLeave={() => hidePlainTextTooltip(true)}
+          >
+            <div className="rounded-lg border border-amber-200 bg-white p-2.5 text-left shadow-xl">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-amber-700">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                数据不是纯文本结构
+              </div>
+              <p className="mt-1 text-[11px] leading-4 text-slate-600">
+                {plainTextTooltip.kind === 'rich-text'
+                  ? '这一格保存的是富文本（含单元格内格式或换行），不是纯文本。粘贴到记事本、CSV 或其它系统时会丢失结构。'
+                  : '这一格的文本里含换行符，粘贴到记事本、CSV 或其它系统时会被拆成多行。'}
+                转为纯文本会把换行合并成空格，并去掉单元格内的格式。
+              </p>
+              {plainTextTooltip.preview && (
+                <p className="mt-1.5 truncate rounded bg-slate-50 px-1.5 py-1 font-mono text-[10px] text-slate-500">{plainTextTooltip.preview}</p>
+              )}
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  data-plain-text-convert={`${plainTextTooltip.row}:${plainTextTooltip.column}`}
+                  onClick={() => convertPlainTextCell(plainTextTooltip.row, plainTextTooltip.column)}
+                  className="inline-flex items-center gap-1 rounded-md bg-amber-500 px-2 py-1 text-[11px] font-semibold text-white hover:bg-amber-600"
+                >
+                  <Wrench className="h-3 w-3" />
+                  转为纯文本
+                </button>
+                <button
+                  type="button"
+                  onClick={() => hidePlainTextTooltip(true)}
+                  className="rounded-md px-2 py-1 text-[11px] font-semibold text-slate-500 hover:bg-slate-100"
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
 
       {onlineCollaborators.length > 0 && (
         <div
@@ -5375,6 +5729,36 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       {approvalNotice && (
         <div className="absolute left-1/2 top-14 z-20 max-w-[min(90%,36rem)] -translate-x-1/2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-center text-xs font-semibold text-amber-800 shadow-lg">
           {approvalNotice}
+        </div>
+      )}
+
+      {plainTextNotice && (
+        <div
+          data-plain-text-notice="true"
+          className="absolute bottom-24 left-1/2 z-[23] flex w-[min(32rem,calc(100%-2rem))] -translate-x-1/2 items-center gap-3 rounded-xl border border-amber-200 bg-white/95 px-3 py-2 shadow-xl backdrop-blur"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+          <div className="min-w-0 flex-1 text-[11px] leading-4">
+            <span className="font-semibold text-slate-800">本次粘贴的 {plainTextNotice.markers.length} 个单元格不是纯文本结构</span>
+            <span className="ml-1 text-slate-400">
+              （{plainTextNotice.truncated ? '已检查部分区域，' : '当前工作表'}共 {plainTextNotice.total} 处）
+            </span>
+          </div>
+          <button
+            type="button"
+            data-plain-text-convert-all="true"
+            onClick={() => convertPlainTextMarkers(plainTextMarkersRef.current)}
+            className="shrink-0 rounded-md bg-amber-500 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-amber-600"
+          >
+            全部转为纯文本
+          </button>
+          <button
+            type="button"
+            onClick={() => setPlainTextNotice(null)}
+            className="shrink-0 rounded-md px-2 py-1 text-[11px] font-semibold text-slate-500 hover:bg-slate-100"
+          >
+            知道了
+          </button>
         </div>
       )}
 
