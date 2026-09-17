@@ -20,7 +20,7 @@ import UniverPresetSheetsDataValidationZhCN from '@univerjs/preset-sheets-data-v
 import { UniverSheetsConditionalFormattingPreset } from '@univerjs/preset-sheets-conditional-formatting'
 import UniverPresetSheetsConditionalFormattingZhCN from '@univerjs/preset-sheets-conditional-formatting/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
-import { CellAlertType, ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
+import { ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand } from '@univerjs/sheets-ui'
 import { BEFORE_CELL_EDIT, SheetInterceptorService } from '@univerjs/sheets'
 import api from '@/lib/api'
 import { usePermission } from '@/hooks/usePermission'
@@ -31,6 +31,7 @@ import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
 import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
+import { registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
 import {
   collectSharedFormulaCells,
   createSharedFormulaResolver,
@@ -1907,12 +1908,20 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     if (!worksheet) return
 
     sheetPresence.forEach((entry) => {
-      if (entry.clientId === currentClientId || entry.state === 'viewing' || typeof entry.row !== 'number' || !entry.col) return
+      if (entry.state === 'viewing' || typeof entry.row !== 'number' || !entry.col) return
+      // Sessions that belong to the same account (or to this very tab) are never
+      // rendered as somebody else's presence: opening the same sheet twice must
+      // not make you look like a second person editing your own cells.
+      if (entry.clientId === currentClientId || (profile?.id != null && entry.userId === profile.id)) return
       const columnIndex = columns.findIndex((column) => column.key === entry.col)
       if (columnIndex < 0) return
       const visual = visualForUser(entry.userId)
       try {
         const range = worksheet.getRange(entry.row + 1, columnIndex, 1, 1)
+        // A plain highlight only — the previous alert popup was a fixed 260x88
+        // box painted on top of the cell, which covered the value and swallowed
+        // clicks, so collaborator activity is surfaced through the presence
+        // widget instead of covering the cell itself.
         presenceDisposablesRef.current.push(range.highlight({
           stroke: visual.stroke,
           strokeWidth: entry.state === 'editing' ? 3 : 2,
@@ -1920,20 +1929,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           isAnimationDash: entry.state !== 'editing',
           fill: entry.state === 'editing' ? visual.fill : 'rgba(255, 255, 255, 0.01)',
         }))
-        presenceDisposablesRef.current.push(range.attachAlertPopup({
-          key: `yaerp-presence-${sheetId}-${entry.clientId || entry.userId}`,
-          type: entry.state === 'editing' ? CellAlertType.WARNING : CellAlertType.INFO,
-          title: `${entry.username}${entry.state === 'editing' ? '正在编辑' : '已选中'}此单元格`,
-          message: entry.state === 'editing' ? '请等待对方结束编辑，避免同时覆盖内容。' : '对方可能准备编辑此单元格。',
-          width: 260,
-          height: 88,
-        }))
       } catch (presenceError) {
         console.error('Failed to render collaborator presence:', presenceError)
       }
     })
     return clearPresenceVisuals
-  }, [clearPresenceVisuals, loading, sheetId, sheetPresence])
+  }, [clearPresenceVisuals, loading, profile?.id, sheetId, sheetPresence])
 
   useEffect(() => () => {
     clearProtectionHighlights()
@@ -3379,6 +3380,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             schedulePersistRef.current?.()
           }
         )
+        // Quoted clipboard text (Excel style) may carry line breaks inside a
+        // cell; handled by Univer's own paste path, that turns one row into two.
+        const quotedClipboardFix = registerQuotedClipboardFixes(univerResult.univer, () => workbookApi.getActiveSheet())
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
@@ -3732,7 +3736,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           const dataRow = params.row - 1
           if (!columnKey || dataRow < 0) return
           const currentClientId = getRealtimeClientId()
+          const ownUserId = getStoredUser()?.id
+          // Your own other tabs/accounts must not lock you out of your own cell.
           const conflict = sheetPresenceRef.current.find((entry) => entry.clientId !== currentClientId
+            && (ownUserId == null || entry.userId !== ownUserId)
             && entry.state === 'editing'
             && entry.row === dataRow
             && entry.col === columnKey)
@@ -3775,6 +3782,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           persistSheetViewMemory()
           disposable.dispose()
           cellShiftRepair?.dispose()
+          quotedClipboardFix?.dispose()
           selectionPresenceDisposable.dispose()
           searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
@@ -4419,6 +4427,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       return priority[left.state] - priority[right.state] || left.username.localeCompare(right.username, 'zh-CN')
     })
   const displayedCollaborators = presenceExpanded ? onlineCollaborators : onlineCollaborators.slice(0, 4)
+  // Your own sessions are listed so you can spot a second window, but they never
+  // count as an edit conflict against yourself.
+  const otherEditingCollaborators = onlineCollaborators.filter((entry) => entry.state === 'editing' && entry.userId !== profile?.id)
+  const selfEditingElsewhere = onlineCollaborators.some((entry) => entry.state === 'editing' && entry.userId === profile?.id)
   const currentApprovalStates = selectionState
     ? approvalStates.filter((item) => item.row === selectionState.rowIndex && item.col === selectionState.columnKey)
     : []
@@ -4469,12 +4481,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             <div className="flex -space-x-1.5">
               {displayedCollaborators.slice(0, 4).map((entry) => {
                 const visual = visualForUser(entry.userId)
-                return <span key={entry.userId} className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white text-[10px] font-semibold" style={{ backgroundColor: visual.soft, color: visual.stroke }} title={`${entry.username} · ${entry.state === 'editing' ? '正在编辑' : entry.state === 'selected' ? '已选中单元格' : '在线查看'}`}>{entry.username.slice(0, 2).toUpperCase()}</span>
+                return <span key={entry.userId} className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white text-[10px] font-semibold" style={{ backgroundColor: visual.soft, color: visual.stroke }} title={`${entry.userId === profile?.id ? '你' : entry.username} · ${entry.state === 'editing' ? '正在编辑' : entry.state === 'selected' ? '已选中单元格' : '在线查看'}`}>{entry.username.slice(0, 2).toUpperCase()}</span>
               })}
             </div>
             <div className="hidden min-w-0 flex-1 sm:block">
               <div className="truncate text-xs font-semibold text-slate-800">{onlineCollaborators.length} 人在线</div>
-              <div className="truncate text-[10px] text-slate-400">{onlineCollaborators.filter((entry) => entry.state === 'editing').length > 0 ? `${onlineCollaborators.filter((entry) => entry.state === 'editing').length} 人正在编辑` : '当前无编辑冲突'}</div>
+              <div className="truncate text-[10px] text-slate-400">{otherEditingCollaborators.length > 0 ? `${otherEditingCollaborators.length} 人正在编辑` : selfEditingElsewhere ? '你在其它窗口编辑中' : '当前无编辑冲突'}</div>
             </div>
             {onlineCollaborators.length > 4 && <span className="shrink-0 text-[10px] font-semibold text-slate-500">+{onlineCollaborators.length - 4}</span>}
             <ChevronDown className={`h-4 w-4 shrink-0 text-slate-400 transition-transform ${presenceExpanded ? 'rotate-180' : ''}`} />
