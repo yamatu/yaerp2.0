@@ -165,6 +165,37 @@ interface CopyRangeLike {
 
 interface CommandServiceLike {
   beforeCommandExecuted?: (listener: (info: { id?: string; params?: unknown }) => void) => { dispose?: () => void }
+  onCommandExecuted?: (listener: (info: { id?: string; params?: unknown }) => void) => { dispose?: () => void }
+}
+
+export interface DisposableLike {
+  dispose?: () => void
+}
+
+/**
+ * Reports every paste, whoever triggered it.
+ *
+ * A paste runs through `SheetPasteShortKeyCommand`, and that command carries the
+ * clipboard payload instead of a `unitId`. The facade callback
+ * (`FWorkbook.onCommandExecuted`) filters on `params.unitId`, so it never sees a
+ * paste; the raw command service does. Callers use this to re-inspect the sheet
+ * after the paste has been applied.
+ */
+export function registerPasteNotifier(univer: unknown, onPaste: () => void): DisposableLike | null {
+  try {
+    const injector = getInjector(univer)
+    const commandService = injector?.get<ICommandService | undefined>(ICommandService)
+    const subscriber = commandService as unknown as CommandServiceLike | undefined
+    if (!subscriber?.onCommandExecuted) return null
+    const disposable = subscriber.onCommandExecuted((info) => {
+      if (!info || info.id !== SheetPasteShortKeyCommand.id) return
+      onPaste()
+    })
+    return disposable ?? null
+  } catch (error) {
+    console.warn('Failed to subscribe to clipboard pastes:', error)
+    return null
+  }
 }
 
 function getInjector(univer: unknown): { get: <T>(token: unknown) => T } | undefined {
