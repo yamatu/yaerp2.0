@@ -31,6 +31,7 @@ import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
 import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
+import { registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
 import {
   collectSharedFormulaCells,
   createSharedFormulaResolver,
@@ -3379,6 +3380,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             schedulePersistRef.current?.()
           }
         )
+        // Quoted clipboard text (Excel style) may carry line breaks inside a
+        // cell; handled by Univer's own paste path, that turns one row into two.
+        const quotedClipboardFix = registerQuotedClipboardFixes(univerResult.univer, () => workbookApi.getActiveSheet())
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
@@ -3778,6 +3782,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           persistSheetViewMemory()
           disposable.dispose()
           cellShiftRepair?.dispose()
+          quotedClipboardFix?.dispose()
           selectionPresenceDisposable.dispose()
           searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
