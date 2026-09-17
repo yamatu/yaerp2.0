@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
-import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -38,7 +38,9 @@ import {
   convertMarkerToPlainText,
   createWorksheetCellReader,
   PLAIN_TEXT_BADGE_COMPONENT_KEY,
+  registerPlainTextConvertMenu,
   resolveScanArea,
+  resolveSelectionScanAreas,
   type NonPlainTextMarker,
   type PlainRect,
   type PlainTextBadgeData,
@@ -1436,8 +1438,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const plainTextRetryCountRef = useRef(0)
   const plainTextTooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const refreshPlainTextBadgesRef = useRef<(options?: { scan?: boolean; notify?: boolean }) => void>(() => {})
+  const convertPlainTextSelectionRef = useRef<() => void>(() => {})
   const pendingPlainTextScanRef = useRef(false)
   const pendingPlainTextNotifyRef = useRef(false)
+  const [plainTextActionNotice, setPlainTextActionNotice] = useState('')
   const [plainTextNotice, setPlainTextNotice] = useState<{ markers: NonPlainTextMarker[]; total: number; truncated: boolean } | null>(null)
   const [plainTextTooltip, setPlainTextTooltip] = useState<{
     signature: string
@@ -1912,6 +1916,42 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   )
 
   /**
+   * Flattens every flagged cell of the current selection, which is how a whole
+   * row or a pasted block is cleaned up in one go. Hyperlinks are skipped by the
+   * scan itself, so a batch conversion can never throw a link away.
+   */
+  const convertPlainTextSelection = useCallback(() => {
+    /* eslint-disable-next-line no-use-before-define */
+    const univerResult = univerApiRef.current
+    const workbook = univerResult?.univerAPI.getActiveWorkbook?.()
+    const worksheet = workbook?.getActiveSheet?.()
+    const reader =
+      univerResult && workbook && worksheet
+        ? createWorksheetCellReader(univerResult.univer, workbook.getId(), worksheet.getSheetId())
+        : null
+    if (!reader || !worksheet) return
+    const areas = resolveSelectionScanAreas(
+      worksheet as Parameters<typeof resolveSelectionScanAreas>[0],
+      worksheet.getSelection?.() as Parameters<typeof resolveSelectionScanAreas>[1]
+    )
+    const markers: NonPlainTextMarker[] = []
+    const seen = new Set<string>()
+    areas.forEach((area) => {
+      collectNonPlainTextMarkers(reader, area).forEach((marker) => {
+        const key = `${marker.row}:${marker.column}`
+        if (seen.has(key)) return
+        seen.add(key)
+        markers.push(marker)
+      })
+    })
+    const converted = convertPlainTextMarkers(markers)
+    setPlainTextActionNotice(
+      converted > 0 ? `已把所选区域中的 ${converted} 个单元格转为纯文本。` : '所选区域没有需要转换的单元格。'
+    )
+    window.setTimeout(() => setPlainTextActionNotice(''), 3200)
+  }, [convertPlainTextMarkers])
+
+  /**
    * Creates, keeps or drops the floating badges of the marked cells. Univer owns
    * the positioning, so only the marker set matters here, and a marker whose
    * content changed is rebuilt while untouched ones are left alone.
@@ -2007,6 +2047,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     },
     [syncPlainTextBadges]
   )
+
+  // The scan, the conversion and the paste notifier run from long lived
+  // subscriptions, so they go through refs to always see the latest callbacks.
+  useEffect(() => {
+    refreshPlainTextBadgesRef.current = refreshPlainTextBadges
+    convertPlainTextSelectionRef.current = convertPlainTextSelection
+  }, [convertPlainTextSelection, refreshPlainTextBadges])
 
   const getProtectionRange = useCallback((item: ProtectionInfo) => {
     const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook?.()
@@ -3656,6 +3703,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           pendingPlainTextNotifyRef.current = true
           window.setTimeout(() => refreshPlainTextBadgesRef.current({ scan: true, notify: true }), 250)
         })
+        // Flattening a whole row or a pasted block in one step: the context menu
+        // entry works on the selection and shares the scan of the badges, so a
+        // hyperlink inside the selection is left alone as well.
+        const plainTextConvertMenu = registerPlainTextConvertMenu(univerResult.univer, () => {
+          convertPlainTextSelectionRef.current()
+        })
         workbookApiRef.current = workbookApi as { setEditable: (editable: boolean) => void }
         workbookApi.setEditable(effectiveCanEditSheet)
         applyColumnDataControls(univerAPI, workbookApi.getActiveSheet(), currentSheet.columns || [])
@@ -4066,6 +4119,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           cellShiftRepair?.dispose()
           quotedClipboardFix?.dispose()
           pasteNotifier?.dispose?.()
+          plainTextConvertMenu?.dispose?.()
           selectionPresenceDisposable.dispose()
           searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
@@ -4795,7 +4849,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 {plainTextTooltip.kind === 'rich-text'
                   ? '这一格保存的是富文本（含单元格内格式或换行），不是纯文本。粘贴到记事本、CSV 或其它系统时会丢失结构。'
                   : '这一格的文本里含换行符，粘贴到记事本、CSV 或其它系统时会被拆成多行。'}
-                转为纯文本会把换行合并成空格，并去掉单元格内的格式。
+                转为纯文本会把换行合并成空格，并去掉单元格内的格式；带链接的单元格不会被转换，链接会保留。
               </p>
               {plainTextTooltip.preview && (
                 <p className="mt-1.5 truncate rounded bg-slate-50 px-1.5 py-1 font-mono text-[10px] text-slate-500">{plainTextTooltip.preview}</p>
@@ -5057,7 +5111,20 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               </FloatingToolHint>
             </div>
           )}
-          {/* Always visible: Save + Toolbar toggle */}
+          {/* Always visible: plain text conversion + Save + Toolbar toggle */}
+          <FloatingToolHint label="把所选区域内的富文本、换行转为纯文本（链接会保留）">
+            <button
+              type="button"
+              data-plain-text-convert-selection="true"
+              onClick={convertPlainTextSelection}
+              disabled={editLocked}
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-amber-200 bg-white text-amber-600 shadow-lg transition hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
+              title="转为纯文本（所选区域）"
+              aria-label="转为纯文本（所选区域）"
+            >
+              <RemoveFormatting className="h-4 w-4" />
+            </button>
+          </FloatingToolHint>
           <FloatingToolHint label={saveStatus === 'saving' ? '正在保存' : saveStatus === 'saved' ? '已保存' : '保存表格 (Ctrl+S)'}>
             <button
               type="button"
@@ -5729,6 +5796,15 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       {approvalNotice && (
         <div className="absolute left-1/2 top-14 z-20 max-w-[min(90%,36rem)] -translate-x-1/2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-center text-xs font-semibold text-amber-800 shadow-lg">
           {approvalNotice}
+        </div>
+      )}
+
+      {plainTextActionNotice && (
+        <div
+          data-plain-text-action-notice="true"
+          className="absolute bottom-24 left-1/2 z-[24] -translate-x-1/2 rounded-full bg-slate-800/95 px-4 py-1.5 text-xs font-semibold text-white shadow-lg"
+        >
+          {plainTextActionNotice}
         </div>
       )}
 
