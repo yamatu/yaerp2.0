@@ -12,8 +12,21 @@
  * keeps a full sheet scan cheap, and the conversion goes through Univer's own
  * `set-range-values` command so undo/redo, permissions and the persistence
  * pipeline all keep working.
+ *
+ * A cell that holds a hyperlink is never a marker: the link lives in the rich
+ * text document, so flattening the cell would throw the link away. The context
+ * menu entry that flattens a whole selection is registered from here as well,
+ * because it has to agree with the very same rule.
  */
-import { CellValueType, IUniverInstanceService } from '@univerjs/core'
+import { CellValueType, CommandType, CustomRangeType, ICommandService, IUniverInstanceService, RANGE_TYPE } from '@univerjs/core'
+import {
+  ContextMenuGroup,
+  ContextMenuPosition,
+  IMenuManagerService,
+  MenuItemType,
+  MenuManagerPosition,
+  type IMenuItem,
+} from '@univerjs/ui'
 
 export type NonPlainTextKind = 'rich-text' | 'line-break'
 
@@ -38,8 +51,13 @@ export interface CellRange {
   endColumn: number
 }
 
+interface CustomRangeLike {
+  /** `CustomRangeType`, stored as a number. */
+  rangeType?: unknown
+}
+
 interface RichTextDocumentLike {
-  body?: { dataStream?: string }
+  body?: { dataStream?: string; customRanges?: CustomRangeLike[] } | null
 }
 
 export interface CellLike {
@@ -56,13 +74,17 @@ interface FacadeRangeLike {
   // Method syntax on purpose: the facade narrows the parameter to
   // `ICellData | CellValue`, which stays assignable this way.
   setValue(value: unknown): unknown
+  getRow?: () => number
+  getLastRow?: () => number
+  getColumn?: () => number
+  getLastColumn?: () => number
 }
 
 interface FacadeWorksheetLike {
   getRange: (row: number, column: number, numRows: number, numColumns: number) => FacadeRangeLike
   getScrollState?: () => { sheetViewStartRow?: number; sheetViewStartColumn?: number } | null | undefined
-  /** Returns the used area of the sheet (not the viewport). */
-  getVisibleRange?: () => CellRange | null | undefined
+  /** Used area of the sheet: `A1` up to the last cell that holds content. */
+  getDataRange?: () => FacadeRangeLike | null | undefined
 }
 
 export interface PlainRect {
@@ -70,6 +92,10 @@ export interface PlainRect {
   y: number
   width: number
   height: number
+}
+
+export interface DisposableLike {
+  dispose?: () => void
 }
 
 export interface PlainTextBadgeData {
@@ -116,6 +142,22 @@ export const PLAIN_TEXT_BADGE_COMPONENT_KEY = 'yaerp-plain-text-badge'
 export const PLAIN_TEXT_BADGE_SIZE = 11
 /** The float DOM layer insets its content by this many pixels on every side. */
 const PLAIN_TEXT_BADGE_INSET = 4
+/** Command the context menu entry dispatches. */
+export const PLAIN_TEXT_CONVERT_COMMAND_ID = 'yaerp-plain-text-convert'
+const PLAIN_TEXT_CONVERT_MENU_KEY = 'yaerpPlainTextConvert'
+
+/**
+ * A hyperlink is stored inside the rich text document, so a cell that carries
+ * one is deliberately left alone: flattening it would drop the link.
+ */
+function hasHyperlink(document: RichTextDocumentLike | null | undefined) {
+  const ranges = document?.body?.customRanges
+  if (!Array.isArray(ranges)) return false
+  return ranges.some((range) => {
+    const type = range?.rangeType
+    return type === CustomRangeType.HYPERLINK || type === 'HYPERLINK'
+  })
+}
 
 /** Rich text stores its text in a data stream where `\r` terminates a paragraph. */
 export function documentPlainText(document: RichTextDocumentLike | null | undefined) {
@@ -133,6 +175,7 @@ export function inspectPlainTextCell(
   cell: CellLike | null | undefined
 ): { kind: NonPlainTextKind; plain: string; preview: string } | null {
   if (!cell) return null
+  if (hasHyperlink(cell.p)) return null
   const hasDocument = typeof cell.p?.body?.dataStream === 'string'
   const scalar =
     typeof cell.v === 'string'
@@ -235,14 +278,22 @@ export interface ScanArea {
 
 function readUsedRange(worksheet: FacadeWorksheetLike | null | undefined): CellRange | null {
   try {
-    const used = worksheet?.getVisibleRange?.()
-    if (!used || !Number.isFinite(used.startRow) || !Number.isFinite(used.endRow)) return null
-    if (!Number.isFinite(used.startColumn) || !Number.isFinite(used.endColumn)) return null
+    const used = worksheet?.getDataRange?.()
+    if (!used?.getRow || !used.getLastRow || !used.getColumn || !used.getLastColumn) return null
+    const range = {
+      startRow: used.getRow(),
+      endRow: used.getLastRow(),
+      startColumn: used.getColumn(),
+      endColumn: used.getLastColumn(),
+    }
+    if (!Number.isFinite(range.startRow) || !Number.isFinite(range.endRow)) return null
+    if (!Number.isFinite(range.startColumn) || !Number.isFinite(range.endColumn)) return null
+    if (range.endRow < range.startRow || range.endColumn < range.startColumn) return null
     return {
-      startRow: Math.max(0, Math.floor(used.startRow)),
-      endRow: Math.max(0, Math.floor(used.endRow)),
-      startColumn: Math.max(0, Math.floor(used.startColumn)),
-      endColumn: Math.max(0, Math.floor(used.endColumn)),
+      startRow: Math.max(0, Math.floor(range.startRow)),
+      endRow: Math.max(0, Math.floor(range.endRow)),
+      startColumn: Math.max(0, Math.floor(range.startColumn)),
+      endColumn: Math.max(0, Math.floor(range.endColumn)),
     }
   } catch {
     return null
@@ -355,5 +406,126 @@ export function convertMarkerToPlainText(
   } catch (error) {
     console.warn('Failed to convert a cell to plain text:', error)
     return false
+  }
+}
+
+function finiteIndex(value: number, fallback: number) {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : fallback
+}
+
+/**
+ * Turns a selection into the area a batch conversion has to cover. A whole row
+ * or column selection only carries one index pair, so it is widened to the used
+ * area of the sheet; `RANGE_TYPE.ALL` covers everything.
+ */
+function expandSelectionRange(
+  range: { startRow: number; endRow: number; startColumn: number; endColumn: number },
+  rangeType: number | undefined,
+  used: CellRange | null
+): CellRange {
+  const startRow = finiteIndex(range.startRow, used?.startRow ?? 0)
+  const expanded: CellRange = {
+    startRow,
+    endRow: finiteIndex(range.endRow, used?.endRow ?? startRow),
+    startColumn: finiteIndex(range.startColumn, used?.startColumn ?? 0),
+    endColumn: finiteIndex(range.endColumn, used?.endColumn ?? range.startColumn),
+  }
+  if (used) {
+    if (rangeType === RANGE_TYPE.ROW || rangeType === RANGE_TYPE.ALL) {
+      expanded.startColumn = Math.min(expanded.startColumn, used.startColumn)
+      expanded.endColumn = Math.max(expanded.endColumn, used.endColumn)
+    }
+    if (rangeType === RANGE_TYPE.COLUMN || rangeType === RANGE_TYPE.ALL) {
+      expanded.startRow = Math.min(expanded.startRow, used.startRow)
+      expanded.endRow = Math.max(expanded.endRow, used.endRow)
+    }
+  }
+  if (expanded.endRow < expanded.startRow) expanded.endRow = expanded.startRow
+  if (expanded.endColumn < expanded.startColumn) expanded.endColumn = expanded.startColumn
+  return expanded
+}
+
+interface MenuManagerLike {
+  mergeMenu: (source: unknown) => unknown
+}
+
+interface SelectionRangeLike {
+  getRange?: () => (CellRange & { rangeType?: number }) | null | undefined
+}
+
+interface FacadeSelectionLike {
+  getActiveRangeList?: () => SelectionRangeLike[]
+}
+
+/**
+ * Resolves the areas a batch conversion covers for the current selection. A
+ * whole row or column selection is widened to the used area of the sheet, so
+ * selecting a row header and choosing "convert" cleans the entire row.
+ */
+export function resolveSelectionScanAreas(
+  worksheet: FacadeWorksheetLike | null | undefined,
+  selection: FacadeSelectionLike | null | undefined
+): CellRange[] {
+  try {
+    const ranges = selection?.getActiveRangeList?.()
+    if (!Array.isArray(ranges) || ranges.length === 0) return []
+    const used = readUsedRange(worksheet)
+    const areas: CellRange[] = []
+    ranges.forEach((entry) => {
+      const raw = entry?.getRange?.()
+      if (!raw) return
+      areas.push(expandSelectionRange(raw, raw.rangeType, used))
+    })
+    return areas
+  } catch (error) {
+    console.warn('Failed to read the current selection:', error)
+    return []
+  }
+}
+
+/**
+ * Registers the command and the context menu entry that flatten the current
+ * selection in one go, so a whole row can be cleaned up without opening the
+ * badge tooltip of every cell. The entry shows up on the grid, the row header
+ * and the column header menus, and it follows the same rule as the badge scan:
+ * cells holding a hyperlink are left untouched.
+ */
+export function registerPlainTextConvertMenu(univer: unknown, onConvert: () => void): DisposableLike | null {
+  try {
+    const injector = getInjector(univer)
+    const commandService = injector?.get<ICommandService | undefined>(ICommandService)
+    if (!commandService?.registerCommand) return null
+    const disposable = commandService.registerCommand({
+      id: PLAIN_TEXT_CONVERT_COMMAND_ID,
+      type: CommandType.OPERATION,
+      handler: () => {
+        onConvert()
+        return true
+      },
+    })
+    const menuManager = injector?.get<MenuManagerLike | undefined>(IMenuManagerService)
+    if (menuManager?.mergeMenu) {
+      const entry = {
+        order: 900,
+        menuItemFactory: (): IMenuItem => ({
+          id: PLAIN_TEXT_CONVERT_MENU_KEY,
+          commandId: PLAIN_TEXT_CONVERT_COMMAND_ID,
+          title: '转为纯文本',
+          type: MenuItemType.BUTTON,
+        }),
+      }
+      const group = { [ContextMenuGroup.OTHERS]: { [PLAIN_TEXT_CONVERT_MENU_KEY]: entry } }
+      menuManager.mergeMenu({
+        [MenuManagerPosition.CONTEXT_MENU]: {
+          [ContextMenuPosition.MAIN_AREA]: group,
+          [ContextMenuPosition.ROW_HEADER]: group,
+          [ContextMenuPosition.COL_HEADER]: group,
+        },
+      })
+    }
+    return disposable ?? null
+  } catch (error) {
+    console.warn('Failed to register the plain text conversion command:', error)
+    return null
   }
 }
