@@ -13,7 +13,7 @@ func NewProxyRepo(db *sql.DB) *ProxyRepo { return &ProxyRepo{db: db} }
 
 const proxySelectSQL = `SELECT id, subscription_url, subscription_name, source_type,
 	source_payload, config_yaml, selected_node, selected_group, enabled,
-	proxy_ai, proxy_whatsapp, proxy_mail, last_error, created_at, updated_at
+	proxy_ai, proxy_whatsapp, proxy_mail, mixed_port, last_error, created_at, updated_at
 	FROM proxy_settings WHERE id = 1`
 
 func (r *ProxyRepo) Get() (*model.ProxySettings, error) {
@@ -25,7 +25,7 @@ func (r *ProxyRepo) Get() (*model.ProxySettings, error) {
 		&settings.ID, &settings.SubscriptionURL, &settings.SubscriptionName, &settings.SourceType,
 		&settings.SourcePayload, &settings.ConfigYAML, &settings.SelectedNode, &settings.SelectedGroup,
 		&settings.Enabled, &settings.ProxyAI, &settings.ProxyWhatsApp, &settings.ProxyMail,
-		&settings.LastError, &settings.CreatedAt, &settings.UpdatedAt,
+		&settings.MixedPort, &settings.LastError, &settings.CreatedAt, &settings.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -41,8 +41,8 @@ func (r *ProxyRepo) Save(settings *model.ProxySettings) error {
 		`INSERT INTO proxy_settings (
 			id, subscription_url, subscription_name, source_type, source_payload, config_yaml,
 			selected_node, selected_group, enabled, proxy_ai, proxy_whatsapp, proxy_mail,
-			last_error, updated_at
-		) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+			mixed_port, last_error, updated_at
+		) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			subscription_url = EXCLUDED.subscription_url,
 			subscription_name = EXCLUDED.subscription_name,
@@ -55,11 +55,12 @@ func (r *ProxyRepo) Save(settings *model.ProxySettings) error {
 			proxy_ai = EXCLUDED.proxy_ai,
 			proxy_whatsapp = EXCLUDED.proxy_whatsapp,
 			proxy_mail = EXCLUDED.proxy_mail,
+			mixed_port = EXCLUDED.mixed_port,
 			last_error = EXCLUDED.last_error,
 			updated_at = NOW()`,
 		settings.SubscriptionURL, settings.SubscriptionName, settings.SourceType, settings.SourcePayload,
 		settings.ConfigYAML, settings.SelectedNode, settings.SelectedGroup, settings.Enabled,
-		settings.ProxyAI, settings.ProxyWhatsApp, settings.ProxyMail, settings.LastError,
+		settings.ProxyAI, settings.ProxyWhatsApp, settings.ProxyMail, settings.MixedPort, settings.LastError,
 	)
 	return err
 }

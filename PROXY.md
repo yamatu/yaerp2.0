@@ -5,7 +5,7 @@
 
 - 管理页面：`/proxy`（管理员可见，入口在“管理后台”导航中的 **XTLS 代理**）
 - 代理内核：`proxy` 容器（`metacubex/mihomo`），由后端通过 external controller REST API 驱动
-- 配置存储：单行表 `proxy_settings`（迁移 `049_proxy_core.sql`）
+- 配置存储：单行表 `proxy_settings`（迁移 `049_proxy_core.sql`、`050_proxy_mixed_port.sql`）
 
 ## 架构
 
@@ -38,9 +38,12 @@
    docker compose up -d proxy backend whatsapp
    ```
 
-   `proxy` 的配置目录是命名卷 `mihomo_config`。首次启动时 mihomo 会自动写入一份最小
-   `config.yaml`（仅 `mixed-port: 7890`），随后由后端把真正的配置推送进去；`-ext-ctl
-   0.0.0.0:9090` 让其它容器可以访问内核的 controller。
+   `proxy` 的配置目录是命名卷 `mihomo_config`，它同时以 `/mihomo-config` 挂载进 backend。
+   后端启动（以及每次检测到内核丢失配置）时会把生成的配置 `PUT /configs` 推给内核，
+   并写入 `/mihomo-config/config.yaml`，因此 **重启 proxy 容器后节点会自动恢复**。
+   没有任何订阅时后端会下发一份基线配置（`allow-lan: true` + 空节点 + `PROXY` 分组），
+   避免 mihomo 自带的最小配置只把 mixed 端口绑在容器 loopback 上（那就是其它容器
+   “connection refused” 的根源）。`-ext-ctl 0.0.0.0:9090` 让其它容器可以访问内核 controller。
 
 2. 打开 `/proxy`，粘贴订阅链接（或直接粘贴 Clash YAML / base64 节点链接），点击 **导入订阅**。
 3. 点击 **测试全部延迟** 确认节点可用，然后 **连接代理**。
@@ -83,6 +86,21 @@ rules:
 
 因此“选择节点”永远只操作 `PROXY` 分组，不会被订阅自带的策略组干扰。
 
+## 代理端口
+
+`/proxy` 页面的 **代理端口** 卡片可以改内核监听的 mixed 端口（HTTP + SOCKS5），
+AI / WhatsApp / 邮箱三条链路共用它：
+
+- 端口保存在 `proxy_settings.mixed_port`（默认 `0`，表示沿用 `MIHOMO_MIXED_ADDR` 里的端口）。
+- 保存时会重写已存配置里的 `mixed-port`、`PUT /configs` 下发、重新选中节点，并刷新
+  WhatsApp sidecar 的代理地址；**不需要重建任何容器**。
+- 主机名始终来自 `MIHOMO_MIXED_ADDR`（容器内 `proxy`、宿主机 `127.0.0.1`），只有端口由页面控制。
+- 端口不能与外部控制器端口相同（默认 `9090`），否则内核会因端口占用拒绝启动。
+- 宿主机要直连新端口时，需同步 `.env` 的 `MIHOMO_MIXED_PORT` / `MIHOMO_PUBLISH_PORT`
+  并重建 proxy 容器（compose 的端口映射在创建容器时固定）。
+- 页面会显示“配置持久化”状态：使用 compose 时为“已开启”，因为 backend 与 proxy 共享
+  `mihomo_config` 卷。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -93,6 +111,8 @@ rules:
 | `MIHOMO_CONTROLLER_SECRET` | 空 | 同时作为 `proxy` 容器的 `CLASH_OVERRIDE_SECRET` |
 | `MIHOMO_TEST_URL` | `http://www.gstatic.com/generate_204` | 测速目标 |
 | `MIHOMO_ALLOW_PRIVATE_SUBSCRIPTION` | `false` | 是否允许导入指向内网/本机的订阅地址 |
+| `MIHOMO_CONFIG_DIR` | 空（compose 中为 `/mihomo-config`） | 与内核共享的配置目录；设置后会持久化下发的配置，使内核重启后自动恢复节点 |
+| `MIHOMO_MIXED_PORT` | `7890` | 仅 compose 使用：端口映射的容器侧端口，应与 `MIHOMO_MIXED_ADDR` 的端口一致 |
 | `MIHOMO_PUBLISH_PORT` | `7890` | 映射到宿主机的 mixed 端口（仅监听 `127.0.0.1`） |
 
 > 后端不通过 `HTTP_PROXY` 环境变量出网，避免把数据库、Redis 等内部流量也送进代理；
@@ -136,6 +156,35 @@ MIHOMO_CONTROLLER_URL=http://127.0.0.1:9090
 
 ## 常见问题
 
+### 节点列表为空 / 切换节点报 404
+
+内核是“内存态”的：`PUT /configs` 下发的配置不会写进 mihomo 自己的 `config.yaml`，
+所以 proxy 容器一旦重启，配置就没了 —— 表现为“内核在线但一个节点都没有”，点“使用”会收到
+mihomo 的标准 404 `{"message":"Resource not found"}`（`PROXY` 分组不存在）。
+现在有三重保护：
+
+1. **导入即下发**：导入订阅后不管是否已连接，都会把配置推给内核，节点表立刻有数据。
+2. **自动修复**：页面轮询发现内核里没有 `PROXY` 分组时，会重新下发已保存的配置（20 秒节流）。
+   日志：`proxy: 内核配置丢失（未找到 PROXY 分组），重新下发已保存的配置`。
+3. **落盘**：下发的配置同时写入共享卷（`MIHOMO_CONFIG_DIR`），proxy 容器重启后 mihomo
+   会直接读取它。日志：`proxy: 已持久化核心配置 ...`。
+
+如果节点仍然为空，先看页面上的红色错误块与 `docker compose logs --tail=100 backend | grep 'proxy:'`：
+
+```bash
+# 内核当前认得的节点（应包含 PROXY 分组）
+docker compose exec proxy wget -qO- --header="Authorization: Bearer $MIHOMO_CONTROLLER_SECRET" \
+  http://127.0.0.1:9090/proxies | head -c 400
+```
+
+### 页面提示“内核在线”但连接代理入口失败
+
+页面会显示后端实际使用的入口地址与 dial 错误：
+
+- `dial tcp ...: connection refused`：内核没在该端口监听。检查“代理端口”卡片里的端口是否与
+  `.env` 的 `MIHOMO_MIXED_PORT` 一致，以及内核是否真的应用了配置（见上一节）。
+- `no such host`：`MIHOMO_MIXED_ADDR` 的主机名写错了（容器内应为 `proxy`，宿主机应为 `127.0.0.1`）。
+
 ### 页面提示“内核离线”
 
 页面会直接显示失败原因（控制器地址 + 已经尝试过的全部地址 + dial 错误），按下面顺序排查：
@@ -163,7 +212,10 @@ version=... controller=...` 表示已恢复。如果 `docker compose ps` 显示�
 | --- | --- |
 | 页面提示“内核离线” | 见上一节；页面会显示真实错误与尝试过的地址 |
 | “内核在线”但 AI/邮箱仍直连 | 页面会同时提示“后端无法连接代理入口”，按提示修正 `MIHOMO_MIXED_ADDR` 后重建 backend |
-| 导入成功但节点为空 | 如果订阅基于 `proxy-providers`，节点由内核联网拉取，需先启动内核；错误提示里会带上识别到的格式与内容片段 |
+| 导入成功但节点为空 | 见“节点列表为空 / 切换节点报 404”；订阅基于 `proxy-providers` 时节点由内核联网拉取，需先启动内核 |
+| 切换节点报 404 `Resource not found` | 内核里没有 `PROXY` 分组，通常是内核重启后配置丢失；等待一次轮询自动修复，或重新导入订阅 |
+| proxy 容器重启后节点消失 | 已自动恢复：配置会落盘到共享卷并在重启时重新下发；页面“配置持久化”应显示“已开启” |
+| 改了代理端口后宿主机连不上 | 容器内部的 AI / WhatsApp / 邮箱会立即生效；宿主机需要同步 `.env` 的 `MIHOMO_MIXED_PORT` / `MIHOMO_PUBLISH_PORT` 并重建 proxy 容器 |
 | 连接成功但 WhatsApp 仍然直连 | 打开 WhatsApp 开关后会自动重启会话；若仍失败请重启该员工账号 |
 | 邮箱打不开 | 邮箱走 SOCKS5（内核 mixed 端口）。关闭邮箱开关即可恢复直连 |
 | 切换节点无效果 | 节点必须属于 `PROXY` 分组；测速超时的节点切换后依然不可用 |

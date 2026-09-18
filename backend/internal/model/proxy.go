@@ -17,6 +17,7 @@ type ProxySettings struct {
 	ProxyAI          bool      `json:"proxy_ai" db:"proxy_ai"`
 	ProxyWhatsApp    bool      `json:"proxy_whatsapp" db:"proxy_whatsapp"`
 	ProxyMail        bool      `json:"proxy_mail" db:"proxy_mail"`
+	MixedPort        int       `json:"mixed_port" db:"mixed_port"` // 0 = 使用 MIHOMO_MIXED_ADDR 的端口
 	LastError        string    `json:"last_error" db:"last_error"`
 	CreatedAt        time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at" db:"updated_at"`
@@ -57,6 +58,9 @@ type ProxyStatus struct {
 	NodeCount        int          `json:"node_count"`
 	GroupCount       int          `json:"group_count"`
 	ProxyEndpoint    string       `json:"proxy_endpoint"`
+	MixedPort        int          `json:"mixed_port"`
+	ControllerPort   int          `json:"controller_port"`
+	ConfigPersisted  bool         `json:"config_persisted"`
 	LastError        string       `json:"last_error"`
 	UpdatedAt        time.Time    `json:"updated_at"`
 	Nodes            []ProxyNode  `json:"nodes,omitempty"`
@@ -82,6 +86,11 @@ type ProxyToggleInput struct {
 type ProxySelectInput struct {
 	Node  string `json:"node"`
 	Group string `json:"group"`
+}
+
+// ProxyPortInput changes the mixed port used by the core and its consumers.
+type ProxyPortInput struct {
+	MixedPort int `json:"mixed_port"`
 }
 
 // ProxyTestInput lists the nodes that should be latency tested.

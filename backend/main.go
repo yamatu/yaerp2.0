@@ -646,6 +646,7 @@ func main() {
 			admin.POST("/admin/proxy/connect", proxyHandler.Connect)
 			admin.POST("/admin/proxy/disconnect", proxyHandler.Disconnect)
 			admin.PUT("/admin/proxy/toggles", proxyHandler.UpdateToggles)
+			admin.PUT("/admin/proxy/port", proxyHandler.UpdatePort)
 		}
 	}
 

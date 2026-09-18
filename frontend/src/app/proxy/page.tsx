@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   Upload,
@@ -44,6 +45,9 @@ const EMPTY_STATUS: ProxyStatus = {
   node_count: 0,
   group_count: 0,
   proxy_endpoint: '',
+  mixed_port: 0,
+  controller_port: 0,
+  config_persisted: false,
   last_error: '',
   updated_at: '',
 }
@@ -83,6 +87,7 @@ export default function ProxyPage() {
   const [subscriptionName, setSubscriptionName] = useState('')
   const [rawPayload, setRawPayload] = useState('')
   const [useRawPayload, setUseRawPayload] = useState(false)
+  const [portDraft, setPortDraft] = useState('')
 
   const statusRequestRef = useRef(0)
 
@@ -166,6 +171,17 @@ export default function ProxyPage() {
   const updateToggle = (key: 'proxy_ai' | 'proxy_whatsapp' | 'proxy_mail', value: boolean) =>
     run(key, () => api.put<ProxyStatus>('/admin/proxy/toggles', { [key]: value }), '分流设置已更新。')
 
+  const savePort = () => {
+    const port = Number(portDraft)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      resetBanners()
+      setError('代理端口必须是 1-65535 之间的整数')
+      return
+    }
+    void run('port', () => api.put<ProxyStatus>('/admin/proxy/port', { mixed_port: port }), `代理端口已改为 ${port}，配置已重新下发。`)
+      .then(() => setPortDraft(''))
+  }
+
   const selectNode = (node: ProxyNode) => run(`node:${node.name}`, async () => {
     const response = await api.post<ProxyStatus>('/admin/proxy/nodes/select', { node: node.name })
     if (response.code === 0) setNodes((current) => current.map((item) => ({ ...item, selected: item.name === node.name })))
@@ -229,6 +245,7 @@ export default function ProxyPage() {
                 <p className="mt-1 text-sm text-slate-500">
                   代理入口 <span className="font-mono text-slate-700">{status.proxy_endpoint || '未配置'}</span>
                   {status.core_endpoint ? <> · 控制器 <span className="font-mono text-slate-700">{status.core_endpoint}</span></> : null}
+                  {status.mixed_port ? <> · 端口 <span className="font-mono text-slate-700">{status.mixed_port}</span></> : null}
                   {status.selected_node ? <> · 当前节点 <span className="font-medium text-slate-700">{status.selected_node}</span></> : null}
                 </p>
               </div>
@@ -289,7 +306,7 @@ export default function ProxyPage() {
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
                 内核在线，但后端无法连接代理入口 <code className="rounded bg-rose-100 px-1">{status.proxy_endpoint || '未配置'}</code>：{status.consumer_error}
-                。请检查 <code className="rounded bg-rose-100 px-1">MIHOMO_MIXED_ADDR</code> 是否与后端所在环境一致（容器内应使用 <code className="rounded bg-rose-100 px-1">proxy:7890</code>，宿主机应使用 <code className="rounded bg-rose-100 px-1">127.0.0.1:7890</code>）。
+                。请检查 <code className="rounded bg-rose-100 px-1">MIHOMO_MIXED_ADDR</code> 的主机名是否与后端所在环境一致（容器内为 <code className="rounded bg-rose-100 px-1">proxy</code>，宿主机为 <code className="rounded bg-rose-100 px-1">127.0.0.1</code>）；端口由上方「代理端口」控制，默认 7890。
               </span>
             </div>
           )}
@@ -366,6 +383,7 @@ export default function ProxyPage() {
           </section>
 
           {/* Routing ------------------------------------------------------ */}
+          <div className="space-y-3">
           <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
             <div className="flex items-center gap-2">
               <Globe2 className="h-5 w-5 text-slate-500" />
@@ -402,6 +420,65 @@ export default function ProxyPage() {
             </div>
             {!status.enabled && <p className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">代理未连接时所有业务都走直连，开关仅记录偏好。</p>}
           </section>
+
+          {/* Port --------------------------------------------------------- */}
+          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+            <div className="flex items-center gap-2">
+              <SlidersHorizontal className="h-5 w-5 text-slate-500" />
+              <h2 className="text-base font-semibold text-slate-900">代理端口</h2>
+            </div>
+            <p className="mt-1 text-sm text-slate-500">内核监听的混合端口（HTTP + SOCKS5），AI、WhatsApp 与邮件均通过它出海。修改后会自动重写并下发配置，无需重建容器。</p>
+
+            <div className="mt-4 flex items-end gap-2">
+              <label className="min-w-0 flex-1">
+                <span className="mb-1.5 block text-xs font-medium text-slate-600">混合端口</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={portDraft !== '' ? portDraft : String(status.mixed_port || '')}
+                  onChange={(event) => setPortDraft(event.target.value)}
+                  placeholder="7890"
+                  className="h-10 w-full rounded-lg border border-slate-200 px-3 font-mono text-sm"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={savePort}
+                disabled={busy !== '' || !coreOnline || portDraft === '' || Number(portDraft) === status.mixed_port}
+                className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
+              >
+                {busy === 'port' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存
+              </button>
+            </div>
+
+            <dl className="mt-4 space-y-2 border-t border-slate-100 pt-3 text-xs">
+              <div className="flex items-center justify-between gap-3">
+                <dt className="text-slate-400">内核监听</dt>
+                <dd className="font-mono text-slate-700">{status.mixed_port || '—'}</dd>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <dt className="text-slate-400">控制器端口</dt>
+                <dd className="font-mono text-slate-700">{status.controller_port || '—'}</dd>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <dt className="text-slate-400">配置持久化</dt>
+                <dd className={status.config_persisted ? 'text-emerald-600' : 'text-amber-600'}>
+                  {status.config_persisted ? '已开启（重启自动恢复）' : '未开启'}
+                </dd>
+              </div>
+            </dl>
+
+            <p className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+              容器网络内（后端 / sidecar）会立即使用新端口。宿主机若需直连，要同步修改 <code className="rounded bg-white px-1">MIHOMO_MIXED_PORT</code> / <code className="rounded bg-white px-1">MIHOMO_PUBLISH_PORT</code> 并重建 proxy 容器。
+            </p>
+            {!status.config_persisted && (
+              <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                未开启持久化时，proxy 容器重启会丢失已下发的配置；建议使用 docker compose（会共享 mihomo_config 卷）。
+              </p>
+            )}
+          </section>
+          </div>
         </div>
 
         {/* Nodes ---------------------------------------------------------- */}

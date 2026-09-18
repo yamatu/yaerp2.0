@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,9 @@ const (
 	// proxyProbeTTL keeps a failed controller probe from being repeated on every
 	// status poll (the fallback candidates can take a few seconds to time out).
 	proxyProbeTTL = 5 * time.Second
+	// proxyRepairInterval throttles the automatic re-push of a configuration
+	// the core has lost.
+	proxyRepairInterval = 20 * time.Second
 )
 
 // controllerProbe is a cached result of probeController.
@@ -71,6 +76,8 @@ type ProxyService struct {
 	// probe caches the last controller probe for a few seconds so frequent
 	// status polls do not repeat slow DNS timeouts while the core is down.
 	probeCache *controllerProbe
+	// lastRepairAt throttles the automatic re-push of a lost configuration.
+	lastRepairAt time.Time
 	// extraControllerCandidates is only used by tests to simulate the Docker /
 	// host counterparts of MIHOMO_CONTROLLER_URL.
 	extraControllerCandidates []string
@@ -148,11 +155,18 @@ func (s *ProxyService) Init() error {
 		log.Printf("proxy: 恢复消费者代理配置失败: %v", err)
 	}
 
-	if !settings.Enabled || strings.TrimSpace(settings.ConfigYAML) == "" {
+	payload, err := s.corePayload(settings)
+	if err != nil {
+		s.setLastError(err.Error())
 		return nil
 	}
 
-	if err := s.pushConfig(settings); err != nil {
+	// Push the payload regardless of the connected flag: the node table, the
+	// latency test and the node switch all read the core's state, so a backend
+	// restart must not leave the core without any node. When no subscription is
+	// imported yet this is a baseline document that keeps the core listening on
+	// every interface, which is what makes it reachable for the backend.
+	if err := s.pushConfig(&model.ProxySettings{ConfigYAML: payload}); err != nil {
 		s.setLastError(err.Error())
 		return nil
 	}
@@ -162,6 +176,19 @@ func (s *ProxyService) Init() error {
 	}
 	s.setLastError("")
 	return nil
+}
+
+// corePayload returns the document that should be running inside the core: the
+// imported subscription, or a baseline configuration. The baseline matters
+// because mihomo's own default only binds the mixed port on its loopback, so
+// without it every other container gets "connection refused".
+func (s *ProxyService) corePayload(settings *model.ProxySettings) (string, error) {
+	if settings != nil && strings.TrimSpace(settings.ConfigYAML) != "" {
+		return settings.ConfigYAML, nil
+	}
+	controllerBind, controllerPort := controllerBindAndPort(s.cfg.Proxy.ControllerURL)
+	return buildMihomoConfig(&parsedSubscription{}, controllerBind,
+		s.effectiveMixedPort(settings), controllerPort, s.cfg.Proxy.ControllerSecret, s.cfg.Proxy.TestURL)
 }
 
 // logCoreDiagnostics writes the resolved controller and consumer endpoints to
@@ -225,6 +252,9 @@ func (s *ProxyService) snapshot() *model.ProxySettings {
 	if settings != nil {
 		return settings
 	}
+	if s.repo == nil {
+		return &model.ProxySettings{}
+	}
 	loaded, err := s.repo.Get()
 	if err != nil {
 		return &model.ProxySettings{}
@@ -238,6 +268,9 @@ func (s *ProxyService) snapshot() *model.ProxySettings {
 func (s *ProxyService) mutate(apply func(*model.ProxySettings)) (*model.ProxySettings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.repo == nil {
+		return nil, fmt.Errorf("代理配置存储不可用")
+	}
 	if s.settings == nil {
 		loaded, err := s.repo.Get()
 		if err != nil {
@@ -312,6 +345,36 @@ func (s *ProxyService) httpProxyURL() string {
 // consumerCacheTTL bounds how often the proxy entry point is re-probed.
 const consumerCacheTTL = 30 * time.Second
 
+// effectiveMixedPort is the port the core should listen on: the value saved by
+// the administrator wins, then the port part of MIHOMO_MIXED_ADDR, then 7890.
+func (s *ProxyService) effectiveMixedPort(settings *model.ProxySettings) int {
+	if settings != nil && settings.MixedPort > 0 && settings.MixedPort <= 65535 {
+		return settings.MixedPort
+	}
+	if port := mixedPortFromAddr(s.cfg.Proxy.MixedAddr); port > 0 {
+		return port
+	}
+	return defaultMixedPort
+}
+
+// consumerAddr is the host:port handed to AI, WhatsApp and mail. The host comes
+// from MIHOMO_MIXED_ADDR so it can point at the docker service name, the port
+// from the saved settings so it can be changed without recreating containers.
+func (s *ProxyService) consumerAddr(settings *model.ProxySettings) string {
+	host, _ := hostPortFromAddr(s.cfg.Proxy.MixedAddr)
+	if strings.TrimSpace(host) == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(s.effectiveMixedPort(settings)))
+}
+
+// invalidateConsumer forces the next read to re-probe the proxy entry point.
+func (s *ProxyService) invalidateConsumer() {
+	s.consumerMu.Lock()
+	s.activeConsumer, s.consumerErr, s.consumerCheckedAt = "", nil, time.Time{}
+	s.consumerMu.Unlock()
+}
+
 // mixedAddr returns the proxy entry point the backend should hand to AI,
 // WhatsApp and mail. The configured MIHOMO_MIXED_ADDR wins; when it is not
 // reachable (for example a container that still carries the host-oriented
@@ -330,10 +393,7 @@ func (s *ProxyService) resolveConsumer() (string, error) {
 		return cached, cachedErr
 	}
 
-	configured := strings.TrimSpace(s.cfg.Proxy.MixedAddr)
-	if configured == "" {
-		configured = fmt.Sprintf("127.0.0.1:%d", defaultMixedPort)
-	}
+	configured := s.consumerAddr(s.snapshot())
 
 	resolved, resolvedErr := configured, s.checkConsumerAddr(configured)
 	if resolvedErr != nil {
@@ -387,8 +447,13 @@ func (s *ProxyService) Status() (*model.ProxyStatus, error) {
 		ProxyWhatsApp:    settings.ProxyWhatsApp,
 		ProxyMail:        settings.ProxyMail,
 		ProxyEndpoint:    s.cfg.Proxy.MixedAddr,
+		MixedPort:        s.effectiveMixedPort(settings),
+		ConfigPersisted:  strings.TrimSpace(s.cfg.Proxy.ConfigDir) != "",
 		LastError:        settings.LastError,
 		UpdatedAt:        settings.UpdatedAt,
+	}
+	if _, controllerPort := controllerBindAndPort(s.cfg.Proxy.ControllerURL); controllerPort > 0 {
+		status.ControllerPort = controllerPort
 	}
 
 	version, err := s.coreVersionCached()
@@ -410,6 +475,18 @@ func (s *ProxyService) Status() (*model.ProxyStatus, error) {
 	if err != nil {
 		status.LastError = err.Error()
 		return status, nil
+	}
+	// A restarted core forgets the pushed configuration; restore it before
+	// reporting an empty node table.
+	if !hasProxyGroup(groups) {
+		s.repairCoreConfig(settings, groups)
+		if repaired, repairedGroups, repairErr := s.coreNodes(); repairErr == nil {
+			nodes, groups = repaired, repairedGroups
+		}
+		// A failed repair records a new error, which has to reach the page.
+		if refreshed := s.snapshot(); refreshed != nil {
+			status.LastError = refreshed.LastError
+		}
 	}
 	status.Nodes = nodes
 	status.Groups = groups
@@ -436,6 +513,15 @@ func (s *ProxyService) fillConsumerState(status *model.ProxyStatus) {
 	}
 	status.ConsumerOK = true
 	status.ConsumerError = ""
+}
+
+func hasProxyGroup(groups []model.ProxyGroup) bool {
+	for _, group := range groups {
+		if group.Name == proxyGroupName {
+			return true
+		}
+	}
+	return false
 }
 
 // ListNodes returns the selectable upstream nodes.
@@ -468,7 +554,7 @@ func (s *ProxyService) ImportSubscription(input model.ProxySubscriptionInput) (*
 		return nil, err
 	}
 
-	mixedPort := mixedPortFromAddr(s.cfg.Proxy.MixedAddr)
+	mixedPort := s.effectiveMixedPort(s.snapshot())
 	controllerBind, controllerPort := controllerBindAndPort(s.cfg.Proxy.ControllerURL)
 	configYAML, err := buildMihomoConfig(parsed, controllerBind, mixedPort, controllerPort, s.cfg.Proxy.ControllerSecret, s.cfg.Proxy.TestURL)
 	if err != nil {
@@ -503,17 +589,18 @@ func (s *ProxyService) ImportSubscription(input model.ProxySubscriptionInput) (*
 		return nil, err
 	}
 
-	if updated.Enabled {
-		if err := s.pushConfig(updated); err != nil {
-			s.setLastError(err.Error())
-			return s.Status()
-		}
-		if err := s.applySelection(updated); err != nil {
-			s.setLastError(err.Error())
-			return s.Status()
-		}
-		s.setLastError("")
+	// Always hand the fresh configuration to the core, even while disconnected:
+	// the node table and the latency test work off the core's own state, so an
+	// import that is not pushed looks like "no nodes" to the administrator.
+	if err := s.pushConfig(updated); err != nil {
+		s.setLastError(err.Error())
+		return s.Status()
 	}
+	if err := s.applySelection(updated); err != nil {
+		s.setLastError(err.Error())
+		return s.Status()
+	}
+	s.setLastError("")
 	return s.Status()
 }
 
@@ -544,6 +631,13 @@ func (s *ProxyService) DeleteSubscription() (*model.ProxyStatus, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Drop the nodes inside the core as well, otherwise the table keeps
+	// showing the deleted subscription until the next push.
+	if payload, payloadErr := s.corePayload(updated); payloadErr != nil {
+		s.setLastError(payloadErr.Error())
+	} else if pushErr := s.pushConfig(&model.ProxySettings{ConfigYAML: payload}); pushErr != nil {
+		s.setLastError(pushErr.Error())
 	}
 	_ = s.applyConsumers(updated)
 	return s.Status()
@@ -612,6 +706,102 @@ func (s *ProxyService) UpdateToggles(input model.ProxyToggleInput) (*model.Proxy
 		s.setLastError(err.Error())
 	}
 	return s.Status()
+}
+
+// UpdatePort changes the mixed port used by the core and by every consumer.
+// The stored configuration is rewritten and pushed, so no container has to be
+// recreated for in-cluster traffic to use the new port.
+func (s *ProxyService) UpdatePort(input model.ProxyPortInput) (*model.ProxyStatus, error) {
+	port := input.MixedPort
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("代理端口必须在 1-65535 之间")
+	}
+	if _, controllerPort := controllerBindAndPort(s.cfg.Proxy.ControllerURL); port == controllerPort {
+		return nil, fmt.Errorf("代理端口不能与控制器端口 %d 相同", controllerPort)
+	}
+
+	current := s.snapshot()
+	next := current.ConfigYAML
+	if strings.TrimSpace(next) != "" {
+		updated, err := withMixedPort(next, port)
+		if err != nil {
+			return nil, err
+		}
+		next = updated
+	}
+
+	saved, err := s.mutate(func(settings *model.ProxySettings) {
+		settings.MixedPort = port
+		settings.ConfigYAML = next
+		settings.LastError = ""
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	s.invalidateConsumer()
+
+	// Even without an imported subscription the baseline config has to follow
+	// the new port, otherwise the core keeps listening on the old one.
+	payload, err := s.corePayload(saved)
+	if err != nil {
+		s.setLastError(err.Error())
+		return s.Status()
+	}
+	if err := s.pushConfig(&model.ProxySettings{ConfigYAML: payload}); err != nil {
+		s.setLastError(err.Error())
+		return s.Status()
+	}
+	if err := s.applySelection(saved); err != nil {
+		s.setLastError(err.Error())
+		return s.Status()
+	}
+	// The WhatsApp sidecar receives the full proxy URL, so it has to be told
+	// about the new port as well.
+	if err := s.applyConsumers(saved); err != nil {
+		s.setLastError(err.Error())
+		return s.Status()
+	}
+	s.setLastError("")
+	return s.Status()
+}
+
+// repairCoreConfig re-pushes the stored configuration when the core is online
+// but no longer knows the managed selector group. The controller applies
+// configurations in memory only, so a restarted proxy container silently ends
+// up with an empty config unless somebody pushes it again.
+func (s *ProxyService) repairCoreConfig(settings *model.ProxySettings, groups []model.ProxyGroup) {
+	for _, group := range groups {
+		if group.Name == proxyGroupName {
+			return
+		}
+	}
+
+	s.controllerMu.Lock()
+	lastRepair := s.lastRepairAt
+	s.controllerMu.Unlock()
+	if !lastRepair.IsZero() && time.Since(lastRepair) < proxyRepairInterval {
+		return
+	}
+	s.controllerMu.Lock()
+	s.lastRepairAt = time.Now()
+	s.controllerMu.Unlock()
+
+	payload, err := s.corePayload(settings)
+	if err != nil {
+		s.setLastError(err.Error())
+		return
+	}
+	log.Printf("proxy: 内核配置丢失（未找到 %s 分组），重新下发已保存的配置", proxyGroupName)
+	if err := s.pushConfig(&model.ProxySettings{ConfigYAML: payload}); err != nil {
+		s.setLastError(err.Error())
+		return
+	}
+	if err := s.applySelection(settings); err != nil {
+		s.setLastError(err.Error())
+		return
+	}
+	s.setLastError("")
 }
 
 // SelectNode selects the upstream node inside the managed selector group.
@@ -924,7 +1114,32 @@ func (s *ProxyService) pushConfig(settings *model.ProxySettings) error {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
 		return fmt.Errorf("推送代理配置失败(%d): %s", response.StatusCode, strings.TrimSpace(string(message)))
 	}
+	// The controller applies the payload in memory only, so persist it next to
+	// the core as well: without this a restart of the proxy container silently
+	// drops every node.
+	s.persistCoreConfig(settings.ConfigYAML)
 	return nil
+}
+
+// persistCoreConfig writes the pushed configuration into the directory shared
+// with the proxy container (MIHOMO_CONFIG_DIR). Failures are logged but never
+// fatal: the running core is already configured.
+func (s *ProxyService) persistCoreConfig(configYAML string) {
+	dir := strings.TrimSpace(s.cfg.Proxy.ConfigDir)
+	if dir == "" || strings.TrimSpace(configYAML) == "" {
+		return
+	}
+	path := filepath.Join(dir, "config.yaml")
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, []byte(configYAML), 0o600); err != nil {
+		log.Printf("proxy: 写入核心配置失败 %s: %v", temporary, err)
+		return
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		log.Printf("proxy: 更新核心配置失败 %s: %v", path, err)
+		return
+	}
+	log.Printf("proxy: 已持久化核心配置 %s（重启后自动恢复）", path)
 }
 
 func (s *ProxyService) applySelection(settings *model.ProxySettings) error {

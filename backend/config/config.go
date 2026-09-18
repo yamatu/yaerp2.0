@@ -100,6 +100,10 @@ type ProxyConfig struct {
 	// mixed (HTTP + SOCKS5) inbound.
 	MixedAddr string
 	TestURL   string
+	// ConfigDir is a directory shared with the proxy container. When set, the
+	// generated config is written to <ConfigDir>/config.yaml after a successful
+	// push, so a restart of the core restores the nodes on its own.
+	ConfigDir string
 	// AllowPrivateSubscription lets administrators import subscription URLs
 	// that resolve to private or loopback addresses. Keep this off in
 	// production unless the subscription server is on the same network.
@@ -170,6 +174,7 @@ func Load() *Config {
 			ControllerURL:            getEnv("MIHOMO_CONTROLLER_URL", "http://127.0.0.1:9090"),
 			ControllerSecret:         getEnv("MIHOMO_CONTROLLER_SECRET", ""),
 			MixedAddr:                getEnv("MIHOMO_MIXED_ADDR", "127.0.0.1:7890"),
+			ConfigDir:                getEnv("MIHOMO_CONFIG_DIR", ""),
 			TestURL:                  getEnv("MIHOMO_TEST_URL", "http://www.gstatic.com/generate_204"),
 			AllowPrivateSubscription: getEnv("MIHOMO_ALLOW_PRIVATE_SUBSCRIPTION", "false") == "true",
 		},

@@ -35,8 +35,12 @@ services:
       PPROF_TOKEN: ${PPROF_TOKEN:-}
       MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-67108864}
       BACKUP_MAX_BYTES: ${BACKUP_MAX_BYTES:-268435456}
+      # Shared with the proxy container so the pushed configuration survives a
+      # restart of the core instead of only living in its memory.
+      MIHOMO_CONFIG_DIR: ${MIHOMO_CONFIG_DIR:-/mihomo-config}
     volumes:
       - ${BACKUP_HOST_DIR:-./backups}:/backups
+      - mihomo_config:/mihomo-config
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,7 +56,8 @@ services:
 
   # XTLS / Clash.Meta core. The backend drives it through the external
   # controller REST API (see PROXY.md); the config directory lives in a named
-  # volume so subscriptions, selected node and geo databases survive restarts.
+  # volume shared with the backend, so the pushed configuration (nodes, group,
+  # selected node) and the geo databases survive restarts.
   proxy:
     image: metacubex/mihomo:latest
     # On the very first boot mihomo writes a minimal config.yaml (mixed-port
@@ -69,7 +74,7 @@ services:
     volumes:
       - mihomo_config:/root/.config/mihomo
     ports:
-      - "127.0.0.1:${MIHOMO_PUBLISH_PORT:-7890}:7890"
+      - "127.0.0.1:${MIHOMO_PUBLISH_PORT:-7890}:${MIHOMO_MIXED_PORT:-7890}"
       - "127.0.0.1:9090:9090"
     # Informational: lets `docker compose ps` show whether the REST controller
     # is really listening (the usual cause of "内核离线" in the ERP page).

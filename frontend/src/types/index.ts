@@ -1821,6 +1821,12 @@ export interface ProxyStatus {
   node_count: number
   group_count: number
   proxy_endpoint: string
+  /** Mixed (HTTP + SOCKS5) port the core listens on. */
+  mixed_port: number
+  /** External controller port of the core. */
+  controller_port: number
+  /** True when the pushed config is written next to the core (survives restarts). */
+  config_persisted: boolean
   last_error: string
   updated_at: string
   nodes?: ProxyNode[]
@@ -1837,6 +1843,10 @@ export interface ProxyToggleInput {
   proxy_ai?: boolean
   proxy_whatsapp?: boolean
   proxy_mail?: boolean
+}
+
+export interface ProxyPortInput {
+  mixed_port: number
 }
 
 export interface ProxyNodeResult {
