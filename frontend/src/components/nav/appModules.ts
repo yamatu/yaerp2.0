@@ -9,6 +9,7 @@ import {
   Mail,
   MessageCircle,
   MessageSquare,
+  Network,
   ScrollText,
   Settings2,
   Shield,
@@ -207,6 +208,15 @@ export const ADMIN_MODULES: AppModule[] = [
     href: '/admin/whatsapp',
     icon: MessageCircle,
     keywords: ['whatsapp', 'wa', '代理'],
+    adminOnly: true,
+  },
+  {
+    id: 'admin-proxy',
+    label: 'XTLS 代理',
+    description: '订阅、节点测速与业务分流',
+    href: '/proxy',
+    icon: Network,
+    keywords: ['proxy', 'xtls', 'mihomo', 'clash', 'vless', 'vmess', '代理', '节点', '订阅'],
     adminOnly: true,
   },
 ]

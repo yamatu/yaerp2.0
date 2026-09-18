@@ -46,6 +46,31 @@ services:
         condition: service_started
       whatsapp:
         condition: service_started
+      proxy:
+        condition: service_started
+    restart: unless-stopped
+
+  # XTLS / Clash.Meta core. The backend drives it through the external
+  # controller REST API (see PROXY.md); the config directory lives in a named
+  # volume so subscriptions, selected node and geo databases survive restarts.
+  proxy:
+    image: metacubex/mihomo:latest
+    # On the very first boot mihomo writes a minimal config.yaml (mixed-port
+    # 7890) into the volume; the backend then pushes the real config. -ext-ctl
+    # exposes the controller to the other containers, and the secret comes
+    # from MIHOMO_CONTROLLER_SECRET so it is set before the first push.
+    command:
+      - -d
+      - /root/.config/mihomo
+      - -ext-ctl
+      - 0.0.0.0:9090
+    environment:
+      CLASH_OVERRIDE_SECRET: ${MIHOMO_CONTROLLER_SECRET:-}
+    volumes:
+      - mihomo_config:/root/.config/mihomo
+    ports:
+      - "127.0.0.1:${MIHOMO_PUBLISH_PORT:-7890}:7890"
+      - "127.0.0.1:9090:9090"
     restart: unless-stopped
 
   whatsapp:
@@ -114,3 +139,4 @@ volumes:
   redis_data:
   minio_data:
   whatsapp_auth:
+  mihomo_config:

@@ -152,7 +152,7 @@ func (s *AIService) callResponsesAPI(assistant *activeAIAssistant, messages []ma
 	if !strings.HasSuffix(endpoint, "/responses") {
 		endpoint += "/responses"
 	}
-	raw, err := doAIRequest(endpoint, assistant.APIKey, body)
+	raw, err := s.doAIRequest(endpoint, assistant.APIKey, body)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -55,6 +55,9 @@ type WhatsAppService struct {
 	httpClient     *http.Client
 	encryptionKey  [32]byte
 	inboundHook    func(*model.ChannelMessage)
+	// externalProxyProvider returns the proxy URL forced by the global
+	// XTLS/Mihomo switch, or "" when WhatsApp traffic goes out directly.
+	externalProxyProvider func() string
 }
 
 type whatsappSendMedia struct {
@@ -1532,8 +1535,51 @@ func (s *WhatsAppService) configureSidecar(settings *model.WhatsAppSettings) err
 	return s.callSidecar(http.MethodPost, "/configure", map[string]interface{}{"proxyUrl": proxyURL}, nil)
 }
 
+// SetExternalProxyProvider installs the callback that returns the proxy URL
+// forced by the global XTLS/Mihomo switch. When it returns a non-empty value
+// it wins over the manual WhatsApp proxy settings.
+func (s *WhatsAppService) SetExternalProxyProvider(provider func() string) {
+	s.externalProxyProvider = provider
+}
+
+// ApplyExternalProxyChange reconfigures the sidecar and restarts the running
+// sessions, because puppeteer only applies --proxy-server when the browser is
+// launched.
+func (s *WhatsAppService) ApplyExternalProxyChange() error {
+	settings, err := s.GetSettings()
+	if err != nil {
+		return err
+	}
+	if !settings.Enabled {
+		return nil
+	}
+	if err := s.configureSidecar(settings); err != nil {
+		return err
+	}
+	accounts, err := s.repo.ListAccounts()
+	if err != nil {
+		return err
+	}
+	for index := range accounts {
+		account := accounts[index]
+		s.refreshAccountStatus(&account)
+		if account.Status != "ready" {
+			continue
+		}
+		if restartErr := s.callSidecar(http.MethodPost, s.sessionPath(account.UserID)+"/restart", nil, nil); restartErr != nil {
+			fmt.Printf("WhatsApp proxy restart for user %d failed: %v\n", account.UserID, restartErr)
+		}
+	}
+	return nil
+}
+
 func (s *WhatsAppService) buildProxyURL(settings *model.WhatsAppSettings) (string, error) {
-	if settings.ProxyType == "none" {
+	if s.externalProxyProvider != nil {
+		if override := strings.TrimSpace(s.externalProxyProvider()); override != "" {
+			return override, nil
+		}
+	}
+	if settings == nil || settings.ProxyType == "none" {
 		return "", nil
 	}
 	values, err := s.repo.GetSettings(whatsappSettingKeys)

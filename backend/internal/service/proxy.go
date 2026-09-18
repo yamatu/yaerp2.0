@@ -1,0 +1,791 @@
+package service
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"yaerp/config"
+	"yaerp/internal/model"
+	"yaerp/internal/repo"
+)
+
+const (
+	proxyCoreTimeout       = 6 * time.Second
+	proxySubscriptionLimit = 10 * 1024 * 1024
+	proxyDelayTestTimeout  = 5000
+	proxyDelayWorkers      = 16
+	proxyDelayMaxNodes     = 200
+	proxyUserAgent         = "clash-verge/v1.6.3"
+	proxySubscriptionFetch = 60 * time.Second
+)
+
+var proxyGroupTypes = map[string]bool{
+	"Selector": true, "URLTest": true, "Fallback": true, "LoadBalance": true,
+	"Relay": true, "Compatible": true, "Pass": true, "ProxyProvider": true,
+}
+
+var proxyBuiltinNames = map[string]bool{
+	"DIRECT": true, "REJECT": true, "REJECT-DROP": true, "PASS": true,
+	"COMPATIBLE": true, "GLOBAL": true,
+}
+
+// ProxyService owns the XTLS/Mihomo subscription and tells the rest of the
+// backend whether AI, WhatsApp and mail traffic should use it.
+type ProxyService struct {
+	cfg         *config.Config
+	repo        *repo.ProxyRepo
+	coreClient  *http.Client
+	delayClient *http.Client
+	fetchClient *http.Client
+
+	mu       sync.RWMutex
+	settings *model.ProxySettings
+
+	whatsAppHook func(proxyURL string) error
+}
+
+func NewProxyService(cfg *config.Config, proxyRepo *repo.ProxyRepo) *ProxyService {
+	fetchTransport := &http.Transport{
+		Proxy:               nil,
+		MaxIdleConns:        10,
+		IdleConnTimeout:     60 * time.Second,
+		TLSHandshakeTimeout: 15 * time.Second,
+	}
+	return &ProxyService{
+		cfg:         cfg,
+		repo:        proxyRepo,
+		coreClient:  &http.Client{Timeout: proxyCoreTimeout},
+		delayClient: &http.Client{Timeout: time.Duration(proxyDelayTestTimeout+3000) * time.Millisecond},
+		fetchClient: &http.Client{
+			Timeout:   proxySubscriptionFetch,
+			Transport: fetchTransport,
+		},
+	}
+}
+
+// SetWhatsAppHook installs the callback that reconfigures the WhatsApp
+// sidecar whenever the WhatsApp proxy switch changes.
+func (s *ProxyService) SetWhatsAppHook(hook func(proxyURL string) error) {
+	s.whatsAppHook = hook
+}
+
+// Init loads the persisted configuration and re-applies it to the core.
+func (s *ProxyService) Init() error {
+	settings, err := s.repo.Get()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.settings = settings
+	s.mu.Unlock()
+
+	if !settings.Enabled || strings.TrimSpace(settings.ConfigYAML) == "" {
+		return nil
+	}
+	if err := s.pushConfig(settings); err != nil {
+		s.setLastError(err.Error())
+		return nil
+	}
+	if err := s.applySelection(settings); err != nil {
+		s.setLastError(err.Error())
+		return nil
+	}
+	s.setLastError("")
+	return nil
+}
+
+func (s *ProxyService) snapshot() *model.ProxySettings {
+	s.mu.RLock()
+	settings := s.settings
+	s.mu.RUnlock()
+	if settings != nil {
+		return settings
+	}
+	loaded, err := s.repo.Get()
+	if err != nil {
+		return &model.ProxySettings{}
+	}
+	s.mu.Lock()
+	s.settings = loaded
+	s.mu.Unlock()
+	return loaded
+}
+
+func (s *ProxyService) mutate(apply func(*model.ProxySettings)) (*model.ProxySettings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		loaded, err := s.repo.Get()
+		if err != nil {
+			return nil, err
+		}
+		s.settings = loaded
+	}
+	next := *s.settings
+	apply(&next)
+	if err := s.repo.Save(&next); err != nil {
+		return nil, err
+	}
+	s.settings = &next
+	return &next, nil
+}
+
+func (s *ProxyService) setLastError(message string) {
+	_, _ = s.mutate(func(next *model.ProxySettings) {
+		next.LastError = message
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Public API used by the handlers and by the other services
+// ---------------------------------------------------------------------------
+
+// AIProxyURL returns the HTTP proxy URL for AI requests, or "" when AI traffic
+// must go out directly.
+func (s *ProxyService) AIProxyURL() string {
+	if !s.cfg.Proxy.Enabled {
+		return ""
+	}
+	settings := s.snapshot()
+	if settings == nil || !settings.Enabled || !settings.ProxyAI {
+		return ""
+	}
+	return s.httpProxyURL()
+}
+
+// MailProxySettings returns a SOCKS5 override for IMAP/SMTP/HTTP mail traffic.
+func (s *ProxyService) MailProxySettings() *model.MailServerSettings {
+	if !s.cfg.Proxy.Enabled {
+		return nil
+	}
+	settings := s.snapshot()
+	if settings == nil || !settings.Enabled || !settings.ProxyMail {
+		return nil
+	}
+	host, port := hostPortFromAddr(s.cfg.Proxy.MixedAddr)
+	if strings.TrimSpace(host) == "" || port <= 0 {
+		return nil
+	}
+	return &model.MailServerSettings{ProxyType: "socks5", ProxyHost: host, ProxyPort: port}
+}
+
+// WhatsAppProxyURL returns the HTTP proxy URL handed to the WhatsApp sidecar.
+func (s *ProxyService) WhatsAppProxyURL() string {
+	if !s.cfg.Proxy.Enabled {
+		return ""
+	}
+	settings := s.snapshot()
+	if settings == nil || !settings.Enabled || !settings.ProxyWhatsApp {
+		return ""
+	}
+	return s.httpProxyURL()
+}
+
+func (s *ProxyService) httpProxyURL() string {
+	addr := strings.TrimSpace(s.cfg.Proxy.MixedAddr)
+	if addr == "" {
+		addr = fmt.Sprintf("127.0.0.1:%d", defaultMixedPort)
+	}
+	return "http://" + addr
+}
+
+// Status reports the current state, including live core information.
+func (s *ProxyService) Status() (*model.ProxyStatus, error) {
+	settings := s.snapshot()
+	status := &model.ProxyStatus{
+		Enabled:          settings.Enabled,
+		SubscriptionURL:  settings.SubscriptionURL,
+		SubscriptionName: settings.SubscriptionName,
+		SourceType:       settings.SourceType,
+		SelectedNode:     settings.SelectedNode,
+		SelectedGroup:    settings.SelectedGroup,
+		ProxyAI:          settings.ProxyAI,
+		ProxyWhatsApp:    settings.ProxyWhatsApp,
+		ProxyMail:        settings.ProxyMail,
+		ProxyEndpoint:    s.cfg.Proxy.MixedAddr,
+		LastError:        settings.LastError,
+		UpdatedAt:        settings.UpdatedAt,
+	}
+
+	version, err := s.coreVersion()
+	if err != nil {
+		status.CoreAvailable = false
+		status.Nodes = s.offlineNodes(settings)
+		status.NodeCount = len(status.Nodes)
+		return status, nil
+	}
+	status.CoreAvailable = true
+	status.CoreVersion = version
+
+	nodes, groups, err := s.coreNodes()
+	if err != nil {
+		status.LastError = err.Error()
+		return status, nil
+	}
+	status.Nodes = nodes
+	status.Groups = groups
+	status.NodeCount = len(nodes)
+	status.GroupCount = len(groups)
+	for _, node := range nodes {
+		if node.Selected {
+			status.SelectedNode = node.Name
+			break
+		}
+	}
+	return status, nil
+}
+
+// ListNodes returns the selectable upstream nodes.
+func (s *ProxyService) ListNodes() ([]model.ProxyNode, []model.ProxyGroup, error) {
+	if _, err := s.coreVersion(); err != nil {
+		return s.offlineNodes(s.snapshot()), nil, nil
+	}
+	return s.coreNodes()
+}
+
+// ImportSubscription fetches (or accepts) a subscription and stores the
+// generated core configuration.
+func (s *ProxyService) ImportSubscription(input model.ProxySubscriptionInput) (*model.ProxyStatus, error) {
+	payload := strings.TrimSpace(input.Payload)
+	subscriptionURL := strings.TrimSpace(input.URL)
+
+	if subscriptionURL != "" {
+		fetched, err := s.fetchSubscription(subscriptionURL)
+		if err != nil {
+			return nil, err
+		}
+		payload = fetched
+	}
+	if payload == "" {
+		return nil, fmt.Errorf("请填写订阅链接或粘贴订阅内容")
+	}
+
+	parsed, err := parseSubscriptionPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	mixedPort := mixedPortFromAddr(s.cfg.Proxy.MixedAddr)
+	controllerBind, controllerPort := controllerBindAndPort(s.cfg.Proxy.ControllerURL)
+	configYAML, err := buildMihomoConfig(parsed, controllerBind, mixedPort, controllerPort, s.cfg.Proxy.ControllerSecret, s.cfg.Proxy.TestURL)
+	if err != nil {
+		return nil, err
+	}
+
+	nodeNames := configProxyNames(configYAML)
+	selectedNode := ""
+	if previous := s.snapshot(); previous != nil && previous.SelectedNode != "" {
+		for _, name := range nodeNames {
+			if name == previous.SelectedNode {
+				selectedNode = name
+				break
+			}
+		}
+	}
+	if selectedNode == "" && len(nodeNames) > 0 {
+		selectedNode = nodeNames[0]
+	}
+
+	updated, err := s.mutate(func(next *model.ProxySettings) {
+		next.SubscriptionURL = subscriptionURL
+		next.SubscriptionName = strings.TrimSpace(input.Name)
+		next.SourceType = parsed.SourceType
+		next.SourcePayload = payload
+		next.ConfigYAML = configYAML
+		next.SelectedNode = selectedNode
+		next.SelectedGroup = proxyGroupName
+		next.LastError = ""
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if updated.Enabled {
+		if err := s.pushConfig(updated); err != nil {
+			s.setLastError(err.Error())
+			return s.Status()
+		}
+		if err := s.applySelection(updated); err != nil {
+			s.setLastError(err.Error())
+			return s.Status()
+		}
+		s.setLastError("")
+	}
+	return s.Status()
+}
+
+// RefreshSubscription re-fetches the stored subscription URL.
+func (s *ProxyService) RefreshSubscription() (*model.ProxyStatus, error) {
+	settings := s.snapshot()
+	if strings.TrimSpace(settings.SubscriptionURL) == "" {
+		return nil, fmt.Errorf("当前订阅不是通过链接导入的，无法刷新")
+	}
+	return s.ImportSubscription(model.ProxySubscriptionInput{
+		URL:  settings.SubscriptionURL,
+		Name: settings.SubscriptionName,
+	})
+}
+
+// DeleteSubscription clears the stored subscription and disconnects consumers.
+func (s *ProxyService) DeleteSubscription() (*model.ProxyStatus, error) {
+	updated, err := s.mutate(func(next *model.ProxySettings) {
+		next.SubscriptionURL = ""
+		next.SubscriptionName = ""
+		next.SourceType = proxySourceNone
+		next.SourcePayload = ""
+		next.ConfigYAML = ""
+		next.SelectedNode = ""
+		next.SelectedGroup = ""
+		next.Enabled = false
+		next.LastError = ""
+	})
+	if err != nil {
+		return nil, err
+	}
+	_ = s.applyConsumers(updated)
+	return s.Status()
+}
+
+// Connect pushes the configuration into the core and enables the proxy.
+func (s *ProxyService) Connect() (*model.ProxyStatus, error) {
+	if !s.cfg.Proxy.Enabled {
+		return nil, fmt.Errorf("服务端未启用代理功能")
+	}
+	settings := s.snapshot()
+	if strings.TrimSpace(settings.ConfigYAML) == "" {
+		return nil, fmt.Errorf("请先导入订阅")
+	}
+	if err := s.pushConfig(settings); err != nil {
+		s.setLastError(err.Error())
+		return nil, err
+	}
+	updated, err := s.mutate(func(next *model.ProxySettings) {
+		next.Enabled = true
+		next.LastError = ""
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.applySelection(updated); err != nil {
+		s.setLastError(err.Error())
+	}
+	if err := s.applyConsumers(updated); err != nil {
+		s.setLastError(err.Error())
+	}
+	return s.Status()
+}
+
+// Disconnect stops routing AI/WhatsApp/mail traffic through the core.
+func (s *ProxyService) Disconnect() (*model.ProxyStatus, error) {
+	updated, err := s.mutate(func(next *model.ProxySettings) {
+		next.Enabled = false
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.applyConsumers(updated); err != nil {
+		s.setLastError(err.Error())
+	}
+	return s.Status()
+}
+
+// UpdateToggles switches the individual traffic sources.
+func (s *ProxyService) UpdateToggles(input model.ProxyToggleInput) (*model.ProxyStatus, error) {
+	updated, err := s.mutate(func(next *model.ProxySettings) {
+		if input.ProxyAI != nil {
+			next.ProxyAI = *input.ProxyAI
+		}
+		if input.ProxyWhatsApp != nil {
+			next.ProxyWhatsApp = *input.ProxyWhatsApp
+		}
+		if input.ProxyMail != nil {
+			next.ProxyMail = *input.ProxyMail
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.applyConsumers(updated); err != nil {
+		s.setLastError(err.Error())
+	}
+	return s.Status()
+}
+
+// SelectNode selects the upstream node inside the managed selector group.
+func (s *ProxyService) SelectNode(name string) (*model.ProxyStatus, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("请选择节点")
+	}
+	if err := s.selectNode(name); err != nil {
+		return nil, err
+	}
+	if _, err := s.mutate(func(next *model.ProxySettings) {
+		next.SelectedNode = name
+		next.SelectedGroup = proxyGroupName
+		next.LastError = ""
+	}); err != nil {
+		return nil, err
+	}
+	return s.Status()
+}
+
+// TestNodes probes latency for the requested nodes (all nodes when empty).
+func (s *ProxyService) TestNodes(names []string) ([]model.ProxyNodeResult, error) {
+	if _, err := s.coreVersion(); err != nil {
+		return nil, fmt.Errorf("代理内核不可用: %w", err)
+	}
+	nodes, _, err := s.coreNodes()
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		for _, node := range nodes {
+			names = append(names, node.Name)
+		}
+	}
+	if len(names) == 0 {
+		return []model.ProxyNodeResult{}, nil
+	}
+	if len(names) > proxyDelayMaxNodes {
+		names = names[:proxyDelayMaxNodes]
+	}
+
+	results := make([]model.ProxyNodeResult, len(names))
+	semaphore := make(chan struct{}, proxyDelayWorkers)
+	var group sync.WaitGroup
+	for index, name := range names {
+		group.Add(1)
+		semaphore <- struct{}{}
+		go func(index int, name string) {
+			defer group.Done()
+			defer func() { <-semaphore }()
+			delay, err := s.testNodeDelay(name)
+			result := model.ProxyNodeResult{Name: name, Delay: delay}
+			if err != nil {
+				result.Delay = 0
+				result.Error = err.Error()
+			}
+			results[index] = result
+		}(index, name)
+	}
+	group.Wait()
+	return results, nil
+}
+
+// ---------------------------------------------------------------------------
+// Core (Mihomo) REST API
+// ---------------------------------------------------------------------------
+
+type proxyCoreProxy struct {
+	Type    string `json:"type"`
+	Now     string `json:"now"`
+	All     []string
+	History []struct {
+		Delay int `json:"delay"`
+	} `json:"history"`
+}
+
+func (s *ProxyService) controllerBase() string {
+	return strings.TrimRight(strings.TrimSpace(s.cfg.Proxy.ControllerURL), "/")
+}
+
+func (s *ProxyService) newCoreRequest(method, path string, body []byte) (*http.Request, error) {
+	endpoint := s.controllerBase() + path
+	request, err := http.NewRequest(method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > 0 {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if secret := strings.TrimSpace(s.cfg.Proxy.ControllerSecret); secret != "" {
+		request.Header.Set("Authorization", "Bearer "+secret)
+	}
+	return request, nil
+}
+
+func (s *ProxyService) coreVersion() (string, error) {
+	if !s.cfg.Proxy.Enabled {
+		return "", fmt.Errorf("代理功能未启用")
+	}
+	request, err := s.newCoreRequest(http.MethodGet, "/version", nil)
+	if err != nil {
+		return "", err
+	}
+	response, err := s.coreClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("无法连接代理内核: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("代理内核返回状态 %d", response.StatusCode)
+	}
+	var payload struct {
+		Version string `json:"version"`
+		Meta    bool   `json:"meta"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&payload); err != nil {
+		return "", err
+	}
+	if payload.Version == "" {
+		payload.Version = "unknown"
+	}
+	return payload.Version, nil
+}
+
+func (s *ProxyService) pushConfig(settings *model.ProxySettings) error {
+	if settings == nil || strings.TrimSpace(settings.ConfigYAML) == "" {
+		return fmt.Errorf("没有可用的代理配置")
+	}
+	body, err := json.Marshal(map[string]string{
+		"path":    "",
+		"payload": settings.ConfigYAML,
+	})
+	if err != nil {
+		return err
+	}
+	request, err := s.newCoreRequest(http.MethodPut, "/configs?force=true", body)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := s.coreClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("推送代理配置失败: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= http.StatusMultipleChoices {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		return fmt.Errorf("推送代理配置失败(%d): %s", response.StatusCode, strings.TrimSpace(string(message)))
+	}
+	return nil
+}
+
+func (s *ProxyService) applySelection(settings *model.ProxySettings) error {
+	if settings == nil || strings.TrimSpace(settings.SelectedNode) == "" {
+		return nil
+	}
+	return s.selectNode(settings.SelectedNode)
+}
+
+func (s *ProxyService) selectNode(name string) error {
+	body, err := json.Marshal(map[string]string{"name": name})
+	if err != nil {
+		return err
+	}
+	request, err := s.newCoreRequest(http.MethodPut, "/proxies/"+url.PathEscape(proxyGroupName), body)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := s.coreClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("切换节点失败: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= http.StatusMultipleChoices {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+		return fmt.Errorf("切换节点失败(%d): %s", response.StatusCode, strings.TrimSpace(string(message)))
+	}
+	return nil
+}
+
+func (s *ProxyService) coreNodes() ([]model.ProxyNode, []model.ProxyGroup, error) {
+	request, err := s.newCoreRequest(http.MethodGet, "/proxies", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	response, err := s.coreClient.Do(request)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取节点列表失败: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("读取节点列表失败(%d)", response.StatusCode)
+	}
+	var payload struct {
+		Proxies map[string]proxyCoreProxy `json:"proxies"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 16*1024*1024)).Decode(&payload); err != nil {
+		return nil, nil, fmt.Errorf("解析节点列表失败: %w", err)
+	}
+
+	selected := ""
+	if group, ok := payload.Proxies[proxyGroupName]; ok {
+		selected = group.Now
+	}
+
+	nodes := make([]model.ProxyNode, 0, len(payload.Proxies))
+	groups := make([]model.ProxyGroup, 0)
+	for name, proxy := range payload.Proxies {
+		if proxyGroupTypes[proxy.Type] {
+			groups = append(groups, model.ProxyGroup{Name: name, Type: proxy.Type, Now: proxy.Now})
+			continue
+		}
+		if proxyBuiltinNames[strings.ToUpper(name)] {
+			continue
+		}
+		delay := -1
+		if len(proxy.History) > 0 && proxy.History[len(proxy.History)-1].Delay > 0 {
+			delay = proxy.History[len(proxy.History)-1].Delay
+		}
+		nodes = append(nodes, model.ProxyNode{
+			Name:     name,
+			Type:     proxy.Type,
+			Delay:    delay,
+			Selected: name == selected,
+		})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
+	sort.Slice(groups, func(i, j int) bool { return groups[i].Name < groups[j].Name })
+	return nodes, groups, nil
+}
+
+func (s *ProxyService) testNodeDelay(name string) (int, error) {
+	testURL := strings.TrimSpace(s.cfg.Proxy.TestURL)
+	if testURL == "" {
+		testURL = "http://www.gstatic.com/generate_204"
+	}
+	path := fmt.Sprintf("/proxies/%s/delay?timeout=%d&url=%s",
+		url.PathEscape(name), proxyDelayTestTimeout, url.QueryEscape(testURL))
+	request, err := s.newCoreRequest(http.MethodGet, path, nil)
+	if err != nil {
+		return 0, err
+	}
+	response, err := s.delayClient.Do(request)
+	if err != nil {
+		return 0, fmt.Errorf("超时")
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+	if response.StatusCode != http.StatusOK {
+		var payload struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		if payload.Message != "" {
+			return 0, fmt.Errorf("%s", payload.Message)
+		}
+		return 0, fmt.Errorf("测试失败(%d)", response.StatusCode)
+	}
+	var payload struct {
+		Delay int `json:"delay"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, fmt.Errorf("解析延迟结果失败")
+	}
+	return payload.Delay, nil
+}
+
+func (s *ProxyService) offlineNodes(settings *model.ProxySettings) []model.ProxyNode {
+	if settings == nil || strings.TrimSpace(settings.ConfigYAML) == "" {
+		return nil
+	}
+	names := configProxyNames(settings.ConfigYAML)
+	nodes := make([]model.ProxyNode, 0, len(names))
+	for _, name := range names {
+		nodes = append(nodes, model.ProxyNode{
+			Name:     name,
+			Delay:    -1,
+			Selected: name == settings.SelectedNode,
+		})
+	}
+	return nodes
+}
+
+// ---------------------------------------------------------------------------
+// Consumers
+// ---------------------------------------------------------------------------
+
+func (s *ProxyService) applyConsumers(settings *model.ProxySettings) error {
+	if s.whatsAppHook == nil {
+		return nil
+	}
+	proxyURL := ""
+	if settings != nil && settings.Enabled && settings.ProxyWhatsApp {
+		proxyURL = s.httpProxyURL()
+	}
+	if err := s.whatsAppHook(proxyURL); err != nil {
+		return fmt.Errorf("WhatsApp 代理配置失败: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Subscription fetching
+// ---------------------------------------------------------------------------
+
+func (s *ProxyService) fetchSubscription(rawURL string) (string, error) {
+	target, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || target.Host == "" {
+		return "", fmt.Errorf("订阅链接格式不正确")
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return "", fmt.Errorf("订阅链接仅支持 http 或 https")
+	}
+	if !s.cfg.Proxy.AllowPrivateSubscription {
+		if err := rejectPrivateHost(target.Hostname()); err != nil {
+			return "", err
+		}
+	}
+	if !strings.Contains(target.RawQuery, "flag=") && !strings.Contains(target.RawQuery, "target=") {
+		query := target.Query()
+		query.Set("flag", "clash")
+		target.RawQuery = query.Encode()
+	}
+
+	request, err := http.NewRequest(http.MethodGet, target.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("User-Agent", proxyUserAgent)
+	request.Header.Set("Accept", "*/*")
+
+	response, err := s.fetchClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("下载订阅失败: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("下载订阅失败，订阅服务器返回 %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, proxySubscriptionLimit+1))
+	if err != nil {
+		return "", fmt.Errorf("读取订阅内容失败: %w", err)
+	}
+	if len(body) > proxySubscriptionLimit {
+		return "", fmt.Errorf("订阅内容超过 10MB 限制")
+	}
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return "", fmt.Errorf("订阅内容为空")
+	}
+	return text, nil
+}
+
+func rejectPrivateHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("订阅链接缺少主机名")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return fmt.Errorf("出于安全考虑，默认禁止导入内网订阅地址；如确需使用请设置 MIHOMO_ALLOW_PRIVATE_SUBSCRIPTION=true")
+		}
+		return nil
+	}
+	if strings.EqualFold(host, "localhost") {
+		return fmt.Errorf("出于安全考虑，默认禁止导入本机订阅地址")
+	}
+	return nil
+}

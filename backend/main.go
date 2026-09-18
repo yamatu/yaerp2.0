@@ -95,6 +95,7 @@ func main() {
 	scheduleRepo := repo.NewAIScheduleRepo(db)
 	tradeRepo := repo.NewTradeRepo(db)
 	mailRepo := repo.NewMailRepo(db)
+	proxyRepo := repo.NewProxyRepo(db)
 
 	// Services
 	authService := service.NewAuthService(userRepo, jwtUtil, rdb)
@@ -144,6 +145,22 @@ func main() {
 	mailService.SetAIService(aiService)
 	mailService.SetTradeService(tradeService)
 	aiService.SetAutomationService(automationService)
+
+	// Global XTLS / Mihomo outbound proxy
+	proxyService := service.NewProxyService(cfg, proxyRepo)
+	aiService.SetAIProxyURLProvider(proxyService.AIProxyURL)
+	mailService.SetProxyOverrideProvider(proxyService.MailProxySettings)
+	whatsAppService.SetExternalProxyProvider(proxyService.WhatsAppProxyURL)
+	proxyService.SetWhatsAppHook(func(string) error {
+		return whatsAppService.ApplyExternalProxyChange()
+	})
+	// Push the persisted config into the core in the background so an offline
+	// proxy container never delays the API server startup.
+	go func() {
+		if err := proxyService.Init(); err != nil {
+			log.Printf("proxy core init: %v", err)
+		}
+	}()
 	channelService.SetAIService(aiService)
 	scheduleService.SetReportGenerator(aiService.GenerateSheetReport)
 	if err := scheduleService.Start(); err != nil {
@@ -244,6 +261,7 @@ func main() {
 	automationHandler := handler.NewAutomationHandler(automationService)
 	tradeHandler := handler.NewTradeHandler(tradeService)
 	mailHandler := handler.NewMailHandler(mailService)
+	proxyHandler := handler.NewProxyHandler(proxyService)
 
 	// Router
 	gin.SetMode(cfg.Server.Mode)
@@ -616,6 +634,18 @@ func main() {
 			admin.GET("/admin/mail/settings", mailHandler.GetSettings)
 			admin.PUT("/admin/mail/settings", mailHandler.UpdateSettings)
 			admin.GET("/admin/mail/accounts", mailHandler.ListAccounts)
+
+			// XTLS / Mihomo outbound proxy (admin)
+			admin.GET("/admin/proxy/status", proxyHandler.Status)
+			admin.POST("/admin/proxy/subscription", proxyHandler.ImportSubscription)
+			admin.POST("/admin/proxy/subscription/refresh", proxyHandler.RefreshSubscription)
+			admin.DELETE("/admin/proxy/subscription", proxyHandler.DeleteSubscription)
+			admin.GET("/admin/proxy/nodes", proxyHandler.ListNodes)
+			admin.POST("/admin/proxy/nodes/test", proxyHandler.TestNodes)
+			admin.POST("/admin/proxy/nodes/select", proxyHandler.SelectNode)
+			admin.POST("/admin/proxy/connect", proxyHandler.Connect)
+			admin.POST("/admin/proxy/disconnect", proxyHandler.Disconnect)
+			admin.PUT("/admin/proxy/toggles", proxyHandler.UpdateToggles)
 		}
 	}
 

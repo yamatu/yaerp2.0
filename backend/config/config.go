@@ -16,6 +16,7 @@ type Config struct {
 	AI       AIConfig
 	Backup   BackupConfig
 	WhatsApp WhatsAppConfig
+	Proxy    ProxyConfig
 	Debug    DebugConfig
 }
 
@@ -89,6 +90,22 @@ type WhatsAppConfig struct {
 	InternalSecret string
 }
 
+// ProxyConfig points the backend at the Mihomo/Clash-Meta core that carries
+// the XTLS subscription traffic for AI, WhatsApp and mail.
+type ProxyConfig struct {
+	Enabled          bool
+	ControllerURL    string
+	ControllerSecret string
+	// MixedAddr is the host:port other containers use to reach the core
+	// mixed (HTTP + SOCKS5) inbound.
+	MixedAddr string
+	TestURL   string
+	// AllowPrivateSubscription lets administrators import subscription URLs
+	// that resolve to private or loopback addresses. Keep this off in
+	// production unless the subscription server is on the same network.
+	AllowPrivateSubscription bool
+}
+
 func Load() *Config {
 	return &Config{
 		Postgres: PostgresConfig{
@@ -147,6 +164,14 @@ func Load() *Config {
 		WhatsApp: WhatsAppConfig{
 			ServiceURL:     getEnv("WHATSAPP_SERVICE_URL", "http://whatsapp:3010"),
 			InternalSecret: getEnv("WHATSAPP_INTERNAL_SECRET", ""),
+		},
+		Proxy: ProxyConfig{
+			Enabled:                  getEnv("MIHOMO_ENABLED", "true") == "true",
+			ControllerURL:            getEnv("MIHOMO_CONTROLLER_URL", "http://127.0.0.1:9090"),
+			ControllerSecret:         getEnv("MIHOMO_CONTROLLER_SECRET", ""),
+			MixedAddr:                getEnv("MIHOMO_MIXED_ADDR", "127.0.0.1:7890"),
+			TestURL:                  getEnv("MIHOMO_TEST_URL", "http://www.gstatic.com/generate_204"),
+			AllowPrivateSubscription: getEnv("MIHOMO_ALLOW_PRIVATE_SUBSCRIPTION", "false") == "true",
 		},
 		Debug: DebugConfig{
 			PprofEnabled:    getEnv("PPROF_ENABLED", "false") == "true",

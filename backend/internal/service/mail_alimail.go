@@ -214,9 +214,10 @@ func (s *MailService) aliMailHTTPClient() (*http.Client, error) {
 			settings = current
 		}
 	}
+	proxySettings := s.mailProxySettings(settings)
 	cacheKey := strings.Join([]string{
-		normalizeMailProxyType(settings.ProxyType), settings.ProxyHost,
-		strconv.Itoa(settings.ProxyPort), settings.ProxyUsername, settings.ProxyPasswordEncrypted,
+		normalizeMailProxyType(proxySettings.ProxyType), proxySettings.ProxyHost,
+		strconv.Itoa(proxySettings.ProxyPort), proxySettings.ProxyUsername, proxySettings.ProxyPasswordEncrypted,
 	}, "|")
 	s.aliHTTPMu.Lock()
 	if client := s.aliHTTPClient[cacheKey]; client != nil {
@@ -232,8 +233,8 @@ func (s *MailService) aliMailHTTPClient() (*http.Client, error) {
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
-	if normalizeMailProxyType(settings.ProxyType) != "none" {
-		dialer, dialErr := s.mailDialer(settings)
+	if normalizeMailProxyType(proxySettings.ProxyType) != "none" {
+		dialer, dialErr := s.mailDialer(proxySettings)
 		if dialErr != nil {
 			return nil, dialErr
 		}
