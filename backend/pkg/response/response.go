@@ -27,6 +27,14 @@ func OKMsg(c *gin.Context, msg string) {
 	})
 }
 
+func OKMsgData(c *gin.Context, msg string, data interface{}) {
+	c.JSON(http.StatusOK, Response{
+		Code:    0,
+		Message: msg,
+		Data:    data,
+	})
+}
+
 func Error(c *gin.Context, httpCode int, msg string) {
 	c.JSON(httpCode, Response{
 		Code:    -1,

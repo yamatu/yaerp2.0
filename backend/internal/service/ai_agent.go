@@ -887,7 +887,7 @@ func (s *AIService) callChatCompletionWithTools(endpoint, apiKey, model string, 
 		chatURL += "/chat/completions"
 	}
 
-	resp, err := doAIRequest(chatURL, apiKey, body)
+	resp, err := s.doAIRequest(chatURL, apiKey, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -911,7 +911,7 @@ func (s *AIService) callChatCompletionWithTools(endpoint, apiKey, model string, 
 	return &apiResp, assistantMessage, nil
 }
 
-func doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
+func (s *AIService) doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
 	request, err := http.NewRequest("POST", chatURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -922,7 +922,7 @@ func doAIRequest(chatURL, apiKey string, body []byte) ([]byte, error) {
 		request.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	client := &http.Client{Timeout: aiRequestTimeout}
+	client := s.aiHTTPClient()
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)

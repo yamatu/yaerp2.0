@@ -8,10 +8,12 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"yaerp/config"
@@ -30,6 +32,54 @@ type AIService struct {
 	automationService *AutomationService
 	tradeService      *TradeService
 	tools             map[string]ToolFunc
+	// proxyURLProvider returns the outbound proxy used for AI requests. It is
+	// wired to the XTLS/Mihomo proxy service and returns "" when AI traffic
+	// must go out directly.
+	proxyURLProvider func() string
+	aiProxyMu        sync.Mutex
+	aiProxyClients   map[string]*http.Client
+}
+
+// SetAIProxyURLProvider installs the callback that decides whether AI traffic
+// is routed through the managed outbound proxy.
+func (s *AIService) SetAIProxyURLProvider(provider func() string) {
+	s.proxyURLProvider = provider
+}
+
+// aiHTTPClient builds an HTTP client for AI calls, optionally through the
+// managed outbound proxy. Clients are cached per proxy URL so connections are
+// reused while the switch stays on.
+func (s *AIService) aiHTTPClient() *http.Client {
+	proxyURL := ""
+	if s.proxyURLProvider != nil {
+		proxyURL = strings.TrimSpace(s.proxyURLProvider())
+	}
+	if proxyURL == "" {
+		return &http.Client{Timeout: aiRequestTimeout}
+	}
+
+	s.aiProxyMu.Lock()
+	defer s.aiProxyMu.Unlock()
+	if cached := s.aiProxyClients[proxyURL]; cached != nil {
+		return cached
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return &http.Client{Timeout: aiRequestTimeout}
+	}
+	transport := &http.Transport{
+		Proxy:               http.ProxyURL(parsed),
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 20 * time.Second,
+	}
+	client := &http.Client{Timeout: aiRequestTimeout, Transport: transport}
+	if s.aiProxyClients == nil {
+		s.aiProxyClients = make(map[string]*http.Client)
+	}
+	s.aiProxyClients[proxyURL] = client
+	return client
 }
 
 func (s *AIService) SetAutomationService(automationService *AutomationService) {
@@ -576,7 +626,7 @@ func (s *AIService) callChatCompletion(endpoint, apiKey, model string, messages 
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
-	client := &http.Client{Timeout: aiRequestTimeout}
+	client := s.aiHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)

@@ -1783,3 +1783,60 @@ export interface TradeDashboard {
   completed_this_month: number;
   stage_counts: Partial<Record<TradeStage, number>>;
 }
+
+// ---------------------------------------------------------------------------
+// XTLS / Mihomo outbound proxy
+// ---------------------------------------------------------------------------
+
+export interface ProxyNode {
+  name: string
+  type: string
+  /** Latency in milliseconds; -1 means "not tested yet". */
+  delay: number
+  selected: boolean
+}
+
+export interface ProxyGroup {
+  name: string
+  type: string
+  now: string
+}
+
+export interface ProxyStatus {
+  core_available: boolean
+  core_version: string
+  enabled: boolean
+  subscription_url: string
+  subscription_name: string
+  source_type: string
+  selected_node: string
+  selected_group: string
+  proxy_ai: boolean
+  proxy_whatsapp: boolean
+  proxy_mail: boolean
+  node_count: number
+  group_count: number
+  proxy_endpoint: string
+  last_error: string
+  updated_at: string
+  nodes?: ProxyNode[]
+  groups?: ProxyGroup[]
+}
+
+export interface ProxySubscriptionInput {
+  url: string
+  payload: string
+  name: string
+}
+
+export interface ProxyToggleInput {
+  proxy_ai?: boolean
+  proxy_whatsapp?: boolean
+  proxy_mail?: boolean
+}
+
+export interface ProxyNodeResult {
+  name: string
+  delay: number
+  error?: string
+}

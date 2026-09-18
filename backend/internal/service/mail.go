@@ -78,6 +78,10 @@ type MailService struct {
 	aliRateMu     sync.Mutex
 	aliRateNext   time.Time
 	rdb           *redis.Client
+	// proxyOverrideProvider returns the outbound proxy forced by the global
+	// XTLS/Mihomo switch. When it returns a non-nil value it wins over the
+	// mail server settings so IMAP/SMTP/HTTP traffic honours the switch.
+	proxyOverrideProvider func() *model.MailServerSettings
 	bulkSendSem   chan struct{}
 
 	attachmentCacheOnce sync.Once
@@ -1173,30 +1177,50 @@ func (s *MailService) connectIMAP(settings *model.MailServerSettings, username, 
 
 func (s *MailService) mailDialer(settings *model.MailServerSettings) (imapclient.Dialer, error) {
 	base := &net.Dialer{Timeout: mailConnectionTimeout}
-	if settings == nil || normalizeMailProxyType(settings.ProxyType) == "none" {
+	proxySettings := s.mailProxySettings(settings)
+	if proxySettings == nil || normalizeMailProxyType(proxySettings.ProxyType) == "none" {
 		return base, nil
 	}
-	if strings.TrimSpace(settings.ProxyHost) == "" || settings.ProxyPort < 1 || settings.ProxyPort > 65535 {
+	if strings.TrimSpace(proxySettings.ProxyHost) == "" || proxySettings.ProxyPort < 1 || proxySettings.ProxyPort > 65535 {
 		return nil, fmt.Errorf("SOCKS5 代理地址或端口无效")
 	}
 	var auth *proxy.Auth
-	if strings.TrimSpace(settings.ProxyUsername) != "" {
+	if strings.TrimSpace(proxySettings.ProxyUsername) != "" {
 		password := ""
-		if strings.TrimSpace(settings.ProxyPasswordEncrypted) != "" {
-			value, err := s.decryptSecret(settings.ProxyPasswordEncrypted)
+		if strings.TrimSpace(proxySettings.ProxyPasswordEncrypted) != "" {
+			value, err := s.decryptSecret(proxySettings.ProxyPasswordEncrypted)
 			if err != nil {
 				return nil, fmt.Errorf("SOCKS5 代理密码无法读取: %w", err)
 			}
 			password = value
 		}
-		auth = &proxy.Auth{User: strings.TrimSpace(settings.ProxyUsername), Password: password}
+		auth = &proxy.Auth{User: strings.TrimSpace(proxySettings.ProxyUsername), Password: password}
 	}
 	return proxy.SOCKS5(
 		"tcp",
-		net.JoinHostPort(strings.TrimSpace(settings.ProxyHost), fmt.Sprintf("%d", settings.ProxyPort)),
+		net.JoinHostPort(strings.TrimSpace(proxySettings.ProxyHost), fmt.Sprintf("%d", proxySettings.ProxyPort)),
 		auth,
 		base,
 	)
+}
+
+// SetProxyOverrideProvider installs the callback that returns the globally
+// managed proxy for mail traffic. Returning nil keeps the per-mail proxy
+// settings untouched.
+func (s *MailService) SetProxyOverrideProvider(provider func() *model.MailServerSettings) {
+	s.proxyOverrideProvider = provider
+}
+
+// mailProxySettings resolves which proxy configuration must be used. A global
+// override returned by the XTLS/Mihomo switch always wins.
+func (s *MailService) mailProxySettings(settings *model.MailServerSettings) *model.MailServerSettings {
+	if s.proxyOverrideProvider == nil {
+		return settings
+	}
+	if override := s.proxyOverrideProvider(); override != nil {
+		return override
+	}
+	return settings
 }
 
 func (s *MailService) connectSMTP(settings *model.MailServerSettings, username, password string) (*smtp.Client, error) {
