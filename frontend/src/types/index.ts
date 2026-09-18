@@ -1805,6 +1805,10 @@ export interface ProxyGroup {
 export interface ProxyStatus {
   core_available: boolean
   core_version: string
+  core_endpoint: string
+  core_error: string
+  consumer_ok: boolean
+  consumer_error: string
   enabled: boolean
   subscription_url: string
   subscription_name: string

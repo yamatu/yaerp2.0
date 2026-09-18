@@ -71,6 +71,15 @@ services:
     ports:
       - "127.0.0.1:${MIHOMO_PUBLISH_PORT:-7890}:7890"
       - "127.0.0.1:9090:9090"
+    # Informational: lets `docker compose ps` show whether the REST controller
+    # is really listening (the usual cause of "内核离线" in the ERP page).
+    # Any HTTP answer counts, so a configured secret does not break it.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://127.0.0.1:9090/version 2>&1 | grep -q 'HTTP/'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   whatsapp:
