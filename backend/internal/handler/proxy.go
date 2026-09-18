@@ -126,3 +126,18 @@ func (h *ProxyHandler) UpdateToggles(c *gin.Context) {
 	}
 	response.OKMsgData(c, "代理分流设置已更新", status)
 }
+
+// UpdatePort changes the mixed port the core listens on and that consumers use.
+func (h *ProxyHandler) UpdatePort(c *gin.Context) {
+	var request model.ProxyPortInput
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	status, err := h.service.UpdatePort(request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OKMsgData(c, "代理端口已更新", status)
+}
