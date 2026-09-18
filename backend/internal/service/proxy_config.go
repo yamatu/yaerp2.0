@@ -36,53 +36,275 @@ type parsedSubscription struct {
 // Payload detection / parsing
 // ---------------------------------------------------------------------------
 
-func looksLikeClashConfig(payload string) bool {
-	trimmed := strings.TrimSpace(payload)
-	if trimmed == "" {
-		return false
+// payloadKind describes what a subscription body actually looks like so import
+// failures can tell the administrator what the panel returned.
+type payloadKind int
+
+const (
+	payloadUnknown payloadKind = iota
+	payloadClashConfig
+	payloadLinkList
+	payloadHTML
+	payloadJSONData
+)
+
+func (kind payloadKind) String() string {
+	switch kind {
+	case payloadClashConfig:
+		return "Clash/Mihomo 配置"
+	case payloadLinkList:
+		return "节点链接列表"
+	case payloadHTML:
+		return "网页内容(HTML)"
+	case payloadJSONData:
+		return "JSON 数据接口响应"
+	default:
+		return "无法识别的格式"
 	}
-	if strings.HasPrefix(trimmed, "{") {
-		// Some panels return the Clash document as JSON.
-		return strings.Contains(trimmed, "\"proxies\"")
-	}
-	for _, marker := range []string{"proxies:", "proxy-groups:", "proxy-providers:", "mixed-port:", "port:", "rules:"} {
-		if strings.Contains(trimmed, marker) {
+}
+
+// hasYAMLKey reports whether a document contains a top level key. Checking the
+// line start is much more reliable than a plain substring match, and base64
+// node lists can never match because ":" is not part of the base64 alphabet.
+func hasYAMLKey(document, key string) bool {
+	for _, line := range strings.Split(document, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "- ")
+		if strings.HasPrefix(line, key+":") {
 			return true
 		}
 	}
 	return false
 }
 
-// parseSubscriptionPayload accepts a Clash/Mihomo YAML document, a base64
-// encoded node list or a plain newline separated node list.
+func detectPayloadKind(payload string) payloadKind {
+	trimmed := strings.TrimSpace(payload)
+	if trimmed == "" {
+		return payloadUnknown
+	}
+	lowered := strings.ToLower(trimmed)
+
+	switch {
+	case strings.HasPrefix(trimmed, "{"):
+		// Some panels return the Clash document as JSON.
+		if strings.Contains(lowered, "\"proxies\"") || strings.Contains(lowered, "\"proxy-providers\"") {
+			return payloadClashConfig
+		}
+		return payloadJSONData
+	case strings.HasPrefix(trimmed, "<"), strings.Contains(lowered, "<!doctype html"), strings.Contains(lowered, "</html>"):
+		return payloadHTML
+	case hasYAMLKey(trimmed, "proxies"), hasYAMLKey(trimmed, "proxy-providers"), hasYAMLKey(trimmed, "proxy_providers"):
+		return payloadClashConfig
+	case strings.Contains(trimmed, "://"):
+		return payloadLinkList
+	default:
+		return payloadUnknown
+	}
+}
+
+// payloadCandidates returns the payload itself plus any base64 decoded
+// variants. Panels either answer with the document directly or wrap it in
+// base64, and a few double encode, so two decoding rounds are attempted.
+func payloadCandidates(payload string) []string {
+	candidates := []string{payload}
+	seen := map[string]bool{payload: true}
+	current := payload
+	for round := 0; round < 2; round++ {
+		decoded, ok := decodeBase64Any(current)
+		if !ok {
+			break
+		}
+		decoded = strings.TrimSpace(decoded)
+		if decoded == "" || seen[decoded] {
+			break
+		}
+		seen[decoded] = true
+		candidates = append(candidates, decoded)
+		current = decoded
+	}
+	return candidates
+}
+
+// parseSubscriptionPayload accepts a Clash/Mihomo document, a base64 encoded
+// node list, a JSON array of links or a plain node link list. Every candidate
+// shape is tried before giving up so a panel that only returns a rule template
+// still imports whatever node links it contains.
 func parseSubscriptionPayload(payload string) (*parsedSubscription, error) {
 	trimmed := strings.TrimSpace(payload)
 	if trimmed == "" {
 		return nil, fmt.Errorf("订阅内容为空")
 	}
 
-	if looksLikeClashConfig(trimmed) {
-		return parseClashConfig(trimmed)
+	var (
+		configErr error
+		linkErr   error
+		sawHTML   bool
+	)
+
+	for _, candidate := range payloadCandidates(trimmed) {
+		switch detectPayloadKind(candidate) {
+		case payloadClashConfig:
+			parsed, err := parseClashConfig(candidate)
+			if err == nil {
+				return parsed, nil
+			}
+			if configErr == nil {
+				configErr = err
+			}
+		case payloadHTML:
+			sawHTML = true
+		}
+
+		// Even a document that looks like a Clash config may really be a link
+		// list, so the link parsers always get a chance.
+		parsed, err := parseLinkPayload(candidate)
+		if parsed != nil {
+			return parsed, nil
+		}
+		if err != nil && linkErr == nil {
+			linkErr = err
+		}
 	}
 
-	linksText := trimmed
-	if decoded, ok := decodeBase64Any(trimmed); ok && strings.Contains(decoded, "://") {
-		linksText = decoded
+	switch {
+	case sawHTML:
+		return nil, fmt.Errorf("订阅返回的是网页内容而不是配置文件，通常是登录页或错误页。请确认订阅链接能在浏览器里直接下载 Clash 配置或节点列表")
+	case configErr != nil:
+		return nil, configErr
+	case linkErr != nil:
+		return nil, linkErr
+	default:
+		return nil, fmt.Errorf("无法识别订阅格式（识别为%s）：%s", detectPayloadKind(trimmed), summarizePayload(trimmed))
+	}
+}
+
+// parseLinkPayload turns every node link found in a payload into a proxy map.
+// It returns (nil, nil) when the payload holds no link at all so the caller can
+// fall through to other strategies.
+func parseLinkPayload(text string) (*parsedSubscription, error) {
+	links := extractNodeLinks(text)
+	if len(links) == 0 {
+		return nil, nil
 	}
 
-	proxies, skipped, err := parseNodeLinks(linksText)
-	if err != nil {
-		return nil, err
+	proxies := make([]map[string]any, 0, len(links))
+	unsupported := make([]string, 0, 4)
+	for _, link := range links {
+		proxy, err := parseNodeLink(link)
+		if err != nil || proxy == nil {
+			unsupported = append(unsupported, linkScheme(link))
+			continue
+		}
+		proxies = append(proxies, proxy)
 	}
 	if len(proxies) == 0 {
-		return nil, fmt.Errorf("未从订阅中解析出任何节点，请确认订阅返回的是 Clash/Mihomo 配置或节点链接")
-	}
-	if skipped > 0 {
-		// Unsupported protocols are ignored on purpose so one bad entry does
-		// not break the whole import.
-		_ = skipped
+		return nil, fmt.Errorf("订阅里有 %d 个节点链接，但协议都不受支持（%s）。当前支持 vless / vmess / trojan / ss / hysteria2 / tuic",
+			len(links), strings.Join(dedupeStrings(unsupported), "/"))
 	}
 	return &parsedSubscription{SourceType: proxySourceLinks, Proxies: proxies, ProxyCount: len(proxies)}, nil
+}
+
+// extractNodeLinks collects the distinct node links inside a payload. Links may
+// be newline separated, space separated, JSON encoded or prefixed with a YAML
+// list marker.
+func extractNodeLinks(text string) []string {
+	if links := jsonLinkList(text); len(links) > 0 {
+		return links
+	}
+
+	fields := strings.FieldsFunc(text, func(r rune) bool {
+		switch r {
+		case '\n', '\r', '\t', ' ', '"', '\'', ',', '[', ']', '{', '}':
+			return true
+		default:
+			return false
+		}
+	})
+	links := make([]string, 0, len(fields))
+	seen := map[string]bool{}
+	for _, field := range fields {
+		field = strings.Trim(strings.TrimSpace(field), "-~")
+		if !strings.Contains(field, "://") || strings.HasPrefix(field, "://") {
+			continue
+		}
+		if seen[field] {
+			continue
+		}
+		seen[field] = true
+		links = append(links, field)
+	}
+	return links
+}
+
+// jsonLinkList walks a JSON document for strings that contain a link. It is
+// tried first because it keeps commas inside link paths intact.
+func jsonLinkList(text string) []string {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "{") {
+		return nil
+	}
+	var document any
+	if err := json.Unmarshal([]byte(trimmed), &document); err != nil {
+		return nil
+	}
+
+	links := make([]string, 0, 4)
+	var walk func(value any, depth int)
+	walk = func(value any, depth int) {
+		if depth > 4 {
+			return
+		}
+		switch typed := value.(type) {
+		case string:
+			if strings.Contains(typed, "://") {
+				links = append(links, strings.TrimSpace(typed))
+			}
+		case []any:
+			for _, item := range typed {
+				walk(item, depth+1)
+			}
+		case map[string]any:
+			for _, item := range typed {
+				walk(item, depth+1)
+			}
+		}
+	}
+	walk(document, 0)
+	return links
+}
+
+func linkScheme(link string) string {
+	if index := strings.Index(link, "://"); index > 0 {
+		return strings.ToLower(link[:index])
+	}
+	return "unknown"
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+// summarizePayload renders a short single line preview of a subscription body
+// so the administrator can see what the panel actually answered.
+func summarizePayload(payload string) string {
+	preview := strings.Join(strings.Fields(payload), " ")
+	if preview == "" {
+		return "(空内容)"
+	}
+	runes := []rune(preview)
+	if len(runes) > 180 {
+		preview = string(runes[:180]) + "..."
+	}
+	return preview
 }
 
 func parseClashConfig(payload string) (*parsedSubscription, error) {
@@ -94,22 +316,46 @@ func parseClashConfig(payload string) (*parsedSubscription, error) {
 		return nil, fmt.Errorf("Clash/Mihomo 配置内容为空")
 	}
 
+	rawProxies, hasProxies := document["proxies"]
 	proxies := make([]map[string]any, 0)
-	if raw, ok := document["proxies"].([]any); ok {
-		for _, item := range raw {
-			if entry, ok := toAnyMap(item); ok {
+	switch typed := rawProxies.(type) {
+	case []any:
+		for _, item := range typed {
+			if entry, ok := toAnyMap(item); ok && len(entry) > 0 {
 				proxies = append(proxies, entry)
 			}
 		}
+	case map[string]any:
+		// A few panels emit proxies as a mapping of name to definition.
+		names := make([]string, 0, len(typed))
+		for name := range typed {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			entry, ok := toAnyMap(typed[name])
+			if !ok || len(entry) == 0 {
+				continue
+			}
+			if _, exists := entry["name"]; !exists {
+				entry["name"] = name
+			}
+			proxies = append(proxies, entry)
+		}
 	}
 
+	rawProviders, hasProviders := document["proxy-providers"]
+	if !hasProviders {
+		rawProviders, hasProviders = document["proxy_providers"]
+	}
 	providers := map[string]any{}
-	if raw, ok := toAnyMap(document["proxy-providers"]); ok {
+	if raw, ok := toAnyMap(rawProviders); ok {
 		providers = raw
 	}
 
 	if len(proxies) == 0 && len(providers) == 0 {
-		return nil, fmt.Errorf("Clash/Mihomo 配置中没有 proxies 或 proxy-providers")
+		return nil, fmt.Errorf("订阅里没有任何可用节点（%s）。常见原因：订阅已过期或套餐流量已用尽，或者该链接只返回了规则模板。可以先在浏览器里打开订阅链接确认，必要时在链接后追加 &flag=clash 后重新导入",
+			emptyProxiesReason(hasProxies, hasProviders, rawProxies))
 	}
 	return &parsedSubscription{
 		SourceType: proxySourceYAML,
@@ -175,14 +421,14 @@ func buildMihomoConfig(parsed *parsedSubscription, controllerBind string, mixedP
 	}
 
 	config := map[string]any{
-		"mixed-port":    mixedPort,
-		"allow-lan":     true,
-		"bind-address":  "*",
-		"mode":          "rule",
-		"log-level":     "warning",
-		"ipv6":          false,
-		"unified-delay": true,
-		"tcp-concurrent": true,
+		"mixed-port":          mixedPort,
+		"allow-lan":           true,
+		"bind-address":        "*",
+		"mode":                "rule",
+		"log-level":           "warning",
+		"ipv6":                false,
+		"unified-delay":       true,
+		"tcp-concurrent":      true,
 		"external-controller": fmt.Sprintf("%s:%d", controllerBind, controllerPort),
 		"external-controller-cors": map[string]any{
 			"allow-origins":         []string{"*"},
@@ -193,13 +439,13 @@ func buildMihomoConfig(parsed *parsedSubscription, controllerBind string, mixedP
 			"store-fake-ip":  true,
 		},
 		"dns": map[string]any{
-			"enable":            true,
-			"ipv6":              false,
-			"enhanced-mode":     "fake-ip",
-			"fake-ip-range":     "198.18.0.1/16",
+			"enable":             true,
+			"ipv6":               false,
+			"enhanced-mode":      "fake-ip",
+			"fake-ip-range":      "198.18.0.1/16",
 			"default-nameserver": []string{"223.5.5.5", "119.29.29.29"},
-			"nameserver":        []string{"https://223.5.5.5/dns-query", "https://1.1.1.1/dns-query"},
-			"fallback":          []string{"https://8.8.8.8/dns-query", "tls://8.8.4.4:853"},
+			"nameserver":         []string{"https://223.5.5.5/dns-query", "https://1.1.1.1/dns-query"},
+			"fallback":           []string{"https://8.8.8.8/dns-query", "tls://8.8.4.4:853"},
 		},
 		"proxies":      proxies,
 		"proxy-groups": []any{group},
@@ -326,24 +572,23 @@ func mixedPortFromAddr(addr string) int {
 // Node link parsing
 // ---------------------------------------------------------------------------
 
-func parseNodeLinks(text string) ([]map[string]any, int, error) {
-	proxies := make([]map[string]any, 0)
-	skipped := 0
-	for _, line := range strings.FieldsFunc(text, func(r rune) bool {
-		return r == '\n' || r == '\r'
-	}) {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, "://") {
-			continue
+// emptyProxiesReason explains why a Clash document yielded no node, which is
+// usually far more useful than "no proxies field".
+func emptyProxiesReason(hasProxies, hasProviders bool, rawProxies any) string {
+	switch {
+	case hasProxies:
+		if list, ok := rawProxies.([]any); ok {
+			return fmt.Sprintf("proxies 是空列表，共 %d 项", len(list))
 		}
-		proxy, err := parseNodeLink(line)
-		if err != nil || proxy == nil {
-			skipped++
-			continue
+		if rawProxies == nil {
+			return "proxies 字段为空"
 		}
-		proxies = append(proxies, proxy)
+		return "proxies 字段格式无法识别"
+	case hasProviders:
+		return "proxy-providers 字段格式无法识别"
+	default:
+		return "配置里既没有 proxies 也没有 proxy-providers"
 	}
-	return proxies, skipped, nil
 }
 
 func parseNodeLink(raw string) (map[string]any, error) {

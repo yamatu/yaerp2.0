@@ -725,7 +725,46 @@ func (s *ProxyService) applyConsumers(settings *model.ProxySettings) error {
 // Subscription fetching
 // ---------------------------------------------------------------------------
 
+// fetchSubscription downloads a subscription and makes sure the answer can be
+// parsed. Many panels need the Clash conversion flag (?flag=clash), but adding
+// it blindly breaks a few servers, so the URL is requested verbatim first and
+// only retried with the flag when the first answer is unusable.
 func (s *ProxyService) fetchSubscription(rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	payload, err := s.fetchSubscriptionOnce(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if _, parseErr := parseSubscriptionPayload(payload); parseErr == nil {
+		return payload, nil
+	}
+
+	target, parseURLErr := url.Parse(rawURL)
+	if parseURLErr != nil || hasSubscriptionFlag(target.RawQuery) {
+		// Nothing left to try; let the caller report the original error.
+		return payload, nil
+	}
+	flagged := *target
+	if flagged.RawQuery == "" {
+		flagged.RawQuery = "flag=clash"
+	} else {
+		flagged.RawQuery += "&flag=clash"
+	}
+	retried, retryErr := s.fetchSubscriptionOnce(flagged.String())
+	if retryErr != nil {
+		return payload, nil
+	}
+	if _, retryParseErr := parseSubscriptionPayload(retried); retryParseErr != nil {
+		return payload, nil
+	}
+	return retried, nil
+}
+
+func hasSubscriptionFlag(rawQuery string) bool {
+	return strings.Contains(rawQuery, "flag=") || strings.Contains(rawQuery, "target=")
+}
+
+func (s *ProxyService) fetchSubscriptionOnce(rawURL string) (string, error) {
 	target, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || target.Host == "" {
 		return "", fmt.Errorf("订阅链接格式不正确")
@@ -737,11 +776,6 @@ func (s *ProxyService) fetchSubscription(rawURL string) (string, error) {
 		if err := rejectPrivateHost(target.Hostname()); err != nil {
 			return "", err
 		}
-	}
-	if !strings.Contains(target.RawQuery, "flag=") && !strings.Contains(target.RawQuery, "target=") {
-		query := target.Query()
-		query.Set("flag", "clash")
-		target.RawQuery = query.Encode()
 	}
 
 	request, err := http.NewRequest(http.MethodGet, target.String(), nil)
@@ -757,7 +791,14 @@ func (s *ProxyService) fetchSubscription(rawURL string) (string, error) {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("下载订阅失败，订阅服务器返回 %d", response.StatusCode)
+		snippet := ""
+		if body, readErr := io.ReadAll(io.LimitReader(response.Body, 256)); readErr == nil {
+			snippet = summarizePayload(string(body))
+		}
+		if snippet == "" || snippet == "(空内容)" {
+			return "", fmt.Errorf("下载订阅失败，订阅服务器返回 %d", response.StatusCode)
+		}
+		return "", fmt.Errorf("下载订阅失败，订阅服务器返回 %d：%s", response.StatusCode, snippet)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, proxySubscriptionLimit+1))
 	if err != nil {
