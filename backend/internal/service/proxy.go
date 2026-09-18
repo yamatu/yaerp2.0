@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -26,7 +28,18 @@ const (
 	proxyDelayMaxNodes     = 200
 	proxyUserAgent         = "clash-verge/v1.6.3"
 	proxySubscriptionFetch = 60 * time.Second
+	// proxyProbeTTL keeps a failed controller probe from being repeated on every
+	// status poll (the fallback candidates can take a few seconds to time out).
+	proxyProbeTTL = 5 * time.Second
 )
+
+// controllerProbe is a cached result of probeController.
+type controllerProbe struct {
+	version string
+	base    string
+	err     error
+	at      time.Time
+}
 
 var proxyGroupTypes = map[string]bool{
 	"Selector": true, "URLTest": true, "Fallback": true, "LoadBalance": true,
@@ -50,7 +63,45 @@ type ProxyService struct {
 	mu       sync.RWMutex
 	settings *model.ProxySettings
 
+	// controllerMu guards activeController, the controller endpoint that last
+	// answered. It lets the service recover when MIHOMO_CONTROLLER_URL does not
+	// match the deployment shape (backend in Docker vs. on the host).
+	controllerMu     sync.Mutex
+	activeController string
+	// probe caches the last controller probe for a few seconds so frequent
+	// status polls do not repeat slow DNS timeouts while the core is down.
+	probeCache *controllerProbe
+	// extraControllerCandidates is only used by tests to simulate the Docker /
+	// host counterparts of MIHOMO_CONTROLLER_URL.
+	extraControllerCandidates []string
+
+	// consumerMu guards the resolved proxy entry point handed to AI, WhatsApp
+	// and mail. The value is cached with a short TTL because it is read on every
+	// request but requires a reachability probe to be trusted.
+	consumerMu        sync.Mutex
+	activeConsumer    string
+	consumerErr       error
+	consumerCheckedAt time.Time
+	// extraConsumerCandidates is only used by tests, see extraControllerCandidates.
+	extraConsumerCandidates []string
+
 	whatsAppHook func(proxyURL string) error
+}
+
+// newCoreTransport builds a transport for controller traffic. It never uses an
+// environment proxy (HTTP_PROXY and friends) because the core always lives on
+// the local network and a proxy would swallow the request.
+func newCoreTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:               nil,
+		MaxIdleConns:        10,
+		IdleConnTimeout:     60 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
 }
 
 func NewProxyService(cfg *config.Config, proxyRepo *repo.ProxyRepo) *ProxyService {
@@ -63,8 +114,8 @@ func NewProxyService(cfg *config.Config, proxyRepo *repo.ProxyRepo) *ProxyServic
 	return &ProxyService{
 		cfg:         cfg,
 		repo:        proxyRepo,
-		coreClient:  &http.Client{Timeout: proxyCoreTimeout},
-		delayClient: &http.Client{Timeout: time.Duration(proxyDelayTestTimeout+3000) * time.Millisecond},
+		coreClient:  &http.Client{Timeout: proxyCoreTimeout, Transport: newCoreTransport()},
+		delayClient: &http.Client{Timeout: time.Duration(proxyDelayTestTimeout+3000) * time.Millisecond, Transport: newCoreTransport()},
 		fetchClient: &http.Client{
 			Timeout:   proxySubscriptionFetch,
 			Transport: fetchTransport,
@@ -88,9 +139,19 @@ func (s *ProxyService) Init() error {
 	s.settings = settings
 	s.mu.Unlock()
 
+	s.logCoreDiagnostics()
+
+	// Reconnect the consumers (WhatsApp sidecar) even when the core is
+	// temporarily unreachable, so the switches and the sidecar stay in sync
+	// across backend restarts.
+	if err := s.applyConsumers(settings); err != nil {
+		log.Printf("proxy: 恢复消费者代理配置失败: %v", err)
+	}
+
 	if !settings.Enabled || strings.TrimSpace(settings.ConfigYAML) == "" {
 		return nil
 	}
+
 	if err := s.pushConfig(settings); err != nil {
 		s.setLastError(err.Error())
 		return nil
@@ -100,6 +161,60 @@ func (s *ProxyService) Init() error {
 		return nil
 	}
 	s.setLastError("")
+	return nil
+}
+
+// logCoreDiagnostics writes the resolved controller and consumer endpoints to
+// the backend log, which makes "内核离线" diagnosable with docker compose logs.
+func (s *ProxyService) logCoreDiagnostics() {
+	if !s.cfg.Proxy.Enabled {
+		log.Printf("proxy: 功能未启用 (MIHOMO_ENABLED=false)")
+		return
+	}
+	version, base, err := s.probeController()
+	if err != nil {
+		log.Printf("proxy: 代理内核不可用: %v", err)
+	} else {
+		log.Printf("proxy: 代理内核已连接 version=%s controller=%s", version, base)
+	}
+	if err := s.checkConsumerAddr(s.cfg.Proxy.MixedAddr); err != nil {
+		log.Printf("proxy: 代理入口不可达: %v", err)
+	} else {
+		log.Printf("proxy: 代理入口可用 addr=%s", s.mixedAddr())
+	}
+	if vars := environmentProxyVars(); len(vars) > 0 {
+		log.Printf("proxy: 检测到环境代理变量 %s（控制器与延迟测试已强制直连，不受其影响）", strings.Join(vars, ", "))
+	}
+}
+
+// environmentProxyVars reports the proxy related environment variables that are
+// set in the backend process. They are useful context when the controller
+// looks unreachable, and they are deliberately ignored by the controller and
+// delay transports.
+func environmentProxyVars() []string {
+	names := []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"}
+	found := make([]string, 0, len(names))
+	for _, name := range names {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			found = append(found, name+"="+value)
+		}
+	}
+	return found
+}
+
+// checkConsumerAddr verifies that the address handed to AI / WhatsApp / mail is
+// reachable from the backend process. It is a common misconfiguration when the
+// backend runs outside Docker or keeps a stale MIHOMO_MIXED_ADDR.
+func (s *ProxyService) checkConsumerAddr(addr string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return fmt.Errorf("未配置 MIHOMO_MIXED_ADDR")
+	}
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("无法连接 %s: %w", addr, err)
+	}
+	_ = conn.Close()
 	return nil
 }
 
@@ -171,7 +286,7 @@ func (s *ProxyService) MailProxySettings() *model.MailServerSettings {
 	if settings == nil || !settings.Enabled || !settings.ProxyMail {
 		return nil
 	}
-	host, port := hostPortFromAddr(s.cfg.Proxy.MixedAddr)
+	host, port := hostPortFromAddr(s.mixedAddr())
 	if strings.TrimSpace(host) == "" || port <= 0 {
 		return nil
 	}
@@ -191,11 +306,71 @@ func (s *ProxyService) WhatsAppProxyURL() string {
 }
 
 func (s *ProxyService) httpProxyURL() string {
-	addr := strings.TrimSpace(s.cfg.Proxy.MixedAddr)
-	if addr == "" {
-		addr = fmt.Sprintf("127.0.0.1:%d", defaultMixedPort)
+	return "http://" + s.mixedAddr()
+}
+
+// consumerCacheTTL bounds how often the proxy entry point is re-probed.
+const consumerCacheTTL = 30 * time.Second
+
+// mixedAddr returns the proxy entry point the backend should hand to AI,
+// WhatsApp and mail. The configured MIHOMO_MIXED_ADDR wins; when it is not
+// reachable (for example a container that still carries the host-oriented
+// default) the Docker or host counterpart is used instead, so the routing keeps
+// working. The result is cached briefly because it is read on every request.
+func (s *ProxyService) mixedAddr() string {
+	addr, _ := s.resolveConsumer()
+	return addr
+}
+
+func (s *ProxyService) resolveConsumer() (string, error) {
+	s.consumerMu.Lock()
+	cached, cachedErr, checkedAt := s.activeConsumer, s.consumerErr, s.consumerCheckedAt
+	s.consumerMu.Unlock()
+	if cached != "" && time.Since(checkedAt) < consumerCacheTTL {
+		return cached, cachedErr
 	}
-	return "http://" + addr
+
+	configured := strings.TrimSpace(s.cfg.Proxy.MixedAddr)
+	if configured == "" {
+		configured = fmt.Sprintf("127.0.0.1:%d", defaultMixedPort)
+	}
+
+	resolved, resolvedErr := configured, s.checkConsumerAddr(configured)
+	if resolvedErr != nil {
+		candidates := append(consumerCandidates(configured), s.extraConsumerCandidates...)
+		for _, candidate := range candidates {
+			if candidate == configured {
+				continue
+			}
+			if probeErr := s.checkConsumerAddr(candidate); probeErr == nil {
+				log.Printf("proxy: 代理入口 %s 不可达（%v），改用 %s", configured, resolvedErr, candidate)
+				resolved, resolvedErr = candidate, nil
+				break
+			}
+		}
+	}
+
+	s.consumerMu.Lock()
+	s.activeConsumer, s.consumerErr, s.consumerCheckedAt = resolved, resolvedErr, time.Now()
+	s.consumerMu.Unlock()
+	return resolved, resolvedErr
+}
+
+// consumerCandidates mirrors candidateControllers for the mixed (HTTP/SOCKS)
+// entry point.
+func consumerCandidates(configured string) []string {
+	host, port := hostPortFromAddr(configured)
+	if port <= 0 {
+		port = defaultMixedPort
+	}
+	portText := fmt.Sprintf("%d", port)
+	candidates := []string{configured}
+	if isLoopbackHost(host) {
+		candidates = append(candidates, "proxy:"+portText, "host.docker.internal:"+portText)
+	} else {
+		candidates = append(candidates, "127.0.0.1:"+portText)
+	}
+	return candidates
 }
 
 // Status reports the current state, including live core information.
@@ -216,15 +391,20 @@ func (s *ProxyService) Status() (*model.ProxyStatus, error) {
 		UpdatedAt:        settings.UpdatedAt,
 	}
 
-	version, err := s.coreVersion()
+	version, err := s.coreVersionCached()
 	if err != nil {
 		status.CoreAvailable = false
+		status.CoreError = err.Error()
+		status.CoreEndpoint = s.configuredController()
 		status.Nodes = s.offlineNodes(settings)
 		status.NodeCount = len(status.Nodes)
+		s.fillConsumerState(status)
 		return status, nil
 	}
 	status.CoreAvailable = true
 	status.CoreVersion = version
+	status.CoreEndpoint = s.controllerBase()
+	s.fillConsumerState(status)
 
 	nodes, groups, err := s.coreNodes()
 	if err != nil {
@@ -242,6 +422,20 @@ func (s *ProxyService) Status() (*model.ProxyStatus, error) {
 		}
 	}
 	return status, nil
+}
+
+// fillConsumerState records whether the proxy entry point handed to AI,
+// WhatsApp and mail can be reached from the backend process.
+func (s *ProxyService) fillConsumerState(status *model.ProxyStatus) {
+	addr, err := s.resolveConsumer()
+	status.ProxyEndpoint = addr
+	if err != nil {
+		status.ConsumerOK = false
+		status.ConsumerError = err.Error()
+		return
+	}
+	status.ConsumerOK = true
+	status.ConsumerError = ""
 }
 
 // ListNodes returns the selectable upstream nodes.
@@ -495,12 +689,173 @@ type proxyCoreProxy struct {
 	} `json:"history"`
 }
 
+// controllerBase returns the controller endpoint that should be used for the
+// REST calls. When a probe already succeeded, that endpoint wins so every
+// request keeps using the same address.
 func (s *ProxyService) controllerBase() string {
+	s.controllerMu.Lock()
+	active := s.activeController
+	s.controllerMu.Unlock()
+	if active != "" {
+		return active
+	}
+	return s.configuredController()
+}
+
+func (s *ProxyService) configuredController() string {
 	return strings.TrimRight(strings.TrimSpace(s.cfg.Proxy.ControllerURL), "/")
 }
 
+func (s *ProxyService) setActiveController(base string) {
+	s.controllerMu.Lock()
+	s.activeController = base
+	s.controllerMu.Unlock()
+}
+
+// candidateControllers lists the controller endpoints worth probing. The
+// configured URL always comes first; the fallbacks cover the two usual
+// deployment shapes so a stale MIHOMO_CONTROLLER_URL (for example a container
+// recreated before the variable was added to .env) does not break the page.
+func (s *ProxyService) candidateControllers() []string {
+	configured := s.configuredController()
+	candidates := make([]string, 0, 3)
+	seen := map[string]bool{}
+	add := func(value string) {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		candidates = append(candidates, value)
+	}
+
+	s.controllerMu.Lock()
+	active := s.activeController
+	s.controllerMu.Unlock()
+	add(active)
+	add(configured)
+
+	scheme, host, port := splitControllerEndpoint(configured)
+	if isLoopbackHost(host) {
+		// The backend runs next to the core inside the compose network.
+		add(scheme + "://proxy:" + port)
+		add(scheme + "://host.docker.internal:" + port)
+	} else {
+		// The backend runs on the host and reaches the published port.
+		add(scheme + "://127.0.0.1:" + port)
+	}
+	for _, extra := range s.extraControllerCandidates {
+		add(extra)
+	}
+	return candidates
+}
+
+func splitControllerEndpoint(base string) (scheme, host, port string) {
+	scheme = "http"
+	port = fmt.Sprintf("%d", defaultControllerPort)
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return scheme, "", port
+	}
+	if parsed.Scheme != "" {
+		scheme = parsed.Scheme
+	}
+	host = parsed.Hostname()
+	if parsed.Port() != "" {
+		port = parsed.Port()
+	}
+	return scheme, host, port
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// probeController returns the version and endpoint of the first candidate that
+// answers, and caches the winner. The error lists every endpoint that was tried
+// so the administrator can see what the backend actually attempted.
+func (s *ProxyService) probeController() (string, string, error) {
+	s.controllerMu.Lock()
+	cached := s.probeCache
+	s.controllerMu.Unlock()
+	if cached != nil && time.Since(cached.at) < proxyProbeTTL {
+		return cached.version, cached.base, cached.err
+	}
+
+	version, base, err := s.runControllerProbe()
+
+	s.controllerMu.Lock()
+	s.probeCache = &controllerProbe{version: version, base: base, err: err, at: time.Now()}
+	s.controllerMu.Unlock()
+	return version, base, err
+}
+
+func (s *ProxyService) runControllerProbe() (string, string, error) {
+	candidates := s.candidateControllers()
+	var (
+		firstErr  error
+		firstBase string
+	)
+	for _, base := range candidates {
+		version, err := s.controllerVersionAt(base)
+		if err != nil {
+			if firstErr == nil {
+				firstErr, firstBase = err, base
+			}
+			continue
+		}
+		s.setActiveController(base)
+		return version, base, nil
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("没有可用的代理内核地址")
+		firstBase = s.configuredController()
+	}
+	return "", firstBase, fmt.Errorf("%w（已尝试 %s）", firstErr, strings.Join(candidates, "、"))
+}
+
+func (s *ProxyService) controllerVersionAt(base string) (string, error) {
+	request, err := s.newCoreRequestAt(http.MethodGet, base, "/version", nil)
+	if err != nil {
+		return "", err
+	}
+	response, err := s.coreClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("无法连接代理内核(%s): %w", base, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusUnauthorized {
+			return "", fmt.Errorf("代理内核(%s)拒绝访问：MIHOMO_CONTROLLER_SECRET 与内核的 secret 不一致", base)
+		}
+		return "", fmt.Errorf("代理内核(%s)返回状态 %d", base, response.StatusCode)
+	}
+	var payload struct {
+		Version string `json:"version"`
+		Meta    bool   `json:"meta"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&payload); err != nil {
+		return "", fmt.Errorf("代理内核(%s)响应无法解析: %w", base, err)
+	}
+	if payload.Version == "" {
+		payload.Version = "unknown"
+	}
+	return payload.Version, nil
+}
+
 func (s *ProxyService) newCoreRequest(method, path string, body []byte) (*http.Request, error) {
-	endpoint := s.controllerBase() + path
+	return s.newCoreRequestAt(method, s.controllerBase(), path, body)
+}
+
+func (s *ProxyService) newCoreRequestAt(method, base, path string, body []byte) (*http.Request, error) {
+	endpoint := strings.TrimRight(base, "/") + path
 	request, err := http.NewRequest(method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -516,36 +871,37 @@ func (s *ProxyService) newCoreRequest(method, path string, body []byte) (*http.R
 
 func (s *ProxyService) coreVersion() (string, error) {
 	if !s.cfg.Proxy.Enabled {
-		return "", fmt.Errorf("代理功能未启用")
+		return "", fmt.Errorf("服务端未启用代理功能（MIHOMO_ENABLED=false）")
 	}
-	request, err := s.newCoreRequest(http.MethodGet, "/version", nil)
+	version, _, err := s.runControllerProbe()
 	if err != nil {
 		return "", err
 	}
-	response, err := s.coreClient.Do(request)
+	return version, nil
+}
+
+// coreVersionCached is the polling variant used by Status: it tolerates a few
+// seconds of staleness so a status poll every few seconds does not repeat the
+// slow DNS timeouts of the fallback candidates.
+func (s *ProxyService) coreVersionCached() (string, error) {
+	if !s.cfg.Proxy.Enabled {
+		return "", fmt.Errorf("服务端未启用代理功能（MIHOMO_ENABLED=false）")
+	}
+	version, _, err := s.probeController()
 	if err != nil {
-		return "", fmt.Errorf("无法连接代理内核: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("代理内核返回状态 %d", response.StatusCode)
-	}
-	var payload struct {
-		Version string `json:"version"`
-		Meta    bool   `json:"meta"`
-	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&payload); err != nil {
 		return "", err
 	}
-	if payload.Version == "" {
-		payload.Version = "unknown"
-	}
-	return payload.Version, nil
+	return version, nil
 }
 
 func (s *ProxyService) pushConfig(settings *model.ProxySettings) error {
 	if settings == nil || strings.TrimSpace(settings.ConfigYAML) == "" {
 		return fmt.Errorf("没有可用的代理配置")
+	}
+	// Resolve the controller first so a stale MIHOMO_CONTROLLER_URL cannot make
+	// the push fail when the fallback endpoint is reachable.
+	if _, err := s.coreVersion(); err != nil {
+		return err
 	}
 	body, err := json.Marshal(map[string]string{
 		"path":    "",

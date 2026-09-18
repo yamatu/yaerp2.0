@@ -88,15 +88,29 @@ rules:
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MIHOMO_ENABLED` | `true` | 关闭后整个代理功能不可用（页面会提示内核离线） |
-| `MIHOMO_MIXED_ADDR` | `proxy:7890` | **消费者**访问内核的地址；后端在容器内使用该地址 |
-| `MIHOMO_CONTROLLER_URL` | `http://proxy:9090` | 内核 external controller 地址 |
+| `MIHOMO_MIXED_ADDR` | `127.0.0.1:7890` | **消费者**访问内核的地址；容器内部署请在 `.env` 中设为 `proxy:7890`，宿主机开发保持默认 |
+| `MIHOMO_CONTROLLER_URL` | `http://127.0.0.1:9090` | 内核 external controller 地址；容器内部署请在 `.env` 中设为 `http://proxy:9090` |
 | `MIHOMO_CONTROLLER_SECRET` | 空 | 同时作为 `proxy` 容器的 `CLASH_OVERRIDE_SECRET` |
 | `MIHOMO_TEST_URL` | `http://www.gstatic.com/generate_204` | 测速目标 |
 | `MIHOMO_ALLOW_PRIVATE_SUBSCRIPTION` | `false` | 是否允许导入指向内网/本机的订阅地址 |
 | `MIHOMO_PUBLISH_PORT` | `7890` | 映射到宿主机的 mixed 端口（仅监听 `127.0.0.1`） |
 
 > 后端不通过 `HTTP_PROXY` 环境变量出网，避免把数据库、Redis 等内部流量也送进代理；
-> AI / WhatsApp / 邮箱三条链路各自显式使用代理。
+> AI / WhatsApp / 邮箱三条链路各自显式使用代理。控制器的 REST 调用与节点测速也强制直连，
+> 因此即使宿主机给容器注入了 `HTTP_PROXY` / `ALL_PROXY` 也不影响内核识别。
+>
+> 若配置的 `MIHOMO_CONTROLLER_URL` / `MIHOMO_MIXED_ADDR` 不可达（常见于“改了 `.env` 但没重建
+> backend 容器”），后端会自动尝试另一侧的地址（容器内 `proxy:9090`、宿主机 `127.0.0.1:9090`）
+> 并把实际使用地址写进日志与页面，因此不会因为环境变量过期而直接不可用。
+
+### 修改 `.env` 后必须重建容器
+
+Compose 只在**创建**容器时读取 `env_file`，因此新增 `MIHOMO_*` 变量后必须重建 backend：
+
+```bash
+ docker compose up -d --build backend proxy    # 或 docker compose up -d --force-recreate backend
+ docker compose exec backend env | grep MIHOMO # 确认变量已注入
+```
 
 ## 本地（非 Docker）开发
 
@@ -122,9 +136,33 @@ MIHOMO_CONTROLLER_URL=http://127.0.0.1:9090
 
 ## 常见问题
 
+### 页面提示“内核离线”
+
+页面会直接显示失败原因（控制器地址 + 已经尝试过的全部地址 + dial 错误），按下面顺序排查：
+
+```bash
+# 1. 容器是否真的在跑、控制器端口是否监听（healthcheck 会直接反映这一点）
+docker compose ps proxy          # 期望：Up (healthy)
+docker compose logs --tail=50 proxy
+
+# 2. 从容器内部直接问内核要版本（返回 {"meta":true,"version":"..."} 即正常）
+docker compose exec proxy wget -qO- http://127.0.0.1:9090/version
+
+# 3. 后端实际用了哪个地址、报了什么错
+docker compose logs --tail=100 backend | grep 'proxy:'
+```
+
+日志里 `proxy: 代理内核不可用: ...` 会列出后端尝试的所有地址；`proxy: 代理内核已连接
+version=... controller=...` 表示已恢复。如果 `docker compose ps` 显示容器是
+`Up (unhealthy)`，说明 9090 端口没有在监听，通常是 `command` 里的 `-ext-ctl` 被覆盖或容器是用旧的
+`docker-compose.yml` 创建的 —— 执行 `docker compose up -d --force-recreate proxy` 即可。
+
+### 其他
+
 | 现象 | 处理 |
 | --- | --- |
-| 页面提示“内核离线” | `docker compose ps proxy`；确认后端 `MIHOMO_CONTROLLER_URL` 指向 `proxy:9090` |
+| 页面提示“内核离线” | 见上一节；页面会显示真实错误与尝试过的地址 |
+| “内核在线”但 AI/邮箱仍直连 | 页面会同时提示“后端无法连接代理入口”，按提示修正 `MIHOMO_MIXED_ADDR` 后重建 backend |
 | 导入成功但节点为空 | 如果订阅基于 `proxy-providers`，节点由内核联网拉取，需先启动内核；错误提示里会带上识别到的格式与内容片段 |
 | 连接成功但 WhatsApp 仍然直连 | 打开 WhatsApp 开关后会自动重启会话；若仍失败请重启该员工账号 |
 | 邮箱打不开 | 邮箱走 SOCKS5（内核 mixed 端口）。关闭邮箱开关即可恢复直连 |

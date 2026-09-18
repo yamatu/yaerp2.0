@@ -41,6 +41,10 @@ type ProxyGroup struct {
 type ProxyStatus struct {
 	CoreAvailable    bool         `json:"core_available"`
 	CoreVersion      string       `json:"core_version"`
+	CoreEndpoint     string       `json:"core_endpoint"`
+	CoreError        string       `json:"core_error"`
+	ConsumerOK       bool         `json:"consumer_ok"`
+	ConsumerError    string       `json:"consumer_error"`
 	Enabled          bool         `json:"enabled"`
 	SubscriptionURL  string       `json:"subscription_url"`
 	SubscriptionName string       `json:"subscription_name"`

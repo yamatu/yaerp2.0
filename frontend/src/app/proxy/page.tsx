@@ -28,6 +28,10 @@ import type { ProxyNode, ProxyNodeResult, ProxyStatus } from '@/types'
 const EMPTY_STATUS: ProxyStatus = {
   core_available: false,
   core_version: '',
+  core_endpoint: '',
+  core_error: '',
+  consumer_ok: false,
+  consumer_error: '',
   enabled: false,
   subscription_url: '',
   subscription_name: '',
@@ -224,6 +228,7 @@ export default function ProxyPage() {
                 </div>
                 <p className="mt-1 text-sm text-slate-500">
                   代理入口 <span className="font-mono text-slate-700">{status.proxy_endpoint || '未配置'}</span>
+                  {status.core_endpoint ? <> · 控制器 <span className="font-mono text-slate-700">{status.core_endpoint}</span></> : null}
                   {status.selected_node ? <> · 当前节点 <span className="font-medium text-slate-700">{status.selected_node}</span></> : null}
                 </p>
               </div>
@@ -266,7 +271,26 @@ export default function ProxyPage() {
           {!coreOnline && (
             <div className="mt-4 flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>代理内核（Mihomo 容器）当前不可用。请执行 <code className="rounded bg-amber-100 px-1">docker compose up -d proxy</code> 后重试；订阅仍可导入，节点要等内核启动后才能测速。</span>
+              <div className="space-y-1">
+                <div>代理内核（Mihomo 容器）当前不可用。</div>
+                {status.core_error && (
+                  <div className="font-mono text-xs break-all text-amber-900">{status.core_error}</div>
+                )}
+                <div className="text-xs text-amber-700">
+                  后端已尝试所有候选控制器地址（当前显示 <code className="rounded bg-amber-100 px-1">{status.core_endpoint || '未配置'}</code>）。
+                  请在服务器执行 <code className="rounded bg-amber-100 px-1">docker compose ps proxy</code> 确认容器为 <code className="rounded bg-amber-100 px-1">Up (healthy)</code>；
+                  若刚刚修改过 <code className="rounded bg-amber-100 px-1">.env</code>，需执行 <code className="rounded bg-amber-100 px-1">docker compose up -d --build backend proxy</code> 重建容器。订阅仍可导入，节点要等内核启动后才能测速。
+                </div>
+              </div>
+            </div>
+          )}
+          {coreOnline && !status.consumer_ok && (
+            <div className="mt-4 flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                内核在线，但后端无法连接代理入口 <code className="rounded bg-rose-100 px-1">{status.proxy_endpoint || '未配置'}</code>：{status.consumer_error}
+                。请检查 <code className="rounded bg-rose-100 px-1">MIHOMO_MIXED_ADDR</code> 是否与后端所在环境一致（容器内应使用 <code className="rounded bg-rose-100 px-1">proxy:7890</code>，宿主机应使用 <code className="rounded bg-rose-100 px-1">127.0.0.1:7890</code>）。
+              </span>
             </div>
           )}
           {status.last_error && (
