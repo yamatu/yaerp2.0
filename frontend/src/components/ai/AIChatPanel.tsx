@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, RefreshCw, RotateCcw, Search, Send, Sparkles, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
+import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, RefreshCw, RotateCcw, Search, Send, Sparkles, Square, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useFloatingDrag, computeTopLeftResize } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
@@ -10,7 +10,7 @@ import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPrefer
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
 import { notifyDataChanged, prepareDataMutation } from '@/lib/dataEvents'
-import type { AIAssistant, AIChatResponse, AIChatToolTrace, AIERPApplyResult, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
+import type { AIAgentEvent, AIAssistant, AIChatResponse, AIChatToolTrace, AIERPApplyResult, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
 
 interface PersistedMessage {
   id: string
@@ -610,6 +610,12 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
   const [thinkingElapsed, setThinkingElapsed] = useState(0)
+  // Live activity of the running agent turn. It is derived from the SSE event
+  // stream so the panel can show what the agent is doing right now instead of
+  // an opaque spinner.
+  const [liveActivity, setLiveActivity] = useState<{ label: string; detail: string } | null>(null)
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [assistants, setAssistants] = useState<AIAssistant[]>([])
   const [assistantId, setAssistantId] = useUserPreference<number | null>(
@@ -885,58 +891,143 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     loadingRef.current = true
     setMessages(history)
     setLoading(true)
+    setLiveActivity({ label: '正在连接智能体', detail: '准备上下文和工具' })
+
+    // The assistant placeholder is created immediately so streamed deltas have
+    // somewhere to land; it is replaced by the final payload at agent_end.
+    const assistantMessageId = makeId()
+    let streamedContent = ''
+    let streamedTraces: AIChatToolTrace[] = []
+    // Held in an object so the TypeScript compiler keeps the real type: a bare
+    // `let` assigned only inside a callback is narrowed to `never`.
+    const outcome: { result: AIChatResponse | null } = { result: null }
+
+    const upsertAssistantMessage = (patch: Partial<PersistedMessage>) => {
+      setMessages((prev) => {
+        const next = [...prev]
+        const index = next.findIndex((message) => message.id === assistantMessageId)
+        const base: PersistedMessage = index >= 0
+          ? next[index]
+          : { id: assistantMessageId, role: 'assistant', content: '', createdAt: Date.now() }
+        const merged: PersistedMessage = { ...base, ...patch }
+        if (index >= 0) next[index] = merged
+        else next.push(merged)
+        return compactChatMessages(next)
+      })
+    }
+
+    setStreamingMessageId(assistantMessageId)
+
+    const applyToolEvent = (event: AIAgentEvent) => {
+      const tool = event.tool
+      if (!tool) return
+      if (tool.status === 'running') {
+        setLiveActivity({ label: `正在${tool.label || '执行工具'}`, detail: tool.name })
+        return
+      }
+      const trace: AIChatToolTrace = {
+        name: tool.name,
+        status: tool.status === 'error' ? 'error' : 'success',
+        summary: tool.summary,
+        data: tool.data,
+      }
+      streamedTraces = [...streamedTraces, trace]
+      upsertAssistantMessage({ content: streamedContent, toolTraces: streamedTraces })
+      setLiveActivity({ label: `已完成${tool.label || '工具'}`, detail: tool.summary || tool.name })
+    }
+
+    const controller = new AbortController()
+    abortRef.current = controller
 
     try {
       await prepareDataMutation()
-      const res = await api.post<AIChatResponse>('/ai/chat', {
-        assistant_id: assistantId,
-        messages: historyMessages,
-        context: contextWorkbook ? {
-          workbook_id: contextWorkbook.id,
-          sheet_ids: contextSheetIds,
-          selection: contextSelection || undefined,
-        } : undefined,
-      })
-      if (res.code !== 0 || !res.data) {
-        throw new Error(res.message || 'AI 请求失败')
-      }
+      await api.stream(
+        '/ai/chat/stream',
+        {
+          assistant_id: assistantId,
+          messages: historyMessages,
+          context: contextWorkbook ? {
+            workbook_id: contextWorkbook.id,
+            sheet_ids: contextSheetIds,
+            selection: contextSelection || undefined,
+          } : undefined,
+        },
+        (rawEvent) => {
+          const event = rawEvent as AIAgentEvent
+          switch (event.type) {
+            case 'agent_start':
+              setLiveActivity({ label: '智能体已启动', detail: '分析需求并选择工具' })
+              break
+            case 'message_delta':
+              streamedContent += event.delta || ''
+              setLiveActivity({ label: '正在生成回答', detail: '已开始输出内容' })
+              upsertAssistantMessage({ content: streamedContent })
+              break
+            case 'tool_start':
+            case 'tool_end':
+              applyToolEvent(event)
+              break
+            case 'error':
+              setLiveActivity({ label: '执行出错', detail: event.error || '未知错误' })
+              break
+            case 'agent_end':
+              if (event.result) outcome.result = event.result
+              break
+            default:
+              break
+          }
+        },
+        controller.signal
+      )
 
-      const assistantMessage: PersistedMessage = {
-        id: makeId(),
-        role: 'assistant',
-        content: res.data?.reply ?? '',
-        createdAt: Date.now(),
-        pendingOperations: res.data?.pending_operations,
-        pendingERPPlan: res.data?.pending_erp_plan,
-        toolTraces: res.data?.tool_traces,
-        touchedSheetIds: res.data?.touched_sheet_ids,
+      const finalResult = outcome.result
+      const reply = finalResult?.reply || streamedContent || '已完成处理。'
+      upsertAssistantMessage({
+        content: reply,
+        pendingOperations: finalResult?.pending_operations,
+        pendingERPPlan: finalResult?.pending_erp_plan,
+        toolTraces: finalResult?.tool_traces ?? streamedTraces,
+        touchedSheetIds: finalResult?.touched_sheet_ids,
         applyState: 'idle',
         erpApplyState: 'idle',
-      }
-      setMessages((prev) => compactChatMessages([...prev, assistantMessage]))
+      })
 
-      if (res.data.resources_changed || (res.data.changed_sheet_ids?.length ?? 0) > 0) {
+      if (finalResult?.resources_changed || (finalResult?.changed_sheet_ids?.length ?? 0) > 0) {
         notifyDataChanged({
           source: 'ai',
-          sheetIds: res.data.changed_sheet_ids || [],
-          resourcesChanged: Boolean(res.data.resources_changed),
+          sheetIds: finalResult?.changed_sheet_ids || [],
+          resourcesChanged: Boolean(finalResult?.resources_changed),
         })
       }
     } catch (error) {
-      setMessages((prev) => compactChatMessages([
-        ...prev,
-        {
-          id: makeId(),
-          role: 'assistant',
+      const aborted = error instanceof DOMException && error.name === 'AbortError'
+      if (aborted) {
+        // Keep whatever the agent already produced instead of discarding it.
+        upsertAssistantMessage({
+          content: streamedContent || '已停止本次处理。',
+          toolTraces: streamedTraces,
+          applyState: 'idle',
+          erpApplyState: 'idle',
+        })
+      } else {
+        upsertAssistantMessage({
           content: error instanceof Error ? error.message : '请求失败，请稍后重试。',
-          createdAt: Date.now(),
-        },
-      ]))
+          toolTraces: streamedTraces.length > 0 ? streamedTraces : undefined,
+        })
+      }
     } finally {
+      abortRef.current = null
+      setStreamingMessageId(null)
+      setLiveActivity(null)
       loadingRef.current = false
       setLoading(false)
     }
   }, [assistantId, contextSelection, contextSheetIds, contextWorkbook])
+
+  /** Cancel a running turn. The backend agent loop stops as soon as the stream closes. */
+  const handleStop = useCallback(() => {
+    abortRef.current?.abort()
+  }, [])
 
   agentTurnRef.current = runChatTurn
 
@@ -1429,11 +1520,22 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             <div className="w-[min(90%,360px)] rounded-2xl rounded-bl-sm border border-slate-200 bg-slate-50 px-4 py-3 text-slate-900 shadow-sm">
               <div className="flex items-center gap-2">
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin text-sky-600" />
-                <div className="min-w-0 flex-1"><div className="text-xs font-semibold text-slate-800">{thinkingProgress.label}</div><div className="mt-0.5 truncate text-[11px] text-slate-500">{thinkingProgress.detail}</div></div>
+                <div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold text-slate-800">{liveActivity?.label || thinkingProgress.label}</div><div className="mt-0.5 truncate text-[11px] text-slate-500">{liveActivity?.detail || thinkingProgress.detail}</div></div>
                 <span className="shrink-0 text-[11px] tabular-nums text-slate-400">{thinkingElapsed}s</span>
               </div>
-              <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-200"><div className="h-full rounded-full bg-sky-500 transition-[width] duration-700" style={{ width: `${thinkingProgress.progress}%` }} /></div>
-              <div className="mt-1.5 text-[10px] text-slate-400">估算进度 {Math.round(thinkingProgress.progress)}%</div>
+              {liveActivity ? (
+                <div className="mt-3 flex items-center gap-2">
+                  <span className="inline-flex h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
+                    <span className="h-full w-1/3 animate-[ai-stream_1.2s_ease-in-out_infinite] rounded-full bg-sky-500" />
+                  </span>
+                  <span className="text-[10px] text-slate-400">实时</span>
+                </div>
+              ) : (
+                <>
+                  <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-200"><div className="h-full rounded-full bg-sky-500 transition-[width] duration-700" style={{ width: `${thinkingProgress.progress}%` }} /></div>
+                  <div className="mt-1.5 text-[10px] text-slate-400">估算进度 {Math.round(thinkingProgress.progress)}%</div>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -1573,12 +1675,13 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           </button>
           <button
             type="button"
-            onClick={() => void handleSend()}
-            disabled={!inputValue.trim() || loading}
-            className="rounded-lg bg-slate-900 p-3 text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
-            aria-label="发送"
+            onClick={loading ? handleStop : () => void handleSend()}
+            disabled={!loading && !inputValue.trim()}
+            className={`rounded-lg p-3 text-white transition disabled:cursor-not-allowed ${loading ? 'bg-rose-600 hover:bg-rose-700' : 'bg-slate-900 hover:bg-slate-800 disabled:opacity-40'}`}
+            aria-label={loading ? '停止生成' : '发送'}
+            title={loading ? '停止生成（已生成的内容会保留）' : '发送'}
           >
-            <Send className="h-4 w-4" />
+            {loading ? <Square className="h-4 w-4" /> : <Send className="h-4 w-4" />}
           </button>
         </div>
       </div>

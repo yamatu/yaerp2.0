@@ -545,6 +545,7 @@ func main() {
 		api.GET("/ai/assistants", aiHandler.ListAvailableAssistants)
 		api.GET("/me/permissions", aiHandler.MyPermissions)
 		api.POST("/ai/chat", aiHandler.Chat)
+		api.POST("/ai/chat/stream", aiHandler.ChatStream)
 		api.POST("/ai/spreadsheet/apply", aiHandler.ApplySpreadsheetPlan)
 		api.POST("/ai/erp/apply", aiHandler.ApplyERPPlan)
 		api.POST("/ai/erp/import/preview", aiHandler.PreviewERPOrderImport)

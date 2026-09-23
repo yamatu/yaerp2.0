@@ -271,3 +271,16 @@ video {
 body.ai-panel-open .sheet-floating-stack {
   display: none !important;
 }
+
+/*
+ * Indeterminate progress bar shown while the agent stream is live. The bar has
+ * no known end, so it slides instead of filling to a fake percentage.
+ */
+@keyframes ai-stream {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}

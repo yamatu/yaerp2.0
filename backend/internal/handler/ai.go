@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 
 	"yaerp/internal/model"
@@ -29,6 +30,109 @@ func NewAIHandler(aiService *service.AIService, hub *ws.Hub) *AIHandler {
 	return &AIHandler{aiService: aiService, hub: hub}
 }
 
+// ChatStream answers a chat turn as a Server-Sent Events stream.
+//
+// The response is a sequence of `data: {"type": ...}` lines. The browser reads
+// them incrementally so assistants appear to type instead of blocking on a
+// single JSON payload, and every tool call is announced before it runs.
+func (h *AIHandler) ChatStream(c *gin.Context) {
+	userID := c.GetInt64("user_id")
+
+	var req service.ChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	if err := validateChatRequest(req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	assistantID := int64(0)
+	if req.AssistantID != nil {
+		assistantID = *req.AssistantID
+	}
+
+	ctx := c.Request.Context()
+	prepared, err := h.aiService.PrepareStream(userID, assistantID, req.Messages, req.Context)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		response.ServerError(c, "当前服务器不支持流式响应")
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	flusher.Flush()
+
+	writeEvent := func(event service.AgentEvent) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", encoded); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	result, runErr := h.aiService.RunPreparedStream(ctx, prepared, writeEvent)
+	if runErr != nil {
+		message := runErr.Error()
+		if ctx.Err() != nil {
+			message = "请求已取消"
+		}
+		_ = writeEvent(service.AgentEvent{Type: service.AgentEventError, Error: message})
+	}
+
+	// The plain JSON payload is still delivered on the non-streaming endpoint;
+	// the stream only needs to tell the client which sheets to refresh.
+	if result != nil && h.hub != nil {
+		for _, sheetID := range result.ChangedSheetIDs {
+			payload, _ := json.Marshal(ws.Message{
+				Type:    "sheet_sync",
+				SheetID: sheetID,
+				UserID:  userID,
+			})
+			h.hub.BroadcastToSheetExceptClientID(sheetID, payload, c.GetHeader("X-Client-Id"))
+		}
+	}
+}
+
+// validateChatRequest applies the shared limits of the plain and streaming
+// chat endpoints.
+func validateChatRequest(req service.ChatRequest) error {
+	if len(req.Messages) == 0 {
+		return fmt.Errorf("messages cannot be empty")
+	}
+	if len(req.Messages) > maxChatMessages {
+		return fmt.Errorf("messages cannot exceed %d items", maxChatMessages)
+	}
+	totalChars := 0
+	for _, message := range req.Messages {
+		if len(message.Content) > maxChatMessageChars {
+			return fmt.Errorf("each message cannot exceed %d characters", maxChatMessageChars)
+		}
+		totalChars += len(message.Content)
+	}
+	if totalChars > maxChatRequestChars {
+		return fmt.Errorf("message content cannot exceed %d characters", maxChatRequestChars)
+	}
+	return nil
+}
+
 func (h *AIHandler) Chat(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 
@@ -38,24 +142,8 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	if len(req.Messages) == 0 {
-		response.BadRequest(c, "messages cannot be empty")
-		return
-	}
-	if len(req.Messages) > maxChatMessages {
-		response.BadRequest(c, fmt.Sprintf("messages cannot exceed %d items", maxChatMessages))
-		return
-	}
-	totalChars := 0
-	for _, message := range req.Messages {
-		if len(message.Content) > maxChatMessageChars {
-			response.BadRequest(c, fmt.Sprintf("each message cannot exceed %d characters", maxChatMessageChars))
-			return
-		}
-		totalChars += len(message.Content)
-	}
-	if totalChars > maxChatRequestChars {
-		response.BadRequest(c, fmt.Sprintf("message content cannot exceed %d characters", maxChatRequestChars))
+	if err := validateChatRequest(req); err != nil {
+		response.BadRequest(c, err.Error())
 		return
 	}
 
