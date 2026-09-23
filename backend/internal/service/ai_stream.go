@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -50,7 +51,8 @@ type AgentEvent struct {
 	MessageID string `json:"message_id,omitempty"`
 	// Tool describes the tool a tool_start/tool_end event refers to.
 	Tool *AgentToolEvent `json:"tool,omitempty"`
-	// Result is only sent with agent_end.
+	// Result is sent with agent_end and, when available, with error events to
+	// report changes committed before a later turn failed.
 	Result *ChatResponse `json:"result,omitempty"`
 	// Error is only sent with error events.
 	Error string `json:"error,omitempty"`
@@ -58,12 +60,15 @@ type AgentEvent struct {
 
 // AgentToolEvent reports one tool call.
 type AgentToolEvent struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Label   string `json:"label,omitempty"`
-	Status  string `json:"status,omitempty"`
-	Summary string `json:"summary,omitempty"`
-	Data    any    `json:"data,omitempty"`
+	ID               string  `json:"id"`
+	Name             string  `json:"name"`
+	Label            string  `json:"label,omitempty"`
+	Status           string  `json:"status,omitempty"`
+	Summary          string  `json:"summary,omitempty"`
+	Data             any     `json:"data,omitempty"`
+	TouchedSheetIDs  []int64 `json:"touched_sheet_ids,omitempty"`
+	ChangedSheetIDs  []int64 `json:"changed_sheet_ids,omitempty"`
+	ResourcesChanged bool    `json:"resources_changed,omitempty"`
 }
 
 // AgentEventSink receives every event. Returning an error aborts the run, which
@@ -127,7 +132,7 @@ func (s *AIService) callChatCompletionStream(
 		request.Header.Set("Authorization", "Bearer "+assistant.APIKey)
 	}
 
-	response, err := s.aiHTTPClient().Do(request)
+	response, err := s.aiStreamHTTPClient().Do(request)
 	if err != nil {
 		return nil, nil, fmt.Errorf("API request failed: %w", err)
 	}
@@ -143,6 +148,8 @@ func (s *AIService) callChatCompletionStream(
 		toolCalls = map[int]*streamToolCall{}
 		order     []int
 		finish    string
+		complete  bool
+		malformed bool
 		model     = assistant.Model
 	)
 
@@ -156,12 +163,15 @@ func (s *AIService) callChatCompletionStream(
 		if strings.HasPrefix(trimmed, "data:") {
 			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			if payload == "[DONE]" {
+				complete = true
 				break
 			}
 			if payload != "" {
 				delta, deltaErr := parseChatCompletionChunk(payload)
 				if deltaErr != nil {
-					// A single malformed chunk must not kill the whole answer.
+					// Text may still be displayed, but tool arguments from a stream
+					// with missing chunks must never be trusted for mutations.
+					malformed = true
 					continue
 				}
 				if delta.finish != "" {
@@ -169,6 +179,9 @@ func (s *AIService) callChatCompletionStream(
 				}
 				if delta.content != "" {
 					content.WriteString(delta.content)
+					if content.Len() > maxAIToolResultBytes {
+						return nil, nil, fmt.Errorf("模型回答超过安全长度")
+					}
 					if onDelta != nil {
 						if err := onDelta(delta.content); err != nil {
 							return nil, nil, err
@@ -176,6 +189,9 @@ func (s *AIService) callChatCompletionStream(
 					}
 				}
 				for index, call := range delta.toolCalls {
+					if index < 0 || index >= agentMaxToolCallsPerTurn {
+						return nil, nil, fmt.Errorf("一次工具调用超过安全上限")
+					}
 					existing, ok := toolCalls[index]
 					if !ok {
 						existing = &streamToolCall{}
@@ -188,6 +204,9 @@ func (s *AIService) callChatCompletionStream(
 					if call.name != "" {
 						existing.name = call.name
 					}
+					if existing.arguments.Len()+call.arguments.Len() > maxAIToolResultBytes {
+						return nil, nil, fmt.Errorf("工具参数超过安全长度")
+					}
 					existing.arguments.WriteString(call.arguments.String())
 				}
 			}
@@ -197,6 +216,20 @@ func (s *AIService) callChatCompletionStream(
 		}
 	}
 
+	// EOF is not a success signal: a dropped connection can leave a syntactically
+	// valid but incomplete write call. Never execute tools without BOTH the
+	// provider's finish reason and the terminal SSE marker.
+	if !complete && finish == "" {
+		return nil, nil, fmt.Errorf("模型流意外中断，未收到完成标记")
+	}
+	if len(order) > 0 && (malformed || !complete || (finish != "tool_calls" && finish != "length")) {
+		return nil, nil, fmt.Errorf("工具调用未完整结束，已拒绝执行")
+	}
+	if finish == "length" && len(order) == 0 {
+		return nil, nil, fmt.Errorf("模型回答被长度限制截断，请缩小请求后重试")
+	}
+
+	sort.Ints(order)
 	assembled := make([]openAIToolCall, 0, len(order))
 	for _, index := range order {
 		call := toolCalls[index]
@@ -264,9 +297,18 @@ func parseChatCompletionChunk(payload string) (*streamDelta, error) {
 	delta.content = extractAIContent(choice.Delta.Content)
 	delta.finish = choice.FinishReason
 	for _, call := range choice.Delta.ToolCalls {
-		entry := &streamToolCall{id: call.ID, name: call.Function.Name}
+		entry := delta.toolCalls[call.Index]
+		if entry == nil {
+			entry = &streamToolCall{}
+			delta.toolCalls[call.Index] = entry
+		}
+		if call.ID != "" {
+			entry.id = call.ID
+		}
+		if call.Function.Name != "" {
+			entry.name = call.Function.Name
+		}
 		entry.arguments.WriteString(call.Function.Arguments)
-		delta.toolCalls[call.Index] = entry
 	}
 	return delta, nil
 }
@@ -320,7 +362,7 @@ func (s *AIService) callResponsesStream(
 		request.Header.Set("Authorization", "Bearer "+assistant.APIKey)
 	}
 
-	response, err := s.aiHTTPClient().Do(request)
+	response, err := s.aiStreamHTTPClient().Do(request)
 	if err != nil {
 		return nil, nil, fmt.Errorf("API request failed: %w", err)
 	}
@@ -335,6 +377,7 @@ func (s *AIService) callResponsesStream(
 		text      strings.Builder
 		output    []json.RawMessage
 		completed *openAIResponsesResult
+		failed    bool
 	)
 
 	reader := bufio.NewReaderSize(response.Body, 64*1024)
@@ -358,6 +401,9 @@ func (s *AIService) callResponsesStream(
 					case "response.output_text.delta":
 						if event.Delta != "" {
 							text.WriteString(event.Delta)
+							if text.Len() > maxAIToolResultBytes {
+								return nil, nil, fmt.Errorf("模型回答超过安全长度")
+							}
 							if onDelta != nil {
 								if err := onDelta(event.Delta); err != nil {
 									return nil, nil, err
@@ -375,6 +421,8 @@ func (s *AIService) callResponsesStream(
 								completed = parsed
 							}
 						}
+					case "response.failed", "response.incomplete", "error":
+						failed = true
 					}
 				}
 			}
@@ -384,10 +432,10 @@ func (s *AIService) callResponsesStream(
 		}
 	}
 
-	if completed == nil {
-		completed = &openAIResponsesResult{Model: assistant.Model}
+	if failed || completed == nil || (completed.Status != "" && completed.Status != "completed") {
+		return nil, nil, fmt.Errorf("模型流意外中断或未完成，工具调用未执行")
 	}
-	if len(output) > 0 {
+	if len(completed.Output) == 0 && len(output) > 0 {
 		completed.Output = output
 	}
 	if completed.OutputText == "" {
@@ -403,6 +451,9 @@ func (s *AIService) callResponsesStream(
 		callID := strings.TrimSpace(item.CallID)
 		if callID == "" {
 			callID = item.ID
+		}
+		if callID == "" || strings.TrimSpace(item.Name) == "" {
+			return nil, nil, fmt.Errorf("Responses 工具调用缺少名称或 call_id，已拒绝执行")
 		}
 		toolCalls = append(toolCalls, openAIToolCall{
 			ID:   callID,

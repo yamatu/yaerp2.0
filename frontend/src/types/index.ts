@@ -745,6 +745,9 @@ export interface AIAgentToolEvent {
   status?: "running" | "success" | "error";
   summary?: string;
   data?: unknown;
+  touched_sheet_ids?: number[];
+  changed_sheet_ids?: number[];
+  resources_changed?: boolean;
 }
 
 export interface AIAgentEvent {

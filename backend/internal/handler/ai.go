@@ -94,19 +94,26 @@ func (h *AIHandler) ChatStream(c *gin.Context) {
 		if ctx.Err() != nil {
 			message = "请求已取消"
 		}
-		_ = writeEvent(service.AgentEvent{Type: service.AgentEventError, Error: message})
+		_ = writeEvent(service.AgentEvent{Type: service.AgentEventError, Error: message, Result: result})
 	}
 
 	// The plain JSON payload is still delivered on the non-streaming endpoint;
 	// the stream only needs to tell the client which sheets to refresh.
 	if result != nil && h.hub != nil {
+		excludeClientID := c.GetHeader("X-Client-Id")
+		if runErr != nil {
+			// The caller may have closed its SSE connection before receiving the
+			// partial result. Broadcast to its websocket as well so an open sheet
+			// still refreshes after a committed write.
+			excludeClientID = ""
+		}
 		for _, sheetID := range result.ChangedSheetIDs {
 			payload, _ := json.Marshal(ws.Message{
 				Type:    "sheet_sync",
 				SheetID: sheetID,
 				UserID:  userID,
 			})
-			h.hub.BroadcastToSheetExceptClientID(sheetID, payload, c.GetHeader("X-Client-Id"))
+			h.hub.BroadcastToSheetExceptClientID(sheetID, payload, excludeClientID)
 		}
 	}
 }

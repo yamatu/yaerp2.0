@@ -8,6 +8,7 @@ import (
 
 type openAIResponsesResult struct {
 	ID         string            `json:"id"`
+	Status     string            `json:"status"`
 	Model      string            `json:"model"`
 	OutputText string            `json:"output_text"`
 	Output     []json.RawMessage `json:"output"`

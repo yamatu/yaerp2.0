@@ -159,6 +159,7 @@ class ApiClient {
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let completed = false
 
     try {
       for (;;) {
@@ -178,14 +179,19 @@ class ApiClient {
             if (!trimmed.startsWith('data:')) continue
             const payload = trimmed.slice(5).trim()
             if (!payload || payload === '[DONE]') continue
+            let event: { type?: string; error?: string }
             try {
-              onEvent(JSON.parse(payload))
+              event = JSON.parse(payload)
             } catch {
-              // Ignore malformed frames instead of dropping the whole answer.
+              throw new Error('智能体返回了损坏的流事件')
             }
+            onEvent(event)
+            if (event.type === 'agent_end') completed = true
+            if (event.type === 'error') throw new Error(event.error || '智能体执行失败')
           }
         }
       }
+      if (!completed) throw new Error('智能体连接意外中断，操作可能仅部分完成')
     } finally {
       reader.releaseLock()
     }

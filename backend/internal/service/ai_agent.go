@@ -485,7 +485,7 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 					"所有工具都按当前登录账号执行；不得尝试读取、推断或写入该账号无权访问的工作簿、工作表、行、列或单元格。只读账号只能查询，不能写回来源表。"+
 					"动手之前先确认能力边界：当员工询问自己能看到或操作什么、或你准备提出写入/删除方案时，调用 get_my_permissions 查明当前账号的角色、可用功能和每张工作表的查看/编辑/删除/导出权限以及行列单元格级限制；被拒绝的能力要如实说明缺少哪种权限，不要尝试绕过。"+
 					"当用户只提供工作簿名、工作表名或业务关键词时，先调用 get_user_context 或 search_spreadsheets 定位准确 ID，再调用 query_sheet 读取实际单元格内容。query_sheet 是分页工具：必须检查 total_rows、returned_rows、has_more 和 next_start_row；用户要求完整读取、逐行核对或基于全表下结论时，不得只读取第一行或第一页。优先使用 profile 理解全表分布，需要精确逐行数据时按 next_start_row 继续读取；统计问题优先使用 calculate_sheet_metrics，检索问题优先使用 search_sheet_rows 或 lookup_sheet_records。"+
-					"编辑表格时优先使用批量工具，不要反复调用 update_cell 逐格写入：整段区域一次性写入用 batch_update_cells；给一整列写公式用 run_sheet_formulas（{{row}} 为 Excel 行号，{{column_key}} 引用同行其他列）；排序用 sort_sheet_range；按条件筛选用 filter_sheet_rows；查重合并用 dedupe_sheet_rows；多步骤任务（先筛选、再排序、再统计、再赋值）用 run_spreadsheet_script。动手前如果不知道确切的列 key，先调用 inspect_sheet_range 查看列结构与取值样例。"+
+					"编辑表格时优先使用批量工具，不要反复调用 update_cell 逐格写入：整段区域一次性写入用 batch_update_cells；给一整列写公式用 run_sheet_formulas（{{row}} 为 Excel 行号，{{column_key}} 引用同行其他列）；排序用 sort_sheet_range；按条件筛选用 filter_sheet_rows；查重合并用 dedupe_sheet_rows；多步骤条件处理用 run_spreadsheet_script（脚本里的 sort 只改变处理顺序、compute 只返回统计结果，真正重排工作表必须调用 sort_sheet_range）。动手前如果不知道确切的列 key，先调用 inspect_sheet_range 查看列结构与取值样例。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
@@ -947,7 +947,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "column_key", "formula"},
 		}),
-		buildToolDefinition("sort_sheet_range", "Sort a block of data rows by one column, keeping every row intact. Numbers sort numerically and text sorts case-insensitively. Row identity and permissions are preserved because values are reordered inside the existing rows.", map[string]any{
+		buildToolDefinition("sort_sheet_range", "Sort a contiguous block by one column. Numbers sort numerically, text case-insensitively. Sorting refuses sparse ranges, hidden/unwritable cells, formulas, and rows with approval records, because permuting only part of a row would corrupt data. At most 2000 changed cells per call; split larger ranges.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":   map[string]any{"type": "integer"},
@@ -988,7 +988,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "key_columns"},
 		}),
-		buildToolDefinition("run_spreadsheet_script", "Run a short, fully validated spreadsheet program over one sheet. This is the most efficient way to express multi-step editing. One statement per line:\n  select where status = \"已付款\"\n  filter where amount > 1000 and region contains \"华南\"\n  sort by amount desc\n  compute total = SUM({{amount}})\n  set note = \"已核对\"\nSupported verbs: select/filter (narrow rows), sort (order rows), compute (SUM/AVG/COUNT/COUNT_NON_EMPTY/MIN/MAX of one column), set (assign a literal to one column of every matched row). Statements run top to bottom; nothing is written unless every line parses and every column and permission is valid.", map[string]any{
+		buildToolDefinition("run_spreadsheet_script", "Run a short, fully validated spreadsheet program over one sheet. This is the most efficient way to express multi-step editing. One statement per line:\n  select where status = \"已付款\"\n  filter where amount > 1000 and region contains \"华南\"\n  sort by amount desc\n  compute total = SUM({{amount}})\n  set note = \"已核对\"\nSupported verbs: select/filter (narrow rows), sort (changes selection order ONLY, never reorders the sheet; call sort_sheet_range for persistent sorting), compute (returns SUM/AVG/COUNT/COUNT_NON_EMPTY/MIN/MAX in the report ONLY, does not write the result cell), set (assigns a literal to every matched row). Statements run top to bottom; all column references and cell permissions are checked before writing.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id": map[string]any{"type": "integer"},
@@ -1866,23 +1866,25 @@ func (s *AIService) toolUpdateCell(userID int64, args map[string]any) (*toolExec
 		return nil, err
 	}
 
+	cacheWarning := ""
 	if len(writeResult.AppliedChanges) > 0 {
 		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-			return nil, err
+			cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
 		}
 	}
 	pending := len(writeResult.PendingStates) > 0
 	summary := fmt.Sprintf("已更新第 %d 行的 %s", row+1, columnKey)
-	changedSheetIDs := []int64{sheetID}
 	if pending {
 		summary = fmt.Sprintf("第 %d 行的 %s 已提交审批，审批通过后才会写入", row+1, columnKey)
-		changedSheetIDs = nil
+	}
+	if cacheWarning != "" {
+		summary += "；" + cacheWarning
 	}
 
 	return &toolExecutionResult{
-		Data:             map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "column_key": columnKey, "value": value, "pending_approval": pending, "approval_states": writeResult.PendingStates},
+		Data:             map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "column_key": columnKey, "value": value, "pending_approval": pending, "approval_states": writeResult.PendingStates, "warning": cacheWarning},
 		TouchedSheetIDs:  []int64{sheetID},
-		ChangedSheetIDs:  changedSheetIDs,
+		ChangedSheetIDs:  changedSheetIDsWhen(len(writeResult.AppliedChanges) > 0, sheetID),
 		ResourcesChanged: pending,
 		Summary:          summary,
 	}, nil
@@ -2052,20 +2054,16 @@ func (s *AIService) toolAutoFillColumn(userID int64, args map[string]any) (*tool
 	startRow, hasStart := intPtrArg(args, "start_row")
 	endRow, hasEnd := intPtrArg(args, "end_row")
 
-	operation := SpreadsheetOperation{Kind: "fill_formula", SheetID: sheetID, ColumnKey: columnKey, FormulaTemplate: formulaTemplate}
-	if hasStart {
-		operation.StartRow = startRow
+	// Legacy tool name, shared safe write path. Never bypass cell approvals by
+	// applying fill_formula through a raw row upsert.
+	batchArgs := map[string]any{"sheet_id": sheetID, "column_key": columnKey, "formula": formulaTemplate}
+	if hasStart && startRow != nil {
+		batchArgs["start_row"] = *startRow
 	}
-	if hasEnd {
-		operation.EndRow = endRow
+	if hasEnd && endRow != nil {
+		batchArgs["end_row"] = *endRow
 	}
-
-	touched, err := s.executeSpreadsheetOperations(userID, []SpreadsheetOperation{operation})
-	if err != nil {
-		return nil, err
-	}
-
-	return &toolExecutionResult{Data: map[string]any{"ok": true, "sheet_id": sheetID, "column_key": columnKey}, TouchedSheetIDs: touched, ChangedSheetIDs: touched, Summary: fmt.Sprintf("已批量填充列 %s", columnKey)}, nil
+	return s.toolRunSheetFormulas(userID, batchArgs)
 }
 
 func (s *AIService) toolGenerateReport(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -4288,6 +4286,33 @@ func splitColumnOptions(value any) []string {
 }
 
 func validateFormulaTemplateReferences(template string, columns []sheetColumnPayload) error {
+	// Validate every placeholder, not only arithmetic expressions. Otherwise
+	// a typo like {{qunatity}} is persisted literally into hundreds of cells.
+	for remaining := template; ; {
+		start := strings.Index(remaining, "{{")
+		if start < 0 {
+			break
+		}
+		remaining = remaining[start+2:]
+		end := strings.Index(remaining, "}}")
+		if end < 0 {
+			return fmt.Errorf("公式模板缺少 }}")
+		}
+		key := remaining[:end]
+		if key != "row" && key != "data_row" {
+			found := false
+			for _, column := range columns {
+				if column.Key == key {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("公式模板中的 {{%s}} 不是列 key；可用列：%s", key, describeColumnKeys(columns))
+			}
+		}
+		remaining = remaining[end+2:]
+	}
 	check := func(leftIndex, rightIndex int, operator string) error {
 		if leftIndex < 0 || leftIndex >= len(columns) || rightIndex < 0 || rightIndex >= len(columns) {
 			return fmt.Errorf("公式中的列引用超出工作表字段范围，请使用 {{column_key}} 引用字段")

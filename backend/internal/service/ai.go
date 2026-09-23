@@ -49,6 +49,15 @@ func (s *AIService) SetAIProxyURLProvider(provider func() string) {
 // aiHTTPClient builds an HTTP client for AI calls, optionally through the
 // managed outbound proxy. Clients are cached per proxy URL so connections are
 // reused while the switch stays on.
+// Streaming requests are bounded by their per-turn context, not the shorter
+// timeout used for non-streaming API calls. Reuse the same managed proxy and
+// connection pool without imposing the 180-second client deadline.
+func (s *AIService) aiStreamHTTPClient() *http.Client {
+	client := *s.aiHTTPClient()
+	client.Timeout = 0
+	return &client
+}
+
 func (s *AIService) aiHTTPClient() *http.Client {
 	proxyURL := ""
 	if s.proxyURLProvider != nil {

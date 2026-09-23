@@ -19,6 +19,7 @@ const (
 	// agentMaxToolErrorsInARow stops a loop where the model keeps calling the
 	// same broken tool.
 	agentMaxToolErrorsInARow = 3
+	agentMaxToolCallsPerTurn = 32
 	// agentTurnTimeout bounds one model request.
 	agentTurnTimeout = 5 * time.Minute
 )
@@ -94,6 +95,16 @@ func (state *agentRunState) toResponse(reply string) *ChatResponse {
 		PendingERPPlan:    state.pendingERPPlan,
 		ToolTraces:        state.traces,
 	}
+}
+
+// partialResponse reports already committed changes without claiming that the
+// entire request completed. The handler needs it even if the client disconnects.
+func (state *agentRunState) partialResponse() *ChatResponse {
+	reply := strings.TrimSpace(state.reply.String())
+	if reply == "" {
+		reply = "任务未完成；已有的工具操作可能已经生效。"
+	}
+	return state.toResponse(reply)
 }
 
 // PreparedAgentStream is a validated agent run that has not started yet. It
@@ -196,9 +207,8 @@ func (s *AIService) runAgentStream(
 		if err != nil {
 			if ctx.Err() != nil {
 				state.aborted = true
-				break
 			}
-			return nil, err
+			return state.partialResponse(), err
 		}
 		state.lastModel = firstNonEmpty(streamed.Model, state.lastModel)
 		state.conversation = append(state.conversation, assistantMessage)
@@ -228,22 +238,29 @@ func (s *AIService) runAgentStream(
 		// A "length" finish means the arguments may be truncated, so running
 		// them could corrupt data. Report them as failed instead.
 		if streamed.Choices[0].FinishReason == "length" {
-			s.appendTruncatedToolResults(state, toolCalls, emit)
+			if err := s.appendTruncatedToolResults(state, toolCalls, emit); err != nil {
+				return state.partialResponse(), err
+			}
 			if err := emit(AgentEvent{Type: AgentEventTurnEnd, Turn: turn}); err != nil {
-				return nil, err
+				return state.partialResponse(), err
 			}
 			continue
 		}
 
+		if len(state.toolDefs) == 0 {
+			return state.partialResponse(), fmt.Errorf("当前回合未向模型提供工具，拒绝执行模型返回的工具调用")
+		}
+		if len(toolCalls) > agentMaxToolCallsPerTurn {
+			return state.partialResponse(), fmt.Errorf("一次最多调用 %d 个工具，请拆成更小的批次", agentMaxToolCallsPerTurn)
+		}
 		if err := s.runToolBatch(ctx, state, toolCalls, turn, emit); err != nil {
 			if ctx.Err() != nil {
 				state.aborted = true
-				break
 			}
-			return nil, err
+			return state.partialResponse(), err
 		}
 		if err := emit(AgentEvent{Type: AgentEventTurnEnd, Turn: turn}); err != nil {
-			return nil, err
+			return state.partialResponse(), err
 		}
 
 		if state.consecutiveErrors >= agentMaxToolErrorsInARow {
@@ -256,11 +273,11 @@ func (s *AIService) runAgentStream(
 	result := state.toResponse("")
 	if state.pendingOperations != nil || state.pendingERPPlan != nil {
 		if err := emit(AgentEvent{Type: AgentEventPlan, Result: result}); err != nil {
-			return nil, err
+			return result, err
 		}
 	}
 	if err := emit(AgentEvent{Type: AgentEventEnd, Result: result}); err != nil {
-		return nil, err
+		return result, err
 	}
 	return result, nil
 }
@@ -300,100 +317,77 @@ func (s *AIService) runToolBatch(
 	turn int,
 	emit AgentEventSink,
 ) error {
-	prepared := make([]preparedToolCall, 0, len(toolCalls))
+	// Show the model's requested calls before execution, without preparing them
+	// against stale state. A write may create a pending ERP plan that must block
+	// the next preview in the SAME batch.
 	for _, call := range toolCalls {
-		prepared = append(prepared, s.prepareToolCall(state, call))
-	}
-
-	// Announce every call first so the UI shows the whole plan up front.
-	for _, call := range prepared {
 		if err := emit(AgentEvent{Type: AgentEventToolStart, Turn: turn, Tool: &AgentToolEvent{
-			ID:     call.id,
-			Name:   call.name,
-			Label:  toolDisplayLabel(call.name),
-			Status: "running",
+			ID: call.ID, Name: call.Function.Name, Label: toolDisplayLabel(call.Function.Name), Status: "running",
 		}}); err != nil {
 			return err
 		}
 	}
 
-	results := make([]*toolExecutionResult, len(prepared))
-	errors := make([]error, len(prepared))
-
-	var (
-		writeIndexes []int
-		readIndexes  []int
-	)
-	for index, call := range prepared {
-		if call.invalid != nil || call.tool == nil {
-			continue
-		}
-		if readOnlyAgentTools[call.name] {
-			readIndexes = append(readIndexes, index)
-		} else {
-			writeIndexes = append(writeIndexes, index)
-		}
-	}
-
-	execute := func(index int) {
-		call := prepared[index]
+	execute := func(call preparedToolCall) (*toolExecutionResult, error) {
 		if call.invalid != nil {
-			errors[index] = call.invalid
-			return
+			return nil, call.invalid
 		}
 		if call.tool == nil {
-			errors[index] = fmt.Errorf("工具不存在")
-			return
+			return nil, fmt.Errorf("工具不存在")
 		}
-		result, err := call.tool(state.userID, call.args)
-		if err != nil {
-			errors[index] = err
-			return
-		}
-		results[index] = result
+		return call.tool(state.userID, call.args)
 	}
 
-	// Sequential writes: the order of mutations matters.
-	for _, index := range writeIndexes {
+	// Only adjacent reads run together: a read-before-write must see the old
+	// data, while a read-after-write must see the new data. Emit and record each
+	// group's results before moving to the next call.
+	for index := 0; index < len(toolCalls); {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		execute(index)
-	}
-
-	// Concurrent reads, bounded so a big sheet list does not fan out forever.
-	if len(readIndexes) > 1 {
-		limit := agentMaxParallelTools
-		if limit > len(readIndexes) {
-			limit = len(readIndexes)
+		if !readOnlyAgentTools[toolCalls[index].Function.Name] {
+			call := s.prepareToolCall(state, toolCalls[index])
+			result, runErr := execute(call)
+			if err := s.recordToolOutcome(state, call, result, runErr, emit); err != nil {
+				return err
+			}
+			index++
+			continue
 		}
-		semaphore := make(chan struct{}, limit)
+
+		end := index + 1
+		for end < len(toolCalls) && readOnlyAgentTools[toolCalls[end].Function.Name] {
+			end++
+		}
+		calls := make([]preparedToolCall, end-index)
+		results := make([]*toolExecutionResult, len(calls))
+		errors := make([]error, len(calls))
+		for offset := range calls {
+			calls[offset] = s.prepareToolCall(state, toolCalls[index+offset])
+		}
+		semaphore := make(chan struct{}, agentMaxParallelTools)
 		var waitGroup sync.WaitGroup
-		for _, index := range readIndexes {
+		for offset := range calls {
 			waitGroup.Add(1)
-			go func(index int) {
+			go func(offset int) {
 				defer waitGroup.Done()
 				select {
 				case semaphore <- struct{}{}:
 					defer func() { <-semaphore }()
 				case <-ctx.Done():
-					errors[index] = ctx.Err()
+					errors[offset] = ctx.Err()
 					return
 				}
-				execute(index)
-			}(index)
+				results[offset], errors[offset] = execute(calls[offset])
+			}(offset)
 		}
 		waitGroup.Wait()
-	} else {
-		for _, index := range readIndexes {
-			execute(index)
+		for offset, call := range calls {
+			if err := s.recordToolOutcome(state, call, results[offset], errors[offset], emit); err != nil {
+				return err
+			}
 		}
-	}
-
-	for index, call := range prepared {
-		if err := s.recordToolOutcome(state, call, results[index], errors[index], emit); err != nil {
-			return err
-		}
+		index = end
 	}
 	return nil
 }
@@ -409,6 +403,17 @@ type preparedToolCall struct {
 
 func (s *AIService) prepareToolCall(state *agentRunState, call openAIToolCall) preparedToolCall {
 	prepared := preparedToolCall{id: call.ID, name: call.Function.Name}
+	allowed := false
+	for _, definition := range state.toolDefs {
+		if definition.Function.Name == call.Function.Name {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		prepared.invalid = fmt.Errorf("本轮未授权工具: %s", call.Function.Name)
+		return prepared
+	}
 	if state.pendingERPPlan != nil && call.Function.Name == "preview_erp_action" {
 		prepared.invalid = fmt.Errorf("本轮对话已经生成一个 ERP 待确认步骤；请先让员工确认、修改或放弃当前步骤，再准备下一步。")
 		return prepared
@@ -419,6 +424,10 @@ func (s *AIService) prepareToolCall(state *agentRunState, call openAIToolCall) p
 		return prepared
 	}
 	args := map[string]any{}
+	if len(call.Function.Arguments) > maxAIToolResultBytes {
+		prepared.invalid = fmt.Errorf("工具参数过大；请缩小批次")
+		return prepared
+	}
 	if strings.TrimSpace(call.Function.Arguments) != "" {
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			prepared.invalid = fmt.Errorf("工具参数解析失败: %v", err)
@@ -439,6 +448,9 @@ func (s *AIService) recordToolOutcome(
 	runErr error,
 	emit AgentEventSink,
 ) error {
+	if runErr == nil && result == nil {
+		runErr = fmt.Errorf("工具返回空结果")
+	}
 	if runErr != nil {
 		message := runErr.Error()
 		state.consecutiveErrors++
@@ -475,18 +487,21 @@ func (s *AIService) recordToolOutcome(
 	})
 
 	return emit(AgentEvent{Type: AgentEventToolEnd, Tool: &AgentToolEvent{
-		ID:      call.id,
-		Name:    call.name,
-		Label:   toolDisplayLabel(call.name),
-		Status:  "success",
-		Summary: result.Summary,
-		Data:    compactAITraceData(result.Data),
+		ID:               call.id,
+		Name:             call.name,
+		Label:            toolDisplayLabel(call.name),
+		Status:           "success",
+		Summary:          result.Summary,
+		Data:             compactAITraceData(result.Data),
+		TouchedSheetIDs:  result.TouchedSheetIDs,
+		ChangedSheetIDs:  result.ChangedSheetIDs,
+		ResourcesChanged: result.ResourcesChanged,
 	}})
 }
 
 // appendTruncatedToolResults fails every call of a message that was cut off by
 // the token limit, because truncated JSON arguments cannot be trusted.
-func (s *AIService) appendTruncatedToolResults(state *agentRunState, toolCalls []openAIToolCall, emit AgentEventSink) {
+func (s *AIService) appendTruncatedToolResults(state *agentRunState, toolCalls []openAIToolCall, emit AgentEventSink) error {
 	for _, call := range toolCalls {
 		message := "模型输出被长度限制截断，本次工具调用未执行以免写入不完整数据。请缩小单次操作的规模后重试。"
 		state.traces = append(state.traces, ChatToolTrace{Name: call.Function.Name, Status: "error", Summary: message})
@@ -495,14 +510,17 @@ func (s *AIService) appendTruncatedToolResults(state *agentRunState, toolCalls [
 			"tool_call_id": call.ID,
 			"content":      mustJSON(map[string]any{"error": message}, nil),
 		})
-		_ = emit(AgentEvent{Type: AgentEventToolEnd, Tool: &AgentToolEvent{
+		if err := emit(AgentEvent{Type: AgentEventToolEnd, Tool: &AgentToolEvent{
 			ID: call.ID, Name: call.Function.Name, Label: toolDisplayLabel(call.Function.Name),
 			Status: "error", Summary: message,
-		}})
+		}}); err != nil {
+			return err
+		}
 	}
 	state.conversation = append(state.conversation, agentSystemNotice(
 		"上一条回复因长度限制被截断。请改用更小的批次，一次只处理少量数据行。",
 	))
+	return nil
 }
 
 func agentSystemNotice(text string) map[string]any {
@@ -545,6 +563,8 @@ var readOnlyAgentTools = map[string]bool{
 	"get_erp_order":           true,
 	"search_erp_suppliers":    true,
 	"query_sheet":             true,
+	"inspect_sheet_range":     true,
+	"filter_sheet_rows":       true,
 	"search_spreadsheets":     true,
 	"search_sheet_rows":       true,
 	"lookup_sheet_records":    true,

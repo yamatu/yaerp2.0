@@ -898,6 +898,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     const assistantMessageId = makeId()
     let streamedContent = ''
     let streamedTraces: AIChatToolTrace[] = []
+    let toolStarted = false
+    const streamedChangedSheetIds = new Set<number>()
     // Held in an object so the TypeScript compiler keeps the real type: a bare
     // `let` assigned only inside a callback is narrowed to `never`.
     const outcome: { result: AIChatResponse | null } = { result: null }
@@ -922,6 +924,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       const tool = event.tool
       if (!tool) return
       if (tool.status === 'running') {
+        toolStarted = true
         setLiveActivity({ label: `正在${tool.label || '执行工具'}`, detail: tool.name })
         return
       }
@@ -930,7 +933,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         status: tool.status === 'error' ? 'error' : 'success',
         summary: tool.summary,
         data: tool.data,
+        touched_sheet_ids: tool.touched_sheet_ids,
       }
+      for (const sheetId of tool.changed_sheet_ids || []) streamedChangedSheetIds.add(sheetId)
       streamedTraces = [...streamedTraces, trace]
       upsertAssistantMessage({ content: streamedContent, toolTraces: streamedTraces })
       setLiveActivity({ label: `已完成${tool.label || '工具'}`, detail: tool.summary || tool.name })
@@ -968,6 +973,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               applyToolEvent(event)
               break
             case 'error':
+              if (event.result) outcome.result = event.result
               setLiveActivity({ label: '执行出错', detail: event.error || '未知错误' })
               break
             case 'agent_end':
@@ -1001,20 +1007,28 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       }
     } catch (error) {
       const aborted = error instanceof DOMException && error.name === 'AbortError'
-      if (aborted) {
-        // Keep whatever the agent already produced instead of discarding it.
-        upsertAssistantMessage({
-          content: streamedContent || '已停止本次处理。',
-          toolTraces: streamedTraces,
-          applyState: 'idle',
-          erpApplyState: 'idle',
-        })
-      } else {
-        upsertAssistantMessage({
-          content: error instanceof Error ? error.message : '请求失败，请稍后重试。',
-          toolTraces: streamedTraces.length > 0 ? streamedTraces : undefined,
+      const detail = error instanceof Error ? error.message : '请求失败，请稍后重试。'
+      const partial = outcome.result
+      // Writes may have committed before a later model request failed (or the
+      // user stopped the stream). Never lose the partial result or leave the
+      // sheet displaying stale data. A disconnected client has no final result,
+      // so refresh the workbook conservatively.
+      if (toolStarted || partial?.resources_changed || (partial?.changed_sheet_ids?.length ?? 0) > 0) {
+        notifyDataChanged({
+          source: 'ai',
+          sheetIds: partial?.changed_sheet_ids?.length ? partial.changed_sheet_ids : Array.from(new Set([...contextSheetIds, ...streamedChangedSheetIds])),
+          resourcesChanged: true,
         })
       }
+      upsertAssistantMessage({
+        content: `${streamedContent || partial?.reply || ''}${streamedContent || partial?.reply ? '\n\n' : ''}${aborted ? '已停止本次处理；已执行的操作可能已经生效。' : `执行未完成：${detail}。已执行的操作可能已经生效。`}`,
+        toolTraces: partial?.tool_traces ?? streamedTraces,
+        touchedSheetIds: partial?.touched_sheet_ids,
+        pendingOperations: partial?.pending_operations,
+        pendingERPPlan: partial?.pending_erp_plan,
+        applyState: 'idle',
+        erpApplyState: 'idle',
+      })
     } finally {
       abortRef.current = null
       setStreamingMessageId(null)
