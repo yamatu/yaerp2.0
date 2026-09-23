@@ -850,6 +850,18 @@ func (r *AutomationRepo) HasPendingCellApproval(sheetID int64, row int, col stri
 	return exists, err
 }
 
+// HasCellApprovalInRange guards whole-row permutations: any approval (even
+// decided) is bound to the record currently at that row coordinate.
+func (r *AutomationRepo) HasCellApprovalInRange(sheetID int64, startRow, endRow int) (bool, error) {
+	var exists bool
+	err := r.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM cell_approval_states
+		 WHERE sheet_id=$1 AND row_index BETWEEN $2 AND $3)`,
+		sheetID, startRow, endRow,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (r *AutomationRepo) UpdateCellApprovalState(runID int64, status string) error {
 	_, err := r.db.Exec(
 		`UPDATE cell_approval_states SET status=$2,decided_at=NOW(),updated_at=NOW()

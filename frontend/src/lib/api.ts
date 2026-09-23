@@ -123,6 +123,80 @@ class ApiClient {
     return this.requestRaw(endpoint, options)
   }
 
+  /**
+   * Consume a Server-Sent Events endpoint. Every `data:` payload is JSON decoded
+   * and handed to onEvent in arrival order.
+   *
+   * Returns a promise that resolves when the server closes the stream. Pass a
+   * signal to cancel the turn; the reader is released so the backend agent loop
+   * sees the closed connection and stops.
+   */
+  async stream(
+    endpoint: string,
+    body: unknown,
+    onEvent: (event: unknown) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const res = await this.requestRaw(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    })
+
+    if (!res.ok || !res.body) {
+      // Validation errors are returned as plain JSON before the stream starts.
+      let message = `请求失败 (${res.status})`
+      try {
+        const payload = await res.json()
+        if (payload && typeof payload.message === 'string') message = payload.message
+      } catch {
+        // keep the status based message
+      }
+      throw new Error(message)
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let completed = false
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        // SSE frames are separated by a blank line.
+        let separator = buffer.indexOf('\n\n')
+        while (separator !== -1) {
+          const frame = buffer.slice(0, separator)
+          buffer = buffer.slice(separator + 2)
+          separator = buffer.indexOf('\n\n')
+
+          for (const line of frame.split('\n')) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const payload = trimmed.slice(5).trim()
+            if (!payload || payload === '[DONE]') continue
+            let event: { type?: string; error?: string }
+            try {
+              event = JSON.parse(payload)
+            } catch {
+              throw new Error('智能体返回了损坏的流事件')
+            }
+            onEvent(event)
+            if (event.type === 'agent_end') completed = true
+            if (event.type === 'error') throw new Error(event.error || '智能体执行失败')
+          }
+        }
+      }
+      if (!completed) throw new Error('智能体连接意外中断，操作可能仅部分完成')
+    } finally {
+      reader.releaseLock()
+    }
+  }
+
   async upload(file: File): Promise<ApiResponse<{ id: number; url: string }>> {
     const token = this.getToken()
     const formData = new FormData()

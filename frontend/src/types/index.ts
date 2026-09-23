@@ -725,6 +725,41 @@ export interface AIChatResponse {
   tool_traces?: AIChatToolTrace[];
 }
 
+/** One step of the streamed agent loop. Mirrors the backend AgentEvent. */
+export type AIAgentEventType =
+  | "agent_start"
+  | "turn_start"
+  | "message_delta"
+  | "message_end"
+  | "tool_start"
+  | "tool_end"
+  | "plan"
+  | "turn_end"
+  | "error"
+  | "agent_end";
+
+export interface AIAgentToolEvent {
+  id: string;
+  name: string;
+  label?: string;
+  status?: "running" | "success" | "error";
+  summary?: string;
+  data?: unknown;
+  touched_sheet_ids?: number[];
+  changed_sheet_ids?: number[];
+  resources_changed?: boolean;
+}
+
+export interface AIAgentEvent {
+  type: AIAgentEventType;
+  turn?: number;
+  delta?: string;
+  message_id?: string;
+  tool?: AIAgentToolEvent;
+  result?: AIChatResponse;
+  error?: string;
+}
+
 export interface AIERPActionPreview {
   kind: string;
   title: string;
