@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Check, ChevronDown, Clock3, Eye, History, Loader2, RefreshCcw, RotateCcw, Save, ShieldCheck, UserRound, X } from 'lucide-react'
 import api from '@/lib/api'
+import OperationLogDetails, { hasOperationDetails } from '@/components/audit/OperationLogDetails'
 import type { OperationLog, PageData, SheetVersion, SheetVersionDiff } from '@/types'
 
 interface Props {
@@ -316,6 +317,12 @@ export default function SheetHistoryPanel({ sheetId, sheetName, canManage, onClo
                       <div className="flex flex-wrap items-center gap-2"><span className="text-sm font-semibold text-slate-800">{ACTION_LABELS[log.action] || log.action}</span><span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">{SOURCE_LABELS[log.source] || log.source}</span></div>
                       <div className="mt-1 text-xs leading-5 text-slate-500">{log.summary || '工作表发生变更'}</div>
                       <div className="mt-1.5 flex flex-wrap gap-x-3 text-[11px] text-slate-400"><span>{log.username || '系统'}</span><span>{formatHistoryTime(log.created_at)}</span>{log.column_key && typeof log.row_index === 'number' && <span>{log.column_key}{log.row_index + 2}</span>}</div>
+                      {hasOperationDetails(log) && (
+                        <details className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2">
+                          <summary className="cursor-pointer text-[11px] font-medium text-slate-600">查看结构化详情</summary>
+                          <OperationLogDetails log={log} className="mt-2" maxCellRows={50} />
+                        </details>
+                      )}
                     </div>
                   </div>
                 </div>

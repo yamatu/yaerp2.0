@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import { ChevronLeft, ChevronRight, Clock3, FileSpreadsheet, FilterX, Loader2, RefreshCw, Search, ScrollText, UserRound } from 'lucide-react'
 import { AdminShell } from '@/components/admin/AdminShell'
+import OperationLogDetails, { hasOperationDetails } from '@/components/audit/OperationLogDetails'
 import api from '@/lib/api'
 import type { OperationLog, PageData } from '@/types'
 
@@ -173,7 +174,6 @@ export default function AuditPage() {
         ) : (
           <div className="divide-y divide-slate-200">
             {logs.map((log) => {
-              const metadata = log.metadata && Object.keys(log.metadata).length > 0 ? log.metadata : null
               return (
                 <article key={log.id} className="px-4 py-4 md:px-5">
                   <div className="flex flex-col gap-3 md:flex-row md:items-start">
@@ -190,10 +190,10 @@ export default function AuditPage() {
                         <span className="inline-flex items-center gap-1"><FileSpreadsheet className="h-3.5 w-3.5" />{[log.workbook_name, log.sheet_name].filter(Boolean).join(' / ') || `${log.resource_type || '资源'} #${log.resource_id || '-'}`}</span>
                         <span className="inline-flex items-center gap-1"><Clock3 className="h-3.5 w-3.5" />{formatTime(log.created_at)}</span>
                       </div>
-                      {metadata && (
+                      {hasOperationDetails(log) && (
                         <details className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                           <summary className="cursor-pointer text-xs font-medium text-slate-600">查看结构化详情</summary>
-                          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all text-[11px] leading-5 text-slate-500">{JSON.stringify(metadata, null, 2)}</pre>
+                          <OperationLogDetails log={log} className="mt-2" />
                         </details>
                       )}
                     </div>
