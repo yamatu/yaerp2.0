@@ -80,6 +80,8 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 	if err := ensureZeroBasedSheetRows(rows); err != nil {
 		return nil, err
 	}
+	totalRowsBefore := len(rows)
+	disableFormula := boolArg(args, "disable_formula")
 
 	cellUpdates := make([]model.CellUpdate, 0, len(updates))
 	applied := make([]map[string]any, 0, len(updates))
@@ -102,7 +104,7 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 		applied = append(applied, map[string]any{"row": *update.Row, "column_key": key, "value": update.Value})
 	}
 
-	writeResult, err := s.sheetService.UpdateCellsWithSourceDetailed(userID, cellUpdates, "ai")
+	writeResult, err := s.sheetService.UpdateCellsWithSourceOptions(userID, cellUpdates, "ai", CellUpdateOptions{AllowFormulaLiteral: disableFormula})
 	if err != nil {
 		return nil, err
 	}
@@ -113,22 +115,46 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 		}
 	}
 
+	// Post-write receipt: the agent must be able to see whether the write changed
+	// the row domain or touched an unexpected column, instead of trusting a bare
+	// "updated_cells" count.
+	totalRowsAfter := totalRowsBefore
+	if reloaded, err := s.sheetRepo.GetRows(sheetID); err == nil {
+		totalRowsAfter = len(reloaded)
+	}
+	affectedColumns := distinctColumnKeys(writeResult.AppliedChanges)
+	invariantsOK := totalRowsAfter >= totalRowsBefore
+	postWriteInvariants := map[string]any{
+		"total_rows_before": totalRowsBefore,
+		"total_rows_after":  totalRowsAfter,
+		"row_count_stable":  invariantsOK,
+		"affected_columns":  affectedColumns,
+	}
+
 	pending := len(writeResult.PendingStates) > 0
-	summary := fmt.Sprintf("已写入 %d 个单元格，%d 个等待审批（涉及 %d 行）", len(writeResult.AppliedChanges), len(applied)-len(writeResult.AppliedChanges), distinctRowCount(applied))
+	summary := fmt.Sprintf("已写入 %d 个单元格，%d 个等待审批（涉及 %d 行，总行数 %d→%d）", len(writeResult.AppliedChanges), len(applied)-len(writeResult.AppliedChanges), distinctRowCount(applied), totalRowsBefore, totalRowsAfter)
+	if !invariantsOK {
+		summary += "；警告：写入后总行数减少，请立即检查"
+	}
 	if cacheWarning != "" {
 		summary += "；" + cacheWarning
 	}
 
 	return &toolExecutionResult{
 		Data: map[string]any{
-			"ok":               true,
-			"sheet_id":         sheetID,
-			"updated_cells":    len(writeResult.AppliedChanges),
-			"requested_cells":  len(applied),
-			"updated_rows":     distinctRowCount(applied),
-			"pending_approval": pending,
-			"approval_states":  writeResult.PendingStates,
-			"warning":          cacheWarning,
+			"ok":                    true,
+			"sheet_id":              sheetID,
+			"updated_cells":         len(writeResult.AppliedChanges),
+			"requested_cells":       len(applied),
+			"updated_rows":          distinctRowCount(applied),
+			"affected_columns":      affectedColumns,
+			"total_rows_before":     totalRowsBefore,
+			"total_rows_after":      totalRowsAfter,
+			"invariants_ok":         invariantsOK,
+			"post_write_invariants": postWriteInvariants,
+			"pending_approval":      pending,
+			"approval_states":       writeResult.PendingStates,
+			"warning":               cacheWarning,
 		},
 		TouchedSheetIDs:  []int64{sheetID},
 		ChangedSheetIDs:  changedSheetIDsWhen(len(writeResult.AppliedChanges) > 0, sheetID),
@@ -198,6 +224,23 @@ func distinctRowCount(applied []map[string]any) int {
 		}
 	}
 	return len(rows)
+}
+
+// distinctColumnKeys returns the sorted set of columns touched by a batch so
+// the write receipt cannot hide an unexpected column.
+func distinctColumnKeys(changes []model.CellUpdate) []string {
+	keys := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		if key := strings.TrimSpace(change.Col); key != "" {
+			keys[key] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // ---------------------------------------------------------------------------

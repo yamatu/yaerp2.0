@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -52,6 +53,10 @@ func (h *CellHandler) BatchUpdate(c *gin.Context) {
 
 	result, err := h.sheetService.UpdateCellsWithSourceDetailed(userID, req.Changes, "web")
 	if err != nil {
+		if errors.Is(err, service.ErrFormulaColumnLiteral) {
+			response.ErrorCode(c, http.StatusConflict, service.FormulaColumnCode, err.Error())
+			return
+		}
 		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
 			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
 			response.Forbidden(c, err.Error())

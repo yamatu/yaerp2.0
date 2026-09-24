@@ -126,6 +126,8 @@ func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 		"filter_sheet_rows":      s.toolFilterSheetRows,
 		"dedupe_sheet_rows":      s.toolDedupeSheetRows,
 		"run_spreadsheet_script": s.toolRunSpreadsheetScript,
+		"list_sheet_versions":    s.toolListSheetVersions,
+		"restore_sheet_version":  s.toolRestoreSheetVersion,
 	}
 }
 
@@ -486,6 +488,10 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 					"动手之前先确认能力边界：当员工询问自己能看到或操作什么、或你准备提出写入/删除方案时，调用 get_my_permissions 查明当前账号的角色、可用功能和每张工作表的查看/编辑/删除/导出权限以及行列单元格级限制；被拒绝的能力要如实说明缺少哪种权限，不要尝试绕过。"+
 					"当用户只提供工作簿名、工作表名或业务关键词时，先调用 get_user_context 或 search_spreadsheets 定位准确 ID，再调用 query_sheet 读取实际单元格内容。query_sheet 是分页工具：必须检查 total_rows、returned_rows、has_more 和 next_start_row；用户要求完整读取、逐行核对或基于全表下结论时，不得只读取第一行或第一页。优先使用 profile 理解全表分布，需要精确逐行数据时按 next_start_row 继续读取；统计问题优先使用 calculate_sheet_metrics，检索问题优先使用 search_sheet_rows 或 lookup_sheet_records。"+
 					"编辑表格时优先使用批量工具，不要反复调用 update_cell 逐格写入：整段区域一次性写入用 batch_update_cells；给一整列写公式用 run_sheet_formulas（{{row}} 为 Excel 行号，{{column_key}} 引用同行其他列）；排序用 sort_sheet_range；按条件筛选用 filter_sheet_rows；查重合并用 dedupe_sheet_rows；多步骤条件处理用 run_spreadsheet_script（脚本里的 sort 只改变处理顺序、compute 只返回统计结果，真正重排工作表必须调用 sort_sheet_range）。动手前如果不知道确切的列 key，先调用 inspect_sheet_range 查看列结构与取值样例。"+
+					"硬性规则一：列类型为 formula 的列是派生列，只能写以 = 开头的公式。向公式列写入普通值会被拒绝并返回 COLUMN_TYPE_FORMULA；除非用户明确要求用普通值覆盖公式列，否则不得设置 disable_formula=true，也不得改列类型来绕过。"+
+					"硬性规则二：每次 batch_update_cells 返回后必须核对回执中的 invariants_ok、total_rows_before、total_rows_after 与 affected_columns。只允许改动预期列；一旦 total_rows_after 小于 total_rows_before、invariants_ok=false，或 affected_columns 出现未预期列，立即停止后续写入，如实把回执报告给用户，不要重试或“修复”后再写入。"+
+					"硬性规则三：不得用逐行脚本或多次 update_cell 重建整张表；写入范围必须由用户在界面上确认过的坐标或 query_sheet 读到的真实坐标决定，不能按当前可见的少量行推断整表结构。"+
+					"硬性规则四：数据被误删或误覆盖时，优先用 list_sheet_versions 查看历史版本，选定版本后经用户确认再调用 restore_sheet_version（必须 confirm=true）。不得靠重新导入、逐行重写或推测原值来“修复”数据。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
@@ -934,7 +940,8 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 					},
 				},
 			},
-			"required": []string{"sheet_id"},
+			"disable_formula": map[string]any{"type": "boolean", "description": "Set true only when the user explicitly wants to overwrite a formula column with plain values. Otherwise writing a literal into a type=formula column is rejected with COLUMN_TYPE_FORMULA."},
+			"required":        []string{"sheet_id"},
 		}),
 		buildToolDefinition("run_sheet_formulas", "Write one formula into every row of a column over a range in a single call. Use {{row}} as the placeholder for the Excel row number and {{column_key}} to reference another column of the same row, for example ={{quantity}}*{{unit_price}}. This is the spreadsheet programming entry point: do not write 100 update_cell calls to fill 100 rows.", map[string]any{
 			"type": "object",
@@ -995,6 +1002,25 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 				"script":   map[string]any{"type": "string", "description": "Newline separated statements. Lines starting with # or // are comments."},
 			},
 			"required": []string{"sheet_id", "script"},
+		}),
+		buildToolDefinition("list_sheet_versions", "List the recent version history of a sheet so you can see what changed and when. Read only. Each item returns version_id, version_number, source, summary, created_at and can_restore. Use it before proposing a restore.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id": map[string]any{"type": "integer"},
+				"page":     map[string]any{"type": "integer", "description": "1-based page. Default 1."},
+				"size":     map[string]any{"type": "integer", "description": "Versions per page, 1-200. Default 20."},
+			},
+			"required": []string{"sheet_id"},
+		}),
+		buildToolDefinition("restore_sheet_version", "Restore a sheet to a historical version (recover deleted or overwritten data). The current state is automatically snapshotted before restoring, so the restore itself is reversible. Requires confirm=true and a preceding user confirmation. Use list_sheet_versions first to pick version_id.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id":   map[string]any{"type": "integer"},
+				"version_id": map[string]any{"type": "integer", "description": "Target version_id from list_sheet_versions."},
+				"confirm":    map[string]any{"type": "boolean", "description": "Must be true. Set only after the user explicitly confirms the restore."},
+				"reason":     map[string]any{"type": "string", "description": "Short Chinese reason recorded in the audit log."},
+			},
+			"required": []string{"sheet_id", "version_id", "confirm"},
 		}),
 	}
 }

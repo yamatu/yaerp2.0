@@ -31,6 +31,7 @@ type AIService struct {
 	scheduleService   *AIScheduleService
 	automationService *AutomationService
 	tradeService      *TradeService
+	historyService    *SheetHistoryService
 	tools             map[string]ToolFunc
 	// proxyURLProvider returns the outbound proxy used for AI requests. It is
 	// wired to the XTLS/Mihomo proxy service and returns "" when AI traffic
@@ -44,6 +45,12 @@ type AIService struct {
 // is routed through the managed outbound proxy.
 func (s *AIService) SetAIProxyURLProvider(provider func() string) {
 	s.proxyURLProvider = provider
+}
+
+// SetHistoryService wires the version-history service used by the agent facing
+// recovery tools (list_sheet_versions / restore_sheet_version).
+func (s *AIService) SetHistoryService(historyService *SheetHistoryService) {
+	s.historyService = historyService
 }
 
 // aiHTTPClient builds an HTTP client for AI calls, optionally through the
@@ -763,6 +770,17 @@ func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs [
 		if len(rowItems) < len(contextRows) && len(rowItems) > 0 {
 			nextStartRow = rowItems[len(rowItems)-1]["row"].(int) + 1
 		}
+		// total_rows is the physical row registry, NOT the number of non-empty
+		// cells. Deriving it from visible cells is how a preview can silently
+		// report 28 rows for a 1800-row sheet after a bad write.
+		totalRows := len(rows)
+		truncated := len(rowItems) < len(contextRows)
+		var coveredRange any
+		if len(rowItems) > 0 {
+			firstRow, _ := rowItems[0]["row"].(int)
+			lastRow, _ := rowItems[len(rowItems)-1]["row"].(int)
+			coveredRange = map[string]any{"start_row": firstRow, "end_row": lastRow, "unit": "data_row_0_based"}
+		}
 
 		sheetsPayload = append(sheetsPayload, map[string]interface{}{
 			"sheet_id":       sheet.ID,
@@ -771,8 +789,11 @@ func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs [
 			"row_base":       0,
 			"rows":           rowItems,
 			"returned_rows":  len(rowItems),
-			"total_rows":     len(contextRows),
-			"has_more":       len(rowItems) < len(contextRows),
+			"total_rows":     totalRows,
+			"non_empty_rows": len(contextRows),
+			"has_more":       truncated,
+			"truncated":      truncated,
+			"covered_range":  coveredRange,
 			"next_start_row": nextStartRow,
 			"profile":        buildAISheetProfile(parsedColumns, contextRows, nil),
 		})
@@ -1145,6 +1166,17 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 		Name:  firstNonEmpty(operation.ColumnName, operation.ColumnKey),
 		Type:  firstNonEmpty(operation.ColumnType, "text"),
 		Width: 140.0,
+	}
+	// Guard the insert_column write path too: it bypasses BatchUpdateCells and
+	// would otherwise persist a literal into a freshly declared formula column.
+	if isFormulaColumn(newColumn) && operation.FormulaTemplate == "" && operation.Value != nil {
+		rawValue, err := json.Marshal(operation.Value)
+		if err != nil {
+			return fmt.Errorf("marshal inserted column value: %w", err)
+		}
+		if !isFormulaCellValue(rawValue) {
+			return &FormulaColumnLiteralError{ColumnKey: newColumn.Key, ColumnName: newColumn.Name, SheetID: operation.SheetID}
+		}
 	}
 	columns = append(columns, sheetColumnPayload{})
 	copy(columns[insertIndex+1:], columns[insertIndex:])

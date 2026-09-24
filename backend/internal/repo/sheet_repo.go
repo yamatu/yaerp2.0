@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -569,6 +570,209 @@ func (r *SheetRepo) BatchUpdateCells(changes []model.CellUpdate, userID int64) e
 		return fmt.Errorf("commit cell updates: %w", err)
 	}
 	return nil
+}
+
+// SheetWriteStats is the per-sheet fingerprint used to validate a cell batch.
+type SheetWriteStats struct {
+	// Total is the number of physical rows registered on the sheet.
+	Total int
+	// Counts records, for every declared column key, how many rows carry it.
+	Counts map[string]int
+}
+
+// SheetWriteInvariant describes what a guarded batch is allowed to change.
+// Untouched columns must never lose non-empty cells and the total row count
+// must never shrink; either condition means the write rebuilt the row domain
+// from a partial payload and is rolled back.
+type SheetWriteInvariant struct {
+	// ColumnsBySheet lists every column key declared on each affected sheet.
+	ColumnsBySheet map[int64][]string
+	// TargetColumns marks the (sheet, column) pairs the batch may touch.
+	TargetColumns map[int64]map[string]struct{}
+}
+
+// WriteInvariantViolation is returned when a guarded batch would have shrunk
+// the sheet's row domain or blanked an untouched column.
+type WriteInvariantViolation struct {
+	SheetID int64
+	Column  string
+	Before  int
+	After   int
+	Reason  string
+}
+
+func (e *WriteInvariantViolation) Error() string {
+	if e.Column == "" {
+		return fmt.Sprintf("工作表 %d 写入被拒绝：%s", e.SheetID, e.Reason)
+	}
+	return fmt.Sprintf("工作表 %d 的列 %s 写入被拒绝：%s", e.SheetID, e.Column, e.Reason)
+}
+
+func isTargetColumn(targets map[int64]map[string]struct{}, sheetID int64, column string) bool {
+	bySheet, ok := targets[sheetID]
+	if !ok {
+		return false
+	}
+	_, ok = bySheet[column]
+	return ok
+}
+
+// VerifySheetWriteInvariant compares the before/after fingerprints and returns
+// a WriteInvariantViolation when the batch lost rows or blanked untouched
+// columns. It is pure so the safety rule can be unit tested without a database.
+func VerifySheetWriteInvariant(before, after map[int64]SheetWriteStats, invariant SheetWriteInvariant) error {
+	sheetIDs := make([]int64, 0, len(before))
+	for sheetID := range before {
+		sheetIDs = append(sheetIDs, sheetID)
+	}
+	sort.Slice(sheetIDs, func(i, j int) bool { return sheetIDs[i] < sheetIDs[j] })
+
+	for _, sheetID := range sheetIDs {
+		beforeStats := before[sheetID]
+		afterStats := after[sheetID]
+		if afterStats.Total < beforeStats.Total {
+			return &WriteInvariantViolation{
+				SheetID: sheetID,
+				Before:  beforeStats.Total,
+				After:   afterStats.Total,
+				Reason:  fmt.Sprintf("写入后总行数从 %d 减少到 %d，已回滚以避免行注册表被重建", beforeStats.Total, afterStats.Total),
+			}
+		}
+		for _, column := range invariant.ColumnsBySheet[sheetID] {
+			if isTargetColumn(invariant.TargetColumns, sheetID, column) {
+				continue
+			}
+			beforeCount := beforeStats.Counts[column]
+			afterCount := afterStats.Counts[column]
+			if afterCount < beforeCount {
+				return &WriteInvariantViolation{
+					SheetID: sheetID,
+					Column:  column,
+					Before:  beforeCount,
+					After:   afterCount,
+					Reason:  fmt.Sprintf("未参与本次写入的列非空单元格从 %d 个减少到 %d 个，已回滚以避免误删数据", beforeCount, afterCount),
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// BatchUpdateCellsGuarded is BatchUpdateCells plus a post-write invariant check.
+// The check runs inside the same transaction as the writes, so a violation
+// rolls the whole batch back and the sheet is left untouched.
+func (r *SheetRepo) BatchUpdateCellsGuarded(changes []model.CellUpdate, userID int64, invariant SheetWriteInvariant) error {
+	if len(changes) == 0 {
+		return nil
+	}
+
+	sheetIDs := make([]int64, 0)
+	seen := make(map[int64]struct{})
+	for _, change := range changes {
+		if _, ok := seen[change.SheetID]; ok {
+			continue
+		}
+		seen[change.SheetID] = struct{}{}
+		sheetIDs = append(sheetIDs, change.SheetID)
+	}
+	sort.Slice(sheetIDs, func(i, j int) bool { return sheetIDs[i] < sheetIDs[j] })
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin cell update transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Lock the sheets in a stable order so concurrent batches cannot interleave
+	// their before/after snapshots.
+	for _, sheetID := range sheetIDs {
+		if _, err := tx.Exec(`SELECT id FROM sheets WHERE id = $1 FOR UPDATE`, sheetID); err != nil {
+			return fmt.Errorf("lock sheet %d: %w", sheetID, err)
+		}
+	}
+
+	before, err := loadSheetWriteStatsTx(tx, sheetIDs)
+	if err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(
+		`INSERT INTO rows (sheet_id, row_index, data, created_by, updated_by, created_at, updated_at)
+		 VALUES ($1, $2, jsonb_build_object($3::text, $4::jsonb), $5, $5, NOW(), NOW())
+		 ON CONFLICT (sheet_id, row_index)
+		 DO UPDATE SET
+			data = jsonb_set(COALESCE(rows.data, '{}'::jsonb), ARRAY[$3::text], $4::jsonb, true),
+			updated_by = $5,
+			updated_at = NOW()`,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare cell update: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, change := range changes {
+		if _, err := stmt.Exec(change.SheetID, change.Row, change.Col, string(change.Value), userID); err != nil {
+			return fmt.Errorf("update cell %s%d on sheet %d: %w", change.Col, change.Row+1, change.SheetID, err)
+		}
+	}
+
+	after, err := loadSheetWriteStatsTx(tx, sheetIDs)
+	if err != nil {
+		return err
+	}
+	if err := VerifySheetWriteInvariant(before, after, invariant); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cell updates: %w", err)
+	}
+	return nil
+}
+
+// loadSheetWriteStatsTx fingerprints every affected sheet inside the open
+// transaction. It uses two single-pass scans per sheet: one for the physical row
+// count and one that unnests every JSONB key to count non-empty values per
+// column. Cost is independent of the number of declared columns, and JSON null,
+// a missing key and an empty string all count as blank.
+func loadSheetWriteStatsTx(tx *sql.Tx, sheetIDs []int64) (map[int64]SheetWriteStats, error) {
+	stats := make(map[int64]SheetWriteStats, len(sheetIDs))
+	for _, sheetID := range sheetIDs {
+		total := 0
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM rows WHERE sheet_id = $1`, sheetID).Scan(&total); err != nil {
+			return nil, fmt.Errorf("count rows for sheet %d: %w", sheetID, err)
+		}
+
+		counts := make(map[string]int)
+		rows, err := tx.Query(
+			`SELECT cell.key, COUNT(*)
+			 FROM rows r
+			 CROSS JOIN LATERAL jsonb_each_text(r.data) AS cell(key, value)
+			 WHERE r.sheet_id = $1 AND jsonb_typeof(r.data) = 'object' AND cell.value IS NOT NULL AND cell.value <> ''
+			 GROUP BY cell.key`,
+			sheetID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("load column stats for sheet %d: %w", sheetID, err)
+		}
+		for rows.Next() {
+			var key string
+			var count int
+			if err := rows.Scan(&key, &count); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan column stats for sheet %d: %w", sheetID, err)
+			}
+			counts[key] = count
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate column stats for sheet %d: %w", sheetID, err)
+		}
+		rows.Close()
+
+		stats[sheetID] = SheetWriteStats{Total: total, Counts: counts}
+	}
+	return stats, nil
 }
 
 func (r *SheetRepo) GetRows(sheetID int64) ([]model.Row, error) {
