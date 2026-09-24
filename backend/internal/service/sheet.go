@@ -1118,7 +1118,21 @@ func (s *SheetService) UpdateCellsWithSource(userID int64, changes []model.CellU
 	return err
 }
 
+// CellUpdateOptions tunes a single cell-write batch.
+type CellUpdateOptions struct {
+	// AllowFormulaLiteral disables the type=formula guard. Agents set this via
+	// the disable_formula tool argument after the user explicitly confirms that
+	// a literal should overwrite a formula column.
+	AllowFormulaLiteral bool
+}
+
 func (s *SheetService) UpdateCellsWithSourceDetailed(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
+	return s.UpdateCellsWithSourceOptions(userID, changes, source, CellUpdateOptions{})
+}
+
+// UpdateCellsWithSourceOptions is UpdateCellsWithSourceDetailed with explicit
+// write-guard tuning.
+func (s *SheetService) UpdateCellsWithSourceOptions(userID int64, changes []model.CellUpdate, source string, options CellUpdateOptions) (*model.CellUpdateResult, error) {
 	if len(changes) == 0 {
 		return &model.CellUpdateResult{}, nil
 	}
@@ -1131,33 +1145,63 @@ func (s *SheetService) UpdateCellsWithSourceDetailed(userID int64, changes []mod
 	trustedTradeMutation := source == "trade_erp"
 	accessCaches := make(map[int64]*sheetCellAccessCache)
 	histories := make(map[int64]*sheetMutationHistory)
-	if !trustedTradeMutation {
-		for _, change := range changes {
-			accessCache, ok := accessCaches[change.SheetID]
-			if !ok {
-				loadedSheet, err := s.sheetRepo.GetSheet(change.SheetID)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get sheet: %w", err)
-				}
-				if err := applySheetLifecycleState(loadedSheet); err != nil {
-					return nil, err
-				}
-				if err := s.ensureSheetModificationAllowed(loadedSheet, userID); err != nil {
-					return nil, err
-				}
-				accessCache, err = newSheetCellAccessCache(s.permService, userID, change.SheetID, loadedSheet.Config, true)
-				if err != nil {
-					return nil, err
-				}
-				accessCaches[change.SheetID] = accessCache
+	loadedSheets := make(map[int64]*model.Sheet)
+	columnsBySheet := make(map[int64][]sheetColumnPayload)
+	ensureSheetColumns := func(sheetID int64) ([]sheetColumnPayload, error) {
+		if columns, ok := columnsBySheet[sheetID]; ok {
+			return columns, nil
+		}
+		loadedSheet, err := s.sheetRepo.GetSheet(sheetID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get sheet: %w", err)
+		}
+		parsedColumns, err := parseSheetColumns(loadedSheet.Columns)
+		if err != nil {
+			return nil, err
+		}
+		loadedSheets[sheetID] = loadedSheet
+		columnsBySheet[sheetID] = parsedColumns
+		return parsedColumns, nil
+	}
+
+	for _, change := range changes {
+		if _, err := ensureSheetColumns(change.SheetID); err != nil {
+			return nil, err
+		}
+		if trustedTradeMutation {
+			continue
+		}
+		accessCache, ok := accessCaches[change.SheetID]
+		if !ok {
+			loadedSheet := loadedSheets[change.SheetID]
+			if err := applySheetLifecycleState(loadedSheet); err != nil {
+				return nil, err
 			}
-			worksheetRow := change.Row + 1
-			if !accessCache.allowsCell(change.Col, worksheetRow, "write") {
-				return nil, fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, change.Col, change.Row+2)
+			if err := s.ensureSheetModificationAllowed(loadedSheet, userID); err != nil {
+				return nil, err
 			}
-			if protected, reason := accessCache.checkProtection(change.Col, worksheetRow, userID); protected {
-				return nil, fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
+			accessCache, err = newSheetCellAccessCache(s.permService, userID, change.SheetID, loadedSheet.Config, true)
+			if err != nil {
+				return nil, err
 			}
+			accessCaches[change.SheetID] = accessCache
+		}
+		worksheetRow := change.Row + 1
+		if !accessCache.allowsCell(change.Col, worksheetRow, "write") {
+			return nil, fmt.Errorf("%w: no write permission for %s%d", ErrSheetPermissionDenied, change.Col, change.Row+2)
+		}
+		if protected, reason := accessCache.checkProtection(change.Col, worksheetRow, userID); protected {
+			return nil, fmt.Errorf("%w: %s", ErrProtectionDenied, reason)
+		}
+	}
+
+	// A formula column holds derived data. Writing a literal into it silently
+	// mixes types and is the first step of the "formula column overwritten and
+	// values appear lost" incident. Reject it unless the caller explicitly opts
+	// out (agent disable_formula=true).
+	for _, change := range changes {
+		if err := validateFormulaColumnWrite(columnsBySheet[change.SheetID], change.SheetID, change.Col, change.Value, options.AllowFormulaLiteral); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1184,7 +1228,7 @@ func (s *SheetService) UpdateCellsWithSourceDetailed(userID int64, changes []mod
 	}
 
 	if len(changes) > 0 {
-		if err := s.sheetRepo.BatchUpdateCells(changes, userID); err != nil {
+		if err := s.sheetRepo.BatchUpdateCellsGuarded(changes, userID, buildSheetWriteInvariant(changes, columnsBySheet)); err != nil {
 			return nil, err
 		}
 		if err := s.syncCellChangesToSnapshots(changes); err != nil {
@@ -1198,6 +1242,33 @@ func (s *SheetService) UpdateCellsWithSourceDetailed(userID int64, changes []mod
 	}
 	s.NotifyCellChanges(userID, changes, source)
 	return result, nil
+}
+
+// buildSheetWriteInvariant derives the post-write safety envelope for a batch:
+// every declared column of every affected sheet, plus the (sheet, column) pairs
+// the batch is allowed to modify. Untouched columns must keep their non-empty
+// cell count and the physical row count must not drop.
+func buildSheetWriteInvariant(changes []model.CellUpdate, columnsBySheet map[int64][]sheetColumnPayload) repo.SheetWriteInvariant {
+	invariant := repo.SheetWriteInvariant{
+		ColumnsBySheet: make(map[int64][]string, len(columnsBySheet)),
+		TargetColumns:  make(map[int64]map[string]struct{}),
+	}
+	for sheetID, columns := range columnsBySheet {
+		keys := make([]string, 0, len(columns))
+		for _, column := range columns {
+			keys = append(keys, column.Key)
+		}
+		invariant.ColumnsBySheet[sheetID] = keys
+	}
+	for _, change := range changes {
+		targets, ok := invariant.TargetColumns[change.SheetID]
+		if !ok {
+			targets = make(map[string]struct{})
+			invariant.TargetColumns[change.SheetID] = targets
+		}
+		targets[change.Col] = struct{}{}
+	}
+	return invariant
 }
 
 func (s *SheetService) syncCellChangesToSnapshots(changes []model.CellUpdate) error {

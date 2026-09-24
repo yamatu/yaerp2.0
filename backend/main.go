@@ -145,6 +145,7 @@ func main() {
 	mailService.SetAIService(aiService)
 	mailService.SetTradeService(tradeService)
 	aiService.SetAutomationService(automationService)
+	aiService.SetHistoryService(historyService)
 
 	// Global XTLS / Mihomo outbound proxy
 	proxyService := service.NewProxyService(cfg, proxyRepo)

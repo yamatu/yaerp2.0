@@ -571,6 +571,7 @@ var readOnlyAgentTools = map[string]bool{
 	"calculate_sheet_metrics": true,
 	"calculate_expression":    true,
 	"list_summary_pages":      true,
+	"list_sheet_versions":     true,
 }
 
 // toolDisplayLabel returns the short Chinese label shown while a tool runs.
@@ -625,4 +626,6 @@ var agentToolLabels = map[string]string{
 	"run_spreadsheet_script":   "执行表格脚本",
 	"inspect_sheet_range":      "查看区域结构",
 	"describe_sheet_columns":   "查看列结构",
+	"list_sheet_versions":      "查看版本历史",
+	"restore_sheet_version":    "恢复历史版本",
 }
