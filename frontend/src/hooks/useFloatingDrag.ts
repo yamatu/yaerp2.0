@@ -34,6 +34,7 @@ interface FloatingDragOptions {
 
 interface FloatingDragState {
   pointerId: number
+  handle: HTMLElement
   originX: number
   originY: number
   startLeft: number
@@ -160,12 +161,18 @@ export function useFloatingDrag({
       const origin = readOrigin()
       stateRef.current = {
         pointerId: event.pointerId,
+        handle: event.currentTarget,
         originX: event.clientX,
         originY: event.clientY,
         startLeft: rect.left - origin.left,
         startTop: rect.top - origin.top,
         moved: false,
       }
+      // Capture on the stable handle, not the moving widget. On phones a
+      // handle must also have touch-action:none BEFORE pointerdown, otherwise
+      // the browser cancels pointer events after only a few pixels of panning.
+      try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* unsupported pointer capture */ }
+      event.stopPropagation()
       suppressClickRef.current = false
       setDragging(true)
       setPosition(clampPosition(rect.left - origin.left, rect.top - origin.top))
@@ -185,6 +192,7 @@ export function useFloatingDrag({
         return
       }
       state.moved = true
+      if (event.cancelable) event.preventDefault()
       setPosition(clampPosition(state.startLeft + deltaX, state.startTop + deltaY))
     }
 
@@ -192,6 +200,7 @@ export function useFloatingDrag({
       const state = stateRef.current
       if (!state || event.pointerId !== state.pointerId) return
       suppressClickRef.current = state.moved
+      try { if (state.handle.hasPointerCapture(state.pointerId)) state.handle.releasePointerCapture(state.pointerId) } catch { /* already released */ }
       stateRef.current = null
       setDragging(false)
       if (state.moved) {
@@ -201,7 +210,7 @@ export function useFloatingDrag({
       }
     }
 
-    window.addEventListener('pointermove', handleMove)
+    window.addEventListener('pointermove', handleMove, { passive: false })
     window.addEventListener('pointerup', handleEnd)
     window.addEventListener('pointercancel', handleEnd)
     return () => {

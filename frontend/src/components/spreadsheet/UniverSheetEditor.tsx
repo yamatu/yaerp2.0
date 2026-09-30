@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
 import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
@@ -23,7 +23,7 @@ import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import { ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand, SheetPasteCommand, SheetPasteShortKeyCommand } from '@univerjs/sheets-ui'
 import { BEFORE_CELL_EDIT, SheetInterceptorService } from '@univerjs/sheets'
 import api from '@/lib/api'
-import { usePermission } from '@/hooks/usePermission'
+import { usePermission, resolveCellPermission } from '@/hooks/usePermission'
 import { useFloatingDrag } from '@/hooks/useFloatingDrag'
 import { isBooleanPreference, useUserPreference } from '@/hooks/useUserPreference'
 import { getStoredUser, isAdmin } from '@/lib/auth'
@@ -55,6 +55,7 @@ import { wsClient } from '@/lib/ws'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
+import SheetMobileControls, { mobileCellValue, type SheetSearchCell } from '@/components/spreadsheet/SheetMobileControls'
 import ImportXlsxButton, { ensureExcelDownloadFilename, EXCEL_IMPORT_FORMATS_LABEL, isSupportedExcelImportFile, uploadWorkbookXlsx } from '@/components/spreadsheet/ImportXlsxButton'
 import type { AuthUser, AutomationApprovalStep, AutomationRule, CellApprovalState, CellUpdate, CellUpdateResult, ColumnDef, Department, ProtectionInfo, ProtectionSnapshot, Row, Sheet, SheetPresenceEntry, User } from '@/types'
 
@@ -821,6 +822,11 @@ function attachUniverTouchPanning(root: HTMLElement) {
 
   const onTouchStart = (event: TouchEvent) => {
     cancelMomentum()
+    // Never turn toolbar, menu or editor-input gestures into canvas scrolling.
+    if (!(event.target instanceof Element) || !event.target.closest('.univer-render-canvas')) {
+      tracking = false
+      return
+    }
     if (event.touches.length !== 1) {
       tracking = false
       return
@@ -915,6 +921,8 @@ function attachUniverTouchPanning(root: HTMLElement) {
   }
 
   // Capture-phase pointerdown records the pointer id used by the synthetic pointerup.
+  const stopPanning = () => { tracking = false; panning = false; cancelMomentum() }
+  root.addEventListener('yaerp-stop-touch-pan', stopPanning)
   root.addEventListener('pointerdown', onPointerDown, true)
   root.addEventListener('touchstart', onTouchStart, { passive: true })
   root.addEventListener('touchmove', onTouchMove, { passive: false })
@@ -923,6 +931,7 @@ function attachUniverTouchPanning(root: HTMLElement) {
 
   return () => {
     cancelMomentum()
+    root.removeEventListener('yaerp-stop-touch-pan', stopPanning)
     root.removeEventListener('pointerdown', onPointerDown, true)
     root.removeEventListener('touchstart', onTouchStart)
     root.removeEventListener('touchmove', onTouchMove)
@@ -1736,6 +1745,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const adminMode = isAdmin(profile)
   const sheetId = sheet.id
   const { permissions, loading: permissionLoading, canEditCell, refreshPermissions } = usePermission(sheetId)
+  const searchAccessToken = useMemo(() => JSON.stringify([permissions, protectionSnapshot]), [permissions, protectionSnapshot])
   const canViewSheet = permissions?.sheet.canView ?? false
   const canEditSheet = permissions?.sheet.canEdit ?? false
   const canExportSheet = permissions?.sheet.canExport ?? false
@@ -5030,6 +5040,109 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     >
       <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
 
+      <SheetMobileControls
+        sheetId={sheetId}
+        ready={!loading && !error && canViewSheet}
+        editable={!editLocked}
+        selectionEditable={Boolean(selectionState && selectionState.rowIndex >= 0 && !editLocked && !selectedCellCannotEdit && !selectedCellMasked)}
+        selectionLabel={selectionState?.rangeLabel || ''}
+        changeToken={`${saveStatus}:${reloadToken || ''}:${searchAccessToken}`}
+        readCells={async (commitEditor) => {
+          if (commitEditor) {
+            if (imeComposingRef.current) throw new Error('请先完成正在输入的文字')
+            commitActiveCellEditor()
+          }
+          // Background index refreshes must not commit a half-typed cell.
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook()
+          const worksheet = workbook?.getActiveSheet()
+          if (!workbook || !worksheet) return []
+          const snapshot = workbook.save().sheets[worksheet.getSheetId()]
+          const result: SheetSearchCell[] = []
+          const rules = protectionSnapshotRef.current
+          const hiddenRows = new Set(rules.rows.filter((rule) => rule.masked_for_current_user).map((rule) => rule.row_index))
+          const hiddenColumns = new Set(rules.columns.filter((rule) => rule.masked_for_current_user).map((rule) => rule.column_key))
+          const hiddenCells = new Set(rules.cells.filter((rule) => rule.masked_for_current_user).map((rule) => `${rule.row_index}:${rule.column_key}`))
+          let visited = 0
+          for (const [rowKey, rowData] of Object.entries(snapshot?.cellData || {})) {
+            const row = Number(rowKey)
+            if (!Number.isInteger(row) || row < 1) continue
+            for (const [columnKey, cell] of Object.entries((rowData || {}) as Record<string, ICellData | null>)) {
+              const column = Number(columnKey)
+              if (!Number.isInteger(column) || !cell) continue
+              const definition = latestSheetRef.current.columns?.[column]
+              if (!definition || !permissions?.sheet.canView || resolveCellPermission(permissions, definition.key, row - 1) === 'none' || hiddenRows.has(row - 1) || hiddenColumns.has(definition.key) || hiddenCells.has(`${row - 1}:${definition.key}`)) continue
+              const displayed = worksheet.getRange(row, column, 1, 1).getDisplayValue()
+              const raw = cell.v ?? cell.p?.body?.dataStream ?? ''
+              if (displayed === '••••' || raw === '••••') continue
+              const text = [displayed, raw].filter((part) => part !== null && part !== undefined && part !== '').map(String).join('\n')
+              if (text) result.push({ row, column, text })
+              if (++visited % 500 === 0) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+            }
+          }
+          return result.sort((a, b) => a.row - b.row || a.column - b.column)
+        }}
+        focusCell={(row, column) => {
+          containerRef.current?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
+          const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
+          worksheet?.getRange(row, column, 1, 1).activate()
+          worksheet?.scrollToCell(row, column)
+          syncSelectionState()
+        }}
+        moveCell={async (rowDelta, columnDelta) => {
+          if (imeComposingRef.current) throw new Error('请先完成正在输入的文字')
+          commitActiveCellEditor()
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          containerRef.current?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
+          const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
+          if (!worksheet) return
+          const range = worksheet.getActiveRange()
+          const row = Math.min(worksheet.getMaxRows() - 1, Math.max(1, (range?.getRow() ?? 1) + rowDelta))
+          const column = Math.min(worksheet.getMaxColumns() - 1, Math.max(0, (range?.getColumn() ?? 0) + columnDelta))
+          worksheet.getRange(row, column, 1, 1).activate()
+          worksheet.scrollToCell(row, column)
+          syncSelectionState()
+        }}
+        undo={async () => {
+          if (imeComposingRef.current) throw new Error('请先完成正在输入的文字')
+          commitActiveCellEditor()
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          if (!await univerApiRef.current?.univerAPI.undo()) throw new Error('没有可撤销的操作（重新打开表格后可使用版本历史恢复）')
+          syncSelectionState()
+          await persistRef.current?.()
+        }}
+        redo={async () => {
+          if (imeComposingRef.current) throw new Error('请先完成正在输入的文字')
+          commitActiveCellEditor()
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          if (!await univerApiRef.current?.univerAPI.redo()) throw new Error('没有可重做的操作')
+          syncSelectionState()
+          await persistRef.current?.()
+        }}
+        readSelected={() => {
+          const range = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()?.getActiveRange()
+          const column = latestSheetRef.current.columns?.[range?.getColumn() ?? -1]
+          if (!range || !column || range.getRow() < 1 || !permissions?.sheet.canView || resolveCellPermission(permissions, column.key, range.getRow() - 1) === 'none') return null
+          const row = range.getRow() - 1
+          const rules = protectionSnapshotRef.current
+          if (rules.rows.some((rule) => rule.row_index === row && rule.masked_for_current_user) || rules.columns.some((rule) => rule.column_key === column.key && rule.masked_for_current_user) || rules.cells.some((rule) => rule.row_index === row && rule.column_key === column.key && rule.masked_for_current_user)) return null
+          return { row: range.getRow(), column: range.getColumn(), value: String(range.getFormula() || (range.getValue() ?? '')) }
+        }}
+        writeSelected={async (value, expected) => {
+          const range = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()?.getActiveRange()
+          const column = latestSheetRef.current.columns?.[range?.getColumn() ?? -1]
+          if (!range || range.getRow() !== expected.row || range.getColumn() !== expected.column) throw new Error('选区已变化，请回到原单元格或重新打开编辑')
+          if (!column || range.getRow() < 1 || editLocked || selectedCellCannotEdit || selectedCellMasked || !canEditCell(column.key, range.getRow() - 1)) throw new Error('这个单元格不可编辑')
+          if (column.type === 'formula' && !value.trim().startsWith('=')) throw new Error('公式列不能写入普通值，请先明确取消该列公式')
+          // A range selection must not turn the phone's one-cell editor into a
+          // bulk overwrite. Only edit its active/top-left cell.
+          const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
+          worksheet?.getRange(range.getRow(), range.getColumn(), 1, 1).setValue(mobileCellValue(value, column.type))
+          syncSelectionState()
+          await persistRef.current?.()
+        }}
+      />
+
       {/* Hover card of a non plain text badge. The badges themselves are float
           DOMs anchored by Univer; this layer only draws the card, so it stays
           click through and pointer events never leak onto the grid. */}
@@ -5088,11 +5201,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       {onlineCollaborators.length > 0 && (
         <div
           ref={presenceWidgetRef}
-          {...presenceDrag.handleProps}
           style={presenceDrag.style}
           className={`absolute right-4 top-14 z-[22] w-auto max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 ${presenceDrag.dragging ? 'cursor-grabbing opacity-100 select-none' : 'cursor-grab'}`}
         >
-          <button type="button" onClick={() => setPresenceExpanded((current) => !current)} className="ml-auto flex min-h-10 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员（可拖动）' : '查看在线协作人员（可拖动）'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
+          <button {...presenceDrag.handleProps} type="button" onClick={() => setPresenceExpanded((current) => !current)} className="touch-none select-none ml-auto flex min-h-11 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员（可拖动）' : '查看在线协作人员（可拖动）'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
             <UserRoundCheck className="h-4 w-4 shrink-0 text-emerald-600" />
             <div className="flex -space-x-1.5">
               {displayedCollaborators.slice(0, 4).map((entry) => {
