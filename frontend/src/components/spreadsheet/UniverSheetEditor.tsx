@@ -733,6 +733,204 @@ function getWheelPointerOffset(root: HTMLElement, event: WheelEvent) {
   return { x, y }
 }
 
+/**
+ * Univer 0.6 only pans the sheet viewport through `wheel` events and tags its
+ * render canvas with `touch-action: none`. Phones and tablets never fire a
+ * wheel, so a one-finger drag fell through to Univer's selection-drag handler
+ * and the sheet could not be moved at all ("单元格划不动").
+ *
+ * This helper turns a one-finger drag into the synthetic wheel events Univer
+ * already understands. Before panning it also ends the in-flight pointer
+ * interaction so the same gesture is not simultaneously treated as a range
+ * selection. It returns a disposer that removes every listener it added.
+ */
+function attachUniverTouchPanning(root: HTMLElement) {
+  // Distance the finger must travel before the touch counts as a pan instead of a tap.
+  const PAN_THRESHOLD_PX = 6
+  // Momentum after the finger lifts, so the sheet keeps gliding like a native scroller.
+  const MOMENTUM_DECAY = 0.94
+  const MOMENTUM_MIN_PX_PER_MS = 0.05
+  const MOMENTUM_MAX_FRAMES = 90
+
+  let pointerId: number | null = null
+  let tracking = false
+  let panning = false
+  let startX = 0
+  let startY = 0
+  let lastX = 0
+  let lastY = 0
+  let lastMoveAt = 0
+  let velocityX = 0
+  let velocityY = 0
+  let momentumFrame = 0
+
+  const getCanvas = () => getLargestVisibleElement(root, '.univer-render-canvas')
+
+  const cancelMomentum = () => {
+    if (momentumFrame) {
+      cancelAnimationFrame(momentumFrame)
+      momentumFrame = 0
+    }
+  }
+
+  const emitWheel = (
+    canvas: HTMLElement,
+    deltaX: number,
+    deltaY: number,
+    clientX: number,
+    clientY: number
+  ) => {
+    if (!deltaX && !deltaY) return
+    canvas.dispatchEvent(
+      new WheelEvent('wheel', {
+        deltaX,
+        deltaY,
+        deltaMode: 0,
+        clientX,
+        clientY,
+        bubbles: true,
+        cancelable: true,
+      })
+    )
+  }
+
+  const endPointerInteraction = () => {
+    const canvas = getCanvas()
+    if (!canvas) return
+    // Univer subscribes its selection-drag handler on pointermove and tears it
+    // down on pointerup. A synthetic pointerup makes it stop extending the
+    // selection while the finger keeps moving, without cancelling the gesture.
+    canvas.dispatchEvent(
+      new PointerEvent('pointerup', {
+        pointerId: pointerId ?? 1,
+        pointerType: 'touch',
+        button: 0,
+        buttons: 0,
+        clientX: lastX,
+        clientY: lastY,
+        bubbles: true,
+        cancelable: true,
+      })
+    )
+  }
+
+  const onPointerDown = (event: PointerEvent) => {
+    if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return
+    pointerId = event.pointerId
+  }
+
+  const onTouchStart = (event: TouchEvent) => {
+    cancelMomentum()
+    if (event.touches.length !== 1) {
+      tracking = false
+      return
+    }
+    const touch = event.touches[0]
+    tracking = true
+    panning = false
+    startX = lastX = touch.clientX
+    startY = lastY = touch.clientY
+    lastMoveAt = performance.now()
+    velocityX = 0
+    velocityY = 0
+  }
+
+  const onTouchMove = (event: TouchEvent) => {
+    if (!tracking || event.touches.length !== 1) return
+    const touch = event.touches[0]
+    const x = touch.clientX
+    const y = touch.clientY
+
+    if (!panning) {
+      if (
+        Math.abs(x - startX) < PAN_THRESHOLD_PX &&
+        Math.abs(y - startY) < PAN_THRESHOLD_PX
+      ) {
+        return
+      }
+      panning = true
+      // Stop Univer from growing the selection before the first pan step.
+      endPointerInteraction()
+    }
+
+    // Keep the browser from also scrolling the page or triggering overscroll.
+    event.preventDefault()
+
+    const deltaX = lastX - x
+    const deltaY = lastY - y
+    const now = performance.now()
+    const elapsed = Math.max(1, now - lastMoveAt)
+    // Exponential smoothing keeps the fling velocity from spiking on one sample.
+    velocityX = velocityX * 0.6 + (deltaX / elapsed) * 0.4
+    velocityY = velocityY * 0.6 + (deltaY / elapsed) * 0.4
+    lastMoveAt = now
+    lastX = x
+    lastY = y
+
+    const canvas = getCanvas()
+    if (canvas) emitWheel(canvas, deltaX, deltaY, x, y)
+  }
+
+  const onTouchEnd = () => {
+    if (!tracking) return
+    tracking = false
+    if (!panning) return
+    panning = false
+
+    const canvas = getCanvas()
+    if (!canvas) return
+
+    let frameVelocityX = velocityX
+    let frameVelocityY = velocityY
+    let frames = 0
+    if (
+      Math.abs(frameVelocityX) < MOMENTUM_MIN_PX_PER_MS &&
+      Math.abs(frameVelocityY) < MOMENTUM_MIN_PX_PER_MS
+    ) {
+      return
+    }
+
+    const step = () => {
+      frameVelocityX *= MOMENTUM_DECAY
+      frameVelocityY *= MOMENTUM_DECAY
+      frames += 1
+      if (
+        frames > MOMENTUM_MAX_FRAMES ||
+        (Math.abs(frameVelocityX) < MOMENTUM_MIN_PX_PER_MS &&
+          Math.abs(frameVelocityY) < MOMENTUM_MIN_PX_PER_MS)
+      ) {
+        momentumFrame = 0
+        return
+      }
+      emitWheel(canvas, frameVelocityX * 16, frameVelocityY * 16, lastX, lastY)
+      momentumFrame = requestAnimationFrame(step)
+    }
+    momentumFrame = requestAnimationFrame(step)
+  }
+
+  const onTouchCancel = () => {
+    tracking = false
+    panning = false
+    cancelMomentum()
+  }
+
+  // Capture-phase pointerdown records the pointer id used by the synthetic pointerup.
+  root.addEventListener('pointerdown', onPointerDown, true)
+  root.addEventListener('touchstart', onTouchStart, { passive: true })
+  root.addEventListener('touchmove', onTouchMove, { passive: false })
+  root.addEventListener('touchend', onTouchEnd)
+  root.addEventListener('touchcancel', onTouchCancel)
+
+  return () => {
+    cancelMomentum()
+    root.removeEventListener('pointerdown', onPointerDown, true)
+    root.removeEventListener('touchstart', onTouchStart)
+    root.removeEventListener('touchmove', onTouchMove)
+    root.removeEventListener('touchend', onTouchEnd)
+    root.removeEventListener('touchcancel', onTouchCancel)
+  }
+}
+
 function cloneJsonSnapshot<T>(value: T): T {
   try {
     if (typeof structuredClone === 'function') {
@@ -3518,6 +3716,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       window.removeEventListener('scroll', commitBeforeScroll, true)
     }
   }, [commitActiveCellEditor, editLocked])
+
+  // Touch devices have no wheel, so Univer's wheel-driven viewport cannot move.
+  // Translate one-finger drags into the wheel events Univer expects.
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root) return
+    if (typeof window === 'undefined' || !('ontouchstart' in window)) return
+
+    return attachUniverTouchPanning(root)
+  }, [])
 
   useEffect(() => {
     const el = containerRef.current

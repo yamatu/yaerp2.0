@@ -41,6 +41,9 @@ type agentRunState struct {
 	reply             strings.Builder
 	consecutiveErrors int
 	aborted           bool
+	// openContext carries the workbook/sheet the employee has open in the UI so
+	// every tool call can search the visible table before anything else.
+	openContext *openSheetContext
 }
 
 func newAgentRunState(userID int64, assistant *activeAIAssistant, conversation []map[string]any, toolDefs []openAIToolDefinition) *agentRunState {
@@ -115,6 +118,7 @@ type PreparedAgentStream struct {
 	assistant    *activeAIAssistant
 	conversation []map[string]any
 	toolDefs     []openAIToolDefinition
+	openContext  *openSheetContext
 }
 
 // PrepareStream validates a streaming request without contacting the model.
@@ -136,6 +140,7 @@ func (s *AIService) PrepareStream(userID, assistantID int64, messages []ChatMess
 		assistant:    assistant,
 		conversation: conversation,
 		toolDefs:     toolDefs,
+		openContext:  openSheetContextFromChatContext(chatContext),
 	}, nil
 }
 
@@ -175,6 +180,7 @@ func (s *AIService) runAgentStream(
 ) (*ChatResponse, error) {
 	assistant := prepared.assistant
 	state := newAgentRunState(prepared.userID, assistant, prepared.conversation, prepared.toolDefs)
+	state.openContext = prepared.openContext
 
 	if err := emit(AgentEvent{Type: AgentEventStart}); err != nil {
 		return nil, err
@@ -435,6 +441,7 @@ func (s *AIService) prepareToolCall(state *agentRunState, call openAIToolCall) p
 		}
 	}
 	args["_assistant_id"] = state.assistant.ID
+	state.openContext.inject(args)
 	prepared.args = args
 	return prepared
 }
@@ -555,23 +562,25 @@ func encodeToolResult(data any) string {
 // readOnlyAgentTools lists the tools that only read data. They are safe to run
 // concurrently and in any order.
 var readOnlyAgentTools = map[string]bool{
-	"get_user_context":        true,
-	"get_my_permissions":      true,
-	"get_erp_context":         true,
-	"search_erp_customers":    true,
-	"search_erp_orders":       true,
-	"get_erp_order":           true,
-	"search_erp_suppliers":    true,
-	"query_sheet":             true,
-	"inspect_sheet_range":     true,
-	"filter_sheet_rows":       true,
-	"search_spreadsheets":     true,
-	"search_sheet_rows":       true,
-	"lookup_sheet_records":    true,
-	"calculate_sheet_metrics": true,
-	"calculate_expression":    true,
-	"list_summary_pages":      true,
-	"list_sheet_versions":     true,
+	"get_user_context":          true,
+	"get_my_permissions":        true,
+	"get_erp_context":           true,
+	"search_erp_customers":      true,
+	"search_erp_orders":         true,
+	"get_erp_order":             true,
+	"search_erp_suppliers":      true,
+	"query_sheet":               true,
+	"get_open_workbook_context": true,
+	"search_sheet_content":      true,
+	"inspect_sheet_range":       true,
+	"filter_sheet_rows":         true,
+	"search_spreadsheets":       true,
+	"search_sheet_rows":         true,
+	"lookup_sheet_records":      true,
+	"calculate_sheet_metrics":   true,
+	"calculate_expression":      true,
+	"list_summary_pages":        true,
+	"list_sheet_versions":       true,
 }
 
 // toolDisplayLabel returns the short Chinese label shown while a tool runs.
@@ -583,49 +592,51 @@ func toolDisplayLabel(name string) string {
 }
 
 var agentToolLabels = map[string]string{
-	"get_user_context":         "读取可访问表格",
-	"get_my_permissions":       "核对权限",
-	"get_erp_context":          "读取 ERP 概览",
-	"search_erp_customers":     "搜索客户",
-	"search_erp_orders":        "搜索业务单",
-	"get_erp_order":            "读取业务单",
-	"search_erp_suppliers":     "搜索供应商",
-	"preview_erp_action":       "准备 ERP 操作",
-	"query_sheet":              "读取工作表",
-	"search_spreadsheets":      "搜索表格",
-	"search_sheet_rows":        "检索数据行",
-	"lookup_sheet_records":     "按条件查记录",
-	"calculate_sheet_metrics":  "计算统计指标",
-	"calculate_expression":     "计算表达式",
-	"update_cell":              "更新单元格",
-	"insert_row":               "插入行",
-	"delete_row":               "删除行",
-	"insert_column":            "插入列",
-	"auto_fill_column":         "自动填充列",
-	"generate_report":          "生成报表",
-	"schedule_daily_report":    "创建日报计划",
-	"run_workflow":             "执行批量操作",
-	"preview_spreadsheet_plan": "生成表格方案",
-	"apply_spreadsheet_plan":   "应用表格方案",
-	"create_workbook":          "创建工作簿",
-	"create_sheet":             "创建工作表",
-	"update_workbook":          "修改工作簿",
-	"update_sheet_name":        "重命名工作表",
-	"set_cell_format":          "设置列类型",
-	"format_cell_range":        "设置单元格格式",
-	"configure_approval_flow":  "配置审批流程",
-	"create_financial_report":  "生成财务分析",
-	"list_summary_pages":       "列出总结页",
-	"create_summary_page":      "创建总结页",
-	"update_summary_page":      "更新总结页",
-	"batch_update_cells":       "批量写单元格",
-	"run_sheet_formulas":       "写入公式",
-	"sort_sheet_range":         "排序数据",
-	"filter_sheet_rows":        "筛选数据",
-	"dedupe_sheet_rows":        "去重合并",
-	"run_spreadsheet_script":   "执行表格脚本",
-	"inspect_sheet_range":      "查看区域结构",
-	"describe_sheet_columns":   "查看列结构",
-	"list_sheet_versions":      "查看版本历史",
-	"restore_sheet_version":    "恢复历史版本",
+	"get_user_context":          "读取可访问表格",
+	"get_my_permissions":        "核对权限",
+	"get_erp_context":           "读取 ERP 概览",
+	"search_erp_customers":      "搜索客户",
+	"search_erp_orders":         "搜索业务单",
+	"get_erp_order":             "读取业务单",
+	"search_erp_suppliers":      "搜索供应商",
+	"preview_erp_action":        "准备 ERP 操作",
+	"query_sheet":               "读取工作表",
+	"get_open_workbook_context": "识别当前工作簿",
+	"search_sheet_content":      "快速检索表格内容",
+	"search_spreadsheets":       "搜索表格",
+	"search_sheet_rows":         "检索数据行",
+	"lookup_sheet_records":      "按条件查记录",
+	"calculate_sheet_metrics":   "计算统计指标",
+	"calculate_expression":      "计算表达式",
+	"update_cell":               "更新单元格",
+	"insert_row":                "插入行",
+	"delete_row":                "删除行",
+	"insert_column":             "插入列",
+	"auto_fill_column":          "自动填充列",
+	"generate_report":           "生成报表",
+	"schedule_daily_report":     "创建日报计划",
+	"run_workflow":              "执行批量操作",
+	"preview_spreadsheet_plan":  "生成表格方案",
+	"apply_spreadsheet_plan":    "应用表格方案",
+	"create_workbook":           "创建工作簿",
+	"create_sheet":              "创建工作表",
+	"update_workbook":           "修改工作簿",
+	"update_sheet_name":         "重命名工作表",
+	"set_cell_format":           "设置列类型",
+	"format_cell_range":         "设置单元格格式",
+	"configure_approval_flow":   "配置审批流程",
+	"create_financial_report":   "生成财务分析",
+	"list_summary_pages":        "列出总结页",
+	"create_summary_page":       "创建总结页",
+	"update_summary_page":       "更新总结页",
+	"batch_update_cells":        "批量写单元格",
+	"run_sheet_formulas":        "写入公式",
+	"sort_sheet_range":          "排序数据",
+	"filter_sheet_rows":         "筛选数据",
+	"dedupe_sheet_rows":         "去重合并",
+	"run_spreadsheet_script":    "执行表格脚本",
+	"inspect_sheet_range":       "查看区域结构",
+	"describe_sheet_columns":    "查看列结构",
+	"list_sheet_versions":       "查看版本历史",
+	"restore_sheet_version":     "恢复历史版本",
 }
