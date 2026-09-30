@@ -22,14 +22,21 @@ const (
 )
 
 type AIHandler struct {
-	aiService *service.AIService
-	hub       *ws.Hub
+	aiService     *service.AIService
+	conversations *service.AIConversationService
+	hub           *ws.Hub
 }
 
 func NewAIHandler(aiService *service.AIService, hub *ws.Hub) *AIHandler {
 	return &AIHandler{aiService: aiService, hub: hub}
 }
 
+func (h *AIHandler) SetConversations(conversations *service.AIConversationService) {
+	h.conversations = conversations
+}
+
+// ChatStream answers a legacy chat turn as a request-bound SSE stream. The web
+// panel uses /ai/conversations/:id/turns for durable backend execution.
 // ChatStream answers a chat turn as a Server-Sent Events stream.
 //
 // The response is a sequence of `data: {"type": ...}` lines. The browser reads
