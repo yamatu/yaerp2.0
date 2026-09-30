@@ -6,11 +6,12 @@ import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, Ch
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useFloatingDrag, computeTopLeftResize } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
+import { useAIConversations } from '@/hooks/useAIConversations'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
-import { notifyDataChanged, prepareDataMutation } from '@/lib/dataEvents'
-import type { AIAgentEvent, AIAssistant, AIChatResponse, AIChatToolTrace, AIERPApplyResult, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
+import { prepareDataMutation } from '@/lib/dataEvents'
+import type { AIAssistant, AIChatToolTrace, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
 
 interface PersistedMessage {
   id: string
@@ -55,53 +56,7 @@ interface AIComposeEventDetail {
 const DEFAULT_PANEL_SIZE: PanelSize = { width: 576, height: 720 }
 const MIN_PANEL_WIDTH = 360
 const MIN_PANEL_HEIGHT = 420
-const MAX_CHAT_MESSAGES = 100
-const MAX_CHAT_CONTEXT_MESSAGES = 24
-const MAX_CHAT_HISTORY_CHARS = 2 * 1024 * 1024
-const MAX_CHAT_MESSAGE_CHARS = 120_000
 const MAX_CHAT_INPUT_CHARS = 20_000
-const MAX_CHAT_TRACE_DATA_CHARS = 256_000
-
-function compactTrace(trace: AIChatToolTrace): AIChatToolTrace {
-  if (trace.data === undefined) return trace
-  let serialized = ''
-  try {
-    serialized = JSON.stringify(trace.data)
-  } catch {
-    return { ...trace, data: { truncated: true } }
-  }
-  if (serialized.length <= MAX_CHAT_TRACE_DATA_CHARS) return trace
-  return { ...trace, data: { truncated: true, preview: serialized.slice(0, MAX_CHAT_TRACE_DATA_CHARS) } }
-}
-
-function compactChatMessages(items: PersistedMessage[]): PersistedMessage[] {
-  const normalized = items
-    .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
-    .slice(-MAX_CHAT_MESSAGES)
-    .map((item) => ({
-      ...item,
-      id: typeof item.id === 'string' ? item.id.slice(0, 128) : makeId(),
-      content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
-      toolTraces: Array.isArray(item.toolTraces) ? item.toolTraces.slice(0, 24).map(compactTrace) : undefined,
-      pendingOperations: Array.isArray(item.pendingOperations) ? item.pendingOperations.slice(0, 100) : undefined,
-      touchedSheetIds: Array.isArray(item.touchedSheetIds) ? item.touchedSheetIds.slice(0, 100) : undefined,
-    }))
-
-  const result: PersistedMessage[] = []
-  let totalChars = 0
-  for (let index = normalized.length - 1; index >= 0; index -= 1) {
-    let item = normalized[index]
-    let itemChars = JSON.stringify(item).length
-    if (itemChars > MAX_CHAT_HISTORY_CHARS) {
-      item = { ...item, content: item.content.slice(0, 1024), toolTraces: undefined, pendingOperations: undefined }
-      itemChars = JSON.stringify(item).length
-    }
-    if (result.length > 0 && totalChars + itemChars > MAX_CHAT_HISTORY_CHARS) break
-    result.unshift(item)
-    totalChars += itemChars
-  }
-  return result
-}
 
 type AIIdeaIcon = 'sparkles' | 'table' | 'chart' | 'wand'
 
@@ -208,10 +163,6 @@ function clampPanelSize(size: PanelSize): PanelSize {
     width: Math.round(Math.min(Math.max(MIN_PANEL_WIDTH, window.innerWidth - 104), Math.max(MIN_PANEL_WIDTH, size.width))),
     height: Math.round(Math.min(Math.max(MIN_PANEL_HEIGHT, window.innerHeight - 40), Math.max(MIN_PANEL_HEIGHT, size.height))),
   }
-}
-
-function makeId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
 function toolTitle(name: string) {
@@ -606,16 +557,16 @@ function ERPReadTraceGroup({ traces }: { traces: AIChatToolTrace[] }) {
 
 export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const userId = getStoredUser()?.id ?? 0
-  const [messages, setMessages] = useState<PersistedMessage[]>([])
+  const cloud = useAIConversations(userId, open)
+  const { messages, loading } = cloud
+  const [sendError, setSendError] = useState('')
   const [inputValue, setInputValue] = useState('')
-  const [loading, setLoading] = useState(false)
   const [thinkingElapsed, setThinkingElapsed] = useState(0)
   // Live activity of the running agent turn. It is derived from the SSE event
   // stream so the panel can show what the agent is doing right now instead of
   // an opaque spinner.
-  const [liveActivity, setLiveActivity] = useState<{ label: string; detail: string } | null>(null)
-  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
-  const abortRef = useRef<AbortController | null>(null)
+  const liveActivity = cloud.liveActivity
+  const streamingMessageId = loading ? cloud.run?.message_id || null : null
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [assistants, setAssistants] = useState<AIAssistant[]>([])
   const [assistantId, setAssistantId] = useUserPreference<number | null>(
@@ -661,13 +612,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
-  const historyReadyRef = useRef(false)
   // The apply handlers run from callbacks that must not re-create on every
   // keystroke, so keep the values they need for a follow-up agent turn in refs.
-  const messagesRef = useRef<PersistedMessage[]>([])
   const loadingRef = useRef(false)
-  const agentTurnRef = useRef<(prompt: string) => Promise<void>>(async () => {})
-  const storageKey = userId ? `yaerp_ai_chat_history_${userId}` : 'yaerp_ai_chat_history_guest'
   const panelSizeStorageKey = userId ? `yaerp_ai_panel_size_${userId}` : 'yaerp_ai_panel_size_guest'
   const panelDrag = useFloatingDrag({ elementRef: panelRef, enabled: isDesktopViewport })
 
@@ -679,8 +626,12 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     return () => media.removeEventListener('change', sync)
   }, [])
 
-  messagesRef.current = messages
   loadingRef.current = loading
+
+  useEffect(() => {
+    const selected = cloud.conversations.find((item) => item.id === cloud.conversationId)
+    if (selected?.assistant_id) setAssistantId(selected.assistant_id)
+  }, [cloud.conversationId, setAssistantId])
 
   const filteredContextWorkbooks = useMemo(() => {
     const keyword = normalizeSearchText(contextWorkbookSearch)
@@ -800,24 +751,6 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     return () => { active = false }
   }, [assistants.length, open])
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    try {
-      const raw = localStorage.getItem(storageKey)
-      if (!raw) {
-        setMessages([])
-        historyReadyRef.current = true
-        return
-      }
-      const parsed = JSON.parse(raw) as PersistedMessage[]
-	  setMessages(Array.isArray(parsed) ? compactChatMessages(parsed) : [])
-    } catch {
-      setMessages([])
-    } finally {
-      historyReadyRef.current = true
-      requestAnimationFrame(() => scrollToBottom('auto'))
-    }
-  }, [scrollToBottom, storageKey])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -863,293 +796,54 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     return () => window.clearInterval(timer)
   }, [loading])
 
-  useEffect(() => {
-    if (typeof window === 'undefined' || !historyReadyRef.current) return
-	try {
-	  localStorage.setItem(storageKey, JSON.stringify(compactChatMessages(messages)))
-	} catch {
-	  // Storage can be disabled or full; keep the in-memory conversation usable.
-	}
-  }, [messages, storageKey])
 
   const runChatTurn = useCallback(async (prompt: string) => {
-    if (loadingRef.current) return
-
-    const userMessage: PersistedMessage = {
-      id: makeId(),
-      role: 'user',
-      content: prompt,
-      createdAt: Date.now(),
-    }
-
-    const history = compactChatMessages([...messagesRef.current, userMessage])
-    const historyMessages = history.slice(-MAX_CHAT_CONTEXT_MESSAGES).map((item) => ({
-      role: item.role,
-      content: item.content.slice(0, MAX_CHAT_MESSAGE_CHARS),
-    }))
-
-    loadingRef.current = true
-    setMessages(history)
-    setLoading(true)
-    setLiveActivity({ label: '正在连接智能体', detail: '准备上下文和工具' })
-
-    // The assistant placeholder is created immediately so streamed deltas have
-    // somewhere to land; it is replaced by the final payload at agent_end.
-    const assistantMessageId = makeId()
-    let streamedContent = ''
-    let streamedTraces: AIChatToolTrace[] = []
-    let toolStarted = false
-    const streamedChangedSheetIds = new Set<number>()
-    // Held in an object so the TypeScript compiler keeps the real type: a bare
-    // `let` assigned only inside a callback is narrowed to `never`.
-    const outcome: { result: AIChatResponse | null } = { result: null }
-
-    const upsertAssistantMessage = (patch: Partial<PersistedMessage>) => {
-      setMessages((prev) => {
-        const next = [...prev]
-        const index = next.findIndex((message) => message.id === assistantMessageId)
-        const base: PersistedMessage = index >= 0
-          ? next[index]
-          : { id: assistantMessageId, role: 'assistant', content: '', createdAt: Date.now() }
-        const merged: PersistedMessage = { ...base, ...patch }
-        if (index >= 0) next[index] = merged
-        else next.push(merged)
-        return compactChatMessages(next)
-      })
-    }
-
-    setStreamingMessageId(assistantMessageId)
-
-    const applyToolEvent = (event: AIAgentEvent) => {
-      const tool = event.tool
-      if (!tool) return
-      if (tool.status === 'running') {
-        toolStarted = true
-        setLiveActivity({ label: `正在${tool.label || '执行工具'}`, detail: tool.name })
-        return
-      }
-      const trace: AIChatToolTrace = {
-        name: tool.name,
-        status: tool.status === 'error' ? 'error' : 'success',
-        summary: tool.summary,
-        data: tool.data,
-        touched_sheet_ids: tool.touched_sheet_ids,
-      }
-      for (const sheetId of tool.changed_sheet_ids || []) streamedChangedSheetIds.add(sheetId)
-      streamedTraces = [...streamedTraces, trace]
-      upsertAssistantMessage({ content: streamedContent, toolTraces: streamedTraces })
-      setLiveActivity({ label: `已完成${tool.label || '工具'}`, detail: tool.summary || tool.name })
-    }
-
-    const controller = new AbortController()
-    abortRef.current = controller
-
+    if (loadingRef.current || !cloud.ready) return
+    const origin = cloud.conversationId
+    setSendError('')
     try {
       await prepareDataMutation()
-      await api.stream(
-        '/ai/chat/stream',
-        {
-          assistant_id: assistantId,
-          messages: historyMessages,
-          context: contextWorkbook ? {
-            workbook_id: contextWorkbook.id,
-            sheet_ids: contextSheetIds,
-            selection: contextSelection || undefined,
-          } : undefined,
-        },
-        (rawEvent) => {
-          const event = rawEvent as AIAgentEvent
-          switch (event.type) {
-            case 'agent_start':
-              setLiveActivity({ label: '智能体已启动', detail: '分析需求并选择工具' })
-              break
-            case 'message_delta':
-              streamedContent += event.delta || ''
-              setLiveActivity({ label: '正在生成回答', detail: '已开始输出内容' })
-              upsertAssistantMessage({ content: streamedContent })
-              break
-            case 'tool_start':
-            case 'tool_end':
-              applyToolEvent(event)
-              break
-            case 'error':
-              if (event.result) outcome.result = event.result
-              setLiveActivity({ label: '执行出错', detail: event.error || '未知错误' })
-              break
-            case 'agent_end':
-              if (event.result) outcome.result = event.result
-              break
-            default:
-              break
-          }
-        },
-        controller.signal
-      )
-
-      const finalResult = outcome.result
-      const reply = finalResult?.reply || streamedContent || '已完成处理。'
-      upsertAssistantMessage({
-        content: reply,
-        pendingOperations: finalResult?.pending_operations,
-        pendingERPPlan: finalResult?.pending_erp_plan,
-        toolTraces: finalResult?.tool_traces ?? streamedTraces,
-        touchedSheetIds: finalResult?.touched_sheet_ids,
-        applyState: 'idle',
-        erpApplyState: 'idle',
-      })
-
-      if (finalResult?.resources_changed || (finalResult?.changed_sheet_ids?.length ?? 0) > 0) {
-        notifyDataChanged({
-          source: 'ai',
-          sheetIds: finalResult?.changed_sheet_ids || [],
-          resourcesChanged: Boolean(finalResult?.resources_changed),
-        })
-      }
+      await cloud.start(prompt, assistantId, contextWorkbook ? {
+        workbook_id: contextWorkbook.id,
+        sheet_ids: contextSheetIds,
+        selection: contextSelection || undefined,
+      } : undefined)
     } catch (error) {
-      const aborted = error instanceof DOMException && error.name === 'AbortError'
-      const detail = error instanceof Error ? error.message : '请求失败，请稍后重试。'
-      const partial = outcome.result
-      // Writes may have committed before a later model request failed (or the
-      // user stopped the stream). Never lose the partial result or leave the
-      // sheet displaying stale data. A disconnected client has no final result,
-      // so refresh the workbook conservatively.
-      if (toolStarted || partial?.resources_changed || (partial?.changed_sheet_ids?.length ?? 0) > 0) {
-        notifyDataChanged({
-          source: 'ai',
-          sheetIds: partial?.changed_sheet_ids?.length ? partial.changed_sheet_ids : Array.from(new Set([...contextSheetIds, ...streamedChangedSheetIds])),
-          resourcesChanged: true,
-        })
-      }
-      upsertAssistantMessage({
-        content: `${streamedContent || partial?.reply || ''}${streamedContent || partial?.reply ? '\n\n' : ''}${aborted ? '已停止本次处理；已执行的操作可能已经生效。' : `执行未完成：${detail}。已执行的操作可能已经生效。`}`,
-        toolTraces: partial?.tool_traces ?? streamedTraces,
-        touchedSheetIds: partial?.touched_sheet_ids,
-        pendingOperations: partial?.pending_operations,
-        pendingERPPlan: partial?.pending_erp_plan,
-        applyState: 'idle',
-        erpApplyState: 'idle',
-      })
-    } finally {
-      abortRef.current = null
-      setStreamingMessageId(null)
-      setLiveActivity(null)
-      loadingRef.current = false
-      setLoading(false)
+      setSendError(error instanceof Error ? error.message : '提交失败，请重试')
+      if (cloud.isCurrent(origin)) setInputValue(prompt)
     }
-  }, [assistantId, contextSelection, contextSheetIds, contextWorkbook])
+  }, [assistantId, contextSelection, contextSheetIds, contextWorkbook, cloud.start, cloud.ready, cloud.conversationId])
 
-  /** Cancel a running turn. The backend agent loop stops as soon as the stream closes. */
+  // Closing the panel/browser only disconnects observation. This button is the
+  // ONLY action that explicitly cancels the owner-authorized backend run.
   const handleStop = useCallback(() => {
-    abortRef.current?.abort()
-  }, [])
-
-  agentTurnRef.current = runChatTurn
+    void cloud.stop().catch((error) => setSendError(error instanceof Error ? error.message : '停止失败'))
+  }, [cloud.stop])
 
   const handleSend = async () => {
     const trimmed = inputValue.trim().slice(0, MAX_CHAT_INPUT_CHARS)
-    if (!trimmed || loading) return
+    if (!trimmed || loading || !cloud.ready) return
 
     setInputValue('')
     await runChatTurn(trimmed)
   }
 
-  /**
-   * Agent mode: once an employee approves a prepared step, hand control back to
-   * the assistant so it can carry on with the rest of the task instead of
-   * waiting for the next typed instruction.
-   */
-  const continueAgentTask = useCallback((completedStep: string) => {
-    if (!agentMode) return
-    void agentTurnRef.current(
-      `已确认执行上一步方案（${completedStep}）。请继续完成整个任务：如果需要下一步操作，请直接给出方案；如果任务已经全部完成，请说明结果和后续建议。`
-    )
-  }, [agentMode])
-
-  const handleApplyPending = useCallback(async (messageId: string, operations: AISpreadsheetOperation[]) => {
-    setMessages((prev) => prev.map((message) => (
-      message.id === messageId
-        ? { ...message, applyState: 'applying', applyError: '' }
-        : message
-    )))
-
+  // Approval, writes, receipts and the next step ALL run on the backend.
+  const handleApplyApproved = useCallback(async (messageId: string, kind: 'apply' | 'erp') => {
+    if (loading || !cloud.ready) return
+    setSendError('')
     try {
       await prepareDataMutation()
-      const res = await api.post('/ai/spreadsheet/apply', { operations })
-      if (res.code !== 0) {
-        setMessages((prev) => prev.map((message) => (
-          message.id === messageId
-            ? { ...message, applyState: 'failed', applyError: res.message || '写入失败，请稍后重试。' }
-            : message
-        )))
-        return
-      }
-
-      setMessages((prev) => prev.map((message) => (
-        message.id === messageId
-          ? { ...message, applyState: 'applied', applyError: '' }
-          : message
-      )))
-      notifyDataChanged({
-        source: 'ai',
-        sheetIds: Array.from(new Set(operations.map((operation) => operation.sheet_id).filter((sheetId) => sheetId > 0))),
-        resourcesChanged: false,
-      })
-      continueAgentTask(`已写入 ${operations.length} 项表格修改`)
-    } catch {
-      setMessages((prev) => prev.map((message) => (
-        message.id === messageId
-          ? { ...message, applyState: 'failed', applyError: '写入失败，请稍后重试。' }
-          : message
-      )))
-    }
-  }, [continueAgentTask])
-
-  const handleApplyERPPlan = useCallback(async (messageId: string, plan: AIERPPendingPlan) => {
-    setMessages((prev) => prev.map((message) => (
-      message.id === messageId
-        ? { ...message, erpApplyState: 'applying', erpApplyError: '' }
-        : message
-    )))
-
-    try {
-      await prepareDataMutation()
-      const res = await api.post<AIERPApplyResult>('/ai/erp/apply', { plan_token: plan.plan_token })
-      if (res.code !== 0 || !res.data) {
-        setMessages((prev) => prev.map((message) => (
-          message.id === messageId
-            ? { ...message, erpApplyState: 'failed', erpApplyError: res.message || 'ERP 操作失败，请重新生成方案。' }
-            : message
-        )))
-        return
-      }
-
-      const result = res.data
-      const followUp: PersistedMessage = {
-        id: makeId(),
-        role: 'assistant',
-        content: `**${result.message}**${result.next_step ? `\n\n${result.next_step}` : ''}`,
-        createdAt: Date.now(),
-      }
-      setMessages((prev) => [
-        ...prev.map((message) => (
-          message.id === messageId
-            ? { ...message, erpApplyState: 'applied' as const, erpApplyError: '' }
-            : message
-        )),
-        followUp,
-      ])
-      notifyDataChanged({ source: 'ai', sheetIds: [], resourcesChanged: true })
-      continueAgentTask(result.message || 'ERP 步骤已执行')
+      await cloud.startAction(messageId, kind, agentMode, assistantId, contextWorkbook ? {
+        workbook_id: contextWorkbook.id, sheet_ids: contextSheetIds, selection: contextSelection || undefined,
+      } : undefined)
     } catch (error) {
-      setMessages((prev) => prev.map((message) => (
-        message.id === messageId
-          ? { ...message, erpApplyState: 'failed', erpApplyError: error instanceof Error ? error.message : 'ERP 操作失败，请重新生成方案。' }
-          : message
-      )))
+      setSendError(error instanceof Error ? error.message : '提交确认方案失败')
     }
-  }, [continueAgentTask])
+  }, [loading, cloud.ready, cloud.startAction, agentMode, assistantId, contextWorkbook, contextSheetIds, contextSelection])
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing) return
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
       void handleSend()
@@ -1170,11 +864,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   }, [])
 
   const handleClearHistory = () => {
-    if (!window.confirm('确定要清空当前账号的 AI 对话记录吗？')) return
-    setMessages([])
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem(storageKey)
-    }
+    if (!window.confirm('确定删除这个对话吗？其它历史对话会保留；运行中的任务需先显式停止。')) return
+    void cloud.remove().catch((error) => setSendError(error instanceof Error ? error.message : '删除失败'))
   }
 
   const handleResizeStart = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
@@ -1346,7 +1037,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             type="button"
             onClick={handleClearHistory}
             className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white"
-            aria-label="清空聊天记录"
+            aria-label="删除当前对话"
           >
             <Trash2 className="h-4 w-4" />
           </button>
@@ -1361,6 +1052,15 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         </div>
       </div>
 
+      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2">
+        <select aria-label="选择历史对话" value={cloud.conversationId || ''} onChange={(event) => { setSendError(''); setInputValue(''); void cloud.select(Number(event.target.value)).catch((error) => setSendError(error.message)) }} className="h-11 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 text-sm">
+          {!cloud.ready && <option value="">正在同步账号历史…</option>}
+          {cloud.conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
+        </select>
+        <button type="button" disabled={!cloud.ready} onClick={() => { setSendError(''); setInputValue(''); void cloud.create(assistantId).catch((error) => setSendError(error.message)) }} className="h-11 shrink-0 rounded-lg bg-sky-600 px-3 text-sm text-white disabled:opacity-50">新对话</button>
+      </div>
+      <div className="shrink-0 px-3 py-1 text-[11px] text-slate-500">账号历史已云端同步 · 手机/电脑可接着聊 · 关闭页面不停止后台任务</div>
+      {(sendError || cloud.error) && <div role="alert" className="shrink-0 bg-rose-50 px-3 py-2 text-xs text-rose-700">{sendError || cloud.error}</div>}
       <div ref={messagesScrollRef} className="relative flex-1 space-y-4 overflow-y-auto px-4 py-4">
         {messages.length === 0 && (
           <div className="mt-6 border-y border-slate-200 bg-slate-50 px-5 py-7 text-center">
@@ -1438,12 +1138,12 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                       ) : (
                         <button
                           type="button"
-                          onClick={() => void handleApplyPending(message.id, message.pendingOperations || [])}
-                          disabled={message.applyState === 'applying'}
+                          onClick={() => void handleApplyApproved(message.id, 'apply')}
+                          disabled={loading || !cloud.ready || message.applyState === 'applying' || message.applyState === 'failed'}
                           className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {message.applyState === 'applying' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
-                          {message.applyState === 'applying' ? '写入中...' : '确认写入表格'}
+                          {message.applyState === 'applying' ? '后台写入中...' : message.applyState === 'failed' ? '请核对后生成新方案' : '确认写入表格'}
                         </button>
                       )}
                     </div>
@@ -1509,12 +1209,12 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
                     ) : (
                       <button
                         type="button"
-                        onClick={() => void handleApplyERPPlan(message.id, message.pendingERPPlan as AIERPPendingPlan)}
-                        disabled={message.erpApplyState === 'applying'}
+                        onClick={() => void handleApplyApproved(message.id, 'erp')}
+                        disabled={loading || !cloud.ready || message.erpApplyState === 'applying' || message.erpApplyState === 'failed'}
                         className="inline-flex items-center gap-2 rounded-full bg-sky-700 px-4 py-2 text-xs font-semibold text-white transition hover:bg-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {message.erpApplyState === 'applying' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
-                        {message.erpApplyState === 'applying' ? '正在校验并导入...' : '确认导入 ERP'}
+                        {message.erpApplyState === 'applying' ? '后台校验并导入...' : message.erpApplyState === 'failed' ? '请核对后生成新方案' : '确认导入 ERP'}
                       </button>
                     )}
                   </div>

@@ -259,6 +259,17 @@ func main() {
 	recycleBinHandler := handler.NewRecycleBinHandler(recycleBinService)
 	backupHandler := handler.NewBackupHandler(backupService)
 	aiHandler := handler.NewAIHandler(aiService, hub)
+	conversationService, err := service.NewAIConversationService(db, aiService)
+	if err != nil {
+		log.Fatalf("failed to initialize AI conversations: %v", err)
+	}
+	conversationService.SetFinishedCallback(func(userID int64, result *service.ChatResponse) {
+		for _, sheetID := range result.ChangedSheetIDs {
+			payload, _ := json.Marshal(ws.Message{Type: "sheet_sync", SheetID: sheetID, UserID: userID})
+			hub.BroadcastToSheetExceptClientID(sheetID, payload, "")
+		}
+	})
+	aiHandler.SetConversations(conversationService)
 	automationHandler := handler.NewAutomationHandler(automationService)
 	tradeHandler := handler.NewTradeHandler(tradeService)
 	mailHandler := handler.NewMailHandler(mailService)
@@ -547,6 +558,13 @@ func main() {
 		api.GET("/me/permissions", aiHandler.MyPermissions)
 		api.POST("/ai/chat", aiHandler.Chat)
 		api.POST("/ai/chat/stream", aiHandler.ChatStream)
+		api.GET("/ai/conversations", aiHandler.ListConversations)
+		api.POST("/ai/conversations", aiHandler.CreateConversation)
+		api.GET("/ai/conversations/:id", aiHandler.GetConversation)
+		api.DELETE("/ai/conversations/:id", aiHandler.DeleteConversation)
+		api.POST("/ai/conversations/:id/turns", aiHandler.StartConversationTurn)
+		api.POST("/ai/conversations/:id/runs/:run_id/stop", aiHandler.StopConversationRun)
+		api.PUT("/ai/conversations/:id/messages/:message_id/action", aiHandler.PatchConversationAction)
 		api.POST("/ai/spreadsheet/apply", aiHandler.ApplySpreadsheetPlan)
 		api.POST("/ai/erp/apply", aiHandler.ApplyERPPlan)
 		api.POST("/ai/erp/import/preview", aiHandler.PreviewERPOrderImport)
