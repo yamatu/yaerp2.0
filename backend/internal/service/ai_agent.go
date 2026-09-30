@@ -82,41 +82,43 @@ var formulaKeyArithmeticPattern = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}\s*
 
 func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 	return map[string]ToolFunc{
-		"get_user_context":         s.toolGetUserContext,
-		"get_my_permissions":       s.toolGetMyPermissions,
-		"get_erp_context":          s.toolGetERPContext,
-		"search_erp_customers":     s.toolSearchERPCustomers,
-		"search_erp_orders":        s.toolSearchERPOrders,
-		"get_erp_order":            s.toolGetERPOrder,
-		"search_erp_suppliers":     s.toolSearchERPSuppliers,
-		"preview_erp_action":       s.toolPreviewERPAction,
-		"query_sheet":              s.toolQuerySheet,
-		"search_spreadsheets":      s.toolSearchSpreadsheets,
-		"search_sheet_rows":        s.toolSearchSheetRows,
-		"lookup_sheet_records":     s.toolLookupSheetRecords,
-		"calculate_sheet_metrics":  s.toolCalculateSheetMetrics,
-		"calculate_expression":     s.toolCalculateExpression,
-		"update_cell":              s.toolUpdateCell,
-		"insert_row":               s.toolInsertRow,
-		"delete_row":               s.toolDeleteRow,
-		"insert_column":            s.toolInsertColumn,
-		"auto_fill_column":         s.toolAutoFillColumn,
-		"generate_report":          s.toolGenerateReport,
-		"schedule_daily_report":    s.toolScheduleDailyReport,
-		"run_workflow":             s.toolRunWorkflow,
-		"preview_spreadsheet_plan": s.toolPreviewSpreadsheetPlan,
-		"apply_spreadsheet_plan":   s.toolApplySpreadsheetPlan,
-		"create_workbook":          s.toolCreateWorkbook,
-		"create_sheet":             s.toolCreateSheet,
-		"update_workbook":          s.toolUpdateWorkbook,
-		"update_sheet_name":        s.toolUpdateSheetName,
-		"set_cell_format":          s.toolSetCellFormat,
-		"format_cell_range":        s.toolFormatCellRange,
-		"configure_approval_flow":  s.toolConfigureApprovalFlow,
-		"create_financial_report":  s.toolCreateFinancialReport,
-		"list_summary_pages":       s.toolListSummaryPages,
-		"create_summary_page":      s.toolCreateSummaryPage,
-		"update_summary_page":      s.toolUpdateSummaryPage,
+		"get_user_context":          s.toolGetUserContext,
+		"get_my_permissions":        s.toolGetMyPermissions,
+		"get_erp_context":           s.toolGetERPContext,
+		"search_erp_customers":      s.toolSearchERPCustomers,
+		"search_erp_orders":         s.toolSearchERPOrders,
+		"get_erp_order":             s.toolGetERPOrder,
+		"search_erp_suppliers":      s.toolSearchERPSuppliers,
+		"preview_erp_action":        s.toolPreviewERPAction,
+		"query_sheet":               s.toolQuerySheet,
+		"get_open_workbook_context": s.toolGetOpenWorkbookContext,
+		"search_sheet_content":      s.toolSearchSheetContent,
+		"search_spreadsheets":       s.toolSearchSpreadsheets,
+		"search_sheet_rows":         s.toolSearchSheetRows,
+		"lookup_sheet_records":      s.toolLookupSheetRecords,
+		"calculate_sheet_metrics":   s.toolCalculateSheetMetrics,
+		"calculate_expression":      s.toolCalculateExpression,
+		"update_cell":               s.toolUpdateCell,
+		"insert_row":                s.toolInsertRow,
+		"delete_row":                s.toolDeleteRow,
+		"insert_column":             s.toolInsertColumn,
+		"auto_fill_column":          s.toolAutoFillColumn,
+		"generate_report":           s.toolGenerateReport,
+		"schedule_daily_report":     s.toolScheduleDailyReport,
+		"run_workflow":              s.toolRunWorkflow,
+		"preview_spreadsheet_plan":  s.toolPreviewSpreadsheetPlan,
+		"apply_spreadsheet_plan":    s.toolApplySpreadsheetPlan,
+		"create_workbook":           s.toolCreateWorkbook,
+		"create_sheet":              s.toolCreateSheet,
+		"update_workbook":           s.toolUpdateWorkbook,
+		"update_sheet_name":         s.toolUpdateSheetName,
+		"set_cell_format":           s.toolSetCellFormat,
+		"format_cell_range":         s.toolFormatCellRange,
+		"configure_approval_flow":   s.toolConfigureApprovalFlow,
+		"create_financial_report":   s.toolCreateFinancialReport,
+		"list_summary_pages":        s.toolListSummaryPages,
+		"create_summary_page":       s.toolCreateSummaryPage,
+		"update_summary_page":       s.toolUpdateSummaryPage,
 		// Advanced spreadsheet editing: range based tools that replace hundreds
 		// of single-cell turns with one validated call.
 		"inspect_sheet_range":    s.toolInspectSheetRange,
@@ -202,6 +204,7 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 	if err != nil {
 		return nil, err
 	}
+	openContext := openSheetContextFromChatContext(chatContext)
 	toolDefs := s.buildToolDefinitions()
 	touchedSheets := make(map[int64]struct{})
 	changedSheets := make(map[int64]struct{})
@@ -278,6 +281,7 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 				}
 			}
 			args["_assistant_id"] = assistant.ID
+			openContext.inject(args)
 
 			result, err := tool(userID, args)
 			if err != nil {
@@ -492,6 +496,7 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 					"硬性规则二：每次 batch_update_cells 返回后必须核对回执中的 invariants_ok、total_rows_before、total_rows_after 与 affected_columns。只允许改动预期列；一旦 total_rows_after 小于 total_rows_before、invariants_ok=false，或 affected_columns 出现未预期列，立即停止后续写入，如实把回执报告给用户，不要重试或“修复”后再写入。"+
 					"硬性规则三：不得用逐行脚本或多次 update_cell 重建整张表；写入范围必须由用户在界面上确认过的坐标或 query_sheet 读到的真实坐标决定，不能按当前可见的少量行推断整表结构。"+
 					"硬性规则四：数据被误删或误覆盖时，优先用 list_sheet_versions 查看历史版本，选定版本后经用户确认再调用 restore_sheet_version（必须 confirm=true）。不得靠重新导入、逐行重写或推测原值来“修复”数据。"+
+					"硬性规则五（检索顺序）：需要按内容找数据时，必须先调用 get_open_workbook_context 确认员工当前打开的工作簿，再用 search_sheet_content 按“当前工作簿优先”的顺序检索；只有当前工作簿没有命中、或员工明确要求全库检索时，才设置 scope=all 扩展到其它工作簿。禁止一上来就对全部工作簿逐表 query_sheet 扫描，也禁止用 search_spreadsheets 代替内容检索（它只匹配工作簿/工作表名称）。"+
 					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
 					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
 					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
@@ -594,13 +599,31 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id"},
 		}),
-		buildToolDefinition("search_spreadsheets", "Search all accessible spreadsheets by keywords.", map[string]any{
+		buildToolDefinition("get_open_workbook_context", "Identify the workbook and sheet the employee currently has open in the spreadsheet UI, including the active sheet, its columns, and the selected range. Call this first whenever the request says 这个表/当前表格/我正在看的/这里 and you do not already know the exact id.", map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}),
+		buildToolDefinition("search_sheet_content", "Keyword search across spreadsheet cell values, tuned so the visible table is searched first. It searches the workbook the employee currently has open FIRST and stops as soon as the limit is reached; only scope=all fans out to the remaining accessible workbooks (most recently updated first, capped by max_sheets). Prefer this over search_spreadsheets when looking for data, and over query_sheet when you do not know which sheet holds the value. scope defaults to current when a workbook is open, otherwise all.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"keywords":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"mode":           map[string]any{"type": "string", "description": "any or all"},
-				"limit":          map[string]any{"type": "integer"},
-				"return_columns": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"keywords":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Search terms matched as case-insensitive substrings."},
+				"query":          map[string]any{"type": "string", "description": "Shortcut for a single keyword or a comma separated list."},
+				"scope":          map[string]any{"type": "string", "description": "current (open workbook only, default when known), workbook (workbook_id only), or all (open workbook first, then everything else)."},
+				"workbook_id":    map[string]any{"type": "integer", "description": "Optional. Defaults to the workbook the employee currently has open."},
+				"sheet_ids":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Optional. Restrict the search to these sheets."},
+				"column_keys":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional. Only match inside these column keys."},
+				"mode":           map[string]any{"type": "string", "description": "any (default) or all."},
+				"limit":          map[string]any{"type": "integer", "description": "Maximum matches, default 20, maximum 100."},
+				"max_sheets":     map[string]any{"type": "integer", "description": "Maximum sheets scanned when scope=all, default 40, maximum 120."},
+				"return_columns": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional. Only return these columns of each matching row."},
+			},
+		}),
+		buildToolDefinition("search_spreadsheets", "Search all accessible spreadsheets by name (workbook or sheet name). This does not search cell values; use search_sheet_content to find data.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"keywords": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"mode":     map[string]any{"type": "string", "description": "any or all"},
+				"limit":    map[string]any{"type": "integer"},
 			},
 			"required": []string{"keywords"},
 		}),
@@ -1458,13 +1481,17 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 	}, nil
 }
 
+// spreadsheetNameSearchWorkbookLimit bounds how many workbooks a name search
+// inspects. Name matching only needs workbook/sheet metadata, so this stays high
+// without loading any row data.
+const spreadsheetNameSearchWorkbookLimit = 1000
+
 func (s *AIService) toolSearchSpreadsheets(userID int64, args map[string]any) (*toolExecutionResult, error) {
 	keywords := normalizeSearchKeywords(stringSliceArg(args, "keywords"))
 	if len(keywords) == 0 {
 		return nil, fmt.Errorf("keywords is required")
 	}
 	mode, _ := stringArgWithDefault(args, "mode", "any")
-	returnColumns := stringSliceArg(args, "return_columns")
 	limit, _ := intArgWithDefault(args, "limit", 20)
 	if limit <= 0 {
 		limit = 20
@@ -1473,7 +1500,7 @@ func (s *AIService) toolSearchSpreadsheets(userID int64, args map[string]any) (*
 		limit = 100
 	}
 
-	snapshot, err := s.buildUserContextSnapshot(userID, 1000)
+	snapshot, err := s.buildUserContextSnapshot(userID, spreadsheetNameSearchWorkbookLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1488,23 +1515,11 @@ func (s *AIService) toolSearchSpreadsheets(userID int64, args map[string]any) (*
 		for _, sheetItem := range sheetItems {
 			sheetID, _ := toInt64(sheetItem["sheet_id"])
 			sheetName, _ := sheetItem["sheet_name"].(string)
-			sheet, err := s.sheetRepo.GetSheet(sheetID)
-			if err != nil {
-				continue
-			}
-			rows, err := s.sheetRepo.GetRows(sheetID)
-			if err != nil {
-				continue
-			}
-			columns, err := parseSheetColumns(sheet.Columns)
-			if err != nil {
-				continue
-			}
-			previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
-			if err != nil {
-				continue
-			}
+			// Name matching only needs metadata. Loading rows (and running a
+			// permission check per cell) for every sheet before this test used to
+			// make even a pure name search scan the whole account.
 			if spreadsheetNameMatches(workbookName, sheetName, keywords, mode) {
+				columns, _ := sheetItem["columns"].([]sheetColumnPayload)
 				matches = append(matches, map[string]any{
 					"workbook_id":   workbookID,
 					"workbook_name": workbookName,
@@ -1517,26 +1532,7 @@ func (s *AIService) toolSearchSpreadsheets(userID int64, args map[string]any) (*
 				if len(matches) >= limit {
 					return buildSpreadsheetSearchResult(keywords, mode, limit, matches, touched), nil
 				}
-			}
-			for _, row := range previewRows {
-				rowMatches := collectRowKeywordMatches(row.Data, columns, keywords, mode)
-				if len(rowMatches) == 0 {
-					continue
-				}
-				matches = append(matches, map[string]any{
-					"workbook_id":   workbookID,
-					"workbook_name": workbookName,
-					"sheet_id":      sheetID,
-					"sheet_name":    sheetName,
-					"row":           row.Row,
-					"display_row":   row.DisplayRow,
-					"matches":       rowMatches,
-					"data":          filterRowDataByColumns(row.Data, columns, returnColumns),
-				})
-				touched[sheetID] = struct{}{}
-				if len(matches) >= limit {
-					return buildSpreadsheetSearchResult(keywords, mode, limit, matches, touched), nil
-				}
+				continue
 			}
 		}
 	}
@@ -1606,16 +1602,32 @@ func (s *AIService) toolSearchSheetRows(userID int64, args map[string]any) (*too
 	if err != nil {
 		return nil, err
 	}
-	previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
-	if err != nil {
-		return nil, err
-	}
-	results := make([]map[string]any, 0, limit)
+	// Reject non-matching rows on their raw values first: permission filtering
+	// only removes cells, so a row that fails the cheap test cannot match once
+	// filtered. This keeps the per-cell permission work proportional to the
+	// matching rows instead of to the whole sheet.
+	previewRows := buildAIPreviewRows(sheet, columns, rows)
+	candidates := make([]aiPreviewRow, 0, len(previewRows))
 	for _, row := range previewRows {
 		if row.Row < startRow {
 			continue
 		}
-		rowMatches := collectRowKeywordMatches(row.Data, columns, keywords, mode)
+		if !rowDataMayContainKeywords(row.Data, keywords, mode) {
+			continue
+		}
+		candidates = append(candidates, row)
+	}
+	filter, err := s.buildSheetCellFilter(userID, sheet)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]map[string]any, 0, limit)
+	for _, row := range candidates {
+		visible, err := s.visibleRowData(userID, sheetID, row.Row, row.Data, filter)
+		if err != nil {
+			return nil, err
+		}
+		rowMatches := collectRowKeywordMatches(visible, columns, keywords, mode)
 		if len(rowMatches) == 0 {
 			continue
 		}
@@ -1625,7 +1637,7 @@ func (s *AIService) toolSearchSheetRows(userID int64, args map[string]any) (*too
 			"row":         row.Row,
 			"display_row": row.DisplayRow,
 			"matches":     rowMatches,
-			"data":        filterRowDataByColumns(row.Data, columns, returnColumns),
+			"data":        filterRowDataByColumns(visible, columns, returnColumns),
 		})
 		if len(results) >= limit {
 			break
@@ -1681,14 +1693,26 @@ func (s *AIService) toolLookupSheetRecords(userID int64, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
-	previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)
+	previewRows := buildAIPreviewRows(sheet, columns, rows)
+	candidates := make([]aiPreviewRow, 0, len(previewRows))
+	for _, row := range previewRows {
+		if !criteriaMayMatchRow(row.Data, criteria) {
+			continue
+		}
+		candidates = append(candidates, row)
+	}
+	filter, err := s.buildSheetCellFilter(userID, sheet)
 	if err != nil {
 		return nil, err
 	}
 
 	results := make([]map[string]any, 0, limit)
-	for _, row := range previewRows {
-		matchedFields := collectCriteriaMatches(row.Data, columns, criteria, matchMode)
+	for _, row := range candidates {
+		visible, err := s.visibleRowData(userID, sheetID, row.Row, row.Data, filter)
+		if err != nil {
+			return nil, err
+		}
+		matchedFields := collectCriteriaMatches(visible, columns, criteria, matchMode)
 		if len(matchedFields) == 0 {
 			continue
 		}
@@ -1699,7 +1723,7 @@ func (s *AIService) toolLookupSheetRecords(userID int64, args map[string]any) (*
 			"row":            row.Row,
 			"display_row":    row.DisplayRow,
 			"matched_fields": matchedFields,
-			"data":           filterRowDataByColumns(row.Data, columns, returnColumns),
+			"data":           filterRowDataByColumns(visible, columns, returnColumns),
 		})
 		if len(results) >= limit {
 			break
@@ -3711,37 +3735,134 @@ func mapArg(args map[string]any, key string) map[string]any {
 	return parsed
 }
 
-func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) ([]aiPreviewRow, error) {
-	previewRows := buildAIPreviewRows(sheet, columns, rows)
+// sheetCellFilter caches the per-user permission facts that decide whether a
+// single cell may be read. Building it once per sheet avoids re-deriving the
+// department set and protection rules for every cell of every row.
+type sheetCellFilter struct {
+	isAdmin       bool
+	departmentSet map[int64]struct{}
+	protections   protectionMaps
+}
+
+func (s *AIService) buildSheetCellFilter(userID int64, sheet *model.Sheet) (sheetCellFilter, error) {
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
-		return nil, err
+		return sheetCellFilter{}, err
 	}
 	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
 	if err != nil {
-		return nil, err
+		return sheetCellFilter{}, err
 	}
 	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
 	if err != nil {
+		return sheetCellFilter{}, err
+	}
+	return sheetCellFilter{
+		isAdmin:       isAdmin,
+		departmentSet: int64Set(departmentIDs),
+		protections:   protections,
+	}, nil
+}
+
+// visibleRowData drops every cell the account may not read, so callers can only
+// ever observe data the employee is allowed to see.
+func (s *AIService) visibleRowData(userID, sheetID int64, rowIndex int, data map[string]interface{}, filter sheetCellFilter) (map[string]interface{}, error) {
+	filtered := make(map[string]interface{}, len(data))
+	for key, value := range data {
+		allowed, err := s.permService.CheckCellPermission(sheetID, userID, key, rowIndex, "read")
+		if err != nil {
+			return nil, err
+		}
+		if allowed && !protectionHidesCell(filter.protections, rowIndex, key, userID, filter.isAdmin, filter.departmentSet) {
+			filtered[key] = value
+		}
+	}
+	return filtered, nil
+}
+
+func (s *AIService) buildVisiblePreviewRows(userID int64, sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) ([]aiPreviewRow, error) {
+	previewRows := buildAIPreviewRows(sheet, columns, rows)
+	filter, err := s.buildSheetCellFilter(userID, sheet)
+	if err != nil {
 		return nil, err
 	}
-	departmentSet := int64Set(departmentIDs)
 	result := make([]aiPreviewRow, 0, len(previewRows))
 	for _, row := range previewRows {
-		filtered := make(map[string]interface{}, len(row.Data))
-		for key, value := range row.Data {
-			allowed, err := s.permService.CheckCellPermission(sheet.ID, userID, key, row.Row, "read")
-			if err != nil {
-				return nil, err
-			}
-			if allowed && !protectionHidesCell(protections, row.Row, key, userID, isAdmin, departmentSet) {
-				filtered[key] = value
-			}
+		filtered, err := s.visibleRowData(userID, sheet.ID, row.Row, row.Data, filter)
+		if err != nil {
+			return nil, err
 		}
 		row.Data = filtered
 		result = append(result, row)
 	}
 	return result, nil
+}
+
+// rowDataMayContainKeywords is a cheap pre-test that reports whether a row could
+// possibly match. Permission filtering only ever removes cells, so a row that
+// fails this test cannot match once filtered either, and callers can skip the
+// per-cell permission work entirely. It must never reject a matching row.
+func rowDataMayContainKeywords(data map[string]interface{}, keywords []string, mode string) bool {
+	if len(data) == 0 {
+		return false
+	}
+	needles := make([]string, 0, len(keywords))
+	for _, keyword := range keywords {
+		if needle := strings.ToLower(strings.TrimSpace(keyword)); needle != "" {
+			needles = append(needles, needle)
+		}
+	}
+	if len(needles) == 0 {
+		return false
+	}
+	if normalizeSearchMode(mode) == "all" {
+		for _, needle := range needles {
+			if !rowDataContainsNeedle(data, needle) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, needle := range needles {
+		if rowDataContainsNeedle(data, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func rowDataContainsNeedle(data map[string]interface{}, needle string) bool {
+	for _, value := range data {
+		if value == nil {
+			continue
+		}
+		// Mirrors collectRowKeywordMatches, which compares the rendered cell value.
+		if strings.Contains(strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", value))), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// criteriaMayMatchRow is the cheap superset test for criteria lookups. Every
+// criterion must match its own column for the row to count as a hit, so a row
+// whose text does not even contain an expected value cannot match and can skip
+// the per-cell permission pass.
+func criteriaMayMatchRow(data map[string]interface{}, criteria map[string]any) bool {
+	if len(data) == 0 || len(criteria) == 0 {
+		return false
+	}
+	for _, expected := range criteria {
+		needle := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", expected)))
+		if needle == "" {
+			// collectCriteriaMatches rejects empty expectations outright.
+			return false
+		}
+		if !rowDataContainsNeedle(data, needle) {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeSearchKeywords(items []string) []string {
