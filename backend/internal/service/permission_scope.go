@@ -21,11 +21,34 @@ type permissionLookupCache struct {
 	workbookSheets map[int64][]model.Sheet
 	workbooksById  map[int64]*model.Workbook
 	departments    map[int64][]int64
+	matrices       map[sheetPermissionLookupKey]*model.PermissionMatrix
+}
+
+type sheetPermissionLookupKey struct {
+	SheetID int64
+	UserID  int64
 }
 
 // getPermissionMatrixCached mirrors PermissionService.GetPermissionMatrix but
 // shares the sheet, workbook, department and folder lookups through the scope.
 func (s *PermissionService) getPermissionMatrixCached(sheetID int64, userID int64, cache *permissionLookupCache) (*model.PermissionMatrix, error) {
+	key := sheetPermissionLookupKey{SheetID: sheetID, UserID: userID}
+	if cache != nil {
+		if matrix, ok := cache.matrices[key]; ok {
+			return matrix, nil
+		}
+	}
+	matrix, err := s.loadPermissionMatrixScoped(sheetID, userID, cache)
+	if err == nil && cache != nil {
+		if cache.matrices == nil {
+			cache.matrices = make(map[sheetPermissionLookupKey]*model.PermissionMatrix)
+		}
+		cache.matrices[key] = matrix
+	}
+	return matrix, err
+}
+
+func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int64, cache *permissionLookupCache) (*model.PermissionMatrix, error) {
 	roles, roleIDs, err := s.getUserRolesCached(userID, cache)
 	if err != nil {
 		return nil, err
@@ -50,7 +73,8 @@ func (s *PermissionService) getPermissionMatrixCached(sheetID int64, userID int6
 		}
 	}
 
-	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	// Access resolution needs lifecycle/protection rules, not every cell value.
+	sheet, err := s.sheetRepo.GetSearchSheet(sheetID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sheet: %w", err)
 	}
@@ -432,7 +456,7 @@ func (s *PermissionService) getSheetsByWorkbookCached(workbookID int64, cache *p
 		}
 	}
 
-	sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbookID)
+	sheets, err := s.sheetRepo.GetSearchSheets(workbookID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load workbook sheets: %w", err)
 	}
