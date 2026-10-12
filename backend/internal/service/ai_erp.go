@@ -320,9 +320,6 @@ func (s *AIService) prepareERPCreateCustomer(userID int64, raw map[string]any) (
 	if request.CustomerLevel != "A" && request.CustomerLevel != "B" && request.CustomerLevel != "C" {
 		return nil, nil, fmt.Errorf("客户等级仅支持 A、B、C")
 	}
-	if err := s.tradeService.ensureWritableTradeFolder(userID, request.WorkbookFolderID); err != nil {
-		return nil, nil, err
-	}
 	if request.CreateChannel == nil {
 		createChannel := true
 		request.CreateChannel = &createChannel
@@ -450,7 +447,7 @@ func (s *AIService) prepareERPCreateInquiry(userID int64, raw map[string]any) (*
 	if len(request.Items) == 0 {
 		return nil, nil, fmt.Errorf("询价至少需要一个产品")
 	}
-	if _, err := buildTradeOrderItems(request.Items); err != nil {
+	if err := normalizeERPTradeItemInputs(request.Items); err != nil {
 		return nil, nil, err
 	}
 	if strings.TrimSpace(request.Priority) == "" {
@@ -467,31 +464,19 @@ func (s *AIService) prepareERPCreateInquiry(userID int64, raw map[string]any) (*
 	if _, err := parseTradeDate(request.QuoteDeadline); err != nil {
 		return nil, nil, fmt.Errorf("报价截止日期格式无效")
 	}
-	if err := s.tradeService.ensureWritableTradeFolder(userID, request.WorkbookFolderID); err != nil {
-		return nil, nil, err
-	}
-	if request.CreateWorkspace == nil {
-		createWorkspace := true
-		request.CreateWorkspace = &createWorkspace
-	}
-	if request.SharedWorkspace == nil {
-		sharedWorkspace := false
-		request.SharedWorkspace = &sharedWorkspace
-	}
 	details := []string{
 		"客户：" + fmt.Sprintf("%s · %s", customer.CustomerCode, customer.Name),
 		"询价主题：" + request.Title,
 		"币种：" + strings.ToUpper(request.Currency),
 		"付款方式：" + emptyERPLabel(firstNonEmptyTrade(request.PaymentMethod, request.PaymentTerms)),
 		"目的地：" + emptyERPLabel(mergeTradeDestination(request.DestinationCountry, request.DestinationPort)),
-		"生成流程工作簿：" + yesNoERP(request.CreateWorkspace != nil && *request.CreateWorkspace),
 	}
 	for index, item := range request.Items {
-		details = append(details, fmt.Sprintf("产品 %d：%s · %s × %s %s", index+1, emptyERPLabel(item.SKU), item.ProductName, formatERPNumber(item.Quantity), firstNonEmptyTrade(item.Unit, "件")))
+		details = append(details, fmt.Sprintf("产品 %d：%s × %s %s", index+1, erpTradeItemLabel(item), formatERPNumber(item.Quantity), firstNonEmptyTrade(item.Unit, "件")))
 	}
 	preview := ERPActionPreview{
 		Kind: "create_inquiry", Title: "创建客户询价",
-		Description: "确认后将创建 ERP 业务单，并按设置生成流程工作簿。",
+		Description: "确认后将创建 ERP 业务单。",
 		TargetLabel: customer.Name + " / " + request.Title,
 		Details:     compactERPDetails(details),
 		CustomerID:  customer.ID,
@@ -518,15 +503,15 @@ func (s *AIService) prepareERPAddInquiryItems(userID int64, raw map[string]any) 
 	if len(items) == 0 {
 		return nil, nil, fmt.Errorf("请至少提供一个新增产品")
 	}
-	if _, err := buildTradeOrderItems(items); err != nil {
+	if err := normalizeERPTradeItemInputs(items); err != nil {
 		return nil, nil, err
 	}
 	details := []string{"业务单：" + order.OrderNo + " · " + order.Title}
 	for index, item := range items {
-		details = append(details, fmt.Sprintf("新增产品 %d：%s · %s × %s %s", index+1, emptyERPLabel(item.SKU), item.ProductName, formatERPNumber(item.Quantity), firstNonEmptyTrade(item.Unit, "件")))
+		details = append(details, fmt.Sprintf("新增产品 %d：%s × %s %s", index+1, erpTradeItemLabel(item), formatERPNumber(item.Quantity), firstNonEmptyTrade(item.Unit, "件")))
 	}
 	payload := erpOrderPayload[model.AddTradeOrderItemsRequest]{OrderID: order.ID, Request: model.AddTradeOrderItemsRequest{Items: items}}
-	preview := ERPActionPreview{Kind: "add_inquiry_items", Title: "向询价追加产品", Description: "确认后会同步更新 ERP 业务单和流程工作簿。", TargetLabel: order.OrderNo, Details: compactERPDetails(details), CustomerID: order.CustomerID, OrderID: order.ID}
+	preview := ERPActionPreview{Kind: "add_inquiry_items", Title: "向询价追加产品", Description: "确认后会更新 ERP 业务单。", TargetLabel: order.OrderNo, Details: compactERPDetails(details), CustomerID: order.CustomerID, OrderID: order.ID}
 	return newStoredERPAction("add_inquiry_items", preview, payload)
 }
 
@@ -673,7 +658,7 @@ func (s *AIService) prepareERPUpdateStageData(userID int64, raw map[string]any) 
 		details = append(details, "物流："+emptyERPLabel(request.Shipment.Carrier), "运单号："+emptyERPLabel(request.Shipment.BookingNo), "发货状态："+firstNonEmptyTrade(request.Shipment.ShippingStatus, "未发货"))
 	}
 	payload := erpOrderPayload[model.UpdateTradeStageDataRequest]{OrderID: order.ID, Request: request}
-	preview := ERPActionPreview{Kind: "update_stage_data", Title: "更新当前 ERP 环节数据", Description: "确认后会写入当前环节，并同步关联流程工作簿。", TargetLabel: order.OrderNo, Details: compactERPDetails(details), CustomerID: order.CustomerID, OrderID: order.ID}
+	preview := ERPActionPreview{Kind: "update_stage_data", Title: "更新当前 ERP 环节数据", Description: "确认后会写入当前 ERP 环节。", TargetLabel: order.OrderNo, Details: compactERPDetails(details), CustomerID: order.CustomerID, OrderID: order.ID}
 	return newStoredERPAction("update_stage_data", preview, payload)
 }
 
@@ -952,7 +937,7 @@ func erpOrderNextStep(order *model.TradeOrder) string {
 		return "请重新读取 ERP 数据确认后续步骤。"
 	}
 	if order.Stage == model.TradeStageCompleted {
-		return "业务单已完成，可查看利润、PI、流程工作簿和归档资料。"
+		return "业务单已完成，可查看利润、PI 和归档资料。"
 	}
 	if order.Stage == model.TradeStageCancelled {
 		return "业务单已取消；如需恢复，请由有权限的负责人退回上一阶段。"
@@ -1161,13 +1146,12 @@ func mergeERPTradeCustomerUpdate(current *model.TradeCustomer, changes map[strin
 		"customer_level": current.CustomerLevel, "whatsapp_account_id": current.WhatsAppAccountID,
 		"whatsapp_chat_id": current.WhatsAppChatID, "whatsapp_chat_name": current.WhatsAppChatName,
 		"avatar_url": current.AvatarURL, "tags": current.Tags, "notes": current.Notes,
-		"workbook_folder_id": current.WorkbookFolderID,
 	}
 	labels := map[string]string{
 		"name": "客户名称", "company_name": "公司全称", "country": "国家", "region": "地区",
 		"contact_name": "联系人", "email": "邮箱", "phone": "电话 / WhatsApp", "source": "来源",
 		"status": "状态", "customer_level": "客户等级", "whatsapp_chat_name": "WhatsApp 名称",
-		"tags": "标签", "notes": "备注", "workbook_folder_id": "默认工作簿文件夹",
+		"tags": "标签", "notes": "备注",
 	}
 	details := make([]string, 0, len(changes))
 	keys := make([]string, 0, len(changes))
@@ -1346,6 +1330,28 @@ func emptyERPLabel(value string) string {
 	return value
 }
 
+// normalizeERPTradeItemInputs applies the same SKU/product-name merge as
+// manual order entry, so AI previews show exactly what will be saved.
+func normalizeERPTradeItemInputs(items []model.CreateTradeOrderItemRequest) error {
+	for index := range items {
+		sku, productName, err := normalizeTradeItemIdentity(items[index].SKU, items[index].ProductName)
+		if err != nil {
+			return err
+		}
+		items[index].SKU = sku
+		items[index].ProductName = productName
+	}
+	_, err := buildTradeOrderItems(items)
+	return err
+}
+
+func erpTradeItemLabel(item model.CreateTradeOrderItemRequest) string {
+	if item.ProductName == "" || item.ProductName == item.SKU {
+		return emptyERPLabel(item.SKU)
+	}
+	return item.SKU + " · " + item.ProductName
+}
+
 func yesNoERP(value bool) string {
 	if value {
 		return "是"
@@ -1407,7 +1413,7 @@ func erpActionToolSchema() map[string]any {
 				"contact_name": map[string]any{"type": "string"}, "email": map[string]any{"type": "string"},
 				"phone": map[string]any{"type": "string"}, "source": map[string]any{"type": "string"},
 				"customer_level": map[string]any{"type": "string"}, "tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"notes": map[string]any{"type": "string"}, "workbook_folder_id": map[string]any{"type": "integer"},
+				"notes":          map[string]any{"type": "string"},
 				"create_channel": map[string]any{"type": "boolean"},
 			},
 		},
@@ -1432,9 +1438,7 @@ func erpActionToolSchema() map[string]any {
 				"quote_deadline": map[string]any{"type": "string"}, "currency": map[string]any{"type": "string"},
 				"destination_country": map[string]any{"type": "string"}, "destination_port": map[string]any{"type": "string"},
 				"payment_method": map[string]any{"type": "string"}, "notes": map[string]any{"type": "string"},
-				"create_workspace": map[string]any{"type": "boolean"}, "shared_workspace": map[string]any{"type": "boolean"},
-				"workbook_folder_id": map[string]any{"type": "integer"},
-				"items":              map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": productProperties}},
+				"items": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": productProperties}},
 			},
 		},
 		"items": map[string]any{"type": "array", "description": "Products for add_inquiry_items.", "items": map[string]any{"type": "object", "properties": productProperties}},

@@ -59,8 +59,6 @@ type TradeCustomer struct {
 	WhatsAppChatName   string    `json:"whatsapp_chat_name"`
 	AvatarURL          string    `json:"avatar_url"`
 	ChannelID          *int64    `json:"channel_id,omitempty"`
-	WorkbookFolderID   *int64    `json:"workbook_folder_id,omitempty"`
-	WorkbookFolderName string    `json:"workbook_folder_name"`
 	Tags               []string  `json:"tags"`
 	Notes              string    `json:"notes"`
 	OrderCount         int64     `json:"order_count"`
@@ -89,31 +87,89 @@ type TradeCustomerDeleteRequest struct {
 }
 
 type TradeOrderItem struct {
-	ID               int64          `json:"id"`
-	OrderID          int64          `json:"order_id"`
-	LineNo           int            `json:"line_no"`
-	SKU              string         `json:"sku"`
-	ProductName      string         `json:"product_name"`
-	Description      string         `json:"description"`
-	Specification    string         `json:"specification"`
-	Quantity         float64        `json:"quantity"`
-	Unit             string         `json:"unit"`
-	TargetPrice      float64        `json:"target_price"`
-	QuotedPrice      float64        `json:"quoted_price"`
-	SupplierName     string         `json:"supplier_name"`
-	PurchaseCurrency string         `json:"purchase_currency"`
-	PurchasePrice    float64        `json:"purchase_price"`
-	ReceivedQuantity float64        `json:"received_quantity"`
-	AcceptedQuantity float64        `json:"accepted_quantity"`
-	PackedQuantity   float64        `json:"packed_quantity"`
-	CartonCount      int            `json:"carton_count"`
-	HSCode           string         `json:"hs_code"`
-	GrossWeight      float64        `json:"gross_weight"`
-	NetWeight        float64        `json:"net_weight"`
-	Status           string         `json:"status"`
-	WorkflowData     map[string]any `json:"workflow_data,omitempty"`
-	CreatedAt        time.Time      `json:"created_at"`
-	UpdatedAt        time.Time      `json:"updated_at"`
+	ID               int64            `json:"id"`
+	OrderID          int64            `json:"order_id"`
+	LineNo           int              `json:"line_no"`
+	SKU              string           `json:"sku"`
+	ProductName      string           `json:"product_name"`
+	Description      string           `json:"description"`
+	Specification    string           `json:"specification"`
+	Quantity         float64          `json:"quantity"`
+	Unit             string           `json:"unit"`
+	TargetPrice      float64          `json:"target_price"`
+	QuotedPrice      float64          `json:"quoted_price"`
+	SupplierName     string           `json:"supplier_name"`
+	PurchaseCurrency string           `json:"purchase_currency"`
+	PurchasePrice    float64          `json:"purchase_price"`
+	ReceivedQuantity float64          `json:"received_quantity"`
+	AcceptedQuantity float64          `json:"accepted_quantity"`
+	PackedQuantity   float64          `json:"packed_quantity"`
+	CartonCount      int              `json:"carton_count"`
+	HSCode           string           `json:"hs_code"`
+	GrossWeight      float64          `json:"gross_weight"`
+	NetWeight        float64          `json:"net_weight"`
+	Status           string           `json:"status"`
+	WorkflowData     map[string]any   `json:"workflow_data,omitempty"`
+	Images           []TradeItemImage `json:"images,omitempty"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
+}
+
+type TradeItemImage struct {
+	ID           int64  `json:"id"`
+	OrderID      int64  `json:"order_id"`
+	OrderItemID  int64  `json:"order_item_id"`
+	AttachmentID int64  `json:"attachment_id"`
+	URL          string `json:"url"`
+	ThumbnailURL string `json:"thumbnail_url"`
+	Filename     string `json:"filename"`
+	Source       string `json:"source"`
+}
+
+type TradeQuoteHistoryRecord struct {
+	QuoteID             int64            `json:"quote_id"`
+	RoundNo             int              `json:"round_no"`
+	Status              string           `json:"status"`
+	OrderID             int64            `json:"order_id"`
+	OrderNo             string           `json:"order_no"`
+	OrderTitle          string           `json:"order_title"`
+	OrderStage          string           `json:"order_stage"`
+	CustomerID          int64            `json:"customer_id"`
+	CustomerName        string           `json:"customer_name"`
+	OwnerID             int64            `json:"-"`
+	OwnerName           string           `json:"owner_name"`
+	OrderItemID         int64            `json:"order_item_id"`
+	SKU                 string           `json:"sku"`
+	ProductName         string           `json:"product_name"`
+	Specification       string           `json:"specification"`
+	Quantity            float64          `json:"quantity"`
+	Unit                string           `json:"unit"`
+	Currency            string           `json:"currency"`
+	UnitPrice           float64          `json:"unit_price"`
+	Amount              float64          `json:"amount"`
+	QuotedAt            time.Time        `json:"quoted_at"`
+	Images              []TradeItemImage `json:"images"`
+	SupplierName        string           `json:"supplier_name,omitempty"`
+	PurchaseCurrency    string           `json:"purchase_currency,omitempty"`
+	PurchasePrice       float64          `json:"purchase_price,omitempty"`
+	ExchangeRateCNY     float64          `json:"exchange_rate_cny,omitempty"`
+	ProfitMarginPercent float64          `json:"profit_margin_percent,omitempty"`
+	UnitCostCNY         float64          `json:"unit_cost_cny,omitempty"`
+	UnitPriceCNY        float64          `json:"unit_price_cny,omitempty"`
+	UnitProfitCNY       float64          `json:"unit_profit_cny,omitempty"`
+	ProfitMargin        float64          `json:"profit_margin,omitempty"`
+	CostComplete        bool             `json:"cost_complete,omitempty"`
+}
+
+type TradeQuoteHistory struct {
+	CanViewCost bool                      `json:"can_view_cost"`
+	Records     []TradeQuoteHistoryRecord `json:"records"`
+}
+
+type TradeQuoteHistoryFilter struct {
+	Search     string
+	CustomerID int64
+	Limit      int
 }
 
 type TradeOrderStageEvent struct {
@@ -344,28 +400,26 @@ type TradeAccessProfile struct {
 }
 
 type TradeOrderAccess struct {
-	ScopeLabel               string   `json:"scope_label"`
-	CanViewCustomer          bool     `json:"can_view_customer"`
-	CanViewCustomerContact   bool     `json:"can_view_customer_contact"`
-	CanViewCustomerPricing   bool     `json:"can_view_customer_pricing"`
-	CanViewSupplier          bool     `json:"can_view_supplier"`
-	CanViewSupplierPricing   bool     `json:"can_view_supplier_pricing"`
-	CanViewReceiving         bool     `json:"can_view_receiving"`
-	CanViewInspection        bool     `json:"can_view_inspection"`
-	CanViewPacking           bool     `json:"can_view_packing"`
-	CanViewShipment          bool     `json:"can_view_shipment"`
-	CanViewProfit            bool     `json:"can_view_profit"`
-	CanViewTimeline          bool     `json:"can_view_timeline"`
-	CanSyncWorkbook          bool     `json:"can_sync_workbook"`
-	CanAddItems              bool     `json:"can_add_items"`
-	CanViewPaymentRecords    bool     `json:"can_view_payment_records"`
-	CanViewAllPaymentRecords bool     `json:"can_view_all_payment_records"`
-	CanUploadPaymentProofs   bool     `json:"can_upload_payment_proofs"`
-	CanManagePaymentStatus   bool     `json:"can_manage_payment_status"`
-	CanViewPI                bool     `json:"can_view_pi"`
-	CanGeneratePI            bool     `json:"can_generate_pi"`
-	VisibleSheetNames        []string `json:"visible_sheet_names"`
-	EditableSheetNames       []string `json:"editable_sheet_names"`
+	ScopeLabel               string `json:"scope_label"`
+	CanViewCustomer          bool   `json:"can_view_customer"`
+	CanViewCustomerContact   bool   `json:"can_view_customer_contact"`
+	CanViewCustomerPricing   bool   `json:"can_view_customer_pricing"`
+	CanViewSupplier          bool   `json:"can_view_supplier"`
+	CanViewSupplierPricing   bool   `json:"can_view_supplier_pricing"`
+	CanViewReceiving         bool   `json:"can_view_receiving"`
+	CanViewInspection        bool   `json:"can_view_inspection"`
+	CanViewPacking           bool   `json:"can_view_packing"`
+	CanViewShipment          bool   `json:"can_view_shipment"`
+	CanViewProfit            bool   `json:"can_view_profit"`
+	CanViewTimeline          bool   `json:"can_view_timeline"`
+	CanAddItems              bool   `json:"can_add_items"`
+	CanViewPaymentRecords    bool   `json:"can_view_payment_records"`
+	CanViewAllPaymentRecords bool   `json:"can_view_all_payment_records"`
+	CanUploadPaymentProofs   bool   `json:"can_upload_payment_proofs"`
+	CanManagePaymentStatus   bool   `json:"can_manage_payment_status"`
+	CanViewPI                bool   `json:"can_view_pi"`
+	CanGeneratePI            bool   `json:"can_generate_pi"`
+	CanManageItemImages      bool   `json:"can_manage_item_images"`
 }
 
 type TradeOrder struct {
@@ -400,10 +454,6 @@ type TradeOrder struct {
 	ActualFreightNotes           string                    `json:"actual_freight_notes"`
 	AdditionalCostAmount         float64                   `json:"additional_cost_amount"`
 	AdditionalCostNotes          string                    `json:"additional_cost_notes"`
-	WorkbookID                   *int64                    `json:"workbook_id,omitempty"`
-	WorkbookSheetID              *int64                    `json:"workbook_sheet_id,omitempty"`
-	WorkspaceFolderID            *int64                    `json:"workspace_folder_id,omitempty"`
-	WorkspaceFolderName          string                    `json:"workspace_folder_name"`
 	ChannelID                    *int64                    `json:"channel_id,omitempty"`
 	Notes                        string                    `json:"notes"`
 	Source                       string                    `json:"source"`
@@ -434,6 +484,7 @@ type TradeOrder struct {
 	ReworkReason                 string                    `json:"rework_reason"`
 	ReworkCount                  int                       `json:"rework_count"`
 	ItemCount                    int64                     `json:"item_count"`
+	SKUPreview                   string                    `json:"sku_preview"`
 	RequiredPositionCode         string                    `json:"required_position_code"`
 	RequiredPositionName         string                    `json:"required_position_name"`
 	CanOperateStage              bool                      `json:"can_operate_stage"`
@@ -603,7 +654,6 @@ type CreateTradeCustomerRequest struct {
 	AvatarURL         string   `json:"avatar_url"`
 	Tags              []string `json:"tags"`
 	Notes             string   `json:"notes"`
-	WorkbookFolderID  *int64   `json:"workbook_folder_id"`
 	CreateChannel     *bool    `json:"create_channel"`
 }
 
@@ -624,7 +674,6 @@ type UpdateTradeCustomerRequest struct {
 	AvatarURL         string   `json:"avatar_url"`
 	Tags              []string `json:"tags"`
 	Notes             string   `json:"notes"`
-	WorkbookFolderID  *int64   `json:"workbook_folder_id"`
 }
 
 type TradeCustomerDeleteRequestInput struct {
@@ -638,12 +687,14 @@ type TradeCustomerDeleteDecisionInput struct {
 
 type CreateTradeOrderItemRequest struct {
 	SKU           string  `json:"sku"`
-	ProductName   string  `json:"product_name" binding:"required"`
+	ProductName   string  `json:"product_name"`
 	Description   string  `json:"description"`
 	Specification string  `json:"specification"`
 	Quantity      float64 `json:"quantity" binding:"gt=0"`
 	Unit          string  `json:"unit"`
 	TargetPrice   float64 `json:"target_price"`
+	// Attachments uploaded beforehand through /upload by the same user.
+	ImageAttachmentIDs []int64 `json:"image_attachment_ids"`
 }
 
 type AddTradeOrderItemsRequest struct {
@@ -718,9 +769,6 @@ type CreateTradeOrderRequest struct {
 	PaymentMethod      string                        `json:"payment_method"`
 	Notes              string                        `json:"notes"`
 	Items              []CreateTradeOrderItemRequest `json:"items" binding:"required,min=1,dive"`
-	CreateWorkspace    *bool                         `json:"create_workspace"`
-	SharedWorkspace    *bool                         `json:"shared_workspace"`
-	WorkbookFolderID   *int64                        `json:"workbook_folder_id"`
 	// AI import metadata is service-internal and cannot be supplied through the
 	// public create-order API.
 	AIImportID      string   `json:"-"`
@@ -735,7 +783,7 @@ type AdvanceTradeOrderRequest struct {
 }
 
 // AI import records are intentionally cleared by an explicit user action after
-// the operator has filled and checked the missing fields in the order/workbook.
+// the operator has filled and checked the missing fields in the order.
 type CompleteAITradeImportRequest struct{}
 
 type CreateTradeSupplierRequest struct {

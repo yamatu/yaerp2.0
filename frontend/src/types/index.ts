@@ -847,9 +847,6 @@ export interface AITradeOrderImportDraft {
   goods_amount: number;
   shipping_cost: number;
   total_amount: number;
-  workbook_folder_id?: number;
-  create_workspace: boolean;
-  shared_workspace: false;
   items: AITradeOrderImportItem[];
   warnings: string[];
   missing_fields: string[];
@@ -1288,8 +1285,6 @@ export interface TradeCustomer {
   whatsapp_chat_name: string;
   avatar_url: string;
   channel_id?: number;
-  workbook_folder_id?: number;
-  workbook_folder_name: string;
   tags: string[];
   notes: string;
   order_count: number;
@@ -1341,8 +1336,58 @@ export interface TradeOrderItem {
   net_weight: number;
   status: string;
   workflow_data?: Record<string, unknown>;
+  images?: TradeItemImage[];
   created_at: string;
   updated_at: string;
+}
+
+export interface TradeItemImage {
+  id: number;
+  order_item_id: number;
+  attachment_id: number;
+  url: string;
+  thumbnail_url: string;
+  filename: string;
+  source: "inquiry" | "inspection";
+}
+
+export interface TradeQuoteHistoryRecord {
+  quote_id: number;
+  round_no: number;
+  status: string;
+  order_id: number;
+  order_no: string;
+  order_title: string;
+  order_stage: string;
+  customer_id: number;
+  customer_name: string;
+  owner_name: string;
+  order_item_id: number;
+  sku: string;
+  product_name: string;
+  specification: string;
+  quantity: number;
+  unit: string;
+  currency: string;
+  unit_price: number;
+  amount: number;
+  quoted_at: string;
+  images: TradeItemImage[];
+  supplier_name?: string;
+  purchase_currency?: string;
+  purchase_price?: number;
+  exchange_rate_cny?: number;
+  profit_margin_percent?: number;
+  unit_cost_cny?: number;
+  unit_price_cny?: number;
+  unit_profit_cny?: number;
+  profit_margin?: number;
+  cost_complete?: boolean;
+}
+
+export interface TradeQuoteHistory {
+  can_view_cost: boolean;
+  records: TradeQuoteHistoryRecord[];
 }
 
 export interface TradeOrderStageEvent {
@@ -1588,7 +1633,6 @@ export interface TradeOrderAccess {
   can_view_shipment: boolean;
   can_view_profit: boolean;
   can_view_timeline: boolean;
-  can_sync_workbook: boolean;
   can_add_items: boolean;
   can_view_payment_records: boolean;
   can_view_all_payment_records: boolean;
@@ -1596,8 +1640,7 @@ export interface TradeOrderAccess {
   can_manage_payment_status: boolean;
   can_view_pi: boolean;
   can_generate_pi: boolean;
-  visible_sheet_names: string[];
-  editable_sheet_names: string[];
+  can_manage_item_images: boolean;
 }
 
 export interface TradeProfitLine {
@@ -1752,10 +1795,6 @@ export interface TradeOrder {
   actual_freight_notes: string;
   additional_cost_amount: number;
   additional_cost_notes: string;
-  workbook_id?: number;
-  workbook_sheet_id?: number;
-  workspace_folder_id?: number;
-  workspace_folder_name: string;
   channel_id?: number;
   notes: string;
   source: "manual" | "ai_import";
@@ -1786,6 +1825,7 @@ export interface TradeOrder {
   rework_reason: string;
   rework_count: number;
   item_count: number;
+  sku_preview?: string;
   required_position_code: string;
   required_position_name: string;
   can_operate_stage: boolean;

@@ -56,9 +56,6 @@ type AITradeOrderImportDraft struct {
 	GoodsAmount        float64                  `json:"goods_amount"`
 	ShippingCost       float64                  `json:"shipping_cost"`
 	TotalAmount        float64                  `json:"total_amount"`
-	WorkbookFolderID   *int64                   `json:"workbook_folder_id,omitempty"`
-	CreateWorkspace    bool                     `json:"create_workspace"`
-	SharedWorkspace    bool                     `json:"shared_workspace"`
 	Items              []AITradeOrderImportItem `json:"items"`
 	Warnings           []string                 `json:"warnings"`
 	MissingFields      []string                 `json:"missing_fields"`
@@ -124,8 +121,6 @@ func (s *AIService) PreviewAITradeOrder(userID int64, request *AITradeOrderPrevi
 	draft.RawText = rawText
 	draft.ImportID = newAITradeImportID()
 	draft.TargetStage = model.TradeStageReceiving
-	draft.CreateWorkspace = true
-	draft.SharedWorkspace = false
 	s.normalizeAITradeOrderDraft(userID, draft)
 	return draft, nil
 }
@@ -148,7 +143,7 @@ func (s *AIService) parseAITradeOrderWithAssistant(userID int64, assistant *acti
 		supplierContext = append(supplierContext, map[string]any{"id": supplier.ID, "name": supplier.Name, "company": supplier.CompanyName, "currency": supplier.DefaultCurrency})
 	}
 	contextJSON, _ := json.Marshal(map[string]any{"customers": customerContext, "suppliers": supplierContext})
-	systemPrompt := `你是外贸 ERP 订单资料解析器。把任意语言、乱序、带算式或聊天式原文整理成一个 JSON 对象，不要输出 Markdown。不得猜测缺失币种、付款状态、到货数量或产品名称；SKU 可以暂时代替产品名称，但要把 product_name 加入 missing_fields。Pay/付款金额只表示付款指令，不代表已经收款。目标阶段固定 receiving，表示等待仓库登记到货。JSON 字段：customer_id,customer_query,customer_name,country,title,priority,currency,destination_country,payment_method,settlement_currency,settlement_amount,goods_amount,shipping_cost,total_amount,items,warnings,missing_fields,confidence。items 字段：sku,product_name,description,specification,quantity,unit,sales_unit_price,supplier_name,purchase_currency,purchase_unit_price。金额和数量使用数字。confidence 为 0 到 1。`
+	systemPrompt := `你是外贸 ERP 订单资料解析器。把任意语言、乱序、带算式或聊天式原文整理成一个 JSON 对象，不要输出 Markdown。不得猜测缺失币种、付款状态或到货数量。SKU 与产品名称视为同一个字段：只识别到其中一个时两个字段填相同值；两者都没有时留空，并把 sku 加入 missing_fields。Pay/付款金额只表示付款指令，不代表已经收款。目标阶段固定 receiving，表示等待仓库登记到货。JSON 字段：customer_id,customer_query,customer_name,country,title,priority,currency,destination_country,payment_method,settlement_currency,settlement_amount,goods_amount,shipping_cost,total_amount,items,warnings,missing_fields,confidence。items 字段：sku,product_name,description,specification,quantity,unit,sales_unit_price,supplier_name,purchase_currency,purchase_unit_price。金额和数量使用数字。confidence 为 0 到 1。`
 	response, err := s.callAssistantCompletionJSON(assistant, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: fmt.Sprintf("现有可匹配资料：%s\n\n订单原文：\n%s", string(contextJSON), rawText)},
@@ -215,7 +210,6 @@ func (s *AIService) normalizeAITradeOrderDraft(userID int64, draft *AITradeOrder
 	}
 	draft.DestinationCountry = strings.TrimSpace(firstNonEmptyTrade(draft.DestinationCountry, draft.Country))
 	draft.TargetStage = model.TradeStageReceiving
-	draft.SharedWorkspace = false
 	if draft.Confidence < 0 {
 		draft.Confidence = 0
 	}
@@ -243,8 +237,6 @@ func (s *AIService) normalizeAITradeOrderDraft(userID int64, draft *AITradeOrder
 	calculatedGoods := 0.0
 	for index := range draft.Items {
 		item := &draft.Items[index]
-		item.SKU = strings.TrimSpace(item.SKU)
-		item.ProductName = strings.TrimSpace(item.ProductName)
 		item.Specification = strings.TrimSpace(item.Specification)
 		item.SupplierName = strings.TrimSpace(item.SupplierName)
 		item.PurchaseCurrency = strings.ToUpper(strings.TrimSpace(item.PurchaseCurrency))
@@ -255,15 +247,15 @@ func (s *AIService) normalizeAITradeOrderDraft(userID int64, draft *AITradeOrder
 		if strings.TrimSpace(item.Unit) == "" {
 			item.Unit = "件"
 		}
-		productNameMissing := item.ProductName == "" || (item.SKU != "" && strings.EqualFold(item.ProductName, item.SKU))
-		if item.ProductName == "" {
-			item.ProductName = item.SKU
-		}
-		if item.ProductName == "" {
-			item.ProductName = fmt.Sprintf("待补产品 %d", index+1)
-		}
-		if productNameMissing {
-			missing = append(missing, fmt.Sprintf("第%d项产品名称", index+1))
+		// Same SKU/product-name merge as manual entry. Imports tolerate gaps, so
+		// a row with neither gets a visible placeholder and stays flagged until
+		// the operator acknowledges the import.
+		if sku, productName, err := normalizeTradeItemIdentity(item.SKU, item.ProductName); err == nil {
+			item.SKU, item.ProductName = sku, productName
+		} else {
+			placeholder := fmt.Sprintf("待补SKU-%d", index+1)
+			item.SKU, item.ProductName = placeholder, placeholder
+			missing = append(missing, fmt.Sprintf("第%d项SKU", index+1))
 		}
 		if item.SalesUnitPrice <= 0 {
 			missing = append(missing, fmt.Sprintf("第%d项对客单价", index+1))
@@ -360,7 +352,7 @@ func (s *AIService) ApplyAITradeOrder(userID int64, request *AITradeOrderApplyRe
 		createChannel := false
 		customer, err = s.tradeService.CreateCustomer(userID, &model.CreateTradeCustomerRequest{
 			Name: name, CompanyName: name, Country: draft.Country,
-			Source: "other", CustomerLevel: "B", WorkbookFolderID: draft.WorkbookFolderID,
+			Source: "other", CustomerLevel: "B",
 			Notes:         fmt.Sprintf("AI 自动建立的待核验客户档案。导入编号：%s", draft.ImportID),
 			CreateChannel: &createChannel,
 		})
@@ -374,13 +366,10 @@ func (s *AIService) ApplyAITradeOrder(userID int64, request *AITradeOrderApplyRe
 		return nil, fmt.Errorf("只有管理员、业务经理或客户负责人可以把历史资料直接导入到仓库到货阶段")
 	}
 
-	createWorkspace := false
-	sharedWorkspace := false
 	createRequest := model.CreateTradeOrderRequest{
 		CustomerID: draft.CustomerID, Title: strings.TrimSpace(draft.Title), Priority: draft.Priority,
 		Currency: draft.Currency, DestinationCountry: draft.DestinationCountry,
 		PaymentMethod: draft.PaymentMethod, PaymentTerms: draft.PaymentMethod,
-		WorkbookFolderID: draft.WorkbookFolderID, CreateWorkspace: &createWorkspace, SharedWorkspace: &sharedWorkspace,
 		Notes: aiTradeImportNotes(&draft), Items: make([]model.CreateTradeOrderItemRequest, 0, len(draft.Items)),
 		AIImportID: draft.ImportID, AISourceText: draft.RawText,
 		AIMissingFields: append([]string(nil), draft.MissingFields...), AIImportModel: draft.Model,
@@ -405,7 +394,7 @@ func (s *AIService) ApplyAITradeOrder(userID int64, request *AITradeOrderApplyRe
 
 // finishAITradeOrderImport is intentionally idempotent. The base order stores
 // its import id and raw audit data atomically, so a request interrupted during
-// enrichment, stage advancement, or workspace creation can resume safely.
+// enrichment or stage advancement can resume safely.
 func (s *AIService) finishAITradeOrderImport(userID int64, draft *AITradeOrderImportDraft, order *model.TradeOrder) (*model.TradeOrder, error) {
 	if draft == nil || order == nil {
 		return nil, fmt.Errorf("AI 建单恢复资料不完整")
@@ -441,7 +430,7 @@ func (s *AIService) finishAITradeOrderImport(userID int64, draft *AITradeOrderIm
 			item.WorkflowData["purchase_status"] = "AI 导入，待核验"
 			item.WorkflowData["receipt_status"] = "待到货"
 			item.WorkflowData["ai_import"] = true
-			if err := s.tradeService.repo.UpsertOrderItemFromWorkbook(item); err != nil {
+			if err := s.tradeService.repo.SaveOrderItem(item); err != nil {
 				return nil, err
 			}
 		}
@@ -467,31 +456,11 @@ func (s *AIService) finishAITradeOrderImport(userID int64, draft *AITradeOrderIm
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.tradeService.repo.ListOrderItems(order.ID)
-	if err != nil {
-		return nil, err
-	}
-	if draft.CreateWorkspace && order.WorkbookID == nil {
-		customer, customerErr := s.tradeService.repo.GetCustomerIncludingDeleted(order.CustomerID, userID, true)
-		if customerErr != nil {
-			return nil, customerErr
-		}
-		workbook, firstSheetID, workspaceErr := s.tradeService.createOrderWorkspace(userID, order, customer, items, false)
-		if workspaceErr != nil {
-			return nil, workspaceErr
-		}
-		if err := s.tradeService.repo.SetOrderWorkspace(order.ID, order.OwnerID, workbook.ID, order.WorkspaceFolderID); err != nil {
-			_ = s.tradeService.sheetSvc.DeleteWorkbookForUser(userID, workbook.ID)
-			return nil, err
-		}
-		order.WorkbookID = &workbook.ID
-		order.WorkbookSheetID = &firstSheetID
-	}
 	if advanced {
 		if order.ChannelID != nil {
 			_, _ = s.tradeService.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-				Content:          fmt.Sprintf("AI 已从原始资料创建业务单 %s，并导入到【仓库到货】。待补字段：%s", order.OrderNo, firstNonEmptyTrade(strings.Join(draft.MissingFields, "、"), "无")),
-				LinkedWorkbookID: order.WorkbookID, InternalOnly: true,
+				Content:      fmt.Sprintf("AI 已从原始资料创建业务单 %s，并导入到【仓库到货】。待补字段：%s", order.OrderNo, firstNonEmptyTrade(strings.Join(draft.MissingFields, "、"), "无")),
+				InternalOnly: true,
 			})
 		}
 		s.tradeService.notifyStageAssignees(order, model.TradeStageReceiving, "AI 导入订单待核验并登记到货")
@@ -501,7 +470,7 @@ func (s *AIService) finishAITradeOrderImport(userID int64, draft *AITradeOrderIm
 }
 
 func heuristicAITradeOrderDraft(rawText string) *AITradeOrderImportDraft {
-	draft := &AITradeOrderImportDraft{Priority: "normal", TargetStage: model.TradeStageReceiving, CreateWorkspace: true, Confidence: 0.56}
+	draft := &AITradeOrderImportDraft{Priority: "normal", TargetStage: model.TradeStageReceiving, Confidence: 0.56}
 	item := AITradeOrderImportItem{Quantity: 1, Unit: "件"}
 	if match := aiTradeSKURegexp.FindString(rawText); match != "" {
 		item.SKU = strings.ToUpper(match)

@@ -46,9 +46,40 @@ func TestNormalizeAITradeOrderDraftPreservesSemanticMissingFields(t *testing.T) 
 	(&AIService{}).normalizeAITradeOrderDraft(1, draft)
 
 	missing := strings.Join(draft.MissingFields, "|")
-	for _, expected := range []string{"报价币种", "第1项产品名称", "第1项采购币种"} {
+	for _, expected := range []string{"报价币种", "第1项采购币种"} {
 		if !strings.Contains(missing, expected) {
 			t.Fatalf("missing fields = %q, want %q", missing, expected)
 		}
+	}
+	if strings.Contains(missing, "产品名称") || strings.Contains(missing, "SKU") {
+		t.Fatalf("a SKU without a separate product name is complete now: %q", missing)
+	}
+}
+
+func TestNormalizeAITradeOrderDraftMergesSKUAndProductName(t *testing.T) {
+	draft := &AITradeOrderImportDraft{
+		CustomerID: 1,
+		Currency:   "USD",
+		Items: []AITradeOrderImportItem{
+			{SKU: " SKU-1 ", Quantity: 1, SalesUnitPrice: 1, SupplierName: "A", PurchaseUnitPrice: 1, PurchaseCurrency: "CNY"},
+			{ProductName: " 名称 ", Quantity: 1, SalesUnitPrice: 1, SupplierName: "A", PurchaseUnitPrice: 1, PurchaseCurrency: "CNY"},
+			{Quantity: 1, SalesUnitPrice: 1, SupplierName: "A", PurchaseUnitPrice: 1, PurchaseCurrency: "CNY"},
+		},
+	}
+
+	(&AIService{}).normalizeAITradeOrderDraft(1, draft)
+
+	if item := draft.Items[0]; item.SKU != "SKU-1" || item.ProductName != "SKU-1" {
+		t.Fatalf("SKU-only item = %#v", item)
+	}
+	if item := draft.Items[1]; item.SKU != "名称" || item.ProductName != "名称" {
+		t.Fatalf("name-only item = %#v", item)
+	}
+	if item := draft.Items[2]; item.SKU == "" || item.ProductName != item.SKU {
+		t.Fatalf("empty item should get a placeholder SKU: %#v", item)
+	}
+	missing := strings.Join(draft.MissingFields, "|")
+	if !strings.Contains(missing, "第3项SKU") || strings.Contains(missing, "第1项SKU") || strings.Contains(missing, "第2项SKU") {
+		t.Fatalf("missing fields = %q, want only item 3 SKU flagged", missing)
 	}
 }

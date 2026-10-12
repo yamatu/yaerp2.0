@@ -121,14 +121,11 @@ func main() {
 		cfg.WhatsApp.ServiceURL, cfg.WhatsApp.InternalSecret, cfg.JWT.Secret,
 	)
 	tradeService := service.NewTradeService(
-		tradeRepo, sheetRepo, sheetService, channelService, whatsAppService, uploadService,
+		tradeRepo, channelService, whatsAppService, uploadService,
 		permService, userRepo, automationRepo,
 	)
-	permService.SetSheetPermissionMatrixOverride(tradeService.TradeSheetPermissionMatrix)
-	permService.SetWorkbookPermissionOverride(tradeService.TradeWorkbookPermission)
 	sheetService.SetCellChangeHook(func(userID int64, changes []model.CellUpdate, source string) {
 		automationService.HandleCellChanges(userID, changes, source)
-		tradeService.HandleCellChanges(userID, changes, source)
 	})
 	importService := service.NewSheetImportService(sheetRepo, sheetService, uploadService)
 	channelService.SetImportService(importService)
@@ -222,9 +219,6 @@ func main() {
 	}
 	tradeService.SetOrderUpdatedHook(broadcastTradeOrderUpdate)
 	recycleBinService.SetTradeOrderChangedHook(broadcastTradeOrderUpdate)
-	tradeService.SetCellBroadcastHook(func(actorID int64, changes []model.CellUpdate) {
-		broadcastAutomationCellChanges(hub, sheetService, actorID, changes)
-	})
 	automationService.SetCellBroadcastHook(func(actorID int64, changes []model.CellUpdate) {
 		broadcastAutomationCellChanges(hub, sheetService, actorID, changes)
 	})
@@ -375,6 +369,9 @@ func main() {
 		api.DELETE("/trade/orders/:id", tradeHandler.DeleteOrder)
 		api.POST("/trade/orders/:id/items", tradeHandler.AddOrderItems)
 		api.DELETE("/trade/orders/:id/items/:itemId", tradeHandler.DeleteOrderItem)
+		api.POST("/trade/orders/:id/items/:itemId/images", tradeHandler.UploadItemImage)
+		api.DELETE("/trade/orders/:id/items/:itemId/images/:imageId", tradeHandler.DeleteItemImage)
+		api.GET("/trade/quote-history", tradeHandler.QuoteHistory)
 		api.PUT("/trade/orders/:id/stage-data", tradeHandler.UpdateStageData)
 		api.POST("/trade/orders/:id/advance", tradeHandler.AdvanceOrder)
 		api.POST("/trade/orders/:id/supplier-quotes", tradeHandler.CreateSupplierQuote)
@@ -392,7 +389,6 @@ func main() {
 		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/pi-seller-profile", tradeHandler.UpdatePISellerProfile)
 		api.POST("/trade/orders/:id/pi/pdf", tradeHandler.GeneratePI)
 		api.POST("/trade/orders/:id/pi/send", tradeHandler.SendPI)
-		api.POST("/trade/orders/:id/sync-workbook", tradeHandler.SyncOrderWorkspace)
 		api.POST("/trade/orders/:id/inspection-photos", tradeHandler.UploadInspectionPhoto)
 		api.POST("/trade/orders/:id/inspection-photos/link", tradeHandler.LinkInspectionPhotos)
 		api.PUT("/trade/orders/:id/packing-groups", tradeHandler.UpdatePackingGroups)

@@ -82,7 +82,7 @@ type MailService struct {
 	// XTLS/Mihomo switch. When it returns a non-nil value it wins over the
 	// mail server settings so IMAP/SMTP/HTTP traffic honours the switch.
 	proxyOverrideProvider func() *model.MailServerSettings
-	bulkSendSem   chan struct{}
+	bulkSendSem           chan struct{}
 
 	attachmentCacheOnce sync.Once
 	attachmentCache     *mailAttachmentCache

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -415,103 +416,6 @@ func TestPhoneFromWhatsAppChat(t *testing.T) {
 	}
 }
 
-func TestTradeWorkbookDefinitions(t *testing.T) {
-	now := time.Now()
-	order := &model.TradeOrder{
-		ID: 8, OrderNo: "FT-TEST-000001", Title: "夏季产品询价", Stage: model.TradeStageInquiry,
-		Priority: "high", OwnerName: "sales", InquiryDate: now, Currency: "USD", Incoterm: "FOB",
-		DestinationCountry: "Italy", DestinationPort: "Genoa",
-	}
-	customer := &model.TradeCustomer{ID: 2, Name: "Marco", CompanyName: "Example Import SRL"}
-	items := []model.TradeOrderItem{{LineNo: 1, SKU: "SKU-1", ProductName: "示例产品", Quantity: 100, Unit: "件"}}
-
-	definitions := tradeWorkbookDefinitions(order, customer, items)
-	if len(definitions) != 9 {
-		t.Fatalf("expected 9 trade sheets, got %d", len(definitions))
-	}
-	wantedNames := []string{"订单总览", "询价明细", "供应商询价", "报价单", "采购跟进", "仓库到货", "质检记录", "装箱清单", "发货跟踪"}
-	for index, name := range wantedNames {
-		if definitions[index].Name != name {
-			t.Fatalf("sheet %d name = %q, want %q", index, definitions[index].Name, name)
-		}
-		if len(definitions[index].Columns) == 0 || len(definitions[index].Rows) == 0 {
-			t.Fatalf("sheet %q must contain columns and initial rows", name)
-		}
-	}
-}
-
-func TestTradeWorkbookDefinitionsKeepExistingProgressAndUnquotedItems(t *testing.T) {
-	now := time.Now()
-	order := &model.TradeOrder{
-		ID: 8, OrderNo: "FT-TEST-000002", Title: "追加产品询价", Stage: model.TradeStageSupplierQuote,
-		Priority: "normal", OwnerName: "sales", InquiryDate: now, Currency: "USD",
-	}
-	customer := &model.TradeCustomer{ID: 2, Name: "Marco"}
-	items := []model.TradeOrderItem{
-		{ID: 11, LineNo: 1, SKU: "SKU-1", ProductName: "已有产品", Quantity: 10, Unit: "件", QuotedPrice: 12.5, ReceivedQuantity: 4, AcceptedQuantity: 3},
-		{ID: 12, LineNo: 2, SKU: "SKU-2", ProductName: "新增产品", Quantity: 20, Unit: "件"},
-	}
-	quotes := []model.TradeSupplierQuote{{
-		OrderItemID: 11, LineNo: 1, SKU: "SKU-1", ProductName: "已有产品",
-		SupplierName: "供应商 A", Currency: "USD", UnitPrice: 8.8,
-	}}
-
-	definitions := tradeWorkbookDefinitionsWithContext(order, customer, items, nil, quotes, nil, nil)
-	byName := make(map[string]tradeSheetDefinition, len(definitions))
-	for _, definition := range definitions {
-		byName[definition.Name] = definition
-	}
-
-	supplierRows := byName["供应商询价"].Rows
-	if len(supplierRows) != 2 {
-		t.Fatalf("supplier quote rows = %d, want quoted and newly-added product rows", len(supplierRows))
-	}
-	if supplierRows[1]["line_no"] != 2 || supplierRows[1]["supplier"] != "" {
-		t.Fatalf("new product row was not retained: %#v", supplierRows[1])
-	}
-	if got := byName["报价单"].Rows[0]["unit_price"]; got != 12.5 {
-		t.Fatalf("quoted price = %#v, want 12.5", got)
-	}
-	if got := byName["仓库到货"].Rows[0]["received_qty"]; got != 4.0 {
-		t.Fatalf("received quantity = %#v, want 4", got)
-	}
-	if got := byName["质检记录"].Rows[0]["passed_qty"]; got != 3.0 {
-		t.Fatalf("accepted quantity = %#v, want 3", got)
-	}
-	if got := byName["质检记录"].Rows[0]["failed_qty"]; got != 1.0 {
-		t.Fatalf("failed quantity = %#v, want 1", got)
-	}
-}
-
-func TestTradeWorkbookDefinitionsPreserveStageWorkflowData(t *testing.T) {
-	order := &model.TradeOrder{ID: 10, OrderNo: "FT-TEST-000010", Stage: model.TradeStageReceiving, Currency: "USD"}
-	customer := &model.TradeCustomer{ID: 3, Name: "Workflow Customer"}
-	items := []model.TradeOrderItem{{
-		ID: 21, LineNo: 1, SKU: "SYNC-1", ProductName: "同步产品", Quantity: 8, Unit: "件",
-		ReceivedQuantity: 6, AcceptedQuantity: 5, PackedQuantity: 4, CartonCount: 2,
-		WorkflowData: map[string]any{
-			"warehouse_location": "A-03", "received_date": "2026-07-19", "receipt_status": "部分到货",
-			"sample_qty": 6.0, "inspection_result": "返工", "inspection_issue": "外观划痕",
-			"inspector": "quality", "inspection_date": "2026-07-20",
-			"carton_no": "C-01", "carton_size": "40x30x20", "marks": "HANDLE WITH CARE",
-		},
-	}}
-	definitions := tradeWorkbookDefinitionsWithContext(order, customer, items, nil, nil, nil, nil)
-	byName := make(map[string]tradeSheetDefinition, len(definitions))
-	for _, definition := range definitions {
-		byName[definition.Name] = definition
-	}
-	if row := byName["仓库到货"].Rows[0]; row["warehouse_location"] != "A-03" || row["receipt_status"] != "部分到货" {
-		t.Fatalf("receiving workflow data was not preserved: %#v", row)
-	}
-	if row := byName["质检记录"].Rows[0]; row["issue"] != "外观划痕" || row["inspector"] != "quality" {
-		t.Fatalf("inspection workflow data was not preserved: %#v", row)
-	}
-	if row := byName["装箱清单"].Rows[0]; row["carton_size"] != "40x30x20" || row["marks"] != "HANDLE WITH CARE" {
-		t.Fatalf("packing workflow data was not preserved: %#v", row)
-	}
-}
-
 func TestBuildTradeOrderItems(t *testing.T) {
 	items, err := buildTradeOrderItems([]model.CreateTradeOrderItemRequest{{
 		SKU: " SKU-3 ", ProductName: " 新产品 ", Quantity: 2,
@@ -522,8 +426,54 @@ func TestBuildTradeOrderItems(t *testing.T) {
 	if len(items) != 1 || items[0].SKU != "SKU-3" || items[0].ProductName != "新产品" || items[0].Unit != "件" {
 		t.Fatalf("unexpected normalized item: %#v", items)
 	}
-	if _, err := buildTradeOrderItems([]model.CreateTradeOrderItemRequest{{ProductName: "", Quantity: 1}}); err == nil {
-		t.Fatal("expected invalid product name to fail")
+	if _, err := buildTradeOrderItems([]model.CreateTradeOrderItemRequest{{SKU: " ", ProductName: "", Quantity: 1}}); !errors.Is(err, errTradeItemSKURequired) {
+		t.Fatalf("expected missing SKU and product name to fail with SKU error, got %v", err)
+	}
+	if _, err := buildTradeOrderItems([]model.CreateTradeOrderItemRequest{{SKU: "SKU-9", Quantity: 0}}); err == nil {
+		t.Fatal("expected non-positive quantity to fail")
+	}
+}
+
+func TestBuildTradeOrderItemsMergesSKUAndProductName(t *testing.T) {
+	items, err := buildTradeOrderItems([]model.CreateTradeOrderItemRequest{
+		{SKU: " SKU-ONLY ", Quantity: 1},
+		{ProductName: " 只有名称 ", Quantity: 1},
+		{SKU: "SKU-2", ProductName: "名称 2", Quantity: 1},
+	})
+	if err != nil {
+		t.Fatalf("buildTradeOrderItems returned error: %v", err)
+	}
+	expected := [][2]string{{"SKU-ONLY", "SKU-ONLY"}, {"只有名称", "只有名称"}, {"SKU-2", "名称 2"}}
+	for index, want := range expected {
+		if items[index].SKU != want[0] || items[index].ProductName != want[1] {
+			t.Fatalf("item %d = %q/%q, want %q/%q", index, items[index].SKU, items[index].ProductName, want[0], want[1])
+		}
+	}
+	if errTradeItemSKURequired.Error() != "每个产品必须填写 SKU" {
+		t.Fatalf("unexpected SKU error message %q", errTradeItemSKURequired.Error())
+	}
+}
+
+func TestApplyTradeStageItemUpdateKeepsSKUAndProductNameInSync(t *testing.T) {
+	item := &model.TradeOrderItem{SKU: "OLD", ProductName: "旧名称"}
+	if err := applyTradeStageItemUpdate(model.TradeStageInquiry, item, &model.UpdateTradeStageItemRequest{
+		SKU: " NEW-SKU ", Quantity: 3,
+	}); err != nil {
+		t.Fatalf("applyTradeStageItemUpdate returned error: %v", err)
+	}
+	if item.SKU != "NEW-SKU" || item.ProductName != "NEW-SKU" {
+		t.Fatalf("blank product name should follow SKU: %#v", item)
+	}
+	if err := applyTradeStageItemUpdate(model.TradeStageInquiry, item, &model.UpdateTradeStageItemRequest{
+		SKU: "SKU-A", ProductName: "名称 A", Quantity: 3,
+	}); err != nil {
+		t.Fatalf("applyTradeStageItemUpdate returned error: %v", err)
+	}
+	if item.SKU != "SKU-A" || item.ProductName != "名称 A" {
+		t.Fatalf("distinct SKU and product name should both be kept: %#v", item)
+	}
+	if err := applyTradeStageItemUpdate(model.TradeStageInquiry, item, &model.UpdateTradeStageItemRequest{Quantity: 3}); !errors.Is(err, errTradeItemSKURequired) {
+		t.Fatalf("expected SKU error, got %v", err)
 	}
 }
 
