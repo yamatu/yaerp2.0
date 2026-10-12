@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"mime/multipart"
 	"regexp"
 	"sort"
@@ -44,38 +43,20 @@ var tradeStageLabels = map[string]string{
 	model.TradeStageCancelled:     "已取消",
 }
 
-var tradeStageColors = map[string]any{
-	"询价":      map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-	"供应商询价":   map[string]string{"backgroundColor": "#FCE7F3", "textColor": "#9D174D"},
-	"对客报价与议价": map[string]string{"backgroundColor": "#DBEAFE", "textColor": "#1D4ED8"},
-	"采购":      map[string]string{"backgroundColor": "#EDE9FE", "textColor": "#6D28D9"},
-	"仓库到货":    map[string]string{"backgroundColor": "#CFFAFE", "textColor": "#0E7490"},
-	"质检":      map[string]string{"backgroundColor": "#CCFBF1", "textColor": "#0F766E"},
-	"装箱":      map[string]string{"backgroundColor": "#FFEDD5", "textColor": "#C2410C"},
-	"发货":      map[string]string{"backgroundColor": "#E0F2FE", "textColor": "#0369A1"},
-	"已完成":     map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-	"已取消":     map[string]string{"backgroundColor": "#F1F5F9", "textColor": "#475569"},
-}
-
 type TradeService struct {
-	repo              *repo.TradeRepo
-	sheetRepo         *repo.SheetRepo
-	sheetSvc          *SheetService
-	channelSvc        *ChannelService
-	whatsAppSvc       *WhatsAppService
-	uploadSvc         *UploadService
-	permSvc           *PermissionService
-	userRepo          *repo.UserRepo
-	automationRepo    *repo.AutomationRepo
-	notificationHook  func([]int64)
-	orderUpdatedHook  func(orderID int64)
-	cellBroadcastHook func(actorID int64, changes []model.CellUpdate)
+	repo             *repo.TradeRepo
+	channelSvc       *ChannelService
+	whatsAppSvc      *WhatsAppService
+	uploadSvc        *UploadService
+	permSvc          *PermissionService
+	userRepo         *repo.UserRepo
+	automationRepo   *repo.AutomationRepo
+	notificationHook func([]int64)
+	orderUpdatedHook func(orderID int64)
 }
 
 func NewTradeService(
 	tradeRepo *repo.TradeRepo,
-	sheetRepo *repo.SheetRepo,
-	sheetSvc *SheetService,
 	channelSvc *ChannelService,
 	whatsAppSvc *WhatsAppService,
 	uploadSvc *UploadService,
@@ -84,7 +65,7 @@ func NewTradeService(
 	automationRepo *repo.AutomationRepo,
 ) *TradeService {
 	return &TradeService{
-		repo: tradeRepo, sheetRepo: sheetRepo, sheetSvc: sheetSvc, channelSvc: channelSvc,
+		repo: tradeRepo, channelSvc: channelSvc,
 		whatsAppSvc: whatsAppSvc, uploadSvc: uploadSvc, permSvc: permSvc, userRepo: userRepo,
 		automationRepo: automationRepo,
 	}
@@ -98,45 +79,14 @@ func (s *TradeService) SetOrderUpdatedHook(hook func(int64)) {
 	s.orderUpdatedHook = hook
 }
 
-func (s *TradeService) SetCellBroadcastHook(hook func(int64, []model.CellUpdate)) {
-	s.cellBroadcastHook = hook
-}
-
 func (s *TradeService) notifyOrderUpdated(orderID int64) {
 	if s.orderUpdatedHook != nil && orderID > 0 {
 		go s.orderUpdatedHook(orderID)
 	}
 }
 
-func (s *TradeService) applyTradeCellChanges(actorID int64, changes []model.CellUpdate) error {
-	if len(changes) == 0 {
-		return nil
-	}
-	if err := s.sheetSvc.UpdateCellsWithSource(actorID, changes, "trade_erp"); err != nil {
-		return err
-	}
-	if s.cellBroadcastHook != nil {
-		s.cellBroadcastHook(actorID, changes)
-	}
-	return nil
-}
-
 func (s *TradeService) isAdmin(userID int64) (bool, error) {
 	return s.permSvc.IsAdmin(userID)
-}
-
-func (s *TradeService) ensureWritableTradeFolder(userID int64, folderID *int64) error {
-	if folderID == nil {
-		return nil
-	}
-	canWrite, err := s.permSvc.CanWriteFolder(*folderID, userID)
-	if err != nil {
-		return err
-	}
-	if !canWrite {
-		return fmt.Errorf("所选工作簿文件夹不存在或没有写入权限")
-	}
-	return nil
 }
 
 func (s *TradeService) Dashboard(userID int64) (*model.TradeDashboard, error) {
@@ -347,9 +297,6 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 	if request == nil {
 		return nil, fmt.Errorf("客户资料不能为空")
 	}
-	if err := s.ensureWritableTradeFolder(userID, request.WorkbookFolderID); err != nil {
-		return nil, err
-	}
 	name := strings.TrimSpace(request.Name)
 	if name == "" {
 		return nil, fmt.Errorf("客户名称不能为空")
@@ -392,8 +339,8 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 		ContactName: strings.TrimSpace(request.ContactName), Email: strings.TrimSpace(request.Email),
 		Phone: phone, Source: source, CustomerLevel: level, WhatsAppAccountID: request.WhatsAppAccountID,
 		WhatsAppChatID: request.WhatsAppChatID, WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
-		AvatarURL: strings.TrimSpace(request.AvatarURL), WorkbookFolderID: request.WorkbookFolderID,
-		Tags: normalizeTradeTags(request.Tags), Notes: strings.TrimSpace(request.Notes),
+		AvatarURL: strings.TrimSpace(request.AvatarURL),
+		Tags:      normalizeTradeTags(request.Tags), Notes: strings.TrimSpace(request.Notes),
 	}
 	if customer.CompanyName == "" {
 		customer.CompanyName = customer.Name
@@ -457,9 +404,6 @@ func (s *TradeService) UpdateCustomer(userID, customerID int64, request *model.U
 	if err != nil {
 		return nil, err
 	}
-	if err := s.ensureWritableTradeFolder(userID, request.WorkbookFolderID); err != nil {
-		return nil, err
-	}
 	updated, err := normalizeTradeCustomerUpdate(request)
 	if err != nil {
 		return nil, err
@@ -518,7 +462,7 @@ func normalizeTradeCustomerUpdate(request *model.UpdateTradeCustomerRequest) (*m
 		WhatsAppChatID:   strings.TrimSpace(request.WhatsAppChatID),
 		WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
 		AvatarURL:        strings.TrimSpace(request.AvatarURL), Tags: normalizeTradeTags(request.Tags),
-		Notes: strings.TrimSpace(request.Notes), WorkbookFolderID: request.WorkbookFolderID,
+		Notes: strings.TrimSpace(request.Notes),
 	}, nil
 }
 
@@ -717,6 +661,9 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 	if err != nil {
 		return nil, err
 	}
+	if err := s.loadOrderItemImages(items); err != nil {
+		return nil, err
+	}
 	order.Items = items
 	order.Events = events
 	order.Customer = customer
@@ -777,7 +724,7 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 
 // CompleteAIImport removes the temporary completeness blocker after an
 // operator has manually checked the imported order and filled the remaining
-// fields in the order/workbook.
+// fields in the order.
 func (s *TradeService) CompleteAIImport(userID, orderID int64) (*model.TradeOrder, error) {
 	access, err := s.loadTradeUserAccess(userID)
 	if err != nil {
@@ -820,8 +767,7 @@ func (s *TradeService) UpdateProfitSettings(userID, orderID int64, request *mode
 	if !access.profile.CanViewAllOrders {
 		return nil, fmt.Errorf("仅管理员或业务负责人可以维护订单利润")
 	}
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
+	if _, err := s.repo.GetOrder(orderID, userID, true); err != nil {
 		return nil, err
 	}
 	items, err := s.repo.ListOrderItems(orderID)
@@ -848,20 +794,14 @@ func (s *TradeService) UpdateProfitSettings(userID, orderID int64, request *mode
 		} else {
 			item.WorkflowData["cost_exchange_rate"] = input.Rate
 		}
-		if err := s.repo.UpsertOrderItemFromWorkbook(item); err != nil {
+		if err := s.repo.SaveOrderItem(item); err != nil {
 			return nil, err
 		}
 	}
 	if err := s.repo.UpdateOrderProfitSettings(orderID, request.AdditionalCostAmount, request.AdditionalCostNotes); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		if syncErr := s.syncOrderWorkspaceInternal(userID, orderID); syncErr != nil {
-			log.Printf("sync profit settings for trade order %d: %v", orderID, syncErr)
-		}
-	} else {
-		s.notifyOrderUpdated(orderID)
-	}
+	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
 }
 
@@ -904,13 +844,6 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	if err != nil {
 		return nil, fmt.Errorf("客户不存在或无权访问")
 	}
-	workspaceFolderID := request.WorkbookFolderID
-	if workspaceFolderID == nil {
-		workspaceFolderID = customer.WorkbookFolderID
-	}
-	if err := s.ensureWritableTradeFolder(userID, workspaceFolderID); err != nil {
-		return nil, err
-	}
 	quoteDeadline, err := parseTradeDate(request.QuoteDeadline)
 	if err != nil {
 		return nil, fmt.Errorf("报价截止日期格式无效")
@@ -924,6 +857,9 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	}
 	items, err := buildTradeOrderItems(request.Items)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateRequestedItemImages(userID, request.Items); err != nil {
 		return nil, err
 	}
 	currency := strings.ToUpper(strings.TrimSpace(request.Currency))
@@ -941,7 +877,7 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 		Priority: priority, InquiryDate: time.Now(), QuoteDeadline: quoteDeadline,
 		Currency: currency, Incoterm: "", DestinationCountry: destination,
 		DestinationPort: "", PaymentTerms: paymentMethod, PaymentMethod: paymentMethod,
-		ChannelID: customer.ChannelID, WorkspaceFolderID: workspaceFolderID, Notes: strings.TrimSpace(request.Notes),
+		ChannelID: customer.ChannelID, Notes: strings.TrimSpace(request.Notes),
 		Source: "manual", DataStatus: "ready",
 	}
 	isAIImport := strings.TrimSpace(request.AIImportID) != ""
@@ -956,36 +892,14 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	if err := s.repo.CreateOrder(order, items); err != nil {
 		return nil, err
 	}
-	if request.WorkbookFolderID != nil && !isAIImport {
-		if err := s.repo.SetCustomerWorkbookFolder(customer.ID, request.WorkbookFolderID); err != nil {
-			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
-			return nil, err
-		}
-		customer.WorkbookFolderID = request.WorkbookFolderID
+	if err := s.attachRequestedItemImages(userID, order.ID, items, request.Items); err != nil {
+		return nil, err
 	}
-
-	createWorkspace := request.CreateWorkspace == nil || *request.CreateWorkspace
-	sharedWorkspace := request.SharedWorkspace != nil && *request.SharedWorkspace
-	if createWorkspace {
-		workbook, firstSheetID, workspaceErr := s.createOrderWorkspace(userID, order, customer, items, sharedWorkspace)
-		if workspaceErr != nil {
-			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
-			return nil, workspaceErr
-		}
-		order.WorkbookID = &workbook.ID
-		order.WorkbookSheetID = &firstSheetID
-		if err := s.repo.SetOrderWorkspace(order.ID, order.OwnerID, workbook.ID, order.WorkspaceFolderID); err != nil {
-			_ = s.sheetSvc.DeleteWorkbookForUser(userID, workbook.ID)
-			_ = s.repo.DeleteOrderAfterCreateFailure(order.ID, order.OwnerID)
-			return nil, err
-		}
-		if order.ChannelID != nil && !isAIImport {
-			_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-				Content:          fmt.Sprintf("已创建外贸业务单 %s：%s。当前阶段：询价。", order.OrderNo, order.Title),
-				LinkedWorkbookID: &workbook.ID,
-				InternalOnly:     true,
-			})
-		}
+	if order.ChannelID != nil && !isAIImport {
+		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
+			Content:      fmt.Sprintf("已创建外贸业务单 %s：%s。当前阶段：询价。", order.OrderNo, order.Title),
+			InternalOnly: true,
+		})
 	}
 	if !isAIImport {
 		s.notifyStageAssignees(order, model.TradeStageInquiry, "新的客户询价待处理")
@@ -1020,17 +934,18 @@ func (s *TradeService) AddOrderItems(userID, orderID int64, request *model.AddTr
 	if err != nil {
 		return nil, err
 	}
+	if err := s.validateRequestedItemImages(userID, request.Items); err != nil {
+		return nil, err
+	}
 	if err := s.repo.AddOrderItems(orderID, items); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		if syncErr := s.syncOrderWorkspaceInternal(userID, orderID); syncErr != nil {
-			log.Printf("sync added items for trade order %d: %v", orderID, syncErr)
-		}
+	if err := s.attachRequestedItemImages(userID, orderID, items, request.Items); err != nil {
+		return nil, err
 	}
 	if order.ChannelID != nil {
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-			Content:      fmt.Sprintf("业务单 %s 新增 %d 个产品，流程工作表已更新。", order.OrderNo, len(items)),
+			Content:      fmt.Sprintf("业务单 %s 新增 %d 个产品。", order.OrderNo, len(items)),
 			InternalOnly: true,
 		})
 	}
@@ -1078,14 +993,9 @@ func (s *TradeService) DeleteOrderItem(userID, orderID, itemID int64) (*model.Tr
 		}
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		if syncErr := s.syncOrderWorkspaceInternal(userID, orderID); syncErr != nil {
-			log.Printf("sync deleted item for trade order %d: %v", orderID, syncErr)
-		}
-	}
 	if order.ChannelID != nil {
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-			Content:      fmt.Sprintf("业务单 %s 删除产品：%s，流程工作表已更新。", order.OrderNo, firstNonEmptyTrade(item.SKU, item.ProductName)),
+			Content:      fmt.Sprintf("业务单 %s 删除产品：%s。", order.OrderNo, firstNonEmptyTrade(item.SKU, item.ProductName)),
 			InternalOnly: true,
 		})
 	}
@@ -1188,7 +1098,7 @@ func (s *TradeService) UpdateStageData(userID, orderID int64, request *model.Upd
 			if err := applyTradeStageItemUpdate(order.Stage, item, &input); err != nil {
 				return nil, fmt.Errorf("第 %d 行：%w", item.LineNo, err)
 			}
-			if err := s.repo.UpsertOrderItemFromWorkbook(item); err != nil {
+			if err := s.repo.SaveOrderItem(item); err != nil {
 				return nil, err
 			}
 		}
@@ -1196,13 +1106,7 @@ func (s *TradeService) UpdateStageData(userID, orderID int64, request *model.Upd
 	if err := s.repo.RecalculateOrderTotal(orderID); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		if err := s.syncOrderWorkspaceInternal(userID, orderID); err != nil {
-			return nil, err
-		}
-	} else {
-		s.notifyOrderUpdated(orderID)
-	}
+	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
 }
 
@@ -1215,14 +1119,15 @@ func applyTradeStageItemUpdate(stage string, item *model.TradeOrderItem, input *
 	}
 	switch stage {
 	case model.TradeStageInquiry:
-		if strings.TrimSpace(input.ProductName) == "" {
-			return fmt.Errorf("产品名称不能为空")
+		sku, productName, err := normalizeTradeItemIdentity(input.SKU, input.ProductName)
+		if err != nil {
+			return err
 		}
 		if input.Quantity <= 0 {
 			return fmt.Errorf("数量必须大于零")
 		}
-		item.SKU = strings.TrimSpace(input.SKU)
-		item.ProductName = strings.TrimSpace(input.ProductName)
+		item.SKU = sku
+		item.ProductName = productName
 		item.Description = strings.TrimSpace(input.Description)
 		item.Specification = strings.TrimSpace(input.Specification)
 		item.Quantity = input.Quantity
@@ -1464,13 +1369,6 @@ func isAIImportedTradeItem(item *model.TradeOrderItem) bool {
 	return ok && value
 }
 
-func tradeFreightModeLabel(mode string) string {
-	if strings.EqualFold(strings.TrimSpace(mode), "quoted") {
-		return "我方报价运费"
-	}
-	return "客户自有货代"
-}
-
 func normalizeTradeShippingStatus(status string) string {
 	switch strings.TrimSpace(status) {
 	case "已发货", "到了", "已离港", "运输中", "已到港", "已签收":
@@ -1509,6 +1407,15 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 		return nil, fmt.Errorf("当前阶段由%s处理，您没有流转权限", positionName)
 	}
 	isCancelled := targetStage == model.TradeStageCancelled
+	if isCancelled && order.OwnerID != userID {
+		userAccess, accessErr := s.loadTradeUserAccess(userID)
+		if accessErr != nil {
+			return nil, accessErr
+		}
+		if !userAccess.profile.CanViewAllOrders {
+			return nil, fmt.Errorf("只有业务单负责人、业务负责人或管理员可以取消业务单")
+		}
+	}
 	isForward := targetStage == nextTradeStage(order.Stage)
 	isBackward := targetStage == prevTradeStage(order.Stage)
 	if !isCancelled && !isForward && !isBackward {
@@ -1539,15 +1446,10 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 			return nil, err
 		}
 	}
-	if order.WorkbookID != nil {
-		if syncErr := s.syncOrderStageToWorkbook(userID, *order.WorkbookID, targetStage); syncErr != nil {
-			log.Printf("sync trade order %d stage to workbook: %v", orderID, syncErr)
-		}
-	}
 	if order.ChannelID != nil {
 		content := fmt.Sprintf("业务单 %s 已进入【%s】阶段。%s", order.OrderNo, tradeStageLabel(targetStage), note)
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-			Content: content, LinkedWorkbookID: order.WorkbookID, InternalOnly: true,
+			Content: content, InternalOnly: true,
 		})
 	}
 	s.notifyStageAssignees(order, targetStage, note)
@@ -1564,109 +1466,9 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 	updated.CustomerName = "任务已交接"
 	updated.CustomerCompany = ""
 	updated.ChannelID = nil
-	updated.WorkbookSheetID = nil
 	updated.Notes = ""
 	updated.Access = &model.TradeOrderAccess{ScopeLabel: "任务已交接"}
 	return updated, nil
-}
-
-func (s *TradeService) createOrderWorkspace(
-	actorID int64,
-	order *model.TradeOrder,
-	customer *model.TradeCustomer,
-	items []model.TradeOrderItem,
-	shared bool,
-) (*model.Workbook, int64, error) {
-	description := fmt.Sprintf("外贸业务单 %s · %s · %s", order.OrderNo, customer.Name, order.Title)
-	metadata, _ := json.Marshal(map[string]any{
-		"tradeErp": map[string]any{
-			"version": 2, "order_id": order.ID, "order_no": order.OrderNo,
-			"customer_id": customer.ID, "stage": order.Stage,
-		},
-	})
-	workbook := &model.Workbook{
-		Name:        fmt.Sprintf("%s %s - %s", order.OrderNo, customer.Name, order.Title),
-		Description: &description, OwnerID: order.OwnerID, FolderID: order.WorkspaceFolderID,
-		Metadata: metadata, Status: 1,
-	}
-	if err := s.sheetSvc.CreateWorkbookForUserWithSource(actorID, workbook, "trade_erp", "创建外贸业务工作簿"); err != nil {
-		return nil, 0, fmt.Errorf("创建外贸业务工作簿失败：%w", err)
-	}
-	cleanup := func() {
-		if err := s.sheetSvc.DeleteWorkbookForUser(actorID, workbook.ID); err != nil {
-			log.Printf("cleanup failed trade workbook %d: %v", workbook.ID, err)
-		}
-	}
-	suppliers, _ := s.repo.ListSuppliers("")
-	definitions := tradeWorkbookDefinitionsWithContext(order, customer, items, suppliers, nil, nil, nil)
-	var firstSheetID int64
-	for index, definition := range definitions {
-		columns, _ := json.Marshal(definition.Columns)
-		sheet := &model.Sheet{
-			WorkbookID: workbook.ID, Name: definition.Name, Columns: columns,
-			Frozen: json.RawMessage(`{"row":1,"col":0}`), Config: json.RawMessage(`{}`),
-		}
-		if err := s.sheetSvc.CreateSheetForUserWithSource(actorID, sheet, "trade_erp", "创建外贸流程工作表"); err != nil {
-			cleanup()
-			return nil, 0, fmt.Errorf("创建工作表“%s”失败：%w", definition.Name, err)
-		}
-		if index == 0 {
-			firstSheetID = sheet.ID
-		}
-		if err := s.writeTradeRows(actorID, sheet.ID, definition.Rows); err != nil {
-			cleanup()
-			return nil, 0, fmt.Errorf("写入工作表“%s”失败：%w", definition.Name, err)
-		}
-	}
-	if shared {
-		username := fmt.Sprintf("用户 #%d", actorID)
-		if user, err := s.userRepo.GetByID(actorID); err == nil && user != nil && strings.TrimSpace(user.Username) != "" {
-			username = user.Username
-		}
-		if _, err := s.sheetSvc.UpdateWorkbookState(actorID, workbook.ID, username, "publish"); err != nil {
-			cleanup()
-			return nil, 0, fmt.Errorf("共享外贸业务工作簿失败：%w", err)
-		}
-	}
-	return workbook, firstSheetID, nil
-}
-
-func (s *TradeService) writeTradeRows(actorID, sheetID int64, rows []map[string]any) error {
-	changes := make([]model.CellUpdate, 0)
-	for rowIndex, row := range rows {
-		keys := make([]string, 0, len(row))
-		for key := range row {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			value, err := json.Marshal(row[key])
-			if err != nil {
-				return err
-			}
-			changes = append(changes, model.CellUpdate{SheetID: sheetID, Row: rowIndex, Col: key, Value: value})
-		}
-	}
-	return s.applyTradeCellChanges(actorID, changes)
-}
-
-func (s *TradeService) syncOrderStageToWorkbook(actorID, workbookID int64, stage string) error {
-	sheets, err := s.sheetRepo.GetSheetsByWorkbook(workbookID)
-	if err != nil {
-		return err
-	}
-	for _, sheet := range sheets {
-		if sheet.Name != "订单总览" {
-			continue
-		}
-		stageValue, _ := json.Marshal(tradeStageLabel(stage))
-		updatedValue, _ := json.Marshal(time.Now().Format("2006-01-02 15:04"))
-		return s.applyTradeCellChanges(actorID, []model.CellUpdate{
-			{SheetID: sheet.ID, Row: 0, Col: "stage", Value: stageValue},
-			{SheetID: sheet.ID, Row: 0, Col: "stage_updated_at", Value: updatedValue},
-		})
-	}
-	return fmt.Errorf("订单总览工作表不存在")
 }
 
 func (s *TradeService) ListSuppliers(userID int64, search string) ([]model.TradeSupplier, error) {
@@ -1761,8 +1563,8 @@ func (s *TradeService) DeleteSupplier(userID, supplierID int64) error {
 	if err != nil {
 		return err
 	}
-	if !access.profile.CanManageSuppliers {
-		return fmt.Errorf("当前岗位没有删除供应商的权限")
+	if !access.profile.CanViewAllOrders {
+		return fmt.Errorf("仅管理员或业务负责人可以删除供应商")
 	}
 	if supplierID <= 0 {
 		return fmt.Errorf("供应商编号无效")
@@ -1817,9 +1619,6 @@ func (s *TradeService) CreateSupplierQuote(userID, orderID int64, request *model
 	if _, err := s.repo.CreateSupplierQuote(orderID, userID, request, validUntil); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
-	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
 }
@@ -1866,9 +1665,6 @@ func (s *TradeService) BatchCreateSupplierQuotes(userID, orderID int64, request 
 	if err := s.repo.CreateSupplierQuotes(orderID, userID, request.Quotes, validUntils); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
-	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
 }
@@ -1901,9 +1697,6 @@ func (s *TradeService) UpdateSupplierQuote(userID, orderID, quoteID int64, reque
 	if err := s.repo.UpdateSupplierQuote(orderID, quoteID, request, validUntil); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
-	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
 }
@@ -1922,9 +1715,6 @@ func (s *TradeService) DeleteSupplierQuote(userID, orderID, quoteID int64) (*mod
 	}
 	if err := s.repo.DeleteSupplierQuote(orderID, quoteID); err != nil {
 		return nil, err
-	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
 	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
@@ -1947,9 +1737,6 @@ func (s *TradeService) SelectSupplierQuote(userID, orderID, quoteID int64) (*mod
 	}
 	if err := s.repo.SelectSupplierQuote(orderID, quoteID, userID); err != nil {
 		return nil, err
-	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
 	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
@@ -1982,7 +1769,7 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 		return nil, err
 	}
 	profitMarginPercent := 0.0
-	if orderAccess.CanViewSupplierPricing {
+	if orderAccess.CanViewProfit {
 		profitMarginPercent = nonNegativeTradeValue(request.ProfitMarginPercent)
 		if profitMarginPercent > 1000 {
 			return nil, fmt.Errorf("成本加价率不能超过 1000%%")
@@ -2065,9 +1852,6 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	if err := s.repo.CreateCustomerQuoteRound(round); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
-	}
 	if order.ChannelID != nil {
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
 			Content:      fmt.Sprintf("业务单 %s 已生成第 %d 轮对客报价，商品 %.2f、运费 %.2f，合计 %s %.2f（约 CNY %.2f）。", order.OrderNo, round.RoundNo, round.GoodsAmount, round.FreightAmount, round.Currency, round.TotalAmount, round.TotalAmountCNY),
@@ -2123,9 +1907,6 @@ func (s *TradeService) UpdateCustomerQuoteRoundStatus(userID, orderID, quoteID i
 		orderID, quoteID, status, strings.TrimSpace(request.CustomerFeedback), strings.TrimSpace(request.Notes),
 	); err != nil {
 		return nil, err
-	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
 	}
 	if order.ChannelID != nil {
 		statusText := tradeCustomerQuoteStatusLabel(status)
@@ -2190,9 +1971,6 @@ func (s *TradeService) UpdateCustomerQuotePayment(userID, orderID, quoteID int64
 	}
 	if err := s.repo.UpdateCustomerQuotePayment(orderID, quoteID, status, currency, amount); err != nil {
 		return nil, err
-	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
 	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
@@ -2564,6 +2342,15 @@ func (s *TradeService) UpdateLabelSettings(userID, orderID int64, request *model
 	if !allowed {
 		return nil, fmt.Errorf("没有修改装箱标签的权限")
 	}
+	if order.Stage != model.TradeStagePacking {
+		userAccess, accessErr := s.loadTradeUserAccess(userID)
+		if accessErr != nil {
+			return nil, accessErr
+		}
+		if !userAccess.profile.CanViewAllOrders {
+			return nil, fmt.Errorf("只有装箱环节可以修改标签排版")
+		}
+	}
 	if request == nil || request.WidthMM < 20 || request.HeightMM < 15 || request.WidthMM > 300 || request.HeightMM > 300 {
 		return nil, fmt.Errorf("标签尺寸超出允许范围")
 	}
@@ -2809,9 +2596,6 @@ func (s *TradeService) UpdatePackingGroups(userID, orderID int64, request *model
 	if err := s.repo.ReplacePackingGroups(orderID, groups); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
-	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
 }
@@ -2840,462 +2624,10 @@ func (s *TradeService) ReturnOrderToPurchase(userID, orderID int64, request *mod
 	if err := s.repo.MarkOrderForRepurchase(orderID, userID, reason); err != nil {
 		return nil, err
 	}
-	if order.WorkbookID != nil {
-		_ = s.syncOrderWorkspaceInternal(userID, orderID)
-	}
 	order.Stage = model.TradeStagePurchase
 	s.notifyStageAssignees(order, model.TradeStagePurchase, "采购异常待重新处理："+reason)
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
-}
-
-func (s *TradeService) SyncOrderWorkspace(userID, orderID int64) error {
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
-		return err
-	}
-	access, err := s.loadTradeUserAccess(userID)
-	if err != nil {
-		return err
-	}
-	if !s.canViewTradeOrder(userID, order, access) {
-		return sql.ErrNoRows
-	}
-	if !access.profile.CanViewAllOrders {
-		return fmt.Errorf("没有同步流程工作簿的权限")
-	}
-	return s.syncOrderWorkspaceInternal(userID, orderID)
-}
-
-func (s *TradeService) ensureOrderWorkspace(userID int64, order *model.TradeOrder) error {
-	if order == nil {
-		return fmt.Errorf("业务单不存在")
-	}
-	if order.WorkbookID != nil {
-		exists, err := s.sheetRepo.ActiveWorkbookExists(*order.WorkbookID)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return nil
-		}
-	}
-	items, err := s.repo.ListOrderItems(order.ID)
-	if err != nil {
-		return err
-	}
-	customer, err := s.repo.GetCustomerIncludingDeleted(order.CustomerID, userID, true)
-	if err != nil {
-		return err
-	}
-	if err := s.ensureWritableTradeFolder(userID, order.WorkspaceFolderID); err != nil {
-		order.WorkspaceFolderID = nil
-	}
-	workbook, firstSheetID, err := s.createOrderWorkspace(userID, order, customer, items, false)
-	if err != nil {
-		return err
-	}
-	if err := s.repo.SetOrderWorkspace(order.ID, order.OwnerID, workbook.ID, order.WorkspaceFolderID); err != nil {
-		_ = s.sheetSvc.DeleteWorkbookForUser(userID, workbook.ID)
-		return err
-	}
-	order.WorkbookID = &workbook.ID
-	order.WorkbookSheetID = &firstSheetID
-	if order.ChannelID != nil {
-		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-			Content:          fmt.Sprintf("业务单 %s 的原流程工作簿不可用，系统已重新创建并完成关联。", order.OrderNo),
-			LinkedWorkbookID: &workbook.ID,
-			InternalOnly:     true,
-		})
-	}
-	return nil
-}
-
-func (s *TradeService) syncOrderWorkspaceInternal(userID, orderID int64) error {
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
-		return err
-	}
-	if err := s.ensureOrderWorkspace(userID, order); err != nil {
-		return err
-	}
-	items, err := s.repo.ListOrderItems(orderID)
-	if err != nil {
-		return err
-	}
-	customer, err := s.repo.GetCustomerIncludingDeleted(order.CustomerID, userID, true)
-	if err != nil {
-		return err
-	}
-	quotes, err := s.repo.ListSupplierQuotes(orderID)
-	if err != nil {
-		return err
-	}
-	shipment, shipmentErr := s.repo.GetShipment(orderID)
-	if shipmentErr != nil && !errors.Is(shipmentErr, sql.ErrNoRows) {
-		return shipmentErr
-	}
-	customerQuotes, err := s.repo.ListCustomerQuoteRounds(orderID)
-	if err != nil {
-		return err
-	}
-	order.Items = items
-	order.Customer = customer
-	order.SupplierQuotes = quotes
-	order.CustomerQuotes = customerQuotes
-	order.Shipment = shipment
-	suppliers, _ := s.repo.ListSuppliers("")
-	definitions := tradeWorkbookDefinitionsWithContext(order, customer, items, suppliers, quotes, customerQuotes, shipment)
-	existingSheets, err := s.sheetRepo.GetSheetsByWorkbook(*order.WorkbookID)
-	if err != nil {
-		return err
-	}
-	byName := make(map[string]*model.Sheet, len(existingSheets))
-	for index := range existingSheets {
-		byName[existingSheets[index].Name] = &existingSheets[index]
-	}
-	for definitionIndex, definition := range definitions {
-		sheet := byName[definition.Name]
-		columns, _ := json.Marshal(definition.Columns)
-		if sheet == nil {
-			sheet = &model.Sheet{WorkbookID: *order.WorkbookID, Name: definition.Name, Columns: columns, Frozen: json.RawMessage(`{"row":1,"col":0}`), Config: json.RawMessage(`{}`)}
-			if err := s.sheetSvc.CreateSheetForUserWithSource(userID, sheet, "trade_erp", "补齐外贸流程工作表"); err != nil {
-				return err
-			}
-		}
-		sheet.Columns = columns
-		sheet.SortOrder = definitionIndex
-		if err := s.sheetSvc.UpdateSheetWithSource(userID, sheet, "trade_erp", "同步外贸流程字段", "同步外贸流程工作表", true); err != nil {
-			return err
-		}
-		if err := s.replaceTradeRows(userID, sheet.ID, definition.Columns, definition.Rows); err != nil {
-			return err
-		}
-	}
-	s.notifyOrderUpdated(orderID)
-	return nil
-}
-
-func (s *TradeService) replaceTradeRows(actorID, sheetID int64, columns []map[string]any, desired []map[string]any) error {
-	existing, err := s.sheetRepo.GetRows(sheetID)
-	if err != nil {
-		return err
-	}
-	columnKeys := make([]string, 0, len(columns))
-	for _, column := range columns {
-		if key, ok := column["key"].(string); ok && key != "" {
-			columnKeys = append(columnKeys, key)
-		}
-	}
-	rowCount := len(desired)
-	if len(existing) > rowCount {
-		rowCount = len(existing)
-	}
-	changes := make([]model.CellUpdate, 0, rowCount*len(columnKeys))
-	existingValues := make(map[int]map[string]any, len(existing))
-	for _, row := range existing {
-		var values map[string]any
-		if err := json.Unmarshal(row.Data, &values); err != nil {
-			return err
-		}
-		existingValues[row.RowIndex] = values
-	}
-	for rowIndex := 0; rowIndex < rowCount; rowIndex++ {
-		var values map[string]any
-		if rowIndex < len(desired) {
-			values = desired[rowIndex]
-		}
-		for _, key := range columnKeys {
-			var value any
-			if values != nil {
-				value = values[key]
-			}
-			current, currentExists := existingValues[rowIndex][key]
-			if values == nil && !currentExists {
-				continue
-			}
-			encoded, err := json.Marshal(value)
-			if err != nil {
-				return err
-			}
-			currentEncoded, err := json.Marshal(current)
-			if err != nil {
-				return err
-			}
-			if currentExists && string(currentEncoded) == string(encoded) {
-				continue
-			}
-			changes = append(changes, model.CellUpdate{SheetID: sheetID, Row: rowIndex, Col: key, Value: encoded})
-		}
-	}
-	return s.applyTradeCellChanges(actorID, changes)
-}
-
-func (s *TradeService) HandleCellChanges(userID int64, changes []model.CellUpdate, source string) {
-	if source == "trade_erp" || len(changes) == 0 {
-		return
-	}
-	bySheet := make(map[int64]map[int]struct{})
-	for _, change := range changes {
-		if bySheet[change.SheetID] == nil {
-			bySheet[change.SheetID] = map[int]struct{}{}
-		}
-		bySheet[change.SheetID][change.Row] = struct{}{}
-	}
-	for sheetID, rowIndexes := range bySheet {
-		orderID, sheetName, err := s.repo.FindOrderBySheetID(sheetID)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			log.Printf("resolve trade sheet %d: %v", sheetID, err)
-			continue
-		}
-		handled, matrix, permissionErr := s.TradeSheetPermissionMatrix(userID, sheetID)
-		if permissionErr != nil {
-			log.Printf("check trade sheet %d permission: %v", sheetID, permissionErr)
-			continue
-		}
-		if handled && (matrix == nil || !matrix.Sheet.CanEdit) {
-			log.Printf("ignore unauthorized trade sheet update: user=%d sheet=%d", userID, sheetID)
-			continue
-		}
-		if err := s.syncChangedTradeRows(userID, orderID, sheetID, sheetName, rowIndexes); err != nil {
-			log.Printf("sync trade sheet %d to order %d: %v", sheetID, orderID, err)
-			continue
-		}
-	}
-}
-
-func (s *TradeService) syncChangedTradeRows(userID, orderID, sheetID int64, sheetName string, rowIndexes map[int]struct{}) error {
-	rows, err := s.sheetRepo.GetRows(sheetID)
-	if err != nil {
-		return err
-	}
-	rowsByIndex := make(map[int]map[string]any, len(rows))
-	for _, row := range rows {
-		var values map[string]any
-		if err := json.Unmarshal(row.Data, &values); err != nil {
-			return err
-		}
-		rowsByIndex[row.RowIndex] = values
-	}
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
-		return err
-	}
-	for rowIndex := range rowIndexes {
-		values := rowsByIndex[rowIndex]
-		if values == nil {
-			continue
-		}
-		switch sheetName {
-		case "订单总览":
-			if rowIndex != 0 {
-				continue
-			}
-			order.Priority = tradePriorityValue(tradeString(values["priority"]))
-			order.Currency = strings.ToUpper(firstNonEmptyTrade(tradeString(values["currency"]), order.Currency))
-			order.DestinationCountry = mergeTradeDestination(
-				tradeString(values["destination_country"]),
-				tradeString(values["destination_port"]),
-			)
-			order.DestinationPort = ""
-			order.QuoteDeadline, _ = parseTradeDate(tradeString(values["quote_deadline"]))
-			order.PaymentMethod = tradeString(values["payment_method"])
-			order.Notes = tradeString(values["notes"])
-			order.AdditionalCostAmount = nonNegativeTradeValue(tradeFloat(values["additional_cost"]))
-			order.AdditionalCostNotes = tradeString(values["additional_cost_notes"])
-			if err := s.repo.UpdateOrderFromWorkbook(order); err != nil {
-				return err
-			}
-		case "询价明细", "报价单", "采购跟进", "仓库到货", "质检记录", "装箱清单":
-			if err := s.syncTradeItemRow(orderID, rowIndex, sheetName, values); err != nil {
-				return err
-			}
-		case "供应商询价":
-			if err := s.syncSupplierQuoteRow(userID, order, rowIndex, values); err != nil {
-				return err
-			}
-		case "发货跟踪":
-			shipment := &model.TradeShipment{
-				OrderID: orderID, BookingNo: tradeString(values["booking_no"]), Carrier: tradeString(values["carrier"]),
-				VesselFlight: tradeString(values["vessel_flight"]), BLNo: tradeString(values["bl_no"]),
-				ShippingStatus:         normalizeTradeShippingStatus(tradeString(values["shipping_status"])),
-				ActualFreightCurrency:  strings.ToUpper(firstNonEmptyTrade(tradeString(values["actual_freight_currency"]), "CNY")),
-				ActualFreightAmount:    nonNegativeTradeValue(tradeFloat(values["actual_freight_amount"])),
-				ActualFreightToCNYRate: nonNegativeTradeValue(tradeFloat(values["actual_freight_to_cny_rate"])),
-				ActualFreightNotes:     tradeString(values["actual_freight_notes"]), Notes: tradeString(values["notes"]),
-			}
-			if strings.EqualFold(shipment.ActualFreightCurrency, "CNY") {
-				shipment.ActualFreightToCNYRate = 1
-			}
-			if order.FreightMode == "customer_forwarder" {
-				shipment.ActualFreightAmount = 0
-				shipment.ActualFreightToCNYRate = 1
-			}
-			shipment.ETD, _ = parseTradeDate(tradeString(values["etd"]))
-			shipment.ETA, _ = parseTradeDate(tradeString(values["eta"]))
-			if err := s.repo.UpsertShipment(shipment); err != nil {
-				return err
-			}
-		}
-	}
-	if err := s.repo.RecalculateOrderTotal(orderID); err != nil {
-		return err
-	}
-	if sheetName == "报价单" {
-		if err := s.syncCustomerQuoteStateFromWorkbook(userID, order, rowsByIndex); err != nil {
-			return err
-		}
-	}
-	return s.syncOrderWorkspaceInternal(userID, orderID)
-}
-
-func (s *TradeService) syncTradeItemRow(orderID int64, rowIndex int, sheetName string, values map[string]any) error {
-	lineNo := tradeInt(values["line_no"], rowIndex+1)
-	if lineNo <= 0 {
-		return nil
-	}
-	item, err := s.repo.GetOrderItemByLineNo(orderID, lineNo)
-	if errors.Is(err, sql.ErrNoRows) {
-		item = &model.TradeOrderItem{OrderID: orderID, LineNo: lineNo, Unit: "件", Status: "pending"}
-	} else if err != nil {
-		return err
-	}
-	switch sheetName {
-	case "询价明细":
-		item.SKU = tradeString(values["sku"])
-		item.ProductName = tradeString(values["product_name"])
-		item.Specification = tradeString(values["specification"])
-		item.Quantity = tradeFloat(values["quantity"])
-		item.Unit = firstNonEmptyTrade(tradeString(values["unit"]), "件")
-		item.TargetPrice = tradeFloat(values["target_price"])
-		item.Description = tradeString(values["customer_notes"])
-		inquiryStatus := firstNonEmptyTrade(tradeString(values["status"]), "待询价")
-		setTradeWorkflowValue(item, "inquiry_status", inquiryStatus)
-		item.Status = inquiryStatus
-	case "报价单":
-		item.QuotedPrice = tradeFloat(values["unit_price"])
-		item.Status = firstNonEmptyTrade(tradeString(values["quote_status"]), item.Status)
-	case "采购跟进":
-		item.SupplierName = tradeString(values["supplier"])
-		item.PurchaseCurrency = strings.ToUpper(firstNonEmptyTrade(tradeString(values["purchase_currency"]), item.PurchaseCurrency))
-		item.PurchasePrice = tradeFloat(values["purchase_price"])
-		setTradeWorkflowValue(item, "purchase_status", tradeString(values["purchase_status"]))
-		setTradeWorkflowValue(item, "cost_exchange_rate", nonNegativeTradeValue(tradeFloat(values["cost_exchange_rate"])))
-		item.Status = firstNonEmptyTrade(tradeWorkflowString(item, "purchase_status"), item.Status)
-	case "仓库到货":
-		item.ReceivedQuantity = tradeFloat(values["received_qty"])
-		setTradeWorkflowValue(item, "warehouse_location", tradeString(values["warehouse_location"]))
-		setTradeWorkflowValue(item, "received_date", tradeString(values["received_date"]))
-		setTradeWorkflowValue(item, "receipt_status", tradeString(values["receipt_status"]))
-		item.Status = firstNonEmptyTrade(tradeWorkflowString(item, "receipt_status"), item.Status)
-	case "质检记录":
-		item.AcceptedQuantity = tradeFloat(values["passed_qty"])
-		setTradeWorkflowValue(item, "sample_qty", tradeFloat(values["sample_qty"]))
-		setTradeWorkflowValue(item, "inspection_result", tradeString(values["result"]))
-		setTradeWorkflowValue(item, "inspection_issue", tradeString(values["issue"]))
-		setTradeWorkflowValue(item, "inspector", tradeString(values["inspector"]))
-		setTradeWorkflowValue(item, "inspection_date", tradeString(values["inspection_date"]))
-		item.Status = firstNonEmptyTrade(tradeWorkflowString(item, "inspection_result"), item.Status)
-	case "装箱清单":
-		item.PackedQuantity = tradeFloat(values["quantity"])
-		item.CartonCount = tradeInt(values["carton_count"], item.CartonCount)
-		item.GrossWeight = tradeFloat(values["gross_weight"])
-		item.NetWeight = tradeFloat(values["net_weight"])
-		setTradeWorkflowValue(item, "carton_no", tradeString(values["carton_no"]))
-		setTradeWorkflowValue(item, "carton_size", tradeString(values["carton_size"]))
-		setTradeWorkflowValue(item, "marks", tradeString(values["marks"]))
-	}
-	return s.repo.UpsertOrderItemFromWorkbook(item)
-}
-
-func (s *TradeService) syncCustomerQuoteStateFromWorkbook(userID int64, order *model.TradeOrder, rows map[int]map[string]any) error {
-	items, err := s.repo.ListOrderItems(order.ID)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
-		return nil
-	}
-	allConfirmed := true
-	anyRejected := false
-	anyNegotiating := false
-	quoteItems := make([]model.TradeCustomerQuoteItem, 0, len(items))
-	for _, item := range items {
-		row := rows[item.LineNo-1]
-		status := tradeString(row["quote_status"])
-		allConfirmed = allConfirmed && status == "客户确认" && item.QuotedPrice > 0
-		anyRejected = anyRejected || status == "客户拒绝"
-		anyNegotiating = anyNegotiating || status == "客户议价"
-		quoteItems = append(quoteItems, model.TradeCustomerQuoteItem{
-			OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU, ProductName: item.ProductName,
-			Quantity: item.Quantity, Unit: item.Unit, UnitPrice: item.QuotedPrice, Amount: item.Quantity * item.QuotedPrice,
-		})
-	}
-	quotes, err := s.repo.ListCustomerQuoteRounds(order.ID)
-	if err != nil {
-		return err
-	}
-	var latest *model.TradeCustomerQuoteRound
-	if len(quotes) > 0 {
-		latest = &quotes[0]
-	}
-	if !allConfirmed {
-		if latest == nil || latest.Status != "accepted" {
-			return nil
-		}
-		status := "sent"
-		if anyRejected {
-			status = "rejected"
-		} else if anyNegotiating {
-			status = "negotiating"
-		}
-		return s.repo.UpdateCustomerQuoteRoundStatus(order.ID, latest.ID, status, "由报价单工作表更新客户状态", "工作表同步")
-	}
-	if latest != nil && latest.Status == "accepted" && sameTradeCustomerQuoteItems(latest.Items, quoteItems) &&
-		strings.EqualFold(latest.Currency, order.Currency) && latest.ExchangeRateCNY == order.QuoteExchangeRateCNY &&
-		latest.FreightMode == order.FreightMode && latest.FreightAmount == order.QuotedFreightAmount {
-		return nil
-	}
-	total := 0.0
-	for _, item := range quoteItems {
-		total += item.Amount
-	}
-	exchangeRateCNY := order.QuoteExchangeRateCNY
-	if strings.EqualFold(order.Currency, "CNY") {
-		exchangeRateCNY = 1
-	}
-	freightMode := firstNonEmptyTrade(order.FreightMode, "customer_forwarder")
-	freightAmount := order.QuotedFreightAmount
-	if freightMode == "customer_forwarder" {
-		freightAmount = 0
-	}
-	round := &model.TradeCustomerQuoteRound{
-		OrderID: order.ID, Currency: order.Currency, Status: "accepted", GoodsAmount: total,
-		ExchangeRateCNY: exchangeRateCNY, FreightMode: freightMode, FreightAmount: freightAmount,
-		TotalAmount: total + freightAmount, TotalAmountCNY: (total + freightAmount) * exchangeRateCNY,
-		Items: quoteItems, CustomerFeedback: "客户确认工作表报价", Notes: "由报价单工作表同步", CreatedBy: userID,
-	}
-	return s.repo.CreateCustomerQuoteRound(round)
-}
-
-func sameTradeCustomerQuoteItems(left, right []model.TradeCustomerQuoteItem) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	byID := make(map[int64]model.TradeCustomerQuoteItem, len(left))
-	for _, item := range left {
-		byID[item.OrderItemID] = item
-	}
-	for _, item := range right {
-		current, exists := byID[item.OrderItemID]
-		if !exists || current.UnitPrice != item.UnitPrice || current.Quantity != item.Quantity {
-			return false
-		}
-	}
-	return true
 }
 
 func setTradeWorkflowValue(item *model.TradeOrderItem, key string, value any) {
@@ -3303,49 +2635,6 @@ func setTradeWorkflowValue(item *model.TradeOrderItem, key string, value any) {
 		item.WorkflowData = map[string]any{}
 	}
 	item.WorkflowData[key] = value
-}
-
-func (s *TradeService) syncSupplierQuoteRow(userID int64, order *model.TradeOrder, rowIndex int, values map[string]any) error {
-	lineNo := tradeInt(values["line_no"], rowIndex+1)
-	supplierName := tradeString(values["supplier"])
-	if lineNo <= 0 || supplierName == "" {
-		return nil
-	}
-	item, err := s.repo.GetOrderItemByLineNo(order.ID, lineNo)
-	if err != nil {
-		return err
-	}
-	suppliers, err := s.repo.ListSuppliers(supplierName)
-	if err != nil {
-		return err
-	}
-	var supplier *model.TradeSupplier
-	for index := range suppliers {
-		if strings.EqualFold(strings.TrimSpace(suppliers[index].Name), supplierName) || strings.EqualFold(strings.TrimSpace(suppliers[index].CompanyName), supplierName) {
-			supplier = &suppliers[index]
-			break
-		}
-	}
-	if supplier == nil {
-		supplier, err = s.CreateSupplier(userID, &model.CreateTradeSupplierRequest{Name: supplierName, CompanyName: supplierName, DefaultCurrency: order.Currency})
-		if err != nil {
-			return err
-		}
-	}
-	currency := strings.ToUpper(firstNonEmptyTrade(tradeString(values["currency"]), order.Currency))
-	validUntil, _ := parseTradeDate(tradeString(values["valid_until"]))
-	quoteID, err := s.repo.UpsertSupplierQuoteFromSheet(
-		order.ID, item.ID, supplier.ID, rowIndex, currency, tradeFloat(values["unit_price"]),
-		tradeFloat(values["moq"]), tradeInt(values["lead_time_days"], 0), validUntil,
-		tradeString(values["notes"]), userID,
-	)
-	if err != nil {
-		return err
-	}
-	if tradeBool(values["selected"]) {
-		return s.repo.SelectSupplierQuote(order.ID, quoteID, userID)
-	}
-	return nil
 }
 
 func (s *TradeService) enrichOrderPermissions(userID int64, order *model.TradeOrder) {
@@ -3456,9 +2745,9 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 	switch order.Stage {
 	case model.TradeStageInquiry:
 		if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
-			return strings.TrimSpace(item.ProductName) == "" || item.Quantity <= 0
+			return (strings.TrimSpace(item.SKU) == "" && strings.TrimSpace(item.ProductName) == "") || item.Quantity <= 0
 		}); labels != "" {
-			blockers = append(blockers, "产品名称或询价数量不完整："+labels)
+			blockers = append(blockers, "SKU 或询价数量不完整："+labels)
 		}
 	case model.TradeStageSupplierQuote:
 		selected := make(map[int64]bool, len(order.SupplierQuotes))
@@ -3620,6 +2909,11 @@ func (s *TradeService) canOperateStageForStage(userID int64, order *model.TradeO
 	if positionErr != nil {
 		return false, nil, positionErr
 	}
+	// The inquiry belongs to its salesperson; other members of the sales
+	// position must not edit or advance a colleague's inquiry.
+	if stage == model.TradeStageInquiry {
+		return order.OwnerID == userID, position, nil
+	}
 	userIDs, err := s.repo.PositionUserIDs(position.ID)
 	if err != nil {
 		return false, position, err
@@ -3658,339 +2952,43 @@ func (s *TradeService) notifyStageAssignees(order *model.TradeOrder, stage, note
 	}
 }
 
-type tradeSheetDefinition struct {
-	Name    string
-	Columns []map[string]any
-	Rows    []map[string]any
-}
+// errTradeItemSKURequired is returned when an order item has neither a SKU
+// nor a product name.
+var errTradeItemSKURequired = errors.New("每个产品必须填写 SKU")
 
-func tradeWorkbookDefinitions(order *model.TradeOrder, customer *model.TradeCustomer, items []model.TradeOrderItem) []tradeSheetDefinition {
-	return tradeWorkbookDefinitionsWithContext(order, customer, items, nil, nil, nil, nil)
-}
-
-func tradeWorkbookDefinitionsWithContext(
-	order *model.TradeOrder,
-	customer *model.TradeCustomer,
-	items []model.TradeOrderItem,
-	suppliers []model.TradeSupplier,
-	supplierQuotes []model.TradeSupplierQuote,
-	customerQuotes []model.TradeCustomerQuoteRound,
-	shipment *model.TradeShipment,
-) []tradeSheetDefinition {
-	profit := buildTradeProfitSummary(order, items)
-	stageOptions := []string{"询价", "供应商询价", "对客报价与议价", "采购", "仓库到货", "质检", "装箱", "发货", "已完成", "已取消"}
-	priorityOptions := []string{"低", "普通", "高", "紧急"}
-	priorityColors := map[string]any{
-		"低":  map[string]string{"backgroundColor": "#F1F5F9", "textColor": "#475569"},
-		"普通": map[string]string{"backgroundColor": "#DBEAFE", "textColor": "#1D4ED8"},
-		"高":  map[string]string{"backgroundColor": "#FFEDD5", "textColor": "#C2410C"},
-		"紧急": map[string]string{"backgroundColor": "#FEE2E2", "textColor": "#B91C1C"},
+// normalizeTradeItemIdentity trims SKU and product name and fills whichever one
+// is blank from the other, because the UI now edits them as a single SKU field.
+func normalizeTradeItemIdentity(sku, productName string) (string, string, error) {
+	sku = strings.TrimSpace(sku)
+	productName = strings.TrimSpace(productName)
+	if sku == "" && productName == "" {
+		return "", "", errTradeItemSKURequired
 	}
-	definitions := []tradeSheetDefinition{
-		{
-			Name: "订单总览",
-			Columns: []map[string]any{
-				tradeColumn("order_no", "业务单号", "text", 150),
-				tradeColumn("customer", "客户", "text", 180),
-				tradeSelectColumn("stage", "当前阶段", stageOptions, tradeStageColors, false, 120),
-				tradeSelectColumn("priority", "优先级", priorityOptions, priorityColors, false, 90),
-				tradeColumn("owner", "负责人", "text", 100),
-				tradeColumn("currency", "币种", "text", 70),
-				tradeColumn("destination_country", "目的地 / 目的港", "text", 220),
-				tradeColumn("quote_deadline", "报价截止", "date", 110),
-				tradeColumn("payment_method", "付款方式", "text", 190),
-				tradeCurrencyColumn("goods_amount", "商品报价", order.Currency, 110),
-				tradeCurrencyColumn("quoted_freight", "报价运费", order.Currency, 110),
-				tradeColumn("quote_exchange_rate_cny", "报价兑人民币", "number", 120),
-				tradeCurrencyColumn("sales_amount", "销售额", order.Currency, 110),
-				tradeCurrencyColumn("product_cost", "产品成本", order.Currency, 110),
-				tradeCurrencyColumn("actual_freight", "实际运费折合", order.Currency, 120),
-				tradeCurrencyColumn("freight_profit", "运费利润", order.Currency, 110),
-				tradeCurrencyColumn("additional_cost", "附加成本", order.Currency, 110),
-				tradeCurrencyColumn("gross_profit", "毛利润", order.Currency, 110),
-				tradeColumn("profit_margin", "利润率/%", "number", 90),
-				tradeCurrencyColumn("profit_cny", "人民币利润", "CNY", 120),
-				tradeColumn("additional_cost_notes", "附加成本说明", "text", 220),
-				tradeColumn("stage_updated_at", "阶段更新时间", "text", 150),
-				tradeColumn("notes", "备注", "text", 260),
-			},
-			Rows: []map[string]any{{
-				"order_no": order.OrderNo, "customer": firstNonEmptyTrade(customer.CompanyName, customer.Name),
-				"stage": tradeStageLabel(order.Stage), "priority": tradePriorityLabel(order.Priority),
-				"owner": order.OwnerName, "currency": order.Currency,
-				"destination_country": mergeTradeDestination(order.DestinationCountry, order.DestinationPort),
-				"quote_deadline":      formatTradeDate(order.QuoteDeadline),
-				"payment_method":      firstNonEmptyTrade(order.PaymentMethod, order.PaymentTerms),
-				"goods_amount":        profit.GoodsRevenue, "quoted_freight": profit.FreightRevenue,
-				"quote_exchange_rate_cny": profit.ExchangeRateCNY,
-				"sales_amount":            profit.Revenue, "product_cost": profit.ProductCost,
-				"actual_freight": profit.ActualFreightCost, "freight_profit": profit.FreightProfit,
-				"additional_cost": profit.AdditionalCost, "gross_profit": profit.ProfitAmount,
-				"profit_margin": profit.ProfitMargin, "profit_cny": profit.ProfitAmountCNY,
-				"additional_cost_notes": profit.AdditionalCostNotes,
-				"stage_updated_at":      time.Now().Format("2006-01-02 15:04"), "notes": order.Notes,
-			}},
-		},
+	if productName == "" {
+		productName = sku
 	}
-
-	inquiryRows := make([]map[string]any, 0, len(items))
-	supplierQuoteRows := make([]map[string]any, 0, len(items))
-	quoteRows := make([]map[string]any, 0, len(items))
-	purchaseRows := make([]map[string]any, 0, len(items))
-	receivingRows := make([]map[string]any, 0, len(items))
-	inspectionRows := make([]map[string]any, 0, len(items))
-	packingRows := make([]map[string]any, 0, len(items))
-	selectedQuotes := make(map[int64]model.TradeSupplierQuote)
-	quotesByItem := make(map[int64][]model.TradeSupplierQuote)
-	latestCustomerQuoteStatus := ""
-	latestCustomerQuoteCurrency := order.Currency
-	latestCustomerQuoteExchangeRateCNY := order.QuoteExchangeRateCNY
-	latestFreightMode := order.FreightMode
-	latestFreightAmount := order.QuotedFreightAmount
-	if len(customerQuotes) > 0 {
-		latestCustomerQuoteStatus = customerQuotes[0].Status
-		latestCustomerQuoteCurrency = customerQuotes[0].Currency
-		latestCustomerQuoteExchangeRateCNY = customerQuotes[0].ExchangeRateCNY
-		latestFreightMode = customerQuotes[0].FreightMode
-		latestFreightAmount = customerQuotes[0].FreightAmount
+	if sku == "" {
+		sku = productName
 	}
-	for _, quote := range supplierQuotes {
-		quotesByItem[quote.OrderItemID] = append(quotesByItem[quote.OrderItemID], quote)
-		if quote.IsSelected {
-			selectedQuotes[quote.OrderItemID] = quote
-		}
-	}
-	for _, item := range items {
-		quoteStatus := "待报价"
-		if item.QuotedPrice > 0 {
-			quoteStatus = "已报价"
-		}
-		switch latestCustomerQuoteStatus {
-		case "negotiating":
-			quoteStatus = "客户议价"
-		case "accepted":
-			quoteStatus = "客户确认"
-		case "rejected":
-			quoteStatus = "客户拒绝"
-		}
-		inquiryRows = append(inquiryRows, map[string]any{
-			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
-			"specification": item.Specification, "quantity": item.Quantity, "unit": item.Unit,
-			"target_price": item.TargetPrice, "customer_notes": item.Description,
-			"status": firstNonEmptyTrade(tradeWorkflowString(&item, "inquiry_status"), "待询价"),
-		})
-		quoteRows = append(quoteRows, map[string]any{
-			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
-			"specification": item.Specification, "quantity": item.Quantity, "unit": item.Unit,
-			"unit_price": item.QuotedPrice, "amount": fmt.Sprintf("=E%d*G%d", item.LineNo+1, item.LineNo+1), "quote_status": quoteStatus,
-			"quote_currency": latestCustomerQuoteCurrency, "exchange_rate_cny": latestCustomerQuoteExchangeRateCNY,
-			"freight_mode": tradeFreightModeLabel(latestFreightMode), "freight_amount": latestFreightAmount,
-		})
-		itemQuotes := quotesByItem[item.ID]
-		if len(itemQuotes) == 0 {
-			supplierQuoteRows = append(supplierQuoteRows, blankTradeSupplierQuoteRow(order, item))
-		} else {
-			for _, quote := range itemQuotes {
-				supplierQuoteRows = append(supplierQuoteRows, tradeSupplierQuoteRow(item, quote))
-			}
-		}
-		selectedQuote := selectedQuotes[item.ID]
-		supplierName := firstNonEmptyTrade(item.SupplierName, selectedQuote.SupplierName)
-		supplierQuotePrice := selectedQuote.UnitPrice
-		if supplierQuotePrice <= 0 {
-			supplierQuotePrice = item.PurchasePrice
-		}
-		purchaseCurrency := strings.TrimSpace(item.PurchaseCurrency)
-		if purchaseCurrency == "" && !isAIImportedTradeItem(&item) {
-			purchaseCurrency = order.Currency
-		}
-		purchaseRows = append(purchaseRows, map[string]any{
-			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
-			"quantity": item.Quantity, "unit": item.Unit, "supplier": supplierName, "supplier_quote": supplierQuotePrice,
-			"purchase_currency": purchaseCurrency,
-			"purchase_price":    item.PurchasePrice, "cost_exchange_rate": tradeProfitExchangeRate(order.Currency, order.QuoteExchangeRateCNY, &item),
-			"lead_time_days":  selectedQuote.LeadTimeDays,
-			"purchase_status": firstNonEmptyTrade(tradeWorkflowString(&item, "purchase_status"), "待采购"),
-		})
-		receiptStatus := "待到货"
-		if item.ReceivedQuantity >= item.Quantity && item.Quantity > 0 {
-			receiptStatus = "全部到货"
-		}
-		receiptStatus = firstNonEmptyTrade(tradeWorkflowString(&item, "receipt_status"), receiptStatus)
-		receivingRows = append(receivingRows, map[string]any{
-			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
-			"expected_qty": item.Quantity, "received_qty": item.ReceivedQuantity,
-			"warehouse_location": tradeWorkflowString(&item, "warehouse_location"),
-			"received_date":      tradeWorkflowString(&item, "received_date"), "receipt_status": receiptStatus,
-		})
-		inspectionBaseQuantity := firstNonZeroTrade(tradeWorkflowFloat(&item, "sample_qty"), item.ReceivedQuantity, item.Quantity)
-		inspectionResult := "待检"
-		if item.AcceptedQuantity > 0 && item.AcceptedQuantity >= inspectionBaseQuantity {
-			inspectionResult = "合格"
-		}
-		inspectionResult = firstNonEmptyTrade(tradeWorkflowString(&item, "inspection_result"), inspectionResult)
-		inspectionRows = append(inspectionRows, map[string]any{
-			"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
-			"sample_qty": inspectionBaseQuantity, "passed_qty": item.AcceptedQuantity,
-			"failed_qty": nonNegativeTradeDifference(inspectionBaseQuantity, item.AcceptedQuantity), "result": inspectionResult,
-			"issue": tradeWorkflowString(&item, "inspection_issue"), "inspector": tradeWorkflowString(&item, "inspector"),
-			"inspection_date": tradeWorkflowString(&item, "inspection_date"),
-		})
-		packingRows = append(packingRows, map[string]any{
-			"line_no": item.LineNo, "carton_no": tradeWorkflowString(&item, "carton_no"), "sku": item.SKU, "product_name": item.ProductName,
-			"quantity": firstNonZeroTrade(item.PackedQuantity, item.Quantity), "carton_count": item.CartonCount,
-			"carton_size": tradeWorkflowString(&item, "carton_size"), "gross_weight": item.GrossWeight,
-			"net_weight": item.NetWeight, "marks": tradeWorkflowString(&item, "marks"),
-		})
-	}
-	supplierOptions := make([]string, 0, len(suppliers))
-	for _, supplier := range suppliers {
-		supplierOptions = append(supplierOptions, supplier.Name)
-	}
-	definitions = append(definitions,
-		tradeSheetDefinition{Name: "询价明细", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("sku", "SKU", "text", 110),
-			tradeColumn("product_name", "产品名称", "text", 180), tradeColumn("specification", "规格", "text", 200),
-			tradeColumn("quantity", "数量", "number", 90), tradeColumn("unit", "单位", "text", 70),
-			tradeCurrencyColumn("target_price", "目标价", order.Currency, 100), tradeColumn("customer_notes", "客户要求", "text", 240),
-			tradeSelectColumn("status", "询价状态", []string{"待询价", "已询价", "无法报价"}, standardStatusColors(), false, 100),
-		}, Rows: inquiryRows},
-		tradeSheetDefinition{Name: "供应商询价", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("sku", "SKU", "text", 110),
-			tradeColumn("product_name", "产品名称", "text", 180), tradeColumn("specification", "规格", "text", 180),
-			tradeColumn("quantity", "询价数量", "number", 100), tradeColumn("unit", "单位", "text", 70),
-			tradeSelectColumn("supplier", "供应商", supplierOptions, map[string]any{}, true, 190),
-			tradeColumn("currency", "币种", "text", 75), tradeCurrencyColumn("unit_price", "供应商单价", order.Currency, 110),
-			tradeColumn("moq", "MOQ", "number", 90), tradeColumn("lead_time_days", "交期/天", "number", 90),
-			tradeColumn("valid_until", "报价有效期", "date", 110),
-			tradeSelectColumn("selected", "采用", []string{"否", "是"}, standardStatusColors(), false, 80),
-			tradeColumn("notes", "供应商备注", "text", 220),
-		}, Rows: supplierQuoteRows},
-		tradeSheetDefinition{Name: "报价单", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("sku", "SKU", "text", 110),
-			tradeColumn("product_name", "产品名称", "text", 180), tradeColumn("specification", "规格", "text", 200),
-			tradeColumn("quantity", "数量", "number", 90), tradeColumn("unit", "单位", "text", 70),
-			tradeCurrencyColumn("unit_price", "报价单价", order.Currency, 100), tradeFormulaColumn("amount", "金额", "=E2*G2", 110),
-			tradeSelectColumn("quote_status", "报价状态", []string{"待报价", "已报价", "客户议价", "客户确认", "客户拒绝"}, standardStatusColors(), false, 110),
-			tradeColumn("quote_currency", "报价币种", "text", 85), tradeColumn("exchange_rate_cny", "兑人民币汇率", "number", 115),
-			tradeColumn("freight_mode", "运费方式", "text", 130), tradeCurrencyColumn("freight_amount", "报价运费", order.Currency, 105),
-		}, Rows: quoteRows},
-		tradeSheetDefinition{Name: "采购跟进", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("sku", "SKU", "text", 110),
-			tradeColumn("product_name", "产品名称", "text", 180), tradeColumn("quantity", "采购数量", "number", 100),
-			tradeColumn("unit", "单位", "text", 70), tradeColumn("supplier", "供应商", "text", 190),
-			tradeCurrencyColumn("supplier_quote", "供应商报价", order.Currency, 110), tradeColumn("purchase_currency", "采购币种", "text", 90),
-			tradeCurrencyColumn("purchase_price", "采购价", order.Currency, 100),
-			tradeColumn("cost_exchange_rate", "成本换算率", "number", 105),
-			tradeColumn("lead_time_days", "交期/天", "number", 90),
-			tradeSelectColumn("purchase_status", "采购状态", []string{"待采购", "询价中", "已下单", "生产中", "已完成"}, standardStatusColors(), false, 110),
-		}, Rows: purchaseRows},
-		tradeSheetDefinition{Name: "仓库到货", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("sku", "SKU", "text", 110),
-			tradeColumn("product_name", "产品名称", "text", 180), tradeColumn("expected_qty", "应到数量", "number", 100),
-			tradeColumn("received_qty", "实到数量", "number", 100), tradeColumn("warehouse_location", "库位", "text", 110),
-			tradeColumn("received_date", "到货日期", "date", 110),
-			tradeSelectColumn("receipt_status", "到货状态", []string{"待到货", "部分到货", "全部到货", "数量异常"}, standardStatusColors(), false, 110),
-		}, Rows: receivingRows},
-		tradeSheetDefinition{Name: "质检记录", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("sku", "SKU", "text", 110),
-			tradeColumn("product_name", "产品名称", "text", 180), tradeColumn("sample_qty", "抽检数量", "number", 100),
-			tradeColumn("passed_qty", "合格数量", "number", 100), tradeColumn("failed_qty", "不合格数量", "number", 110),
-			tradeSelectColumn("result", "质检结论", []string{"待检", "合格", "返工", "拒收"}, standardStatusColors(), false, 100),
-			tradeColumn("issue", "问题描述", "text", 240), tradeColumn("inspector", "质检员", "text", 100), tradeColumn("inspection_date", "质检日期", "date", 110),
-		}, Rows: inspectionRows},
-		tradeSheetDefinition{Name: "装箱清单", Columns: []map[string]any{
-			tradeColumn("line_no", "序号", "number", 60), tradeColumn("carton_no", "箱号", "text", 90),
-			tradeColumn("sku", "SKU", "text", 110), tradeColumn("product_name", "产品名称", "text", 180),
-			tradeColumn("quantity", "装箱数量", "number", 100), tradeColumn("carton_count", "箱数", "number", 80),
-			tradeColumn("carton_size", "箱规", "text", 140),
-			tradeColumn("gross_weight", "毛重/kg", "number", 100), tradeColumn("net_weight", "净重/kg", "number", 100),
-			tradeColumn("marks", "唛头", "text", 220),
-		}, Rows: packingRows},
-		tradeSheetDefinition{Name: "发货跟踪", Columns: []map[string]any{
-			tradeColumn("booking_no", "订舱号", "text", 130), tradeColumn("carrier", "承运人", "text", 140),
-			tradeColumn("vessel_flight", "船名/航班", "text", 150), tradeColumn("etd", "ETD", "date", 100),
-			tradeColumn("eta", "ETA", "date", 100), tradeColumn("bl_no", "提单号", "text", 150),
-			tradeColumn("destination", "目的港", "text", 160),
-			tradeSelectColumn("shipping_status", "运输状态", []string{"未发货", "已发货"}, standardStatusColors(), false, 110),
-			tradeColumn("actual_freight_currency", "实际运费币种", "text", 110),
-			tradeColumn("actual_freight_amount", "实际运费", "number", 100),
-			tradeColumn("actual_freight_to_cny_rate", "实际运费兑人民币", "number", 135),
-			tradeColumn("actual_freight_notes", "实际运费说明", "text", 200),
-			tradeColumn("notes", "备注", "text", 240),
-		}, Rows: []map[string]any{tradeShipmentRow(order, shipment)}},
-	)
-	return definitions
-}
-
-func tradeColumn(key, name, columnType string, width int) map[string]any {
-	return map[string]any{"key": key, "name": name, "type": columnType, "width": width}
-}
-
-func tradeCurrencyColumn(key, name, currency string, width int) map[string]any {
-	column := tradeColumn(key, name, "currency", width)
-	column["currencyCode"] = currency
-	return column
-}
-
-func tradeFormulaColumn(key, name, formula string, width int) map[string]any {
-	column := tradeColumn(key, name, "formula", width)
-	column["formula"] = formula
-	return column
-}
-
-func tradeSelectColumn(key, name string, options []string, colors map[string]any, searchable bool, width int) map[string]any {
-	column := tradeColumn(key, name, "select", width)
-	column["options"] = options
-	column["optionColors"] = colors
-	if searchable {
-		column["searchable"] = true
-	}
-	return column
-}
-
-func standardStatusColors() map[string]any {
-	return map[string]any{
-		"是":    map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"否":    map[string]string{"backgroundColor": "#F1F5F9", "textColor": "#475569"},
-		"待询价":  map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-		"待报价":  map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-		"待采购":  map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-		"待到货":  map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-		"待检":   map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-		"询价中":  map[string]string{"backgroundColor": "#DBEAFE", "textColor": "#1D4ED8"},
-		"生产中":  map[string]string{"backgroundColor": "#DBEAFE", "textColor": "#1D4ED8"},
-		"运输中":  map[string]string{"backgroundColor": "#DBEAFE", "textColor": "#1D4ED8"},
-		"已询价":  map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"已报价":  map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"客户议价": map[string]string{"backgroundColor": "#FEF3C7", "textColor": "#92400E"},
-		"客户确认": map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"已下单":  map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"已完成":  map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"全部到货": map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"合格":   map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"已签收":  map[string]string{"backgroundColor": "#DCFCE7", "textColor": "#166534"},
-		"无法报价": map[string]string{"backgroundColor": "#FEE2E2", "textColor": "#B91C1C"},
-		"客户拒绝": map[string]string{"backgroundColor": "#FEE2E2", "textColor": "#B91C1C"},
-		"数量异常": map[string]string{"backgroundColor": "#FEE2E2", "textColor": "#B91C1C"},
-		"返工":   map[string]string{"backgroundColor": "#FFEDD5", "textColor": "#C2410C"},
-		"拒收":   map[string]string{"backgroundColor": "#FEE2E2", "textColor": "#B91C1C"},
-	}
+	return sku, productName, nil
 }
 
 func buildTradeOrderItems(inputs []model.CreateTradeOrderItemRequest) ([]model.TradeOrderItem, error) {
 	items := make([]model.TradeOrderItem, 0, len(inputs))
 	for index, input := range inputs {
-		productName := strings.TrimSpace(input.ProductName)
-		if productName == "" || input.Quantity <= 0 {
-			return nil, fmt.Errorf("第 %d 行产品名称和数量不能为空", index+1)
+		sku, productName, err := normalizeTradeItemIdentity(input.SKU, input.ProductName)
+		if err != nil {
+			return nil, err
+		}
+		if input.Quantity <= 0 {
+			return nil, fmt.Errorf("第 %d 行产品数量必须大于零", index+1)
 		}
 		unit := strings.TrimSpace(input.Unit)
 		if unit == "" {
 			unit = "件"
 		}
 		items = append(items, model.TradeOrderItem{
-			SKU: strings.TrimSpace(input.SKU), ProductName: productName,
+			SKU: sku, ProductName: productName,
 			Description: strings.TrimSpace(input.Description), Specification: strings.TrimSpace(input.Specification),
 			Quantity: input.Quantity, Unit: unit, TargetPrice: input.TargetPrice,
 		})
@@ -4072,19 +3070,6 @@ func tradeCustomerQuoteStatusLabel(status string) string {
 	}
 }
 
-func tradePriorityLabel(priority string) string {
-	switch priority {
-	case "low":
-		return "低"
-	case "high":
-		return "高"
-	case "urgent":
-		return "紧急"
-	default:
-		return "普通"
-	}
-}
-
 func parseTradeDate(value string) (*time.Time, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -4098,69 +3083,6 @@ func parseTradeDate(value string) (*time.Time, error) {
 		return nil, err
 	}
 	return &parsed, nil
-}
-
-func formatTradeDate(value *time.Time) string {
-	if value == nil {
-		return ""
-	}
-	return value.Format("2006-01-02")
-}
-
-func blankTradeSupplierQuoteRow(order *model.TradeOrder, item model.TradeOrderItem) map[string]any {
-	currency := "USD"
-	if order != nil {
-		currency = firstNonEmptyTrade(order.Currency, currency)
-	}
-	return map[string]any{
-		"line_no": item.LineNo, "sku": item.SKU, "product_name": item.ProductName,
-		"specification": item.Specification, "quantity": item.Quantity, "unit": item.Unit,
-		"supplier": "", "currency": currency, "unit_price": 0, "moq": 0,
-		"lead_time_days": 0, "valid_until": "", "selected": "否", "notes": "",
-	}
-}
-
-func tradeSupplierQuoteRow(item model.TradeOrderItem, quote model.TradeSupplierQuote) map[string]any {
-	return map[string]any{
-		"line_no": item.LineNo, "sku": firstNonEmptyTrade(quote.SKU, item.SKU),
-		"product_name":  firstNonEmptyTrade(quote.ProductName, item.ProductName),
-		"specification": item.Specification, "quantity": item.Quantity, "unit": item.Unit,
-		"supplier": quote.SupplierName, "currency": quote.Currency, "unit_price": quote.UnitPrice,
-		"moq": quote.MOQ, "lead_time_days": quote.LeadTimeDays, "valid_until": formatTradeDate(quote.ValidUntil),
-		"selected": map[bool]string{true: "是", false: "否"}[quote.IsSelected], "notes": quote.Notes,
-	}
-}
-
-func nonNegativeTradeDifference(total, completed float64) float64 {
-	if total <= completed {
-		return 0
-	}
-	return total - completed
-}
-
-func tradeShipmentRow(order *model.TradeOrder, shipment *model.TradeShipment) map[string]any {
-	row := map[string]any{
-		"booking_no": "", "carrier": "", "vessel_flight": "", "etd": "", "eta": "", "bl_no": "",
-		"destination": order.DestinationPort, "shipping_status": "未发货",
-		"actual_freight_currency": "CNY", "actual_freight_amount": 0, "actual_freight_to_cny_rate": 1,
-		"actual_freight_notes": "", "notes": "",
-	}
-	if shipment == nil {
-		return row
-	}
-	row["booking_no"] = shipment.BookingNo
-	row["carrier"] = shipment.Carrier
-	row["vessel_flight"] = shipment.VesselFlight
-	row["etd"] = formatTradeDate(shipment.ETD)
-	row["eta"] = formatTradeDate(shipment.ETA)
-	row["bl_no"] = shipment.BLNo
-	row["shipping_status"] = normalizeTradeShippingStatus(shipment.ShippingStatus)
-	row["actual_freight_currency"] = shipment.ActualFreightCurrency
-	row["actual_freight_amount"] = shipment.ActualFreightAmount
-	row["actual_freight_to_cny_rate"] = shipment.ActualFreightToCNYRate
-	row["actual_freight_notes"] = shipment.ActualFreightNotes
-	row["notes"] = shipment.Notes
-	return row
 }
 
 func tradeString(value any) string {
@@ -4216,38 +3138,6 @@ func tradeFloat(value any) float64 {
 		}
 		parsed, _ := strconv.ParseFloat(text, 64)
 		return parsed
-	}
-}
-
-func tradeInt(value any, fallback int) int {
-	if parsed := int(tradeFloat(value)); parsed != 0 {
-		return parsed
-	}
-	return fallback
-}
-
-func tradeBool(value any) bool {
-	if typed, ok := value.(bool); ok {
-		return typed
-	}
-	switch strings.ToLower(tradeString(value)) {
-	case "是", "true", "yes", "y", "1", "采用", "已选择":
-		return true
-	default:
-		return false
-	}
-}
-
-func tradePriorityValue(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "低", "low":
-		return "low"
-	case "高", "high":
-		return "high"
-	case "紧急", "urgent":
-		return "urgent"
-	default:
-		return "normal"
 	}
 }
 

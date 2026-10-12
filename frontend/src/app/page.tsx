@@ -1,45 +1,54 @@
 "use client";
 
 import {
-  Bell,
-  EyeOff,
   ArrowRight,
   ArrowUpDown,
   BarChart3,
+  Bell,
   BriefcaseBusiness,
   CheckSquare,
   ChevronLeft,
   ChevronRight,
+  ClipboardList,
+  Clock3,
+  Command,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   FileSpreadsheet,
   FolderInput,
-  FolderIcon,
   FolderKanban,
+  FolderOpen,
   FolderPlus,
   FolderUp,
   Globe2,
+  Home,
+  Images,
+  Info,
   Layers3,
   LayoutGrid,
   List as ListIcon,
-  Images,
+  Lock,
   LogOut,
   Mail,
-  MessageSquare,
   MessageCircle,
+  MessageSquare,
   PencilLine,
   Plus,
   Search,
+  Settings,
   Share2,
   Shield,
   Square,
-  Lock,
+  Star,
+  StarOff,
   Trash2,
   Unlock,
   Upload,
-  Users,
   UserRoundPlus,
   X,
+  type LucideIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -48,6 +57,38 @@ import {
   WhatsAppSendDialog,
   type WhatsAppSendResource,
 } from "@/components/whatsapp/WhatsAppSendDialog";
+import { ActionMenu, type ActionMenuRequest } from "@/components/workbench/ActionMenu";
+import { FileIconView } from "@/components/workbench/FileIconView";
+import {
+  FileListView,
+  type WorkbenchSortKey,
+} from "@/components/workbench/FileListView";
+import { ItemIcon } from "@/components/workbench/ItemIcon";
+import { MoveDialog, type MoveTarget } from "@/components/workbench/MoveDialog";
+import {
+  PropertiesDialog,
+  type PropertyRow,
+} from "@/components/workbench/PropertiesDialog";
+import {
+  ResponsiveDialog,
+  dialogDangerButton,
+  dialogInput,
+  dialogPrimaryButton,
+  dialogSecondaryButton,
+} from "@/components/workbench/ResponsiveDialog";
+import {
+  formatDateTime,
+  formatShortDate,
+  type BrowserBadge,
+  type BrowserItem,
+  type MenuPoint,
+  type WorkbenchAction,
+} from "@/components/workbench/types";
+import { useBrowserInteractions } from "@/components/workbench/useBrowserInteractions";
+import {
+  useCoarsePointer,
+  useIsMobileLayout,
+} from "@/components/workbench/useMediaQuery";
 import { useWorkbooks } from "@/hooks/useSheet";
 import { useFileManager } from "@/hooks/useFileManager";
 import {
@@ -70,6 +111,7 @@ import type {
   AuthUser,
   Channel,
   Folder,
+  FolderOption,
   FolderShareUser,
   PageData,
   TaskCenterSummary,
@@ -223,6 +265,119 @@ function channelStorageKey(userId: number, suffix: string) {
   return `yaerp:channels:${userId}:${suffix}`;
 }
 
+function pinnedStorageKey(userId: number) {
+  return `yaerp:home:${userId}:pinned`;
+}
+
+function sortStorageKey(userId: number) {
+  return `yaerp:home:${userId}:workbook-sort`;
+}
+
+interface PinnedEntry {
+  kind: "folder" | "workbook";
+  id: number;
+  name: string;
+}
+
+interface ConfirmRequest {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  danger?: boolean;
+  onConfirm: () => Promise<void>;
+}
+
+type WorkbookStateAction =
+  | "lock"
+  | "unlock"
+  | "hide"
+  | "unhide"
+  | "publish"
+  | "unpublish";
+
+const SORT_OPTIONS: Array<{ value: WorkbenchSortKey; label: string }> = [
+  { value: "updated_at", label: "修改时间" },
+  { value: "created_at", label: "创建时间" },
+  { value: "name", label: "名称" },
+  { value: "type", label: "类型" },
+];
+
+function readPinned(userId: number | undefined): PinnedEntry[] {
+  if (!userId || typeof window === "undefined") return [];
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(pinnedStorageKey(userId)) || "[]",
+    );
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is PinnedEntry =>
+        !!entry &&
+        (entry.kind === "folder" || entry.kind === "workbook") &&
+        typeof entry.id === "number" &&
+        typeof entry.name === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function readSortPreference(userId: number | undefined): {
+  by: WorkbenchSortKey;
+  order: "asc" | "desc";
+} {
+  const fallback = { by: "updated_at" as WorkbenchSortKey, order: "desc" as const };
+  if (!userId || typeof window === "undefined") return fallback;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(sortStorageKey(userId)) || "null");
+    if (
+      parsed &&
+      SORT_OPTIONS.some((option) => option.value === parsed.by) &&
+      (parsed.order === "asc" || parsed.order === "desc")
+    )
+      return parsed;
+  } catch {
+    // Ignore malformed preferences.
+  }
+  return fallback;
+}
+
+function greetingFor(date: Date) {
+  const hour = date.getHours();
+  if (hour < 6) return "夜深了";
+  if (hour < 12) return "早上好";
+  if (hour < 14) return "中午好";
+  if (hour < 18) return "下午好";
+  return "晚上好";
+}
+
+function folderAccessLabel(folder: Folder) {
+  switch (folder.access_level) {
+    case "owner":
+      return "所有者";
+    case "admin":
+      return "管理员";
+    case "edit":
+      return "可写共享";
+    case "view":
+      return "只读共享";
+    default:
+      return folder.can_manage ? "可管理" : folder.can_write ? "可写" : "只读";
+  }
+}
+
+function CountBadge({ value, tone = "rose" }: { value: number; tone?: "rose" | "amber" | "sky" }) {
+  if (value <= 0) return null;
+  const toneClass =
+    tone === "amber" ? "bg-amber-500" : tone === "sky" ? "bg-sky-600" : "bg-rose-500";
+  return (
+    <span
+      className={`absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-4 text-white ring-2 ring-white ${toneClass}`}
+    >
+      {value > 99 ? "99+" : value}
+    </span>
+  );
+}
+
 export default function HomePage() {
   const router = useRouter();
   const { workbooks, refresh } = useWorkbooks();
@@ -236,11 +391,14 @@ export default function HomePage() {
     refresh: refreshFolder,
     createFolder,
     renameFolder,
-    deleteFolder,
-    moveWorkbook,
   } = useFileManager();
+  const isMobile = useIsMobileLayout();
+  const coarsePointer = useCoarsePointer();
+  const touchUi = isMobile || coarsePointer;
   const [creating, setCreating] = useState(false);
   const [creatingFolder, setCreatingFolder] = useState(false);
+  const [createSaving, setCreateSaving] = useState(false);
+  const [createError, setCreateError] = useState("");
   const [newFolderName, setNewFolderName] = useState("");
   const [folderBeingRenamed, setFolderBeingRenamed] =
     useState<Folder | null>(null);
@@ -291,11 +449,11 @@ export default function HomePage() {
     useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
-  const [workbookSortBy, setWorkbookSortBy] = useState<
-    "updated_at" | "created_at" | "name"
-  >("updated_at");
+  const [workbookSortBy, setWorkbookSortBy] = useState<WorkbenchSortKey>(
+    () => readSortPreference(getStoredUser()?.id).by,
+  );
   const [workbookSortOrder, setWorkbookSortOrder] = useState<"asc" | "desc">(
-    "desc",
+    () => readSortPreference(getStoredUser()?.id).order,
   );
   const [workbookViewMode, setWorkbookViewMode] = useState<WorkbookViewMode>(
     () => {
@@ -323,19 +481,13 @@ export default function HomePage() {
   const [selectedAssigneeIds, setSelectedAssigneeIds] = useState<number[]>([]);
   const [assignmentLoading, setAssignmentLoading] = useState(false);
   const [assignmentMessage, setAssignmentMessage] = useState("");
-  const [folderSearchQuery, setFolderSearchQuery] = useState("");
-  const [folderPage, setFolderPage] = useState(1);
-  const [movingWorkbookId, setMovingWorkbookId] = useState<number | null>(null);
-  const [draggedWorkbookId, setDraggedWorkbookId] = useState<number | null>(
-    null,
-  );
+  const [movingWorkbookIds, setMovingWorkbookIds] = useState<number[]>([]);
+  const [draggedWorkbookIds, setDraggedWorkbookIds] = useState<number[]>([]);
   const [workbookDropTarget, setWorkbookDropTarget] = useState<string | null>(
     null,
   );
-  const [selectedDesktopItem, setSelectedDesktopItem] = useState<string | null>(
-    null,
-  );
-  const [workbookMoveError, setWorkbookMoveError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [notice, setNotice] = useState("");
   const [sharedFolders, setSharedFolders] = useState<Folder[]>([]);
   const [sharingFolder, setSharingFolder] = useState<Folder | null>(null);
   const [shareableUsers, setShareableUsers] = useState<User[]>([]);
@@ -346,12 +498,34 @@ export default function HomePage() {
   const [shareSaving, setShareSaving] = useState(false);
   const [shareLoadFailed, setShareLoadFailed] = useState(false);
   const [shareMessage, setShareMessage] = useState("");
-  const [selectedReclaimWorkbookIds, setSelectedReclaimWorkbookIds] = useState<
-    number[]
-  >([]);
   const [batchWorkbookActionLoading, setBatchWorkbookActionLoading] =
     useState(false);
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  const [selectMode, setSelectMode] = useState(false);
+  const [menuRequest, setMenuRequest] = useState<ActionMenuRequest | null>(
+    null,
+  );
+  const [moveRequest, setMoveRequest] = useState<{
+    workbookIds: number[];
+    title: string;
+  } | null>(null);
+  const [moveTargets, setMoveTargets] = useState<MoveTarget[]>([]);
+  const [moveTargetsLoading, setMoveTargetsLoading] = useState(false);
+  const [moveBusy, setMoveBusy] = useState(false);
+  const [moveDialogError, setMoveDialogError] = useState("");
+  const [propertiesItem, setPropertiesItem] = useState<BrowserItem | null>(
+    null,
+  );
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(
+    null,
+  );
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [pinnedEntries, setPinnedEntries] = useState<PinnedEntry[]>(() =>
+    readPinned(getStoredUser()?.id),
+  );
   const searchRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const notificationAreaRef = useRef<HTMLDivElement>(null);
   const latestChannelMessageIdsRef = useRef<Map<number, number>>(new Map());
   const channelNotificationsInitializedRef = useRef(false);
   const previousMailUnreadRef = useRef<number | null>(null);
@@ -363,8 +537,7 @@ export default function HomePage() {
     currentFolderId !== null ? breadcrumb[breadcrumb.length - 1] || null : null;
   const canWriteCurrentFolder =
     currentFolderId === null || Boolean(currentFolderMeta?.can_write);
-  const canManageCurrentFolder =
-    currentFolderId === null || Boolean(currentFolderMeta?.can_manage);
+  const importBusy = importingWorkbook || importingWorkbookFolder;
   const unreadChannels = useMemo(
     () =>
       channelNotifications
@@ -563,20 +736,22 @@ export default function HomePage() {
   }, [directoryWorkbooks, searchQuery]);
 
   const sortedWorkbooks = useMemo(() => {
+    const direction = workbookSortOrder === "asc" ? 1 : -1;
+    const byName = (left: Workbook, right: Workbook) =>
+      left.name.localeCompare(right.name, "zh-CN", {
+        numeric: true,
+        sensitivity: "base",
+      });
     return [...filteredWorkbooks].sort((left, right) => {
-      if (workbookSortBy === "name") {
-        const compare = left.name.localeCompare(right.name, "zh-CN", {
-          numeric: true,
-          sensitivity: "base",
-        });
-        return workbookSortOrder === "asc" ? compare : -compare;
+      if (workbookSortBy === "name") return byName(left, right) * direction;
+      if (workbookSortBy === "type") {
+        const rank = (workbook: Workbook) =>
+          hasWorkbookSourceXlsx(workbook) ? 0 : 1;
+        return (rank(left) - rank(right)) * direction || byName(left, right);
       }
-
       const leftValue = new Date(left[workbookSortBy]).getTime();
       const rightValue = new Date(right[workbookSortBy]).getTime();
-      return workbookSortOrder === "asc"
-        ? leftValue - rightValue
-        : rightValue - leftValue;
+      return (leftValue - rightValue) * direction;
     });
   }, [filteredWorkbooks, workbookSortBy, workbookSortOrder]);
 
@@ -616,23 +791,6 @@ export default function HomePage() {
         : [],
     [adminMode, paginatedWorkbooks],
   );
-
-  const foldersPerPage = 8;
-  const filteredFolders = useMemo(() => {
-    const keyword = folderSearchQuery.trim().toLowerCase();
-    if (!keyword) return directoryFolders;
-    return directoryFolders.filter((folder) =>
-      folder.name.toLowerCase().includes(keyword),
-    );
-  }, [directoryFolders, folderSearchQuery]);
-  const totalFolderPages = Math.max(
-    1,
-    Math.ceil(filteredFolders.length / foldersPerPage),
-  );
-  const paginatedFolders = useMemo(() => {
-    const start = (folderPage - 1) * foldersPerPage;
-    return filteredFolders.slice(start, start + foldersPerPage);
-  }, [filteredFolders, folderPage]);
   const visibleSharedFolders = useMemo(() => {
     if (adminMode && showOnlyOwnResources) return [];
     const existingIds = new Set(contents.folders.map((folder) => folder.id));
@@ -645,12 +803,158 @@ export default function HomePage() {
     });
     return Array.from(unique.values());
   }, [directoryFolders, visibleSharedFolders]);
-  useEffect(() => {
-    setFolderPage(1);
-  }, [folderSearchQuery, showOnlyOwnResources]);
-  useEffect(() => {
-    setWorkbookPage(1);
-  }, [showOnlyOwnResources]);
+
+  const pinnedKeySet = useMemo(
+    () => new Set(pinnedEntries.map((entry) => `${entry.kind}:${entry.id}`)),
+    [pinnedEntries],
+  );
+
+  const folderEntries = useMemo(() => {
+    const entries = [
+      ...directoryFolders.map((folder) => ({ folder, shared: false })),
+      ...(currentFolderId === null
+        ? visibleSharedFolders.map((folder) => ({ folder, shared: true }))
+        : []),
+    ];
+    const keyword = searchQuery.trim();
+    const filtered = keyword
+      ? entries.filter(
+          ({ folder }) =>
+            fuzzyMatch(keyword, folder.name) ||
+            fuzzyMatch(keyword, folder.owner_name || ""),
+        )
+      : entries;
+    const direction = workbookSortOrder === "asc" ? 1 : -1;
+    return [...filtered].sort((left, right) => {
+      const byName = left.folder.name.localeCompare(right.folder.name, "zh-CN", {
+        numeric: true,
+        sensitivity: "base",
+      });
+      if (workbookSortBy === "name") return byName * direction;
+      if (workbookSortBy === "type") return byName;
+      const leftValue = new Date(left.folder[workbookSortBy]).getTime();
+      const rightValue = new Date(right.folder[workbookSortBy]).getTime();
+      return (leftValue - rightValue) * direction || byName;
+    });
+    // fuzzyMatch is a pure helper recreated each render.
+  }, [
+    currentFolderId,
+    directoryFolders,
+    searchQuery,
+    visibleSharedFolders,
+    workbookSortBy,
+    workbookSortOrder,
+  ]);
+
+  const groupedListMode =
+    workbookViewMode === "list" && adminMode && groupByOwner;
+  const displayWorkbooks = useMemo(
+    () =>
+      groupedListMode
+        ? workbookGroups.flatMap((group) => group.items)
+        : paginatedWorkbooks,
+    [groupedListMode, paginatedWorkbooks, workbookGroups],
+  );
+
+  const workbookToItem = (workbook: Workbook): BrowserItem => {
+    const key = `workbook:${workbook.id}`;
+    const excelSource = hasWorkbookSourceXlsx(workbook);
+    const badges: BrowserBadge[] = [];
+    if (workbook.is_locked)
+      badges.push({ label: "锁定", tone: "amber", icon: Lock });
+    if (workbook.is_hidden)
+      badges.push({ label: "不可见", tone: "slate", icon: EyeOff });
+    if (workbook.is_public)
+      badges.push({ label: "公共", tone: "emerald", icon: Globe2 });
+    if (adminMode && isAssignedTaskWorkbook(workbook))
+      badges.push({ label: "任务", tone: "violet", icon: ClipboardList });
+    return {
+      key,
+      kind: "workbook",
+      id: workbook.id,
+      name: workbook.name,
+      description: workbook.description?.trim() || undefined,
+      ownerName: workbook.owner_name,
+      typeLabel: excelSource ? "Excel 工作簿" : "在线工作簿",
+      createdAt: workbook.created_at,
+      updatedAt: workbook.updated_at,
+      badges,
+      pinned: pinnedKeySet.has(key),
+      canDrag: canManageWorkbook(workbook),
+      canDrop: false,
+      excelSource,
+      locked: workbook.is_locked,
+      hidden: workbook.is_hidden,
+      isPublic: workbook.is_public,
+      busy: movingWorkbookIds.includes(workbook.id),
+      dimmed: workbook.is_hidden,
+      groupLabel: workbook.owner_name || `用户 #${workbook.owner_id}`,
+    };
+  };
+
+  const folderToItem = (folder: Folder, shared: boolean): BrowserItem => {
+    const key = `folder:${folder.id}`;
+    const badges: BrowserBadge[] = [];
+    if (shared)
+      badges.push({
+        label: folder.access_level === "edit" ? "可写共享" : "只读共享",
+        tone: folder.access_level === "edit" ? "emerald" : "sky",
+        icon: Share2,
+      });
+    else if (!folder.can_write)
+      badges.push({ label: "只读", tone: "slate", icon: Lock });
+    return {
+      key,
+      kind: "folder",
+      id: folder.id,
+      name: folder.name,
+      ownerName: folder.owner_name,
+      typeLabel: shared ? "共享文件夹" : "文件夹",
+      createdAt: folder.created_at,
+      updatedAt: folder.updated_at,
+      badges,
+      pinned: pinnedKeySet.has(key),
+      canDrag: false,
+      canDrop: canWriteFolder(folder),
+      shared,
+    };
+  };
+
+  const browserItems: BrowserItem[] = [
+    ...folderEntries.map(({ folder, shared }) => folderToItem(folder, shared)),
+    ...displayWorkbooks.map(workbookToItem),
+  ];
+  const browserItemKeys = browserItems.map((item) => item.key).join("|");
+
+  const workbookLookup = useMemo(() => {
+    const map = new Map<number, Workbook>();
+    workbooks.forEach((workbook) => map.set(workbook.id, workbook));
+    contents.workbooks.forEach((workbook) => map.set(workbook.id, workbook));
+    return map;
+  }, [contents.workbooks, workbooks]);
+  const folderLookup = useMemo(() => {
+    const map = new Map<number, Folder>();
+    sharedFolders.forEach((folder) => map.set(folder.id, folder));
+    contents.folders.forEach((folder) => map.set(folder.id, folder));
+    return map;
+  }, [contents.folders, sharedFolders]);
+
+  const recentWorkbooks = useMemo(
+    () =>
+      [...workbooks]
+        .filter(
+          (workbook) =>
+            !(adminMode && showOnlyOwnResources) ||
+            workbook.owner_id === profile?.id,
+        )
+        .sort(
+          (left, right) =>
+            new Date(right.updated_at).getTime() -
+            new Date(left.updated_at).getTime(),
+        )
+        .slice(0, 6),
+    [adminMode, profile?.id, showOnlyOwnResources, workbooks],
+  );
 
   // Quick actions coming from the global command palette. The request can
   // arrive before this page mounts (navigating from another route), so it is
@@ -710,12 +1014,69 @@ export default function HomePage() {
     );
   }, [profile?.id, workbookViewMode]);
   useEffect(() => {
-    if (folderPage > totalFolderPages) setFolderPage(totalFolderPages);
-  }, [folderPage, totalFolderPages]);
+    setWorkbookPage(1);
+  }, [showOnlyOwnResources]);
   useEffect(() => {
-    setSelectedDesktopItem(null);
+    if (!profile?.id) return;
+    localStorage.setItem(
+      sortStorageKey(profile.id),
+      JSON.stringify({ by: workbookSortBy, order: workbookSortOrder }),
+    );
+  }, [profile?.id, workbookSortBy, workbookSortOrder]);
+  useEffect(() => {
+    setPinnedEntries(readPinned(profile?.id));
+  }, [profile?.id]);
+  const persistPinned = useCallback(
+    (next: PinnedEntry[]) => {
+      setPinnedEntries(next);
+      if (profile?.id)
+        localStorage.setItem(pinnedStorageKey(profile.id), JSON.stringify(next));
+    },
+    [profile?.id],
+  );
+  // Keep pinned names in sync with renamed resources that are on screen.
+  useEffect(() => {
+    let changed = false;
+    const next = pinnedEntries.map((entry) => {
+      const source =
+        entry.kind === "workbook"
+          ? workbookLookup.get(entry.id)
+          : folderLookup.get(entry.id);
+      if (source && source.name !== entry.name) {
+        changed = true;
+        return { ...entry, name: source.name };
+      }
+      return entry;
+    });
+    if (changed) persistPinned(next);
+  }, [folderLookup, persistPinned, pinnedEntries, workbookLookup]);
+  useEffect(() => {
+    setSelectedKeys([]);
     setWorkbookDropTarget(null);
   }, [currentFolderId, workbookPage, workbookViewMode]);
+  useEffect(() => {
+    const visible = new Set(browserItemKeys.split("|"));
+    setSelectedKeys((current) => {
+      const next = current.filter((key) => visible.has(key));
+      return next.length === current.length ? current : next;
+    });
+  }, [browserItemKeys]);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 3200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  useEffect(() => {
+    if (!channelNotificationOpen && !mailNotificationOpen) return;
+    if (isMobile) return;
+    const handlePointer = (event: PointerEvent) => {
+      if (notificationAreaRef.current?.contains(event.target as Node)) return;
+      setChannelNotificationOpen(false);
+      setMailNotificationOpen(false);
+    };
+    window.addEventListener("pointerdown", handlePointer);
+    return () => window.removeEventListener("pointerdown", handlePointer);
+  }, [channelNotificationOpen, isMobile, mailNotificationOpen]);
 
   useEffect(() => {
     let active = true;
@@ -825,22 +1186,60 @@ export default function HomePage() {
     },
     [],
   );
-
   const handleCreateWorkbook = async () => {
-    if (!canWriteCurrentFolder) return;
+    if (!canWriteCurrentFolder || createSaving) return;
     if (!newName.trim()) return;
 
+    setCreateSaving(true);
+    setCreateError("");
     try {
-      await api.post("/workbooks", {
+      const response = await api.post<Workbook>("/workbooks", {
         name: newName.trim(),
         folder_id: currentFolderId,
       });
+      if (response.code !== 0) {
+        setCreateError(response.message || "新建工作簿失败，请稍后重试。");
+        return;
+      }
       setNewName("");
       setCreating(false);
       await Promise.all([refresh(), refreshFolder()]);
     } catch (err) {
       console.error("Failed to create workbook:", err);
+      setCreateError(
+        err instanceof Error ? err.message : "新建工作簿失败，请稍后重试。",
+      );
+    } finally {
+      setCreateSaving(false);
     }
+  };
+
+  const handleCreateFolder = async () => {
+    if (!canWriteCurrentFolder || createSaving) return;
+    const name = newFolderName.trim();
+    if (!name) return;
+    setCreateSaving(true);
+    setCreateError("");
+    try {
+      await createFolder(name);
+      setNewFolderName("");
+      setCreatingFolder(false);
+    } catch (err) {
+      setCreateError(
+        err instanceof Error ? err.message : "新建文件夹失败，请稍后重试。",
+      );
+    } finally {
+      setCreateSaving(false);
+    }
+  };
+
+  const closeCreateDialogs = () => {
+    if (createSaving) return;
+    setCreating(false);
+    setCreatingFolder(false);
+    setNewName("");
+    setNewFolderName("");
+    setCreateError("");
   };
 
   const handleImportWorkbookXlsx = async (file: File) => {
@@ -1096,46 +1495,48 @@ export default function HomePage() {
     })();
   };
 
-  const handleDownloadWorkbookSource = async (
-    event: React.MouseEvent,
-    workbook: Workbook,
-  ) => {
-    event.stopPropagation();
-    if (downloadingSourceWorkbookId !== null) return;
+  const downloadWorkbookFile = async (workbook: Workbook) => {
+    const source = getWorkbookImportSource(workbook);
+    const hasSource = hasWorkbookSourceXlsx(workbook);
+    const fallbackBase = sanitizeDownloadFilename(
+      source?.filename || workbook.name || "workbook",
+    );
+    const fallbackFilename = ensureExcelDownloadFilename(fallbackBase);
+    const response = await api.download(
+      hasSource
+        ? `/workbooks/${workbook.id}/source/xlsx`
+        : `/workbooks/${workbook.id}/export?filename=${encodeURIComponent(fallbackFilename)}`,
+    );
+    if (!response.ok) {
+      let message = "下载 Excel 失败，请稍后再试。";
+      try {
+        const data = (await response.json()) as { message?: string };
+        if (data?.message) {
+          message = data.message;
+        }
+      } catch {
+        // Ignore JSON parse errors for binary responses.
+      }
+      throw new Error(message);
+    }
 
-    setDownloadingSourceWorkbookId(workbook.id);
+    const blob = await response.blob();
+    const filename = parseFilenameFromDisposition(
+      response.headers.get("Content-Disposition"),
+      fallbackFilename,
+    );
+    triggerBrowserDownload(blob, filename);
+  };
+
+  const handleDownloadWorkbooks = async (targets: Workbook[]) => {
+    if (downloadingSourceWorkbookId !== null || targets.length === 0) return;
     setWorkbookImportError("");
     try {
-      const source = getWorkbookImportSource(workbook);
-      const hasSource = hasWorkbookSourceXlsx(workbook);
-      const fallbackBase = sanitizeDownloadFilename(
-        source?.filename || workbook.name || "workbook",
-      );
-      const fallbackFilename = ensureExcelDownloadFilename(fallbackBase);
-      const response = await api.download(
-        hasSource
-          ? `/workbooks/${workbook.id}/source/xlsx`
-          : `/workbooks/${workbook.id}/export?filename=${encodeURIComponent(fallbackFilename)}`,
-      );
-      if (!response.ok) {
-        let message = "下载 Excel 失败，请稍后再试。";
-        try {
-          const data = (await response.json()) as { message?: string };
-          if (data?.message) {
-            message = data.message;
-          }
-        } catch {
-          // Ignore JSON parse errors for binary responses.
-        }
-        throw new Error(message);
+      for (const workbook of targets) {
+        setDownloadingSourceWorkbookId(workbook.id);
+        await downloadWorkbookFile(workbook);
       }
-
-      const blob = await response.blob();
-      const filename = parseFilenameFromDisposition(
-        response.headers.get("Content-Disposition"),
-        fallbackFilename,
-      );
-      triggerBrowserDownload(blob, filename);
+      if (targets.length > 1) setNotice(`已下载 ${targets.length} 个工作簿`);
     } catch (err) {
       setWorkbookImportError(
         err instanceof Error ? err.message : "下载 Excel 失败，请稍后再试。",
@@ -1167,14 +1568,6 @@ export default function HomePage() {
       setWorkbookPage(totalWorkbookPages);
     }
   }, [workbookPage, totalWorkbookPages]);
-
-  useEffect(() => {
-    const visibleIds = new Set(workbooks.map((workbook) => workbook.id));
-    setSelectedReclaimWorkbookIds((current) =>
-      current.filter((id) => visibleIds.has(id)),
-    );
-  }, [workbooks]);
-
   useEffect(() => {
     if (!sharingFolder) return;
 
@@ -1245,34 +1638,9 @@ export default function HomePage() {
     };
   }, [adminMode, assigningWorkbook]);
 
-  const handleDeleteWorkbook = async (
-    e: React.MouseEvent,
-    workbookId: number,
-  ) => {
-    e.stopPropagation();
-    const workbook =
-      workbooks.find((item) => item.id === workbookId) ||
-      contents.workbooks.find((item) => item.id === workbookId);
-    if (workbook && !canDeleteWorkbook(workbook)) return;
-    if (
-      !confirm(
-        "确定要将此工作簿移入回收站吗？删除后保留 30 天，可在回收站中还原。",
-      )
-    )
-      return;
-    try {
-      await api.delete(`/workbooks/${workbookId}`);
-      await Promise.all([refresh(), refreshFolder()]);
-    } catch (err) {
-      console.error("Failed to delete workbook:", err);
-    }
-  };
+  const refreshAll = () => Promise.all([refresh(), refreshFolder()]);
 
-  const handleDuplicateWorkbook = async (
-    event: React.MouseEvent,
-    workbook: Workbook,
-  ) => {
-    event.stopPropagation();
+  const handleDuplicateWorkbook = async (workbook: Workbook) => {
     if (!canManageWorkbook(workbook) || duplicatingWorkbookId !== null) return;
 
     setDuplicatingWorkbookId(workbook.id);
@@ -1286,7 +1654,8 @@ export default function HomePage() {
         return;
       }
       setWorkbookPage(1);
-      await Promise.all([refresh(), refreshFolder()]);
+      await refreshAll();
+      setNotice(`已复制「${workbook.name}」`);
     } catch (err) {
       console.error("Failed to duplicate workbook:", err);
       setWorkbookImportError(
@@ -1298,65 +1667,50 @@ export default function HomePage() {
   };
 
   const handleUpdateWorkbookState = async (
-    e: React.MouseEvent,
     workbookId: number,
-    action: "lock" | "unlock" | "hide" | "unhide" | "publish" | "unpublish",
+    action: WorkbookStateAction,
   ) => {
-    e.stopPropagation();
+    setActionError("");
     try {
       const res = await api.put(`/workbooks/${workbookId}/state`, { action });
       if (res.code !== 0) {
-        console.error("Failed to update workbook state:", res.message);
+        setActionError(res.message || "更新工作簿状态失败。");
         return;
       }
-      await Promise.all([refresh(), refreshFolder()]);
+      await refreshAll();
     } catch (err) {
       console.error("Failed to update workbook state:", err);
+      setActionError(
+        err instanceof Error ? err.message : "更新工作簿状态失败。",
+      );
     }
   };
 
-  const toggleReclaimWorkbookSelection = (workbookId: number) => {
-    setSelectedReclaimWorkbookIds((current) =>
-      current.includes(workbookId)
-        ? current.filter((id) => id !== workbookId)
-        : [...current, workbookId],
-    );
-  };
-
-  const handleSelectAllVisibleTaskWorkbooks = () => {
-    const ids = visibleAssignedTaskWorkbooks.map((workbook) => workbook.id);
-    if (ids.length === 0) return;
-
-    setSelectedReclaimWorkbookIds((current) => {
-      const allSelected = ids.every((id) => current.includes(id));
-      if (allSelected) {
-        return current.filter((id) => !ids.includes(id));
-      }
-      return Array.from(new Set([...current, ...ids]));
-    });
-  };
-
   const handleBatchUpdateWorkbookState = async (
+    workbookIds: number[],
     action: "lock" | "unlock" | "hide" | "unhide",
   ) => {
-    if (selectedReclaimWorkbookIds.length === 0) return;
+    if (workbookIds.length === 0) return;
 
     setBatchWorkbookActionLoading(true);
+    setActionError("");
     try {
       const res = await api.put("/workbooks/state/batch", {
-        workbook_ids: selectedReclaimWorkbookIds,
+        workbook_ids: workbookIds,
         action,
       });
       if (res.code !== 0) {
-        console.error("Failed to batch update workbook state:", res.message);
+        setActionError(res.message || "批量更新工作簿状态失败。");
         return;
       }
-      await Promise.all([refresh(), refreshFolder()]);
-      if (action === "hide") {
-        setSelectedReclaimWorkbookIds([]);
-      }
+      await refreshAll();
+      setNotice(`已更新 ${workbookIds.length} 个工作簿`);
+      if (action === "hide") setSelectedKeys([]);
     } catch (err) {
       console.error("Failed to batch update workbook state:", err);
+      setActionError(
+        err instanceof Error ? err.message : "批量更新工作簿状态失败。",
+      );
     } finally {
       setBatchWorkbookActionLoading(false);
     }
@@ -1369,59 +1723,154 @@ export default function HomePage() {
         name: editWorkbookName.trim(),
       });
       setEditingWorkbook(null);
-      await Promise.all([refresh(), refreshFolder()]);
+      await refreshAll();
     } catch (err) {
       console.error("Failed to rename workbook:", err);
     }
   };
 
-  const handleMoveWorkbookToFolder = async (
-    workbookId: number,
+  const moveWorkbooks = async (
+    workbookIds: number[],
     targetFolderId: number | null,
   ) => {
-    if (targetFolderId === currentFolderId) {
-      setDraggedWorkbookId(null);
-      setWorkbookDropTarget(null);
-      return;
-    }
-    setMovingWorkbookId(workbookId);
-    setWorkbookMoveError("");
+    const ids = workbookIds.filter((id) => {
+      const workbook = workbookLookup.get(id);
+      return !workbook || (workbook.folder_id ?? null) !== targetFolderId;
+    });
+    setDraggedWorkbookIds([]);
+    setWorkbookDropTarget(null);
+    if (ids.length === 0 || targetFolderId === currentFolderId) return true;
+    setMovingWorkbookIds(ids);
+    setActionError("");
+    const failures: string[] = [];
     try {
-      await moveWorkbook(workbookId, targetFolderId);
-      await refresh();
-    } catch (err) {
-      console.error("Failed to move workbook:", err);
-      setWorkbookMoveError(
-        err instanceof Error ? err.message : "移动工作簿失败，请稍后重试。",
-      );
+      for (const id of ids) {
+        try {
+          const response = await api.put(`/workbooks/${id}/move`, {
+            folder_id: targetFolderId,
+          });
+          if (response.code !== 0)
+            failures.push(response.message || "移动工作簿失败");
+        } catch (err) {
+          failures.push(err instanceof Error ? err.message : "移动工作簿失败");
+        }
+      }
+      await refreshAll();
     } finally {
-      setMovingWorkbookId(null);
+      setMovingWorkbookIds([]);
     }
+    if (failures.length > 0) {
+      setActionError(
+        failures.length === ids.length
+          ? failures[0]
+          : `${ids.length - failures.length} 个已移动，${failures.length} 个失败：${failures[0]}`,
+      );
+      return false;
+    }
+    const target =
+      targetFolderId === null
+        ? "根目录"
+        : folderLookup.get(targetFolderId)?.name ||
+          breadcrumb.find((folder) => folder.id === targetFolderId)?.name ||
+          moveTargets.find((option) => option.id === targetFolderId)?.name ||
+          "目标文件夹";
+    setNotice(`已将 ${ids.length} 个工作簿移动到「${target}」`);
+    setSelectedKeys([]);
+    return true;
+  };
+
+  const openMoveDialog = (workbookIds: number[], title: string) => {
+    if (workbookIds.length === 0) return;
+    setMoveRequest({ workbookIds, title });
+    setMoveDialogError("");
+    setMoveTargetsLoading(true);
+    const fallback = (): MoveTarget[] => {
+      const map = new Map<number, MoveTarget>();
+      [...breadcrumb, ...writableWorkbookTargetFolders].forEach((folder) => {
+        if (folder.can_write !== false)
+          map.set(folder.id, { id: folder.id, name: folder.name, path: folder.name });
+      });
+      return Array.from(map.values());
+    };
+    void (async () => {
+      let targets: MoveTarget[] = [];
+      try {
+        const response = await api.get<FolderOption[]>("/folders/options");
+        targets =
+          response.code === 0 && response.data
+            ? response.data
+                .filter((option) => option.can_write)
+                .map((option) => ({
+                  id: option.id,
+                  name: option.name,
+                  path: option.path,
+                }))
+                .sort((left, right) => left.path.localeCompare(right.path, "zh-CN"))
+            : fallback();
+      } catch {
+        targets = fallback();
+      }
+      if (targets.length === 0) targets = fallback();
+      setMoveTargets([{ id: null, name: "根目录", path: "" }, ...targets]);
+      setMoveTargetsLoading(false);
+    })();
+  };
+
+  const confirmMove = async (targetFolderId: number | null) => {
+    if (!moveRequest) return;
+    setMoveBusy(true);
+    setMoveDialogError("");
+    const ok = await moveWorkbooks(moveRequest.workbookIds, targetFolderId);
+    setMoveBusy(false);
+    if (ok) setMoveRequest(null);
+    else setMoveDialogError("部分工作簿移动失败，详见页面提示。");
   };
 
   const hasInternalWorkbookDrag = (dataTransfer: DataTransfer) =>
-    draggedWorkbookId !== null ||
+    draggedWorkbookIds.length > 0 ||
     Array.from(dataTransfer.types || []).includes(WORKBOOK_DRAG_MIME);
 
-  const readDraggedWorkbookId = (dataTransfer: DataTransfer) => {
+  const readDraggedWorkbookIds = (dataTransfer: DataTransfer) => {
     const raw = dataTransfer.getData(WORKBOOK_DRAG_MIME);
-    const parsed = Number(raw);
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : draggedWorkbookId;
+    const parsed = raw
+      .split(",")
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
+    return parsed.length > 0 ? parsed : draggedWorkbookIds;
   };
 
-  const handleInternalWorkbookDragStart = (
+  const handleItemDragStart = (
+    item: BrowserItem,
     event: React.DragEvent<HTMLElement>,
-    workbookId: number,
   ) => {
+    const ids = selectedKeys.includes(item.key)
+      ? browserItems
+          .filter(
+            (entry) =>
+              entry.kind === "workbook" &&
+              entry.canDrag &&
+              selectedKeys.includes(entry.key),
+          )
+          .map((entry) => entry.id)
+      : [item.id];
     event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData(WORKBOOK_DRAG_MIME, String(workbookId));
-    event.dataTransfer.setData("text/plain", String(workbookId));
-    setDraggedWorkbookId(workbookId);
-    setWorkbookMoveError("");
+    event.dataTransfer.setData(WORKBOOK_DRAG_MIME, ids.join(","));
+    event.dataTransfer.setData("text/plain", ids.join(","));
+    if (ids.length > 1) {
+      const ghost = document.createElement("div");
+      ghost.textContent = `移动 ${ids.length} 个工作簿`;
+      ghost.style.cssText =
+        "position:fixed;top:-200px;left:-200px;padding:6px 12px;border-radius:8px;background:#0f172a;color:#fff;font:600 12px system-ui,sans-serif;";
+      document.body.appendChild(ghost);
+      event.dataTransfer.setDragImage(ghost, 12, 12);
+      window.setTimeout(() => ghost.remove(), 0);
+    }
+    setDraggedWorkbookIds(ids);
+    setActionError("");
   };
 
   const handleInternalWorkbookDragEnd = () => {
-    setDraggedWorkbookId(null);
+    setDraggedWorkbookIds([]);
     setWorkbookDropTarget(null);
   };
 
@@ -1460,26 +1909,137 @@ export default function HomePage() {
     if (!hasInternalWorkbookDrag(event.dataTransfer)) return;
     event.preventDefault();
     event.stopPropagation();
-    const workbookId = readDraggedWorkbookId(event.dataTransfer);
-    setDraggedWorkbookId(null);
+    const ids = readDraggedWorkbookIds(event.dataTransfer);
+    setDraggedWorkbookIds([]);
     setWorkbookDropTarget(null);
-    if (canWrite && workbookId !== null) {
-      void handleMoveWorkbookToFolder(workbookId, targetFolderId);
+    if (canWrite && ids.length > 0) {
+      void moveWorkbooks(ids, targetFolderId);
     }
   };
 
-  const handleDeleteFolder = async (folderId: number, folderName: string) => {
-    if (
-      !confirm(
-        `确定要将文件夹「${folderName}」移入回收站吗？目录结构和其中的工作簿会保留 30 天。`,
-      )
-    )
+  const isPinned = (kind: "folder" | "workbook", id: number) =>
+    pinnedKeySet.has(`${kind}:${id}`);
+
+  const togglePinned = (entries: PinnedEntry[]) => {
+    if (entries.length === 0) return;
+    const allPinned = entries.every((entry) => isPinned(entry.kind, entry.id));
+    if (allPinned) {
+      const remove = new Set(entries.map((entry) => `${entry.kind}:${entry.id}`));
+      persistPinned(
+        pinnedEntries.filter((entry) => !remove.has(`${entry.kind}:${entry.id}`)),
+      );
+      setNotice(entries.length > 1 ? `已取消收藏 ${entries.length} 项` : "已取消收藏");
+    } else {
+      const additions = entries.filter((entry) => !isPinned(entry.kind, entry.id));
+      persistPinned([...additions, ...pinnedEntries].slice(0, 30));
+      setNotice(
+        entries.length > 1 ? `已收藏 ${additions.length} 项` : "已收藏到快速访问",
+      );
+    }
+  };
+
+  const itemToPinned = (item: BrowserItem): PinnedEntry => ({
+    kind: item.kind,
+    id: item.id,
+    name: item.name,
+  });
+
+  const requestDelete = (items: BrowserItem[]) => {
+    const deletable = items.filter((item) => {
+      if (item.kind === "folder") {
+        const folder = folderLookup.get(item.id);
+        return Boolean(folder && canManageFolder(folder));
+      }
+      const workbook = workbookLookup.get(item.id);
+      return Boolean(
+        workbook && canManageWorkbook(workbook) && canDeleteWorkbook(workbook),
+      );
+    });
+    if (deletable.length === 0) {
+      setActionError(
+        items.length > 1 ? "所选项目都没有删除权限。" : "没有删除此项目的权限。",
+      );
       return;
-    try {
-      await deleteFolder(folderId);
-      await refresh();
-    } catch (err) {
-      console.error("Failed to delete folder:", err);
+    }
+    const skipped = items.length - deletable.length;
+    const hasFolder = deletable.some((item) => item.kind === "folder");
+    setConfirmRequest({
+      title:
+        deletable.length === 1
+          ? `将「${deletable[0].name}」移入回收站？`
+          : `将 ${deletable.length} 项移入回收站？`,
+      message: `${
+        hasFolder
+          ? "文件夹的目录结构和其中的工作簿会一并移入回收站，"
+          : ""
+      }保留 30 天，可在回收站中还原。${
+        skipped > 0 ? `另有 ${skipped} 项没有删除权限，将被跳过。` : ""
+      }`,
+      confirmLabel: "移入回收站",
+      danger: true,
+      onConfirm: async () => {
+        const failures: string[] = [];
+        for (const item of deletable) {
+          try {
+            const response = await api.delete(
+              item.kind === "folder"
+                ? `/folders/${item.id}`
+                : `/workbooks/${item.id}`,
+            );
+            if (response.code !== 0)
+              failures.push(response.message || `删除「${item.name}」失败`);
+          } catch (err) {
+            failures.push(
+              err instanceof Error ? err.message : `删除「${item.name}」失败`,
+            );
+          }
+        }
+        await refreshAll();
+        setSelectedKeys([]);
+        const removed = new Set(deletable.map((item) => `${item.kind}:${item.id}`));
+        if (pinnedEntries.some((entry) => removed.has(`${entry.kind}:${entry.id}`)))
+          persistPinned(
+            pinnedEntries.filter((entry) => !removed.has(`${entry.kind}:${entry.id}`)),
+          );
+        if (failures.length > 0) setActionError(failures[0]);
+        else setNotice(`已将 ${deletable.length} 项移入回收站`);
+      },
+    });
+  };
+
+  const startRename = (item: BrowserItem) => {
+    if (item.kind === "folder") {
+      const folder = folderLookup.get(item.id);
+      if (!folder || !canManageFolder(folder)) return;
+      setFolderBeingRenamed(folder);
+      setFolderRenameName(folder.name);
+      setFolderRenameError("");
+      return;
+    }
+    const workbook = workbookLookup.get(item.id);
+    if (!workbook || !canManageWorkbook(workbook)) return;
+    setEditingWorkbook({ id: workbook.id, name: workbook.name });
+    setEditWorkbookName(workbook.name);
+  };
+
+  const openFolderShare = (folder: Folder) => {
+    setSharingFolder(folder);
+    setSelectedShares({});
+    setShareMessage("");
+  };
+
+  const openAssign = (workbook: Workbook) => {
+    setAssigningWorkbook(workbook);
+    setSelectedAssigneeIds([]);
+    setAssignmentMessage("");
+  };
+
+  const openItem = (item: BrowserItem) => {
+    if (item.kind === "folder") {
+      setSearchQuery("");
+      void navigateToFolder(item.id);
+    } else {
+      router.push(`/sheets/${item.id}`);
     }
   };
 
@@ -1584,2330 +2144,2195 @@ export default function HomePage() {
       setShareSaving(false);
     }
   };
+  const enterSelectMode = (keys: string[]) => {
+    setSelectMode(true);
+    setSelectedKeys(keys);
+  };
+
+  const buildWorkbookActions = (
+    workbook: Workbook,
+    item: BrowserItem,
+  ): WorkbenchAction[] => {
+    const manage = canManageWorkbook(workbook);
+    const pinned = isPinned("workbook", workbook.id);
+    const hasSource = hasWorkbookSourceXlsx(workbook);
+    const actions: Array<WorkbenchAction | false> = [
+      {
+        key: "open",
+        label: "打开",
+        icon: ArrowRight,
+        shortcut: "Enter",
+        onSelect: () => router.push(`/sheets/${workbook.id}`),
+      },
+      manage && {
+        key: "rename",
+        label: "重命名",
+        icon: PencilLine,
+        shortcut: "F2",
+        onSelect: () => startRename(item),
+      },
+      manage && {
+        key: "move",
+        label: "移动到…",
+        icon: FolderInput,
+        onSelect: () => openMoveDialog([workbook.id], `移动「${workbook.name}」`),
+      },
+      manage && {
+        key: "duplicate",
+        label: duplicatingWorkbookId === workbook.id ? "正在复制…" : "复制一份",
+        icon: Copy,
+        disabled: duplicatingWorkbookId !== null,
+        onSelect: () => void handleDuplicateWorkbook(workbook),
+      },
+      {
+        key: "download",
+        label: hasSource ? "下载原始 Excel" : "导出 Excel",
+        icon: Download,
+        disabled: downloadingSourceWorkbookId !== null,
+        onSelect: () => void handleDownloadWorkbooks([workbook]),
+      },
+      {
+        key: "whatsapp",
+        label: "发送到 WhatsApp",
+        icon: MessageCircle,
+        onSelect: () =>
+          setWhatsAppResource({
+            workbookId: workbook.id,
+            title: workbook.name,
+            defaultContent: `工作簿：${workbook.name}`,
+          }),
+      },
+      {
+        key: "pin",
+        label: pinned ? "取消收藏" : "收藏到快速访问",
+        icon: pinned ? StarOff : Star,
+        separatorBefore: true,
+        onSelect: () => togglePinned([itemToPinned(item)]),
+      },
+      manage && {
+        key: "public",
+        label: workbook.is_public ? "取消公共访问" : "设为公共工作簿",
+        icon: Globe2,
+        onSelect: () =>
+          void handleUpdateWorkbookState(
+            workbook.id,
+            workbook.is_public ? "unpublish" : "publish",
+          ),
+      },
+      adminMode && {
+        key: "lock",
+        label: workbook.is_locked ? "解除锁定" : "锁定工作簿",
+        icon: workbook.is_locked ? Unlock : Lock,
+        onSelect: () =>
+          void handleUpdateWorkbookState(
+            workbook.id,
+            workbook.is_locked ? "unlock" : "lock",
+          ),
+      },
+      adminMode && {
+        key: "hide",
+        label: workbook.is_hidden ? "恢复可见" : "设为不可见",
+        icon: workbook.is_hidden ? Eye : EyeOff,
+        onSelect: () =>
+          void handleUpdateWorkbookState(
+            workbook.id,
+            workbook.is_hidden ? "unhide" : "hide",
+          ),
+      },
+      adminMode && {
+        key: "assign",
+        label: "发放任务",
+        icon: UserRoundPlus,
+        onSelect: () => openAssign(workbook),
+      },
+      touchUi && {
+        key: "select",
+        label: "多选",
+        icon: CheckSquare,
+        separatorBefore: true,
+        onSelect: () => enterSelectMode([item.key]),
+      },
+      {
+        key: "properties",
+        label: "属性",
+        icon: Info,
+        separatorBefore: !touchUi,
+        onSelect: () => setPropertiesItem(item),
+      },
+      manage &&
+        canDeleteWorkbook(workbook) && {
+          key: "delete",
+          label: "移入回收站",
+          icon: Trash2,
+          danger: true,
+          shortcut: "Del",
+          separatorBefore: true,
+          onSelect: () => requestDelete([item]),
+        },
+    ];
+    return actions.filter(Boolean) as WorkbenchAction[];
+  };
+
+  const buildFolderActions = (
+    folder: Folder,
+    item: BrowserItem,
+  ): WorkbenchAction[] => {
+    const manage = canManageFolder(folder);
+    const pinned = isPinned("folder", folder.id);
+    const actions: Array<WorkbenchAction | false> = [
+      {
+        key: "open",
+        label: "打开",
+        icon: FolderOpen,
+        shortcut: "Enter",
+        onSelect: () => openItem(item),
+      },
+      manage && {
+        key: "rename",
+        label: "重命名",
+        icon: PencilLine,
+        shortcut: "F2",
+        onSelect: () => startRename(item),
+      },
+      manage && {
+        key: "share",
+        label: "共享与权限",
+        icon: Share2,
+        onSelect: () => openFolderShare(folder),
+      },
+      {
+        key: "pin",
+        label: pinned ? "取消收藏" : "收藏到快速访问",
+        icon: pinned ? StarOff : Star,
+        separatorBefore: true,
+        onSelect: () => togglePinned([itemToPinned(item)]),
+      },
+      touchUi && {
+        key: "select",
+        label: "多选",
+        icon: CheckSquare,
+        onSelect: () => enterSelectMode([item.key]),
+      },
+      {
+        key: "properties",
+        label: "属性",
+        icon: Info,
+        onSelect: () => setPropertiesItem(item),
+      },
+      manage && {
+        key: "delete",
+        label: "移入回收站",
+        icon: Trash2,
+        danger: true,
+        shortcut: "Del",
+        separatorBefore: true,
+        onSelect: () => requestDelete([item]),
+      },
+    ];
+    return actions.filter(Boolean) as WorkbenchAction[];
+  };
+
+  const selectedItems = browserItems.filter((item) =>
+    selectedKeys.includes(item.key),
+  );
+  const selectedWorkbooks = selectedItems
+    .filter((item) => item.kind === "workbook")
+    .map((item) => workbookLookup.get(item.id))
+    .filter((workbook): workbook is Workbook => Boolean(workbook));
+  const movableSelectedIds = selectedWorkbooks
+    .filter((workbook) => canManageWorkbook(workbook))
+    .map((workbook) => workbook.id);
+
+  const buildBatchActions = (items: BrowserItem[]): WorkbenchAction[] => {
+    const workbooksInSelection = items
+      .filter((item) => item.kind === "workbook")
+      .map((item) => workbookLookup.get(item.id))
+      .filter((workbook): workbook is Workbook => Boolean(workbook));
+    const movable = workbooksInSelection.filter((workbook) =>
+      canManageWorkbook(workbook),
+    );
+    const ids = workbooksInSelection.map((workbook) => workbook.id);
+    const allPinned = items.every((item) => isPinned(item.kind, item.id));
+    const actions: Array<WorkbenchAction | false> = [
+      movable.length > 0 && {
+        key: "move",
+        label: `移动 ${movable.length} 个工作簿…`,
+        icon: FolderInput,
+        onSelect: () =>
+          openMoveDialog(
+            movable.map((workbook) => workbook.id),
+            `移动 ${movable.length} 个工作簿`,
+          ),
+      },
+      workbooksInSelection.length > 0 && {
+        key: "download",
+        label: `下载 ${workbooksInSelection.length} 个工作簿`,
+        icon: Download,
+        disabled: downloadingSourceWorkbookId !== null,
+        onSelect: () => void handleDownloadWorkbooks(workbooksInSelection),
+      },
+      {
+        key: "pin",
+        label: allPinned ? "取消收藏" : "收藏所选",
+        icon: allPinned ? StarOff : Star,
+        onSelect: () => togglePinned(items.map(itemToPinned)),
+      },
+      adminMode &&
+        ids.length > 0 && {
+          key: "lock",
+          label: "批量锁定",
+          icon: Lock,
+          separatorBefore: true,
+          disabled: batchWorkbookActionLoading,
+          onSelect: () => void handleBatchUpdateWorkbookState(ids, "lock"),
+        },
+      adminMode &&
+        ids.length > 0 && {
+          key: "unlock",
+          label: "批量解除锁定",
+          icon: Unlock,
+          disabled: batchWorkbookActionLoading,
+          onSelect: () => void handleBatchUpdateWorkbookState(ids, "unlock"),
+        },
+      adminMode &&
+        ids.length > 0 && {
+          key: "hide",
+          label: "批量设为不可见",
+          icon: EyeOff,
+          disabled: batchWorkbookActionLoading,
+          onSelect: () => void handleBatchUpdateWorkbookState(ids, "hide"),
+        },
+      adminMode &&
+        ids.length > 0 && {
+          key: "unhide",
+          label: "批量恢复可见",
+          icon: Eye,
+          disabled: batchWorkbookActionLoading,
+          onSelect: () => void handleBatchUpdateWorkbookState(ids, "unhide"),
+        },
+      {
+        key: "clear",
+        label: "取消选择",
+        icon: X,
+        separatorBefore: true,
+        onSelect: () => {
+          setSelectedKeys([]);
+          setSelectMode(false);
+        },
+      },
+      {
+        key: "delete",
+        label: `移入回收站（${items.length}）`,
+        icon: Trash2,
+        danger: true,
+        shortcut: "Del",
+        onSelect: () => requestDelete(items),
+      },
+    ];
+    return actions.filter(Boolean) as WorkbenchAction[];
+  };
+
+  const handleItemMenu = (
+    item: BrowserItem,
+    point: MenuPoint,
+    selection: string[],
+    options?: { alignEnd?: boolean },
+  ) => {
+    if (selection.length > 1 && selection.includes(item.key)) {
+      const items = browserItems.filter((entry) => selection.includes(entry.key));
+      setMenuRequest({
+        point,
+        alignEnd: options?.alignEnd,
+        title: `已选择 ${items.length} 项`,
+        subtitle: `${items.filter((entry) => entry.kind === "folder").length} 个文件夹 · ${items.filter((entry) => entry.kind === "workbook").length} 个工作簿`,
+        icon: <CheckSquare className="h-5 w-5 text-sky-600" />,
+        actions: buildBatchActions(items),
+      });
+      return;
+    }
+    const actions =
+      item.kind === "folder"
+        ? (() => {
+            const folder = folderLookup.get(item.id);
+            return folder ? buildFolderActions(folder, item) : [];
+          })()
+        : (() => {
+            const workbook = workbookLookup.get(item.id);
+            return workbook ? buildWorkbookActions(workbook, item) : [];
+          })();
+    if (actions.length === 0) return;
+    setMenuRequest({
+      point,
+      alignEnd: options?.alignEnd,
+      title: item.name,
+      subtitle: [item.typeLabel, item.ownerName, formatShortDate(item.updatedAt)]
+        .filter(Boolean)
+        .join(" · "),
+      icon: <ItemIcon item={item} size="sm" />,
+      actions,
+    });
+  };
+
+  const closeMenu = useCallback(() => {
+    setMenuRequest(null);
+    if (touchUi && !selectMode) setSelectedKeys([]);
+  }, [selectMode, touchUi]);
+
+  const openMenuAt = (
+    anchor: HTMLElement,
+    request: Omit<ActionMenuRequest, "point" | "alignEnd">,
+  ) => {
+    const rect = anchor.getBoundingClientRect();
+    setMenuRequest({
+      ...request,
+      point: { x: rect.right, y: rect.bottom + 6 },
+      alignEnd: true,
+    });
+  };
+
+  const createActions: WorkbenchAction[] = [
+    {
+      key: "workbook",
+      label: "新建工作簿",
+      icon: Plus,
+      disabled: !canWriteCurrentFolder || importBusy,
+      onSelect: () => setCreating(true),
+    },
+    {
+      key: "folder",
+      label: "新建文件夹",
+      icon: FolderPlus,
+      disabled: !canWriteCurrentFolder,
+      onSelect: () => setCreatingFolder(true),
+    },
+    {
+      key: "upload",
+      label: "上传 Excel",
+      icon: Upload,
+      separatorBefore: true,
+      disabled: !canWriteCurrentFolder || importBusy,
+      onSelect: () => workbookImportInputRef.current?.click(),
+    },
+    {
+      key: "upload-folder",
+      label: "上传 Excel 文件夹",
+      icon: FolderUp,
+      disabled: !canWriteCurrentFolder || importBusy,
+      onSelect: () => workbookFolderImportInputRef.current?.click(),
+    },
+  ];
+
+  const accountActions: WorkbenchAction[] = [
+    {
+      key: "settings",
+      label: "个人设置",
+      icon: Settings,
+      onSelect: () => router.push("/settings"),
+    },
+    ...(adminMode
+      ? [
+          {
+            key: "admin",
+            label: "管理后台",
+            icon: Shield,
+            onSelect: () => router.push("/admin"),
+          },
+        ]
+      : []),
+    {
+      key: "recycle",
+      label: "回收站",
+      icon: Trash2,
+      onSelect: () => router.push("/recycle-bin"),
+    },
+    {
+      key: "logout",
+      label: loggingOut ? "退出中…" : "退出登录",
+      icon: LogOut,
+      danger: true,
+      separatorBefore: true,
+      disabled: loggingOut,
+      onSelect: () => void handleLogout(),
+    },
+  ];
+
+  const interactions = useBrowserInteractions({
+    items: browserItems,
+    selectedKeys,
+    onSelectionChange: setSelectedKeys,
+    selectMode,
+    coarsePointer,
+    onOpen: openItem,
+    onMenu: handleItemMenu,
+    onRename: startRename,
+    onDelete: requestDelete,
+    dnd: {
+      dropTargetKey: workbookDropTarget,
+      draggingKeys: new Set(draggedWorkbookIds.map((id) => `workbook:${id}`)),
+      onDragStart: handleItemDragStart,
+      onDragEnd: handleInternalWorkbookDragEnd,
+      onDragOver: handleWorkbookTargetDragOver,
+      onDragLeave: handleWorkbookTargetDragLeave,
+      onDrop: (event, folderId, canDrop) =>
+        handleWorkbookTargetDrop(event, folderId, canDrop),
+    },
+  });
+  const draggingKeys = new Set(
+    draggedWorkbookIds.map((id) => `workbook:${id}`),
+  );
+
+  const locationLabel = ["根目录", ...breadcrumb.map((folder) => folder.name)].join(
+    " / ",
+  );
+  const propertyRows = (item: BrowserItem | null): PropertyRow[] => {
+    if (!item) return [];
+    if (item.kind === "folder") {
+      const folder = folderLookup.get(item.id);
+      return [
+        { label: "类型", value: item.typeLabel },
+        { label: "位置", value: item.shared ? "共享给我" : locationLabel },
+        {
+          label: "所有者",
+          value: folder?.owner_name || (folder ? `用户 #${folder.owner_id}` : "-"),
+        },
+        { label: "我的权限", value: folder ? folderAccessLabel(folder) : "-" },
+        { label: "创建时间", value: formatDateTime(item.createdAt) },
+        { label: "修改时间", value: formatDateTime(item.updatedAt) },
+        { label: "ID", value: `#${item.id}` },
+      ];
+    }
+    const workbook = workbookLookup.get(item.id);
+    const source = workbook ? getWorkbookImportSource(workbook) : null;
+    const status = [
+      workbook?.is_locked
+        ? `已锁定${workbook.locked_by_name ? `（${workbook.locked_by_name}）` : ""}`
+        : "",
+      workbook?.is_hidden
+        ? `不可见${workbook.hidden_by_name ? `（${workbook.hidden_by_name}）` : ""}`
+        : "",
+      workbook?.is_public ? "公共工作簿" : "",
+      workbook && isAssignedTaskWorkbook(workbook) ? "任务工作簿" : "",
+    ].filter(Boolean);
+    return [
+      { label: "类型", value: item.typeLabel },
+      { label: "位置", value: locationLabel },
+      {
+        label: "所有者",
+        value:
+          workbook?.owner_name || (workbook ? `用户 #${workbook.owner_id}` : "-"),
+      },
+      { label: "状态", value: status.length > 0 ? status.join("、") : "正常" },
+      ...(source?.filename ? [{ label: "来源文件", value: source.filename }] : []),
+      ...(workbook?.sheets?.length
+        ? [{ label: "工作表", value: `${workbook.sheets.length} 个` }]
+        : []),
+      { label: "描述", value: workbook?.description?.trim() || "—" },
+      { label: "创建时间", value: formatDateTime(item.createdAt) },
+      { label: "修改时间", value: formatDateTime(item.updatedAt) },
+      { label: "ID", value: `#${item.id}` },
+    ];
+  };
+
+  const greeting = greetingFor(new Date());
+  const folderCount = folderEntries.length;
+  const workbookCount = sortedWorkbooks.length;
+  const isSearching = Boolean(searchQuery.trim());
+  const selectionActive = selectMode || selectedKeys.length > 1;
+  const visibleTaskKeys = visibleAssignedTaskWorkbooks.map(
+    (workbook) => `workbook:${workbook.id}`,
+  );
+
+  const apps: Array<{
+    key: string;
+    label: string;
+    meta: string;
+    href: string;
+    icon: LucideIcon;
+    tone: string;
+    badge?: number;
+    badgeTone?: "rose" | "amber" | "sky";
+  }> = [
+    { key: "trade", label: "外贸 ERP", meta: "询价 · 报价 · 发货", href: "/trade", icon: BriefcaseBusiness, tone: "bg-sky-600 text-white" },
+    { key: "tasks", label: "任务中心", meta: totalTaskUnread > 0 ? `${totalTaskUnread} 项待处理` : "暂无待办", href: "/tasks", icon: CheckSquare, tone: "bg-amber-50 text-amber-700", badge: totalTaskUnread, badgeTone: "amber" },
+    { key: "channels", label: "频道", meta: totalChannelUnread > 0 ? `${totalChannelUnread} 条未读` : "团队沟通", href: "/channels", icon: MessageSquare, tone: "bg-indigo-50 text-indigo-700", badge: totalChannelUnread },
+    { key: "mail", label: "邮件", meta: mailSummary.configured ? (mailSummary.unread > 0 ? `${mailSummary.unread} 封未读` : "已全部阅读") : "未绑定邮箱", href: "/mail", icon: Mail, tone: "bg-sky-50 text-sky-700", badge: mailSummary.unread, badgeTone: "sky" },
+    { key: "whatsapp", label: "WhatsApp", meta: "客户消息", href: "/whatsapp", icon: MessageCircle, tone: "bg-emerald-50 text-emerald-700" },
+    { key: "gallery", label: "图库", meta: "图片素材", href: "/gallery", icon: Images, tone: "bg-violet-50 text-violet-700" },
+    { key: "ai", label: "AI 总结", meta: "经营洞察", href: "/ai/summaries", icon: BarChart3, tone: "bg-slate-100 text-slate-700" },
+    { key: "recycle", label: "回收站", meta: "30 天内可还原", href: "/recycle-bin", icon: Trash2, tone: "bg-rose-50 text-rose-600" },
+    ...(adminMode
+      ? [{ key: "admin", label: "管理后台", meta: "用户与权限", href: "/admin", icon: Shield, tone: "bg-slate-900 text-white" }]
+      : []),
+  ];
+
+  const channelPanelBody = (
+    <>
+      <div className="max-h-80 overflow-y-auto">
+        {unreadChannels.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm text-slate-400">
+            频道消息已全部阅读
+          </div>
+        ) : (
+          unreadChannels.map((channel) => (
+            <button
+              key={channel.id}
+              type="button"
+              onClick={() => {
+                setChannelNotificationOpen(false);
+                openChannelFromNotification(channel.id);
+              }}
+              className="flex min-h-14 w-full items-center gap-3 border-b border-slate-100 px-4 py-2.5 text-left last:border-b-0 hover:bg-slate-50 active:bg-slate-100"
+            >
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-sky-50 text-sky-700">
+                {channel.avatar_url ? (
+                  <img src={channel.avatar_url} alt="" className="h-full w-full object-cover" />
+                ) : (
+                  <MessageSquare className="h-4 w-4" />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-semibold text-slate-800">
+                  {channel.name}
+                </div>
+                <div className="mt-0.5 truncate text-xs text-slate-400">
+                  {channel.description || `${channel.member_count || 1} 位成员`}
+                </div>
+              </div>
+              <span className="shrink-0 rounded-full bg-rose-500 px-2 py-0.5 text-[10px] font-semibold text-white">
+                {channel.unread_count > 99 ? "99+" : channel.unread_count}
+              </span>
+            </button>
+          ))
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          setChannelNotificationOpen(false);
+          router.push("/channels");
+        }}
+        className="flex h-11 w-full items-center justify-center gap-1 border-t border-slate-200 text-sm font-medium text-sky-700 hover:bg-sky-50"
+      >
+        进入频道
+        <ArrowRight className="h-4 w-4" />
+      </button>
+    </>
+  );
+
+  const mailPanelBody = (
+    <>
+      <div className="px-4 py-5">
+        {!mailSummary.configured ? (
+          <div className="text-sm text-slate-500">
+            尚未绑定工作邮箱，进入邮件客户端完成配置。
+          </div>
+        ) : mailSummary.last_error ? (
+          <div className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            {mailSummary.last_error}
+          </div>
+        ) : (
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-sky-50 text-sky-700">
+              <Mail className="h-4 w-4" />
+            </div>
+            <div>
+              <div className="text-sm font-semibold text-slate-900">
+                {mailSummary.unread > 0
+                  ? `${mailSummary.unread} 封未读邮件`
+                  : "邮件已全部阅读"}
+              </div>
+              <div className="mt-0.5 text-xs text-slate-400">
+                {mailSummary.address || "当前工作邮箱"} · 共 {mailSummary.total || 0} 封
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          setMailNotificationOpen(false);
+          router.push("/mail");
+        }}
+        className="flex h-11 w-full items-center justify-center gap-1 border-t border-slate-200 text-sm font-medium text-sky-700 hover:bg-sky-50"
+      >
+        进入邮件
+        <ArrowRight className="h-4 w-4" />
+      </button>
+    </>
+  );
+
+  const headerIconButton =
+    "relative inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 active:bg-slate-200 md:h-9 md:w-9 md:border md:border-slate-200";
+
+  const header = (
+    <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/95 pt-[env(safe-area-inset-top)] backdrop-blur">
+      <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-x-2 gap-y-2 px-3 py-2 md:h-16 md:flex-nowrap md:gap-x-3 md:px-5 md:py-0">
+        <div className="flex min-w-0 flex-1 items-center gap-2.5 md:flex-none">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white md:h-10 md:w-10">
+            <FolderKanban className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold text-slate-950 md:text-lg">
+              YaERP 工作台
+            </h1>
+            <p className="truncate text-xs text-slate-500">
+              {greeting}，{profile?.username || "欢迎回来"}
+              <span className="hidden sm:inline">
+                {" · "}
+                {profile?.roles?.[0]?.name || "普通用户"}
+              </span>
+            </p>
+          </div>
+        </div>
+
+        <div
+          ref={searchRef}
+          className="relative order-last w-full md:order-none md:mx-auto md:max-w-xl md:flex-1"
+        >
+          <div className="flex items-center gap-2">
+            <div className="relative min-w-0 flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <input
+                ref={searchInputRef}
+                type="search"
+                enterKeyHint="search"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onFocus={() => setSearchFocused(true)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    setSearchQuery("");
+                    setSearchFocused(false);
+                    event.currentTarget.blur();
+                  }
+                }}
+                placeholder={
+                  adminMode
+                    ? "搜索当前目录：工作簿 / 文件夹 / 员工"
+                    : "搜索当前目录的工作簿和文件夹"
+                }
+                className="h-10 w-full rounded-lg border border-slate-200 bg-slate-50 pl-9 pr-9 text-base text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100 md:h-9 md:text-sm [&::-webkit-search-cancel-button]:hidden"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery("");
+                    setSearchFocused(false);
+                  }}
+                  className="absolute right-0.5 top-1/2 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-slate-400 hover:text-slate-700 md:h-8 md:w-8"
+                  aria-label="清除搜索"
+                  title="清除搜索"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() =>
+                window.dispatchEvent(new Event("yaerp:open-command-palette"))
+              }
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:border-sky-200 hover:text-sky-700 md:h-9"
+              title="搜索全部模块与工作簿（Ctrl / ⌘ + K）"
+              aria-label="全库搜索"
+            >
+              <Command className="h-4 w-4" />
+              <span className="hidden lg:inline">全库搜索</span>
+              <kbd className="hidden rounded border border-slate-200 bg-slate-50 px-1 text-[10px] font-medium text-slate-400 xl:inline">
+                Ctrl K
+              </kbd>
+            </button>
+          </div>
+          {suggestions.length > 0 && (
+            <div className="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-xl">
+              {suggestions.map((workbook) => (
+                <button
+                  key={workbook.id}
+                  type="button"
+                  onClick={() => {
+                    router.push(`/sheets/${workbook.id}`);
+                    setSearchFocused(false);
+                  }}
+                  className="flex min-h-11 w-full items-center gap-3 px-3 py-2 text-left text-sm transition hover:bg-slate-50 active:bg-slate-100"
+                >
+                  <ItemIcon
+                    item={{ kind: "workbook", excelSource: hasWorkbookSourceXlsx(workbook) }}
+                    size="sm"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium text-slate-900">
+                      {workbook.name}
+                    </div>
+                    <div className="truncate text-xs text-slate-400">
+                      {workbook.owner_name || workbook.description || "无描述"}
+                    </div>
+                  </div>
+                  <ArrowRight className="h-3.5 w-3.5 shrink-0 text-slate-300" />
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div ref={notificationAreaRef} className="flex shrink-0 items-center gap-0.5 md:gap-2">
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                setMailNotificationOpen(false);
+                setChannelNotificationOpen((current) => !current);
+              }}
+              className={headerIconButton}
+              title="频道未读消息"
+              aria-label="频道未读消息"
+              aria-expanded={channelNotificationOpen}
+            >
+              <Bell className="h-[18px] w-[18px] md:h-4 md:w-4" />
+              <CountBadge value={totalChannelUnread} />
+            </button>
+            {channelNotificationOpen && !isMobile && (
+              <div className="absolute right-0 top-11 z-50 w-80 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+                <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900">频道消息</div>
+                    <div className="mt-0.5 text-xs text-slate-400">
+                      {totalChannelUnread > 0 ? `${totalChannelUnread} 条未读` : "没有未读消息"}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setChannelNotificationOpen(false)}
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+                    aria-label="关闭频道消息"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                {channelPanelBody}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => router.push("/tasks")}
+            className={headerIconButton}
+            title="任务中心"
+            aria-label="任务中心"
+          >
+            <CheckSquare className="h-[18px] w-[18px] md:h-4 md:w-4" />
+            <CountBadge value={totalTaskUnread} tone="amber" />
+          </button>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                setChannelNotificationOpen(false);
+                setMailNotificationOpen((current) => !current);
+              }}
+              className={headerIconButton}
+              title={mailSummary.configured ? "邮件提醒" : "绑定工作邮箱"}
+              aria-label="邮件提醒"
+              aria-expanded={mailNotificationOpen}
+            >
+              <Mail className="h-[18px] w-[18px] md:h-4 md:w-4" />
+              <CountBadge value={mailSummary.unread} tone="sky" />
+            </button>
+            {mailNotificationOpen && !isMobile && (
+              <div className="absolute right-0 top-11 z-50 w-80 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+                <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                  <div className="text-sm font-semibold text-slate-900">邮件提醒</div>
+                  <button
+                    type="button"
+                    onClick={() => setMailNotificationOpen(false)}
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+                    aria-label="关闭邮件提醒"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                {mailPanelBody}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={(event) =>
+              openMenuAt(event.currentTarget, {
+                title: profile?.username || "账户",
+                subtitle: profile?.roles?.[0]?.name || "普通用户",
+                actions: accountActions,
+              })
+            }
+            className="ml-0.5 flex h-10 min-w-0 items-center gap-2 rounded-lg pl-0.5 pr-0.5 text-left transition hover:bg-slate-100 md:ml-1 md:border-l md:border-slate-200 md:pl-3 md:pr-2"
+            title="账户与设置"
+            aria-label="账户与设置"
+          >
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-slate-100 text-xs font-semibold text-slate-600 ring-1 ring-slate-200">
+              {profile?.avatar ? (
+                <img src={profile.avatar} alt="" className="h-full w-full object-cover" />
+              ) : (
+                profile?.username?.slice(0, 2).toUpperCase() || "U"
+              )}
+            </span>
+            <span className="hidden min-w-0 lg:block">
+              <span className="block max-w-28 truncate text-sm font-semibold text-slate-800">
+                {profile?.username || "未加载"}
+              </span>
+              <span className="block max-w-28 truncate text-[11px] text-slate-400">
+                {profile?.roles?.[0]?.name || "普通用户"}
+              </span>
+            </span>
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+
+  const appsSection = (
+    <section aria-label="应用" className="rounded-lg border border-slate-200 bg-white">
+      <div className="flex gap-1 overflow-x-auto px-2 py-2 [scrollbar-width:none] md:grid md:grid-cols-5 md:gap-0 md:overflow-visible md:p-0 xl:grid-cols-9 [&::-webkit-scrollbar]:hidden">
+        {apps.map((app) => {
+          const Icon = app.icon;
+          return (
+            <button
+              key={app.key}
+              type="button"
+              onClick={() => router.push(app.href)}
+              className="group flex w-[72px] shrink-0 flex-col items-center gap-1.5 rounded-lg px-1 py-2 text-center transition active:bg-slate-100 md:w-auto md:flex-row md:gap-3 md:rounded-none md:border-b md:border-r md:border-slate-100 md:px-4 md:py-3 md:text-left md:hover:bg-slate-50 xl:border-b-0 xl:last:border-r-0"
+            >
+              <span className={`relative flex h-11 w-11 shrink-0 items-center justify-center rounded-xl md:h-9 md:w-9 md:rounded-lg ${app.tone}`}>
+                <Icon className="h-5 w-5 md:h-[18px] md:w-[18px]" />
+                {app.badge ? <CountBadge value={app.badge} tone={app.badgeTone} /> : null}
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-xs font-medium text-slate-700 md:text-sm md:font-semibold md:text-slate-900">
+                  {app.label}
+                </span>
+                <span className="hidden truncate text-[11px] text-slate-500 md:block">
+                  {app.meta}
+                </span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+
+  const openPinned = (entry: PinnedEntry) => {
+    if (entry.kind === "folder") {
+      setSearchQuery("");
+      void navigateToFolder(entry.id);
+    } else router.push(`/sheets/${entry.id}`);
+  };
+
+  const quickAccessEntries: Array<{
+    key: string;
+    kind: "folder" | "workbook";
+    id: number;
+    name: string;
+    meta: string;
+    pinned: boolean;
+    excelSource?: boolean;
+  }> = [
+    ...pinnedEntries
+      .filter(
+        (entry) =>
+          entry.kind === "folder" ||
+          workbooks.length === 0 ||
+          workbookLookup.has(entry.id),
+      )
+      .slice(0, 8)
+      .map((entry) => {
+      const workbook = entry.kind === "workbook" ? workbookLookup.get(entry.id) : undefined;
+      return {
+        key: `pin-${entry.kind}-${entry.id}`,
+        kind: entry.kind,
+        id: entry.id,
+        name: entry.name,
+        meta: entry.kind === "folder" ? "收藏的文件夹" : workbook ? `收藏 · ${formatShortDate(workbook.updated_at)}` : "收藏的工作簿",
+        pinned: true,
+        excelSource: workbook ? hasWorkbookSourceXlsx(workbook) : false,
+      };
+    }),
+    ...recentWorkbooks
+      .filter((workbook) => !isPinned("workbook", workbook.id))
+      .map((workbook) => ({
+        key: `recent-${workbook.id}`,
+        kind: "workbook" as const,
+        id: workbook.id,
+        name: workbook.name,
+        meta: `${formatShortDate(workbook.updated_at)} 更新${workbook.owner_name && adminMode ? ` · ${workbook.owner_name}` : ""}`,
+        pinned: false,
+        excelSource: hasWorkbookSourceXlsx(workbook),
+      })),
+  ];
+
+  const quickAccessStrip =
+    quickAccessEntries.length > 0 && !isSearching ? (
+      <section aria-label="快速访问" className="xl:hidden">
+        <div className="mb-2 flex items-center justify-between px-0.5">
+          <h2 className="flex items-center gap-1.5 text-sm font-semibold text-slate-900">
+            <Clock3 className="h-4 w-4 text-slate-400" />
+            快速访问
+          </h2>
+          <span className="text-xs text-slate-400">收藏与最近更新</span>
+        </div>
+        <div className="-mx-3 flex snap-x gap-2 overflow-x-auto px-3 pb-1 [scrollbar-width:none] md:mx-0 md:px-0 [&::-webkit-scrollbar]:hidden">
+          {quickAccessEntries.map((entry) => (
+            <button
+              key={entry.key}
+              type="button"
+              onClick={() => openPinned(entry)}
+              className="flex w-[200px] shrink-0 snap-start items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-left transition hover:border-slate-300 active:bg-slate-50"
+            >
+              <span className="relative">
+                <ItemIcon item={entry} size="md" />
+                {entry.pinned && (
+                  <Star className="absolute -right-1 -top-1 h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+                )}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium text-slate-900">{entry.name}</span>
+                <span className="block truncate text-xs text-slate-500">{entry.meta}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
+    ) : null;
+
+  const taskRows = [
+    { key: "approvals", label: "待我审批", value: taskSummary.pending_approvals, href: "/tasks", icon: CheckSquare, tone: "text-amber-600" },
+    { key: "erp", label: "ERP 任务", value: taskSummary.unread_erp_tasks, href: "/tasks", icon: ClipboardList, tone: "text-violet-600" },
+    { key: "system", label: "系统通知", value: taskSummary.unread_system_notifications, href: "/tasks", icon: Bell, tone: "text-sky-600" },
+    { key: "channels", label: "频道未读", value: totalChannelUnread, href: "/channels", icon: MessageSquare, tone: "text-indigo-600" },
+    { key: "mail", label: "未读邮件", value: mailSummary.unread, href: "/mail", icon: Mail, tone: "text-sky-700" },
+  ];
+
+  const aside = (
+    <aside className="hidden space-y-3 xl:block">
+      <section className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <div className="flex h-11 items-center justify-between border-b border-slate-200 px-4">
+          <h2 className="text-sm font-semibold text-slate-900">待办与通知</h2>
+          <button
+            type="button"
+            onClick={() => router.push("/tasks")}
+            className="text-xs font-medium text-sky-700 hover:text-sky-900"
+          >
+            任务中心
+          </button>
+        </div>
+        <div className="divide-y divide-slate-100">
+          {taskRows.map((row) => {
+            const Icon = row.icon;
+            return (
+              <button
+                key={row.key}
+                type="button"
+                onClick={() => router.push(row.href)}
+                className="flex h-10 w-full items-center gap-3 px-4 text-left text-sm transition hover:bg-slate-50"
+              >
+                <Icon className={`h-4 w-4 ${row.tone}`} />
+                <span className="flex-1 text-slate-700">{row.label}</span>
+                <span
+                  className={`min-w-6 rounded-full px-1.5 text-center text-xs font-semibold tabular-nums ${
+                    row.value > 0 ? "bg-rose-50 text-rose-600" : "text-slate-300"
+                  }`}
+                >
+                  {row.value > 99 ? "99+" : row.value}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+        <div className="flex h-11 items-center justify-between border-b border-slate-200 px-4">
+          <h2 className="text-sm font-semibold text-slate-900">快速访问</h2>
+          <span className="text-xs text-slate-400">收藏 · 最近更新</span>
+        </div>
+        {quickAccessEntries.length === 0 ? (
+          <div className="px-4 py-8 text-center text-xs leading-5 text-slate-400">
+            右键工作簿或文件夹选择“收藏到快速访问”，常用内容会出现在这里。
+          </div>
+        ) : (
+          <div className="py-1">
+            {quickAccessEntries.map((entry) => (
+              <div key={entry.key} className="group flex items-center">
+                <button
+                  type="button"
+                  onClick={() => openPinned(entry)}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 px-4 py-2 text-left transition hover:bg-slate-50"
+                >
+                  <ItemIcon item={entry} size="sm" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-slate-800">{entry.name}</span>
+                    <span className="block truncate text-[11px] text-slate-400">{entry.meta}</span>
+                  </span>
+                </button>
+                {entry.pinned && (
+                  <button
+                    type="button"
+                    onClick={() => togglePinned([{ kind: entry.kind, id: entry.id, name: entry.name }])}
+                    className="mr-2 inline-flex h-8 w-8 items-center justify-center rounded-lg text-amber-400 transition hover:bg-amber-50 hover:text-amber-600"
+                    title="取消收藏"
+                    aria-label={`取消收藏 ${entry.name}`}
+                  >
+                    <Star className="h-4 w-4 fill-current" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </aside>
+  );
+
+  const toolbarButton =
+    "inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50 md:h-9";
+
+  const breadcrumbBar = (
+    <nav aria-label="目录" className="flex min-w-0 flex-1 items-center gap-1">
+      {currentFolderId !== null && (
+        <button
+          type="button"
+          onClick={() =>
+            void navigateToFolder(
+              breadcrumb.length > 1 ? breadcrumb[breadcrumb.length - 2].id : null,
+            )
+          }
+          className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 md:h-8 md:w-8"
+          aria-label="返回上一级"
+          title="返回上一级"
+        >
+          <ChevronLeft className="h-5 w-5 md:h-4 md:w-4" />
+        </button>
+      )}
+      <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <button
+          type="button"
+          onClick={() => void navigateToFolder(null)}
+          onDragOver={(event) => handleWorkbookTargetDragOver(event, "root", true)}
+          onDragLeave={(event) => handleWorkbookTargetDragLeave(event, "root")}
+          onDrop={(event) => handleWorkbookTargetDrop(event, null, true)}
+          className={`inline-flex h-9 shrink-0 items-center gap-1.5 rounded-md px-2 text-[15px] transition md:h-8 md:text-sm ${
+            workbookDropTarget === "root"
+              ? "bg-sky-100 text-sky-900 ring-2 ring-sky-300"
+              : currentFolderId === null
+                ? "font-semibold text-slate-900"
+                : "font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+          }`}
+        >
+          <Home className="h-4 w-4" />
+          业务工作簿
+        </button>
+        {breadcrumb.map((folder) => {
+          const targetKey = `breadcrumb-${folder.id}`;
+          const isCurrent = folder.id === currentFolderId;
+          const canDropHere = !isCurrent && folder.can_write !== false;
+          return (
+            <span key={folder.id} className="flex shrink-0 items-center gap-0.5">
+              <ChevronRight className="h-3.5 w-3.5 text-slate-300" />
+              <button
+                type="button"
+                onClick={() => void navigateToFolder(folder.id)}
+                onDragOver={(event) => handleWorkbookTargetDragOver(event, targetKey, canDropHere)}
+                onDragLeave={(event) => handleWorkbookTargetDragLeave(event, targetKey)}
+                onDrop={(event) => handleWorkbookTargetDrop(event, folder.id, canDropHere)}
+                className={`inline-flex h-9 max-w-[180px] items-center truncate rounded-md px-2 text-[15px] transition md:h-8 md:text-sm ${
+                  workbookDropTarget === targetKey
+                    ? "bg-sky-100 text-sky-900 ring-2 ring-sky-300"
+                    : isCurrent
+                      ? "font-semibold text-slate-900"
+                      : "font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+                }`}
+              >
+                <span className="truncate">{folder.name}</span>
+              </button>
+            </span>
+          );
+        })}
+      </div>
+    </nav>
+  );
+
+  const emptyState = (() => {
+    if (folderLoading || folderError || browserItems.length > 0) return null;
+    if (isSearching) {
+      return (
+        <div className="flex flex-col items-center rounded-lg border border-dashed border-slate-300 bg-slate-50/70 px-6 py-14 text-center">
+          <Search className="mb-3 h-8 w-8 text-slate-300" />
+          <h3 className="text-base font-semibold text-slate-700">没有找到匹配的项目</h3>
+          <p className="mt-1 text-sm text-slate-400">
+            当前目录中没有与「{searchQuery.trim()}」匹配的工作簿或文件夹。
+          </p>
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            <button type="button" onClick={() => setSearchQuery("")} className={toolbarButton}>
+              清除搜索
+            </button>
+            <button
+              type="button"
+              onClick={() => window.dispatchEvent(new Event("yaerp:open-command-palette"))}
+              className={toolbarButton}
+            >
+              <Command className="h-4 w-4" />
+              全库搜索
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="flex flex-col items-center rounded-lg border border-dashed border-slate-300 bg-slate-50/70 px-6 py-14 text-center">
+        <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-xl bg-white text-slate-400 ring-1 ring-slate-200">
+          {currentFolderId === null ? (
+            <FolderKanban className="h-7 w-7" />
+          ) : (
+            <FolderOpen className="h-7 w-7" />
+          )}
+        </div>
+        <h3 className="text-base font-semibold text-slate-800">
+          {currentFolderId !== null
+            ? "这个文件夹还是空的"
+            : showOnlyOwnResources
+              ? "还没有自己的工作簿或文件夹"
+              : "还没有工作簿"}
+        </h3>
+        <p className="mt-1 max-w-md text-sm leading-6 text-slate-500">
+          {!canWriteCurrentFolder
+            ? "这是只读共享文件夹，暂时没有可查看的内容。"
+            : currentFolderId !== null
+              ? "新建工作簿、上传 Excel，或把其他工作簿拖到这里。"
+              : showOnlyOwnResources
+                ? "可以新建自己的文件夹或工作簿，关闭筛选后仍可查看其他有权限的资源。"
+                : "从一个基础业务台账开始，后续可以逐步延展成销售、库存、采购和人事模块。也可以直接把 Excel 拖进来。"}
+        </p>
+        {canWriteCurrentFolder && (
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            <button
+              type="button"
+              onClick={() => setCreating(true)}
+              className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 md:h-9"
+            >
+              <Plus className="h-4 w-4" />
+              新建工作簿
+            </button>
+            <button
+              type="button"
+              onClick={() => workbookImportInputRef.current?.click()}
+              disabled={importBusy}
+              className={toolbarButton}
+            >
+              <Upload className="h-4 w-4" />
+              上传 Excel
+            </button>
+            <button type="button" onClick={() => setCreatingFolder(true)} className={toolbarButton}>
+              <FolderPlus className="h-4 w-4" />
+              新建文件夹
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  })();
+
+  const countLabel = folderLoading
+    ? "正在加载…"
+    : `${folderCount} 个文件夹 · ${workbookCount} 个工作簿${isSearching ? "（已筛选）" : ""}`;
+  const countLabelShort = folderLoading ? "加载中…" : `${folderCount + workbookCount} 项`;
+
+  const browserSection = (
+    <section
+      className="relative min-w-0 rounded-lg border border-slate-200 bg-white"
+      onDragEnter={handleWorkbookDragEnter}
+      onDragOver={handleWorkbookDragOver}
+      onDragLeave={handleWorkbookDragLeave}
+      onDrop={handleWorkbookDrop}
+    >
+      {workbookDropActive && (
+        <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-lg border-2 border-dashed border-sky-300 bg-sky-50/95 p-6 text-center backdrop-blur-sm">
+          <div>
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-lg bg-white text-sky-700 shadow-sm">
+              <FileSpreadsheet className="h-6 w-6" />
+            </div>
+            <div className="mt-3 text-sm font-semibold text-slate-900">松开即可导入 Excel</div>
+            <div className="mt-1 text-xs text-slate-500">
+              支持同时拖入多个 Excel 文件或多个目录，并保留目录层级
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-col gap-2 border-b border-slate-200 px-3 py-2.5 md:px-4 md:py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          {breadcrumbBar}
+          <div className="shrink-0 text-xs text-slate-400 md:hidden">{countLabelShort}</div>
+          <div className="hidden shrink-0 items-center gap-2 md:flex">
+            <button
+              type="button"
+              onClick={() => setCreatingFolder(true)}
+              disabled={!canWriteCurrentFolder}
+              className={toolbarButton}
+            >
+              <FolderPlus className="h-4 w-4" />
+              <span className="hidden lg:inline">新建文件夹</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => workbookFolderImportInputRef.current?.click()}
+              disabled={!canWriteCurrentFolder || importBusy}
+              className={toolbarButton}
+              title="上传 Excel 文件夹（保留目录结构）"
+            >
+              <FolderUp className="h-4 w-4" />
+              <span className="hidden lg:inline">
+                {importingWorkbookFolder ? `批量导入 ${workbookImportProgress}%` : "上传文件夹"}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => workbookImportInputRef.current?.click()}
+              disabled={!canWriteCurrentFolder || importBusy}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-sky-200 bg-sky-50 px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Upload className="h-4 w-4" />
+              {importingWorkbook ? `导入中 ${workbookImportProgress}%` : "上传 Excel"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setCreating(true)}
+              disabled={!canWriteCurrentFolder || importBusy}
+              className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Plus className="h-4 w-4" />
+              新建工作簿
+            </button>
+          </div>
+        </div>
+
+        <div className="-mx-3 flex items-center gap-2 overflow-x-auto px-3 [scrollbar-width:none] md:mx-0 md:flex-wrap md:overflow-visible md:px-0 [&::-webkit-scrollbar]:hidden">
+          <div className="mr-auto hidden text-xs text-slate-500 md:block">{countLabel}</div>
+          {adminMode && (
+            <button
+              type="button"
+              onClick={() => {
+                const nextValue = !showOnlyOwnResources;
+                setShowOnlyOwnResources(nextValue);
+                if (nextValue && currentFolderMeta && currentFolderMeta.owner_id !== profile?.id) {
+                  void navigateToFolder(null);
+                }
+              }}
+              className={`${toolbarButton} ${showOnlyOwnResources ? "!border-sky-200 !bg-sky-50 !text-sky-700" : ""}`}
+              title={showOnlyOwnResources ? "恢复查看全部工作簿和文件夹" : "仅显示自己创建的工作簿和文件夹"}
+              aria-pressed={showOnlyOwnResources}
+            >
+              {showOnlyOwnResources ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
+              仅看自己
+            </button>
+          )}
+          {adminMode && workbookViewMode === "list" && (
+            <button
+              type="button"
+              onClick={() => setGroupByOwner((current) => !current)}
+              className={`${toolbarButton} ${groupByOwner ? "!border-sky-200 !bg-sky-50 !text-sky-700" : ""}`}
+              aria-pressed={groupByOwner}
+              title="按员工分组显示工作簿"
+            >
+              <Layers3 className="h-4 w-4" />
+              <span className="hidden sm:inline">按员工分组</span>
+            </button>
+          )}
+          {adminMode && visibleTaskKeys.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectMode(true);
+                setSelectedKeys(visibleTaskKeys);
+              }}
+              className={toolbarButton}
+              title="选中当前页全部任务工作簿，用于批量回收"
+            >
+              <ClipboardList className="h-4 w-4" />
+              <span className="hidden sm:inline">选择任务工作簿</span>
+            </button>
+          )}
+          <label className="relative inline-flex shrink-0">
+            <span className="sr-only">排序方式</span>
+            <select
+              value={workbookSortBy}
+              onChange={(event) => setWorkbookSortBy(event.target.value as WorkbenchSortKey)}
+              className="h-10 appearance-none rounded-lg border border-slate-200 bg-white pl-3 pr-8 text-sm text-slate-700 outline-none transition hover:bg-slate-50 focus:border-sky-300 focus:ring-2 focus:ring-sky-100 md:h-9"
+            >
+              {SORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  按{option.label}
+                </option>
+              ))}
+            </select>
+            <ChevronRight className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 rotate-90 text-slate-400" />
+          </label>
+          <button
+            type="button"
+            onClick={() => setWorkbookSortOrder((current) => (current === "desc" ? "asc" : "desc"))}
+            className={`${toolbarButton} w-10 px-0 md:w-auto md:px-3`}
+            title={workbookSortOrder === "desc" ? "当前降序，点击切换为升序" : "当前升序，点击切换为降序"}
+            aria-label={workbookSortOrder === "desc" ? "降序" : "升序"}
+          >
+            <ArrowUpDown className="h-4 w-4" />
+            <span className="hidden md:inline">{workbookSortOrder === "desc" ? "降序" : "升序"}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (selectMode) {
+                setSelectMode(false);
+                setSelectedKeys([]);
+              } else setSelectMode(true);
+            }}
+            className={`${toolbarButton} ${selectMode ? "!border-sky-200 !bg-sky-50 !text-sky-700" : ""}`}
+            aria-pressed={selectMode}
+          >
+            <CheckSquare className="h-4 w-4" />
+            {selectMode ? "完成" : "选择"}
+          </button>
+          <div className="order-first inline-flex h-10 shrink-0 items-center rounded-lg bg-slate-100 p-1 md:order-none md:h-9" role="group" aria-label="显示方式">
+            <button
+              type="button"
+              onClick={() => setWorkbookViewMode("desktop")}
+              className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-sm font-medium transition md:h-7 ${
+                workbookViewMode === "desktop" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-800"
+              }`}
+              aria-pressed={workbookViewMode === "desktop"}
+              title="桌面图标视图"
+            >
+              <LayoutGrid className="h-4 w-4" />
+              <span className="hidden sm:inline">桌面</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setWorkbookViewMode("list")}
+              className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-sm font-medium transition md:h-7 ${
+                workbookViewMode === "list" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-800"
+              }`}
+              aria-pressed={workbookViewMode === "list"}
+              title="详细列表视图"
+            >
+              <ListIcon className="h-4 w-4" />
+              <span className="hidden sm:inline">列表</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-3 p-2 md:p-4">
+        {(importingWorkbook || importingWorkbookFolder || workbookFolderImportStatus || workbookImportError) && (
+          <div
+            className={`rounded-lg border px-3 py-2.5 text-sm ${
+              workbookImportError ? "border-rose-200 bg-rose-50 text-rose-700" : "border-sky-200 bg-sky-50 text-sky-700"
+            }`}
+          >
+            {workbookImportError ? (
+              <div className="flex items-start justify-between gap-3">
+                <span className="font-medium">{workbookImportError}</span>
+                <button type="button" onClick={() => setWorkbookImportError("")} aria-label="关闭提示" className="shrink-0">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            ) : (
+              <div>
+                <div className="flex items-center justify-between gap-3 font-semibold">
+                  <span className="truncate">
+                    {importingWorkbookFolder
+                      ? workbookFolderImportStatus || "正在批量导入 Excel 文件夹"
+                      : importingWorkbook
+                        ? "正在导入 Excel 工作簿"
+                        : workbookFolderImportStatus}
+                  </span>
+                  <span className="tabular-nums">{workbookImportProgress}%</span>
+                </div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white">
+                  <div className="h-full rounded-full bg-sky-500 transition-all duration-200" style={{ width: `${workbookImportProgress}%` }} />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {currentFolderMeta && !canWriteCurrentFolder && (
+          <div className="flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5 text-sm text-sky-700">
+            <Lock className="h-4 w-4 shrink-0" />
+            当前位于只读共享文件夹中，可以查看和打开文件，但不能在这里新建或写入内容。
+          </div>
+        )}
+        {(folderError || actionError) && (
+          <div className="flex items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm font-medium text-rose-700">
+            <span>{folderError || actionError}</span>
+            {actionError && (
+              <button type="button" onClick={() => setActionError("")} aria-label="关闭提示" className="shrink-0">
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        )}
+
+        {folderLoading && browserItems.length === 0 && (
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-[repeat(auto-fill,minmax(116px,1fr))]" aria-busy="true">
+            {Array.from({ length: 8 }).map((_, index) => (
+              <div key={index} className="flex h-[124px] flex-col items-center gap-2 rounded-lg bg-slate-50 p-3">
+                <div className="h-14 w-14 animate-pulse rounded-lg bg-slate-200" />
+                <div className="h-3 w-16 animate-pulse rounded bg-slate-200" />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {emptyState}
+
+        {!folderError && browserItems.length > 0 &&
+          (workbookViewMode === "desktop" ? (
+            <FileIconView
+              items={browserItems}
+              interactions={interactions}
+              selectMode={selectMode}
+              coarsePointer={coarsePointer}
+              dropTargetKey={workbookDropTarget}
+              draggingKeys={draggingKeys}
+              dragActive={draggedWorkbookIds.length > 0}
+              selectedKeys={selectedKeys}
+              onSelectionChange={setSelectedKeys}
+            />
+          ) : (
+            <FileListView
+              items={browserItems}
+              interactions={interactions}
+              selectMode={selectMode}
+              coarsePointer={coarsePointer}
+              dropTargetKey={workbookDropTarget}
+              draggingKeys={draggingKeys}
+              dragActive={draggedWorkbookIds.length > 0}
+              selectedKeys={selectedKeys}
+              onSelectionChange={setSelectedKeys}
+              grouped={groupedListMode}
+              sortBy={workbookSortBy}
+              sortOrder={workbookSortOrder}
+              onSort={(key) => {
+                if (key === workbookSortBy)
+                  setWorkbookSortOrder((current) => (current === "desc" ? "asc" : "desc"));
+                else {
+                  setWorkbookSortBy(key);
+                  setWorkbookSortOrder(key === "name" ? "asc" : "desc");
+                }
+              }}
+              onOpen={openItem}
+              onDownload={(item) => {
+                const workbook = workbookLookup.get(item.id);
+                if (workbook) void handleDownloadWorkbooks([workbook]);
+              }}
+              downloadingId={downloadingSourceWorkbookId}
+            />
+          ))}
+
+        {!touchUi && browserItems.length > 0 && (
+          <p className="hidden text-[11px] text-slate-400 md:block">
+            {workbookViewMode === "desktop" ? "单击选择，双击打开；" : "单击名称打开；"}
+            Ctrl / Shift 多选{workbookViewMode === "desktop" ? "，在空白处拖动框选" : ""}；右键或「⋯」查看全部操作；Enter 打开 · F2 重命名 · Delete 删除；可把工作簿拖到文件夹或路径上移动。
+          </p>
+        )}
+      </div>
+
+      {totalWorkbookPages > 1 && (
+        <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-3 py-2.5 md:px-4">
+          <div className="text-xs text-slate-500">
+            共 {sortedWorkbooks.length} 个工作簿 · 第 {workbookPage} / {totalWorkbookPages} 页
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setWorkbookPage((current) => Math.max(1, current - 1))}
+              disabled={workbookPage <= 1}
+              className={`${toolbarButton} w-10 px-0 md:w-9`}
+              aria-label="上一页"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setWorkbookPage((current) => Math.min(totalWorkbookPages, current + 1))}
+              disabled={workbookPage >= totalWorkbookPages}
+              className={`${toolbarButton} w-10 px-0 md:w-9`}
+              aria-label="下一页"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      <input
+        ref={workbookImportInputRef}
+        type="file"
+        accept={EXCEL_IMPORT_ACCEPT}
+        multiple
+        className="hidden"
+        onChange={(event) => {
+          const files = Array.from(event.target.files || []);
+          if (files.length === 1) void handleImportWorkbookXlsx(files[0]);
+          if (files.length > 1)
+            void handleImportDroppedWorkbooks(files.map((file) => ({ file, relativePath: file.name })));
+        }}
+      />
+      <input
+        ref={workbookFolderImportInputRef}
+        type="file"
+        accept={EXCEL_IMPORT_ACCEPT}
+        multiple
+        className="hidden"
+        {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement>)}
+        onChange={(event) => {
+          if (event.target.files?.length) void handleImportWorkbookFolder(event.target.files);
+        }}
+      />
+    </section>
+  );
+
+  const allVisibleSelected =
+    browserItems.length > 0 && selectedKeys.length === browserItems.length;
+  const exitSelection = () => {
+    setSelectMode(false);
+    setSelectedKeys([]);
+  };
+  const selectionButtons: Array<{
+    key: string;
+    label: string;
+    icon: LucideIcon;
+    onClick: (anchor: HTMLElement) => void;
+    disabled?: boolean;
+    danger?: boolean;
+  }> = [
+    {
+      key: "move",
+      label: "移动",
+      icon: FolderInput,
+      disabled: movableSelectedIds.length === 0,
+      onClick: () =>
+        openMoveDialog(movableSelectedIds, `移动 ${movableSelectedIds.length} 个工作簿`),
+    },
+    {
+      key: "download",
+      label: "下载",
+      icon: Download,
+      disabled: selectedWorkbooks.length === 0 || downloadingSourceWorkbookId !== null,
+      onClick: () => void handleDownloadWorkbooks(selectedWorkbooks),
+    },
+    {
+      key: "pin",
+      label: "收藏",
+      icon: Star,
+      disabled: selectedItems.length === 0,
+      onClick: () => togglePinned(selectedItems.map(itemToPinned)),
+    },
+    {
+      key: "delete",
+      label: "删除",
+      icon: Trash2,
+      danger: true,
+      disabled: selectedItems.length === 0,
+      onClick: () => requestDelete(selectedItems),
+    },
+    {
+      key: "more",
+      label: "更多",
+      icon: Layers3,
+      disabled: selectedItems.length === 0,
+      onClick: (anchor) =>
+        openMenuAt(anchor, {
+          title: `已选择 ${selectedItems.length} 项`,
+          icon: <CheckSquare className="h-5 w-5 text-sky-600" />,
+          actions: buildBatchActions(selectedItems),
+        }),
+    },
+  ];
+
+  const selectionBar = selectionActive ? (
+    <>
+      {/* Phone: contextual bar covers the sticky header */}
+      <div className="fixed inset-x-0 top-0 z-[45] border-b border-sky-200 bg-sky-50 pt-[env(safe-area-inset-top)] md:hidden">
+        <div className="flex h-[104px] items-center gap-1 px-2">
+          <button
+            type="button"
+            onClick={exitSelection}
+            className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 active:bg-sky-100"
+            aria-label="退出选择"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-base font-semibold text-slate-900">
+              {selectedKeys.length > 0 ? `已选 ${selectedKeys.length} 项` : "选择项目"}
+            </div>
+            <div className="truncate text-xs text-slate-500">轻点项目进行选择，在底部执行批量操作</div>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              setSelectedKeys(allVisibleSelected ? [] : browserItems.map((item) => item.key))
+            }
+            className="inline-flex h-10 items-center rounded-lg px-3 text-sm font-semibold text-sky-700 active:bg-sky-100"
+          >
+            {allVisibleSelected ? "全不选" : "全选"}
+          </button>
+        </div>
+      </div>
+      {/* Phone: action bar above the tab bar. Desktop: floating toolbar. */}
+      <div className="fixed inset-x-0 bottom-[var(--mobile-tabbar-offset)] z-[61] border-t border-slate-200 bg-white md:inset-x-auto md:bottom-6 md:left-1/2 md:-translate-x-1/2 md:rounded-lg md:border md:shadow-xl">
+        <div className="flex items-center md:h-12 md:gap-1 md:px-2">
+          <div className="hidden items-center gap-2 border-r border-slate-200 pl-1 pr-3 md:flex">
+            <span className="text-sm font-semibold text-slate-900 tabular-nums">
+              已选 {selectedKeys.length} 项
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                setSelectedKeys(allVisibleSelected ? [] : browserItems.map((item) => item.key))
+              }
+              className="text-xs font-medium text-sky-700 hover:text-sky-900"
+            >
+              {allVisibleSelected ? "全不选" : "全选"}
+            </button>
+          </div>
+          {selectionButtons.map((button) => {
+            const Icon = button.icon;
+            return (
+              <button
+                key={button.key}
+                type="button"
+                disabled={button.disabled}
+                onClick={(event) => button.onClick(event.currentTarget)}
+                className={`flex h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[11px] font-medium transition disabled:opacity-35 md:h-9 md:flex-none md:flex-row md:gap-1.5 md:rounded-lg md:px-3 md:text-sm ${
+                  button.danger
+                    ? "text-rose-600 md:hover:bg-rose-50"
+                    : "text-slate-700 md:hover:bg-slate-100"
+                }`}
+              >
+                <Icon className="h-5 w-5 md:h-4 md:w-4" />
+                {button.label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={exitSelection}
+            className="hidden h-9 w-9 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 md:inline-flex"
+            aria-label="取消选择"
+            title="取消选择（Esc）"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+    </>
+  ) : null;
+
+  const fab =
+    !selectionActive && canWriteCurrentFolder ? (
+      <button
+        type="button"
+        onClick={(event) =>
+          openMenuAt(event.currentTarget, {
+            title: currentFolderMeta ? `新建到「${currentFolderMeta.name}」` : "新建",
+            icon: <Plus className="h-5 w-5 text-slate-600" />,
+            actions: createActions,
+          })
+        }
+        className="fixed bottom-[calc(var(--mobile-tabbar-offset)+76px)] right-4 z-50 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-sky-600 text-white shadow-lg shadow-sky-900/20 transition active:scale-95 md:hidden"
+        aria-label="新建或上传"
+      >
+        {importBusy ? (
+          <span className="text-xs font-semibold tabular-nums">{workbookImportProgress}%</span>
+        ) : (
+          <Plus className="h-6 w-6" strokeWidth={2.5} />
+        )}
+      </button>
+    ) : null;
+
+  const toast = notice ? (
+    <div
+      role="status"
+      className={`pointer-events-none fixed left-1/2 z-[70] -translate-x-1/2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-medium text-white shadow-lg ${
+        selectionActive
+          ? "bottom-[calc(var(--mobile-tabbar-offset)+72px)] md:bottom-24"
+          : "bottom-[calc(var(--mobile-tabbar-offset)+16px)] md:bottom-6"
+      }`}
+    >
+      {notice}
+    </div>
+  ) : null;
+
+  const closeShareDialog = () => {
+    setSharingFolder(null);
+    setShareableUsers([]);
+    setSelectedShares({});
+    setShareMessage("");
+  };
+  const closeAssignDialog = () => {
+    setAssigningWorkbook(null);
+    setSelectedAssigneeIds([]);
+  };
+
+  const dialogs = (
+    <>
+      <ResponsiveDialog
+        open={creating || creatingFolder}
+        onClose={closeCreateDialogs}
+        busy={createSaving}
+        size="sm"
+        title={creatingFolder ? "新建文件夹" : "新建工作簿"}
+        description={`创建到「${currentFolderMeta?.name || "业务工作簿"}」`}
+        icon={creatingFolder ? <FolderPlus className="h-5 w-5" /> : <Plus className="h-5 w-5" />}
+        footer={
+          <>
+            <button type="button" onClick={closeCreateDialogs} disabled={createSaving} className={dialogSecondaryButton}>
+              取消
+            </button>
+            <button
+              type="submit"
+              form="workbench-create-form"
+              disabled={createSaving || !(creatingFolder ? newFolderName : newName).trim()}
+              className={dialogPrimaryButton}
+            >
+              {createSaving ? "创建中..." : "创建"}
+            </button>
+          </>
+        }
+      >
+        <form
+          id="workbench-create-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (creatingFolder) void handleCreateFolder();
+            else void handleCreateWorkbook();
+          }}
+        >
+          <label className="mb-1.5 block text-sm font-medium text-slate-700" htmlFor="workbench-create-name">
+            {creatingFolder ? "文件夹名称" : "工作簿名称"}
+          </label>
+          <input
+            id="workbench-create-name"
+            type="text"
+            value={creatingFolder ? newFolderName : newName}
+            onChange={(event) => {
+              if (creatingFolder) setNewFolderName(event.target.value);
+              else setNewName(event.target.value);
+              if (createError) setCreateError("");
+            }}
+            maxLength={256}
+            placeholder={creatingFolder ? "例如：采购管理" : "例如：2026 年客户台账"}
+            className={dialogInput}
+            autoFocus
+          />
+          {createError && <div className="mt-2 text-xs font-medium text-rose-600">{createError}</div>}
+        </form>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        open={Boolean(editingWorkbook)}
+        onClose={() => setEditingWorkbook(null)}
+        size="sm"
+        title="重命名工作簿"
+        icon={<PencilLine className="h-5 w-5" />}
+        footer={
+          <>
+            <button type="button" onClick={() => setEditingWorkbook(null)} className={dialogSecondaryButton}>
+              取消
+            </button>
+            <button
+              type="submit"
+              form="workbench-rename-workbook"
+              disabled={!editWorkbookName.trim()}
+              className={dialogPrimaryButton}
+            >
+              保存
+            </button>
+          </>
+        }
+      >
+        <form
+          id="workbench-rename-workbook"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleRenameWorkbook();
+          }}
+        >
+          <label className="mb-1.5 block text-sm font-medium text-slate-700" htmlFor="workbench-rename-workbook-name">
+            工作簿名称
+          </label>
+          <input
+            id="workbench-rename-workbook-name"
+            type="text"
+            value={editWorkbookName}
+            onChange={(event) => setEditWorkbookName(event.target.value)}
+            onFocus={(event) => event.currentTarget.select()}
+            className={dialogInput}
+            autoFocus
+          />
+        </form>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        open={Boolean(folderBeingRenamed)}
+        onClose={closeFolderRenameDialog}
+        busy={folderRenameSaving}
+        size="sm"
+        title="重命名文件夹"
+        description="修改后，文件夹内的工作簿和共享设置不会改变。"
+        icon={<PencilLine className="h-5 w-5" />}
+        footer={
+          <>
+            <button type="button" onClick={closeFolderRenameDialog} disabled={folderRenameSaving} className={dialogSecondaryButton}>
+              取消
+            </button>
+            <button
+              type="submit"
+              form="workbench-rename-folder"
+              disabled={folderRenameSaving || !folderRenameName.trim()}
+              className={dialogPrimaryButton}
+            >
+              {folderRenameSaving ? "保存中..." : "保存名称"}
+            </button>
+          </>
+        }
+      >
+        <form
+          id="workbench-rename-folder"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleRenameFolder();
+          }}
+        >
+          <label htmlFor="folder-rename-name" className="mb-1.5 block text-sm font-medium text-slate-700">
+            文件夹名称
+          </label>
+          <input
+            id="folder-rename-name"
+            type="text"
+            value={folderRenameName}
+            onChange={(event) => {
+              setFolderRenameName(event.target.value);
+              if (folderRenameError) setFolderRenameError("");
+            }}
+            onFocus={(event) => event.currentTarget.select()}
+            maxLength={256}
+            disabled={folderRenameSaving}
+            className={dialogInput}
+            autoFocus
+          />
+          <div className="mt-2 flex min-h-5 items-start justify-between gap-3 text-xs">
+            <span className="text-rose-600">{folderRenameError}</span>
+            <span className="shrink-0 text-slate-400">{[...folderRenameName].length}/256</span>
+          </div>
+        </form>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        open={Boolean(sharingFolder)}
+        onClose={closeShareDialog}
+        busy={shareSaving}
+        size="lg"
+        title="共享文件夹"
+        description={
+          sharingFolder
+            ? `「${sharingFolder.name}」默认仅创建者和管理员可见，可按用户分别设置只读或可写共享。`
+            : undefined
+        }
+        icon={<Share2 className="h-5 w-5" />}
+        footer={
+          <>
+            <span className="mr-auto text-xs text-slate-500 max-md:hidden">
+              已共享给 {Object.keys(selectedShares).length} 位用户
+            </span>
+            <button type="button" onClick={closeShareDialog} className={dialogSecondaryButton}>
+              关闭
+            </button>
+            <button
+              type="button"
+              onClick={handleSaveFolderShares}
+              disabled={shareSaving || shareLoading || shareLoadFailed}
+              className={dialogPrimaryButton}
+            >
+              {shareSaving ? "保存中..." : "保存共享设置"}
+            </button>
+          </>
+        }
+      >
+        {shareMessage && (
+          <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-700">
+            {shareMessage}
+          </div>
+        )}
+        <div className="space-y-2">
+          {shareLoading ? (
+            <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+              正在加载可共享用户...
+            </div>
+          ) : shareableUsers.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+              当前没有可共享的启用账号。
+            </div>
+          ) : (
+            shareableUsers.map((user) => {
+              const accessLevel = selectedShares[user.id];
+              const checked = Boolean(accessLevel);
+              return (
+                <label
+                  key={user.id}
+                  className={`flex min-h-14 cursor-pointer flex-wrap items-center gap-3 rounded-lg border px-3 py-2 transition ${
+                    checked ? "border-sky-200 bg-sky-50" : "border-slate-200 hover:bg-slate-50"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(event) => {
+                      setSelectedShares((current) => {
+                        const next = { ...current };
+                        if (event.target.checked) next[user.id] = next[user.id] || "view";
+                        else delete next[user.id];
+                        return next;
+                      });
+                    }}
+                    className="h-5 w-5 rounded border-slate-300 text-sky-600 focus:ring-sky-500 md:h-4 md:w-4"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold text-slate-900">{user.username}</div>
+                    <div className="truncate text-xs text-slate-500">{user.email}</div>
+                  </div>
+                  <select
+                    value={accessLevel || "view"}
+                    disabled={!checked}
+                    onChange={(event) => {
+                      const value = event.target.value as "view" | "edit";
+                      setSelectedShares((current) => ({ ...current, [user.id]: value }));
+                    }}
+                    className="h-10 rounded-lg border border-slate-200 bg-white px-2 text-sm text-slate-700 outline-none disabled:cursor-not-allowed disabled:opacity-50 md:h-9"
+                  >
+                    <option value="view">只读共享</option>
+                    <option value="edit">可写共享</option>
+                  </select>
+                </label>
+              );
+            })
+          )}
+        </div>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        open={Boolean(assigningWorkbook)}
+        onClose={closeAssignDialog}
+        busy={assignmentLoading}
+        size="lg"
+        title="发放任务工作簿"
+        description={
+          assigningWorkbook
+            ? `将「${assigningWorkbook.name}」复制给选中的员工，作为待执行任务模板。`
+            : undefined
+        }
+        icon={<UserRoundPlus className="h-5 w-5" />}
+        footer={
+          <>
+            <span className="mr-auto text-xs text-slate-500 max-md:hidden">
+              已选择 {selectedAssigneeIds.length} 位员工
+            </span>
+            <button type="button" onClick={closeAssignDialog} className={dialogSecondaryButton}>
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={handleAssignWorkbook}
+              disabled={assignmentLoading || selectedAssigneeIds.length === 0}
+              className={dialogPrimaryButton}
+            >
+              {assignmentLoading ? "发放中..." : `发放任务${selectedAssigneeIds.length ? `（${selectedAssigneeIds.length}）` : ""}`}
+            </button>
+          </>
+        }
+      >
+        {assignmentMessage && (
+          <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-700">
+            {assignmentMessage}
+          </div>
+        )}
+        <div className="space-y-2">
+          {assignableUsers.map((user) => {
+            const checked = selectedAssigneeIds.includes(user.id);
+            return (
+              <label
+                key={user.id}
+                className={`flex min-h-14 cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 transition ${
+                  checked ? "border-sky-200 bg-sky-50" : "border-slate-200 hover:bg-slate-50"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={(event) =>
+                    setSelectedAssigneeIds((current) =>
+                      event.target.checked ? [...current, user.id] : current.filter((id) => id !== user.id),
+                    )
+                  }
+                  className="h-5 w-5 rounded border-slate-300 text-sky-600 focus:ring-sky-500 md:h-4 md:w-4"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-semibold text-slate-900">{user.username}</div>
+                  <div className="truncate text-xs text-slate-500">{user.email}</div>
+                </div>
+              </label>
+            );
+          })}
+          {assignableUsers.length === 0 && (
+            <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+              暂无可发放任务的员工账号。
+            </div>
+          )}
+        </div>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        open={Boolean(confirmRequest)}
+        onClose={() => setConfirmRequest(null)}
+        busy={confirmBusy}
+        size="sm"
+        title={confirmRequest?.title || ""}
+        icon={<Trash2 className="h-5 w-5 text-rose-600" />}
+        footer={
+          <>
+            <button type="button" onClick={() => setConfirmRequest(null)} disabled={confirmBusy} className={dialogSecondaryButton}>
+              取消
+            </button>
+            <button
+              type="button"
+              data-autofocus
+              disabled={confirmBusy}
+              onClick={async () => {
+                if (!confirmRequest) return;
+                setConfirmBusy(true);
+                try {
+                  await confirmRequest.onConfirm();
+                } finally {
+                  setConfirmBusy(false);
+                  setConfirmRequest(null);
+                }
+              }}
+              className={confirmRequest?.danger ? dialogDangerButton : dialogPrimaryButton}
+            >
+              {confirmBusy ? "处理中..." : confirmRequest?.confirmLabel}
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm leading-6 text-slate-600">{confirmRequest?.message}</p>
+      </ResponsiveDialog>
+
+      <MoveDialog
+        open={Boolean(moveRequest)}
+        title={moveRequest?.title || "移动到"}
+        description="选择目标文件夹，只显示你有写入权限的位置。"
+        targets={moveTargets}
+        loading={moveTargetsLoading}
+        busy={moveBusy}
+        currentFolderId={currentFolderId}
+        error={moveDialogError}
+        onClose={() => setMoveRequest(null)}
+        onConfirm={(folderId) => void confirmMove(folderId)}
+      />
+
+      <PropertiesDialog
+        item={propertiesItem}
+        rows={propertyRows(propertiesItem)}
+        onClose={() => setPropertiesItem(null)}
+        onOpen={openItem}
+      />
+
+      {isMobile && (
+        <>
+          <ResponsiveDialog
+            open={channelNotificationOpen}
+            onClose={() => setChannelNotificationOpen(false)}
+            title="频道消息"
+            description={totalChannelUnread > 0 ? `${totalChannelUnread} 条未读` : "没有未读消息"}
+            icon={<Bell className="h-5 w-5" />}
+            flush
+          >
+            {channelPanelBody}
+          </ResponsiveDialog>
+          <ResponsiveDialog
+            open={mailNotificationOpen}
+            onClose={() => setMailNotificationOpen(false)}
+            title="邮件提醒"
+            description={mailSummary.address || "当前工作邮箱"}
+            icon={<Mail className="h-5 w-5" />}
+            flush
+          >
+            {mailPanelBody}
+          </ResponsiveDialog>
+        </>
+      )}
+
+      <ActionMenu request={menuRequest} onClose={closeMenu} asSheet={touchUi} />
+
+      <WhatsAppSendDialog
+        open={Boolean(whatsAppResource)}
+        resource={whatsAppResource}
+        onClose={() => setWhatsAppResource(null)}
+      />
+    </>
+  );
 
   return (
     <AuthGuard>
-      <div className="min-h-screen bg-slate-100">
-        <div className="mx-auto flex min-h-screen max-w-[1440px] flex-col gap-3 p-3 md:p-5">
-          <header className="rounded-lg border border-slate-200 bg-white px-4 py-4 shadow-sm md:px-5">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex min-w-0 items-center gap-3">
-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white">
-                  <FolderKanban className="h-5 w-5" />
-                </div>
-                <div className="min-w-0">
-                  <h1 className="truncate text-xl font-semibold text-slate-950">
-                    YaERP 工作台
-                  </h1>
-                  <p className="mt-0.5 truncate text-sm text-slate-500">
-                    管理业务工作簿、文件夹和协作任务
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="mr-1 hidden items-center gap-2 border-r border-slate-200 pr-3 text-sm md:flex">
-                  <span className="text-slate-400">工作簿</span>
-                  <span className="font-semibold text-slate-900">
-                    {directoryWorkbooks.length}
-                  </span>
-                </div>
-                <div className="relative">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMailNotificationOpen(false);
-                      setChannelNotificationOpen((current) => !current);
-                    }}
-                    className="ui-tooltip relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-sky-700"
-                    title="频道未读消息"
-                    aria-label="频道未读消息"
-                    data-tooltip="频道未读消息"
-                  >
-                    <Bell className="h-4 w-4" />
-                    {totalChannelUnread > 0 && (
-                      <span className="absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-4 text-white">
-                        {totalChannelUnread > 99 ? "99+" : totalChannelUnread}
-                      </span>
-                    )}
-                  </button>
-                  {channelNotificationOpen && (
-                    <div className="fixed inset-x-3 top-20 z-50 max-h-[70vh] overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl sm:absolute sm:inset-x-auto sm:right-0 sm:top-11 sm:w-80">
-                      <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                        <div>
-                          <div className="text-sm font-semibold text-slate-900">
-                            频道消息
-                          </div>
-                          <div className="mt-0.5 text-xs text-slate-400">
-                            {totalChannelUnread > 0
-                              ? `${totalChannelUnread} 条未读`
-                              : "没有未读消息"}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setChannelNotificationOpen(false)}
-                          className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-                          title="关闭频道消息"
-                          aria-label="关闭频道消息"
-                          data-tooltip="关闭"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                      <div className="max-h-80 overflow-y-auto">
-                        {unreadChannels.length === 0 ? (
-                          <div className="px-4 py-8 text-center text-sm text-slate-400">
-                            频道消息已全部阅读
-                          </div>
-                        ) : (
-                          unreadChannels.map((channel) => (
-                            <button
-                              key={channel.id}
-                              type="button"
-                              onClick={() => {
-                                setChannelNotificationOpen(false);
-                                openChannelFromNotification(channel.id);
-                              }}
-                              className="flex w-full items-center gap-3 border-b border-slate-100 px-4 py-3 text-left last:border-b-0 hover:bg-slate-50"
-                            >
-                              <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-sky-50 text-sky-700">
-                                {channel.avatar_url ? (
-                                  <img
-                                    src={channel.avatar_url}
-                                    alt=""
-                                    className="h-full w-full object-cover"
-                                  />
-                                ) : (
-                                  <MessageSquare className="h-4 w-4" />
-                                )}
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <div className="truncate text-sm font-semibold text-slate-800">
-                                  {channel.name}
-                                </div>
-                                <div className="mt-0.5 truncate text-xs text-slate-400">
-                                  {channel.description ||
-                                    `${channel.member_count || 1} 位成员`}
-                                </div>
-                              </div>
-                              <span className="shrink-0 rounded-full bg-rose-500 px-2 py-0.5 text-[10px] font-semibold text-white">
-                                {channel.unread_count > 99
-                                  ? "99+"
-                                  : channel.unread_count}
-                              </span>
-                            </button>
-                          ))
-                        )}
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setChannelNotificationOpen(false);
-                          router.push("/channels");
-                        }}
-                        className="flex h-10 w-full items-center justify-center border-t border-slate-200 text-sm font-medium text-sky-700 hover:bg-sky-50"
-                      >
-                        进入频道
-                      </button>
-                    </div>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => router.push("/tasks")}
-                  className="ui-tooltip relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-amber-700"
-                  title="任务中心"
-                  aria-label="任务中心"
-                  data-tooltip="任务中心"
-                >
-                  <CheckSquare className="h-4 w-4" />
-                  {totalTaskUnread > 0 && (
-                    <span className="absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-4 text-white">
-                      {totalTaskUnread > 99 ? "99+" : totalTaskUnread}
-                    </span>
-                  )}
-                </button>
-                <div className="relative">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setChannelNotificationOpen(false);
-                      setMailNotificationOpen((current) => !current);
-                    }}
-                    className="ui-tooltip relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-sky-50 hover:text-sky-700"
-                    title={mailSummary.configured ? "邮件提醒" : "绑定工作邮箱"}
-                    aria-label="邮件提醒"
-                    data-tooltip={mailSummary.configured ? "邮件提醒" : "绑定工作邮箱"}
-                  >
-                    <Mail className="h-4 w-4" />
-                    {mailSummary.unread > 0 && (
-                      <span className="absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full bg-sky-600 px-1 text-[10px] font-semibold leading-4 text-white">
-                        {mailSummary.unread > 99 ? "99+" : mailSummary.unread}
-                      </span>
-                    )}
-                  </button>
-                  {mailNotificationOpen && (
-                    <div className="fixed inset-x-3 top-20 z-50 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl sm:absolute sm:inset-x-auto sm:right-0 sm:top-11 sm:w-80">
-                      <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold text-slate-900">
-                            邮件提醒
-                          </div>
-                          <div className="mt-0.5 truncate text-xs text-slate-400">
-                            {mailSummary.address || "当前工作邮箱"}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setMailNotificationOpen(false)}
-                          className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-                          title="关闭邮件提醒"
-                          aria-label="关闭邮件提醒"
-                          data-tooltip="关闭"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                      <div className="px-4 py-5">
-                        {!mailSummary.configured ? (
-                          <div className="text-sm text-slate-500">
-                            尚未绑定工作邮箱，进入邮件客户端完成配置。
-                          </div>
-                        ) : mailSummary.last_error ? (
-                          <div className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
-                            {mailSummary.last_error}
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-3">
-                            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-sky-50 text-sky-700">
-                              <Mail className="h-4 w-4" />
-                            </div>
-                            <div>
-                              <div className="text-sm font-semibold text-slate-900">
-                                {mailSummary.unread > 0
-                                  ? `${mailSummary.unread} 封未读邮件`
-                                  : "邮件已全部阅读"}
-                              </div>
-                              <div className="mt-0.5 text-xs text-slate-400">
-                                共 {mailSummary.total || 0} 封邮件
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setMailNotificationOpen(false);
-                          router.push("/mail");
-                        }}
-                        className="flex h-10 w-full items-center justify-center border-t border-slate-200 text-sm font-medium text-sky-700 hover:bg-sky-50"
-                      >
-                        进入邮件
-                      </button>
-                    </div>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => router.push("/trade")}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 text-sm font-semibold text-sky-800 transition hover:bg-sky-100"
-                >
-                  <BriefcaseBusiness className="h-4 w-4" />
-                  外贸 ERP
-                </button>
-                <button
-                  type="button"
-                  onClick={() => router.push("/channels")}
-                  className="relative inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
-                >
-                  <MessageSquare className="h-4 w-4" />
-                  频道
-                  {totalChannelUnread > 0 && (
-                    <span className="rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                      {totalChannelUnread > 99 ? "99+" : totalChannelUnread}
-                    </span>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => router.push("/gallery")}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
-                >
-                  <Images className="h-4 w-4" />
-                  图库
-                </button>
-                <button
-                  type="button"
-                  onClick={() => router.push("/recycle-bin")}
-                  className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"
-                  title="回收站"
-                  aria-label="回收站"
-                  data-tooltip="回收站"
-                >
-                  <Trash2 className="h-4 w-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => router.push("/whatsapp")}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 px-3 text-sm font-medium text-emerald-700 transition hover:bg-emerald-50"
-                >
-                  <MessageCircle className="h-4 w-4" />
-                  WhatsApp
-                </button>
-                <button
-                  type="button"
-                  onClick={() => router.push("/ai/summaries")}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
-                >
-                  <BarChart3 className="h-4 w-4" />
-                  AI 总结
-                </button>
-                {adminMode && (
-                  <button
-                    type="button"
-                    onClick={() => router.push("/admin")}
-                    className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white transition hover:bg-slate-700"
-                  >
-                    <Shield className="h-4 w-4" />
-                    管理后台
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => router.push("/settings")}
-                  className="ml-1 flex min-w-0 items-center gap-2 border-l border-slate-200 pl-3 text-left"
-                  title="个人设置"
-                >
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-slate-100 text-xs font-semibold text-slate-600">
-                    {profile?.avatar ? (
-                      <img
-                        src={profile.avatar}
-                        alt=""
-                        className="h-full w-full object-cover"
-                      />
-                    ) : (
-                      profile?.username?.slice(0, 2).toUpperCase() || "U"
-                    )}
-                  </div>
-                  <div className="min-w-0">
-                    <div className="max-w-28 truncate text-sm font-semibold text-slate-800">
-                      {profile?.username || "未加载"}
-                    </div>
-                    <div className="max-w-28 truncate text-[11px] text-slate-400">
-                      {profile?.roles?.[0]?.name || "普通用户"}
-                    </div>
-                  </div>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  disabled={loggingOut}
-                  className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 transition hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
-                  title={loggingOut ? "退出中" : "退出登录"}
-                  aria-label={loggingOut ? "退出中" : "退出登录"}
-                  data-tooltip={loggingOut ? "退出中" : "退出登录"}
-                  data-tooltip-side="left"
-                >
-                  <LogOut className="h-4 w-4" />
-                </button>
-              </div>
-            </div>
-          </header>
-
-          {totalChannelUnread > 0 && (
-            <section className="flex flex-col gap-3 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-center gap-3">
-                <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-600 text-white">
-                  <Bell className="h-4 w-4" />
-                  <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-sky-50 bg-rose-500" />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-sky-950">
-                    频道有 {totalChannelUnread} 条未读消息
-                  </div>
-                  <div className="mt-0.5 truncate text-xs text-sky-700">
-                    {unreadChannels
-                      .slice(0, 3)
-                      .map((channel) => channel.name)
-                      .join("、")}
-                    {unreadChannels.length > 3
-                      ? ` 等 ${unreadChannels.length} 个频道`
-                      : ""}
-                  </div>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() =>
-                  openChannelFromNotification(unreadChannels[0].id)
-                }
-                className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-lg bg-sky-700 px-4 text-sm font-semibold text-white hover:bg-sky-800"
-              >
+      <div className="min-h-screen overflow-x-clip bg-slate-100 text-slate-900">
+        {header}
+        <main className="mx-auto max-w-[1600px] space-y-3 p-3 pb-36 md:p-5 md:pb-24">
+          {totalChannelUnread > 0 && unreadChannels.length > 0 && (
+            <button
+              type="button"
+              onClick={() => openChannelFromNotification(unreadChannels[0].id)}
+              className="flex w-full items-center gap-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5 text-left transition hover:bg-sky-100 md:px-4"
+            >
+              <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-sky-600 text-white">
+                <MessageSquare className="h-4 w-4" />
+                <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-sky-50 bg-rose-500" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-semibold text-sky-950">
+                  频道有 {totalChannelUnread} 条未读消息
+                </span>
+                <span className="block truncate text-xs text-sky-700">
+                  {unreadChannels.slice(0, 3).map((channel) => channel.name).join("、")}
+                  {unreadChannels.length > 3 ? ` 等 ${unreadChannels.length} 个频道` : ""}
+                </span>
+              </span>
+              <span className="hidden shrink-0 items-center gap-1 text-sm font-semibold text-sky-700 sm:inline-flex">
                 查看消息
                 <ArrowRight className="h-4 w-4" />
-              </button>
-            </section>
+              </span>
+              <ChevronRight className="h-5 w-5 shrink-0 text-sky-500 sm:hidden" />
+            </button>
           )}
-
-          <section
-            className="relative rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5"
-            onDragEnter={handleWorkbookDragEnter}
-            onDragOver={handleWorkbookDragOver}
-            onDragLeave={handleWorkbookDragLeave}
-            onDrop={handleWorkbookDrop}
-          >
-            {workbookDropActive && (
-              <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-lg border-2 border-dashed border-sky-300 bg-sky-50/95 p-6 text-center shadow-inner backdrop-blur-sm">
-                <div>
-                  <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-lg bg-white text-sky-700 shadow-sm">
-                    <FileSpreadsheet className="h-6 w-6" />
-                  </div>
-                  <div className="mt-3 text-sm font-semibold text-slate-900">
-                    松开即可导入 Excel
-                  </div>
-                  <div className="mt-1 text-xs text-slate-500">
-                    支持同时拖入多个 Excel 文件或多个目录，并保留目录层级
-                  </div>
-                </div>
-              </div>
-            )}
-            <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-              <div>
-                <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                  Workbooks
-                </div>
-                <div className="mt-2 flex items-center gap-3">
-                  <h2 className="text-2xl font-semibold text-slate-950">
-                    业务工作簿
-                  </h2>
-                  <span className="rounded-lg bg-slate-100 px-2 py-1 text-xs font-medium text-slate-500">
-                    {sortedWorkbooks.length} 个
-                  </span>
-                </div>
-                <p className="mt-2 text-sm text-slate-500">
-                  {adminMode
-                    ? "管理员可按员工查看全部工作簿，并按时间排序、搜索和发放任务模板。"
-                    : "用工作簿组织你的业务模块，再在工作表里扩展字段、权限和协作规则。"}
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <div
-                  className="order-4 inline-flex h-10 items-center rounded-lg border border-slate-200 bg-slate-50 p-1"
-                  aria-label="工作簿显示方式"
-                >
-                  <button
-                    type="button"
-                    onClick={() => setWorkbookViewMode("desktop")}
-                    className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition ${
-                      workbookViewMode === "desktop"
-                        ? "bg-white text-slate-900 shadow-sm"
-                        : "text-slate-500 hover:text-slate-800"
-                    }`}
-                    aria-pressed={workbookViewMode === "desktop"}
-                    title="桌面图标视图"
-                  >
-                    <LayoutGrid className="h-4 w-4" />
-                    桌面
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setWorkbookViewMode("list")}
-                    className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition ${
-                      workbookViewMode === "list"
-                        ? "bg-white text-slate-900 shadow-sm"
-                        : "text-slate-500 hover:text-slate-800"
-                    }`}
-                    aria-pressed={workbookViewMode === "list"}
-                    title="详细列表视图"
-                  >
-                    <ListIcon className="h-4 w-4" />
-                    列表
-                  </button>
-                </div>
-                {adminMode && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextValue = !showOnlyOwnResources;
-                      setShowOnlyOwnResources(nextValue);
-                      if (
-                        nextValue &&
-                        currentFolderMeta &&
-                        currentFolderMeta.owner_id !== profile?.id
-                      ) {
-                        void navigateToFolder(null);
-                      }
-                    }}
-                    className={`order-3 inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition ${showOnlyOwnResources ? "border-sky-200 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"}`}
-                    title={
-                      showOnlyOwnResources
-                        ? "恢复查看全部工作簿和文件夹"
-                        : "仅显示自己创建的工作簿和文件夹"
-                    }
-                    aria-pressed={showOnlyOwnResources}
-                  >
-                    {showOnlyOwnResources ? (
-                      <CheckSquare className="h-4 w-4" />
-                    ) : (
-                      <Square className="h-4 w-4" />
-                    )}
-                    仅看自己
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setCreatingFolder(true)}
-                  disabled={!canWriteCurrentFolder}
-                  className="order-3 inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <FolderPlus className="h-4 w-4" />
-                  新建文件夹
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setCreating((prev) => !prev)}
-                  disabled={
-                    !canWriteCurrentFolder ||
-                    importingWorkbook ||
-                    importingWorkbookFolder
-                  }
-                  className="order-1 inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Plus className="h-4 w-4" />
-                  新建工作簿
-                </button>
-                <button
-                  type="button"
-                  onClick={() => workbookImportInputRef.current?.click()}
-                  disabled={
-                    !canWriteCurrentFolder ||
-                    importingWorkbook ||
-                    importingWorkbookFolder
-                  }
-                  className="order-2 inline-flex h-10 items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Upload className="h-4 w-4" />
-                  {importingWorkbook
-                    ? `导入中 ${workbookImportProgress}%`
-                    : "上传 Excel"}
-                </button>
-                <input
-                  ref={workbookImportInputRef}
-                  type="file"
-                  accept={EXCEL_IMPORT_ACCEPT}
-                  multiple
-                  className="hidden"
-                  onChange={(event) => {
-                    const files = Array.from(event.target.files || []);
-                    if (files.length === 1)
-                      void handleImportWorkbookXlsx(files[0]);
-                    if (files.length > 1)
-                      void handleImportDroppedWorkbooks(
-                        files.map((file) => ({
-                          file,
-                          relativePath: file.name,
-                        })),
-                      );
-                  }}
-                />
-                <button
-                  type="button"
-                  onClick={() => workbookFolderImportInputRef.current?.click()}
-                  disabled={
-                    !canWriteCurrentFolder ||
-                    importingWorkbook ||
-                    importingWorkbookFolder
-                  }
-                  className="order-2 inline-flex h-10 items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 text-sm font-semibold text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <FolderUp className="h-4 w-4" />
-                  {importingWorkbookFolder
-                    ? `批量导入 ${workbookImportProgress}%`
-                    : "上传 Excel 文件夹"}
-                </button>
-                <input
-                  ref={workbookFolderImportInputRef}
-                  type="file"
-                  accept={EXCEL_IMPORT_ACCEPT}
-                  multiple
-                  className="hidden"
-                  {...({
-                    webkitdirectory: "",
-                    directory: "",
-                  } as React.InputHTMLAttributes<HTMLInputElement>)}
-                  onChange={(event) => {
-                    if (event.target.files?.length)
-                      void handleImportWorkbookFolder(event.target.files);
-                  }}
-                />
-              </div>
-            </div>
-
-            {(importingWorkbook ||
-              importingWorkbookFolder ||
-              workbookFolderImportStatus ||
-              workbookImportError) && (
-              <div
-                className={`mb-4 rounded-2xl border px-4 py-3 text-sm ${
-                  workbookImportError
-                    ? "border-rose-200 bg-rose-50 text-rose-700"
-                    : "border-sky-200 bg-sky-50 text-sky-700"
-                }`}
-              >
-                {workbookImportError ? (
-                  <div className="font-medium">{workbookImportError}</div>
-                ) : (
-                  <div>
-                    <div className="flex items-center justify-between font-semibold">
-                      <span>
-                        {importingWorkbookFolder
-                          ? workbookFolderImportStatus ||
-                            "正在批量导入 Excel 文件夹"
-                          : "正在导入 Excel 工作簿"}
-                      </span>
-                      <span>{workbookImportProgress}%</span>
-                    </div>
-                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white">
-                      <div
-                        className="h-full rounded-full bg-sky-500 transition-all duration-200"
-                        style={{ width: `${workbookImportProgress}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Breadcrumb */}
-            {breadcrumb.length > 0 && (
-              <div className="mb-4 flex items-center gap-1 text-sm text-slate-500">
-                <button
-                  type="button"
-                  onClick={() => void navigateToFolder(null)}
-                  onDragOver={(event) =>
-                    handleWorkbookTargetDragOver(event, "root", true)
-                  }
-                  onDragLeave={(event) =>
-                    handleWorkbookTargetDragLeave(event, "root")
-                  }
-                  onDrop={(event) =>
-                    handleWorkbookTargetDrop(event, null, true)
-                  }
-                  className={`rounded-md px-1.5 py-1 font-medium transition ${
-                    workbookDropTarget === "root"
-                      ? "bg-sky-100 text-sky-900 ring-2 ring-sky-300"
-                      : "text-sky-700 hover:bg-sky-50 hover:text-sky-900"
-                  }`}
-                >
-                  根目录
-                </button>
-                {breadcrumb.map((folder) => {
-                  const targetKey = `breadcrumb-${folder.id}`;
-                  const canDropHere =
-                    folder.id !== currentFolderId && folder.can_write !== false;
-                  return (
-                    <span key={folder.id} className="flex items-center gap-1">
-                      <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                      <button
-                        type="button"
-                        onClick={() => void navigateToFolder(folder.id)}
-                        onDragOver={(event) =>
-                          handleWorkbookTargetDragOver(
-                            event,
-                            targetKey,
-                            canDropHere,
-                          )
-                        }
-                        onDragLeave={(event) =>
-                          handleWorkbookTargetDragLeave(event, targetKey)
-                        }
-                        onDrop={(event) =>
-                          handleWorkbookTargetDrop(
-                            event,
-                            folder.id,
-                            canDropHere,
-                          )
-                        }
-                        className={`rounded-md px-1.5 py-1 font-medium transition ${
-                          workbookDropTarget === targetKey
-                            ? "bg-sky-100 text-sky-900 ring-2 ring-sky-300"
-                            : folder.id === currentFolderId
-                              ? "text-slate-900"
-                              : "text-sky-700 hover:bg-sky-50 hover:text-sky-900"
-                        }`}
-                      >
-                        {folder.name}
-                      </button>
-                    </span>
-                  );
-                })}
-              </div>
-            )}
-
-            {currentFolderMeta && !canWriteCurrentFolder && (
-              <div className="mb-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-700">
-                当前位于只读共享文件夹中，你可以查看和打开文件，但不能在这里新建或写入内容。
-              </div>
-            )}
-
-            {folderError && (
-              <div className="mb-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">
-                {folderError}
-              </div>
-            )}
-
-            {workbookMoveError && (
-              <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">
-                {workbookMoveError}
-              </div>
-            )}
-
-            {/* Create folder inline */}
-            {creatingFolder && (
-              <div className="mb-4 flex items-center gap-3">
-                <FolderIcon className="h-5 w-5 text-amber-500" />
-                <input
-                  type="text"
-                  value={newFolderName}
-                  onChange={(e) => setNewFolderName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && newFolderName.trim()) {
-                      if (!canWriteCurrentFolder) return;
-                      void createFolder(newFolderName.trim()).then(() => {
-                        setNewFolderName("");
-                        setCreatingFolder(false);
-                      });
-                    }
-                    if (e.key === "Escape") {
-                      setCreatingFolder(false);
-                      setNewFolderName("");
-                    }
-                  }}
-                  placeholder="输入文件夹名称，按 Enter 创建"
-                  className="h-10 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                  autoFocus
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCreatingFolder(false);
-                    setNewFolderName("");
-                  }}
-                  className="ui-tooltip rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                  title="取消新建文件夹"
-                  aria-label="取消新建文件夹"
-                  data-tooltip="取消新建文件夹"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            )}
-
-            {creating && (
-              <div className="mb-4 flex items-center gap-3">
-                <FolderKanban className="h-5 w-5 text-sky-600" />
-                <input
-                  type="text"
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && newName.trim()) {
-                      void handleCreateWorkbook();
-                    }
-                    if (e.key === "Escape") {
-                      setCreating(false);
-                      setNewName("");
-                    }
-                  }}
-                  placeholder={
-                    currentFolderId !== null
-                      ? "输入工作簿名称，按 Enter 创建到当前文件夹"
-                      : "输入工作簿名称，按 Enter 创建"
-                  }
-                  className="h-10 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                  autoFocus
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCreating(false);
-                    setNewName("");
-                  }}
-                  className="ui-tooltip rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                  title="取消新建工作簿"
-                  aria-label="取消新建工作簿"
-                  data-tooltip="取消新建工作簿"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            )}
-
-            {currentFolderId === null && visibleSharedFolders.length > 0 && (
-              <div className="mb-4 space-y-3 rounded-[24px] border border-sky-200 bg-sky-50/60 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900">
-                      共享给我的文件夹
-                    </div>
-                    <div className="text-xs text-slate-500">
-                      这里显示别人直接共享给你的文件夹入口，避免深层共享文件夹找不到。
-                    </div>
-                  </div>
-                  <div className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-500">
-                    {visibleSharedFolders.length} 个入口
-                  </div>
-                </div>
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  {visibleSharedFolders.map((folder) => (
-                    <button
-                      key={`shared-${folder.id}`}
-                      type="button"
-                      onClick={() => void navigateToFolder(folder.id)}
-                      onDragOver={(event) =>
-                        handleWorkbookTargetDragOver(
-                          event,
-                          `shared-folder-${folder.id}`,
-                          canWriteFolder(folder),
-                        )
-                      }
-                      onDragLeave={(event) =>
-                        handleWorkbookTargetDragLeave(
-                          event,
-                          `shared-folder-${folder.id}`,
-                        )
-                      }
-                      onDrop={(event) =>
-                        handleWorkbookTargetDrop(
-                          event,
-                          folder.id,
-                          canWriteFolder(folder),
-                        )
-                      }
-                      className={`rounded-2xl border bg-white/90 p-4 text-left transition hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-md ${
-                        workbookDropTarget === `shared-folder-${folder.id}`
-                          ? "border-sky-400 bg-sky-100 ring-2 ring-sky-300"
-                          : draggedWorkbookId !== null &&
-                              canWriteFolder(folder)
-                            ? "border-dashed border-sky-300"
-                            : "border-sky-200"
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-center gap-3">
-                          <FolderIcon className="h-8 w-8 flex-shrink-0 text-sky-500" />
-                          <div>
-                            <div className="text-sm font-semibold text-slate-900">
-                              {folder.name}
-                            </div>
-                            <div className="mt-1 text-xs text-slate-500">
-                              共享者：
-                              {folder.owner_name || `用户 #${folder.owner_id}`}
-                            </div>
-                          </div>
-                        </div>
-                        <span
-                          className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
-                            folder.access_level === "edit"
-                              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                              : "bg-slate-100 text-slate-600 border border-slate-200"
-                          }`}
-                        >
-                          {folder.access_level === "edit"
-                            ? "可写共享"
-                            : "只读共享"}
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Folder list */}
-            {workbookViewMode === "list" && directoryFolders.length > 0 && (
-              <div className="mb-4 space-y-3">
-                {/* Folder search + pagination toolbar */}
-                {(directoryFolders.length > foldersPerPage ||
-                  folderSearchQuery.trim()) && (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="relative flex-1 max-w-xs">
-                      <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                      <input
-                        type="text"
-                        value={folderSearchQuery}
-                        onChange={(e) => setFolderSearchQuery(e.target.value)}
-                        placeholder="搜索文件夹..."
-                        className="h-9 w-full rounded-xl border border-slate-200 bg-white pl-9 pr-3 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                      />
-                    </div>
-                    <div className="text-xs text-slate-500">
-                      {filteredFolders.length} 个文件夹 / 第 {folderPage} 页
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setFolderPage((c) => Math.max(1, c - 1))}
-                      disabled={folderPage <= 1}
-                      className="ui-tooltip inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                      title="上一页文件夹"
-                      aria-label="上一页文件夹"
-                      data-tooltip="上一页"
-                    >
-                      <ChevronLeft className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setFolderPage((c) => Math.min(totalFolderPages, c + 1))
-                      }
-                      disabled={folderPage >= totalFolderPages}
-                      className="ui-tooltip inline-flex h-8 w-8 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                      title="下一页文件夹"
-                      aria-label="下一页文件夹"
-                      data-tooltip="下一页"
-                    >
-                      <ChevronRight className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                )}
-                <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-4">
-                  {paginatedFolders.map((folder) => (
-                    <div
-                      key={folder.id}
-                      onDragOver={(event) =>
-                        handleWorkbookTargetDragOver(
-                          event,
-                          `folder-${folder.id}`,
-                          canWriteFolder(folder),
-                        )
-                      }
-                      onDragLeave={(event) =>
-                        handleWorkbookTargetDragLeave(
-                          event,
-                          `folder-${folder.id}`,
-                        )
-                      }
-                      onDrop={(event) =>
-                        handleWorkbookTargetDrop(
-                          event,
-                          folder.id,
-                          canWriteFolder(folder),
-                        )
-                      }
-                      className={`group rounded-2xl border bg-white/90 p-4 text-left transition hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-md ${
-                        workbookDropTarget === `folder-${folder.id}`
-                          ? "border-sky-400 bg-sky-50 ring-2 ring-sky-200"
-                          : draggedWorkbookId !== null
-                            ? "border-dashed border-slate-300"
-                          : "border-slate-200"
-                      }`}
-                    >
-                      <div className="mb-3 flex items-start justify-between gap-2">
-                        <button
-                          type="button"
-                          onClick={() => void navigateToFolder(folder.id)}
-                          className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                        >
-                          <FolderIcon className="h-8 w-8 flex-shrink-0 text-amber-400" />
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate text-sm font-semibold text-slate-900">
-                              {folder.name}
-                            </div>
-                            <div className="text-xs text-slate-400">
-                              {folder.can_write
-                                ? "可拖入工作簿"
-                                : `只读共享自 ${folder.owner_name || `用户 #${folder.owner_id}`}`}
-                            </div>
-                          </div>
-                          <ChevronRight className="h-4 w-4 flex-shrink-0 text-slate-300 transition group-hover:translate-x-0.5" />
-                        </button>
-                        <div className="flex items-center gap-1">
-                          {canManageFolder(folder) && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setFolderBeingRenamed(folder);
-                                setFolderRenameName(folder.name);
-                                setFolderRenameError("");
-                              }}
-                              className="ui-tooltip rounded-full p-1.5 text-slate-300 transition hover:bg-slate-100 hover:text-slate-700"
-                              title="重命名文件夹"
-                              aria-label={`重命名文件夹 ${folder.name}`}
-                              data-tooltip="重命名文件夹"
-                            >
-                              <PencilLine className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                          {canManageFolder(folder) && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSharingFolder(folder);
-                                setSelectedShares({});
-                                setShareMessage("");
-                              }}
-                              className="ui-tooltip rounded-full p-1.5 text-slate-300 transition hover:bg-sky-50 hover:text-sky-600"
-                              title="共享文件夹"
-                              aria-label={`共享文件夹 ${folder.name}`}
-                              data-tooltip="共享文件夹"
-                            >
-                              <Share2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                          {canManageFolder(folder) && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void handleDeleteFolder(folder.id, folder.name)
-                              }
-                              className="ui-tooltip rounded-full p-1.5 text-slate-300 transition hover:bg-rose-50 hover:text-rose-600"
-                              title="删除文件夹"
-                              aria-label={`删除文件夹 ${folder.name}`}
-                              data-tooltip="删除文件夹"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                  {filteredFolders.length === 0 && (
-                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500 md:col-span-3 lg:col-span-4">
-                      没有找到匹配的文件夹
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Search bar */}
-            {!folderLoading && directoryWorkbooks.length > 0 && (
-              <div className="mb-5 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                <div ref={searchRef} className="relative flex-1 xl:max-w-xl">
-                  <div className="relative">
-                    <span className="pointer-events-none absolute inset-y-0 left-0 flex w-12 items-center justify-center text-slate-400">
-                      <Search className="h-4 w-4" />
-                    </span>
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      onFocus={() => setSearchFocused(true)}
-                      placeholder={
-                        adminMode
-                          ? "搜索工作簿 / 描述 / 员工..."
-                          : "搜索工作簿名称..."
-                      }
-                      className="h-11 w-full rounded-2xl border border-slate-200 bg-white pl-12 pr-10 text-sm leading-[44px] text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                    />
-                    {searchQuery && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSearchQuery("");
-                          setSearchFocused(false);
-                        }}
-                        className="ui-tooltip absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
-                        title="清除搜索"
-                        aria-label="清除搜索"
-                        data-tooltip="清除搜索"
-                        data-tooltip-side="top"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    )}
-                  </div>
-                  {suggestions.length > 0 && (
-                    <div className="absolute left-0 right-0 top-full z-20 mt-1 rounded-2xl border border-slate-200 bg-white py-1 shadow-lg">
-                      {suggestions.map((wb) => (
-                        <button
-                          key={wb.id}
-                          type="button"
-                          onClick={() => {
-                            router.push(`/sheets/${wb.id}`);
-                            setSearchFocused(false);
-                          }}
-                          className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm transition hover:bg-slate-50"
-                        >
-                          <FolderKanban className="h-4 w-4 flex-shrink-0 text-sky-600" />
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate font-medium text-slate-900">
-                              {wb.name}
-                            </div>
-                            <div className="truncate text-xs text-slate-400">
-                              {wb.owner_name || wb.description || "无描述"}
-                            </div>
-                          </div>
-                          <ArrowRight className="h-3.5 w-3.5 flex-shrink-0 text-slate-300" />
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      window.dispatchEvent(new Event("yaerp:open-command-palette"))
-                    }
-                    className="inline-flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:border-sky-200 hover:text-sky-700"
-                    title="搜索全部模块与工作簿（Ctrl / ⌘ + K）"
-                  >
-                    <Search className="h-4 w-4" />
-                    全库搜索
-                    <kbd className="hidden rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 md:inline">
-                      Ctrl / ⌘ K
-                    </kbd>
-                  </button>
-                  <select
-                    value={workbookSortBy}
-                    onChange={(event) =>
-                      setWorkbookSortBy(
-                        event.target.value as
-                          | "updated_at"
-                          | "created_at"
-                          | "name",
-                      )
-                    }
-                    className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                  >
-                    <option value="updated_at">按更新时间</option>
-                    <option value="created_at">按创建时间</option>
-                    <option value="name">按名称</option>
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setWorkbookSortOrder((current) =>
-                        current === "desc" ? "asc" : "desc",
-                      )
-                    }
-                    className="inline-flex h-11 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
-                  >
-                    <ArrowUpDown className="h-4 w-4" />
-                    {workbookSortOrder === "desc" ? "降序" : "升序"}
-                  </button>
-                  {adminMode && workbookViewMode === "list" && (
-                    <button
-                      type="button"
-                      onClick={() => setGroupByOwner((current) => !current)}
-                      className={`inline-flex h-11 items-center gap-2 rounded-2xl border px-4 text-sm font-medium transition ${
-                        groupByOwner
-                          ? "border-sky-200 bg-sky-50 text-sky-700"
-                          : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
-                      }`}
-                    >
-                      <Layers3 className="h-4 w-4" />
-                      {groupByOwner ? "按员工分组中" : "按员工分组"}
-                    </button>
-                  )}
-                </div>
-                {/* Suggestions dropdown */}
-              </div>
-            )}
-
-            {!folderLoading &&
-              !folderError &&
-              workbookViewMode === "desktop" &&
-              (directoryFolders.length > 0 || paginatedWorkbooks.length > 0) && (
-                <div className="space-y-3">
-                  <div className="grid min-h-64 grid-cols-[repeat(auto-fill,minmax(118px,1fr))] content-start gap-2 rounded-lg border border-slate-200 bg-slate-100/70 p-3 sm:grid-cols-[repeat(auto-fill,minmax(132px,1fr))] sm:p-4">
-                    {directoryFolders.map((folder) => {
-                      const itemKey = `folder-${folder.id}`;
-                      const selected = selectedDesktopItem === itemKey;
-                      const dropActive = workbookDropTarget === itemKey;
-                      return (
-                        <div
-                          key={folder.id}
-                          onDragOver={(event) =>
-                            handleWorkbookTargetDragOver(
-                              event,
-                              itemKey,
-                              canWriteFolder(folder),
-                            )
-                          }
-                          onDragLeave={(event) =>
-                            handleWorkbookTargetDragLeave(event, itemKey)
-                          }
-                          onDrop={(event) =>
-                            handleWorkbookTargetDrop(
-                              event,
-                              folder.id,
-                              canWriteFolder(folder),
-                            )
-                          }
-                          className={`group relative flex min-h-36 flex-col items-center rounded-lg border px-2 py-3 transition ${
-                            dropActive
-                              ? "border-sky-400 bg-sky-100 ring-2 ring-sky-300"
-                              : selected
-                                ? "border-sky-300 bg-sky-50"
-                                : draggedWorkbookId !== null &&
-                                    canWriteFolder(folder)
-                                  ? "border-dashed border-slate-300 bg-white/80"
-                                  : "border-transparent hover:border-slate-300 hover:bg-white/80"
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => setSelectedDesktopItem(itemKey)}
-                            onDoubleClick={() =>
-                              void navigateToFolder(folder.id)
-                            }
-                            className="flex w-full min-w-0 flex-1 flex-col items-center text-center outline-none"
-                            aria-label={`文件夹 ${folder.name}`}
-                          >
-                            <FolderIcon className="h-14 w-14 shrink-0 fill-amber-300 text-amber-500 drop-shadow-sm" />
-                            <span className="mt-2 max-h-10 w-full overflow-hidden break-words text-xs font-semibold leading-5 text-slate-800">
-                              {folder.name}
-                            </span>
-                            {!folder.can_write && (
-                              <span className="mt-1 text-[10px] font-medium text-slate-400">
-                                只读
-                              </span>
-                            )}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void navigateToFolder(folder.id)}
-                            className="ui-tooltip absolute right-1.5 top-1.5 inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/90 text-slate-500 opacity-100 shadow-sm transition hover:text-sky-700 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
-                            title="打开文件夹"
-                            aria-label={`打开文件夹 ${folder.name}`}
-                            data-tooltip="打开文件夹"
-                          >
-                            <ArrowRight className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      );
-                    })}
-
-                    {paginatedWorkbooks.map((workbook) => {
-                      const itemKey = `workbook-${workbook.id}`;
-                      const selected = selectedDesktopItem === itemKey;
-                      const writableFolders = writableWorkbookTargetFolders;
-                      const canMove = canManageWorkbook(workbook);
-                      return (
-                        <div
-                          key={workbook.id}
-                          draggable={canMove}
-                          onDragStart={(event) =>
-                            canMove &&
-                            handleInternalWorkbookDragStart(event, workbook.id)
-                          }
-                          onDragEnd={handleInternalWorkbookDragEnd}
-                          className={`group relative flex min-h-36 flex-col items-center rounded-lg border px-2 py-3 transition ${
-                            selected
-                              ? "border-sky-300 bg-sky-50"
-                              : "border-transparent hover:border-slate-300 hover:bg-white/80"
-                          } ${
-                            movingWorkbookId === workbook.id
-                              ? "pointer-events-none opacity-50"
-                              : ""
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            onClick={() => setSelectedDesktopItem(itemKey)}
-                            onDoubleClick={() =>
-                              router.push(`/sheets/${workbook.id}`)
-                            }
-                            className="flex w-full min-w-0 flex-1 flex-col items-center text-center outline-none"
-                            aria-label={`工作簿 ${workbook.name}`}
-                          >
-                            <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-lg border border-emerald-200 bg-white text-emerald-600 shadow-sm">
-                              <FileSpreadsheet className="h-8 w-8" />
-                            </span>
-                            <span className="mt-2 max-h-10 w-full overflow-hidden break-words text-xs font-semibold leading-5 text-slate-800">
-                              {workbook.name}
-                            </span>
-                            <span className="mt-1 max-w-full truncate text-[10px] text-slate-400">
-                              {workbook.owner_name || `#${workbook.id}`}
-                            </span>
-                          </button>
-                          <div className="absolute right-1.5 top-1.5 flex items-center gap-1 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
-                            {canMove &&
-                              (currentFolderId !== null ||
-                                writableFolders.length > 0) && (
-                                <details className="relative">
-                                  <summary
-                                    className="ui-tooltip flex h-7 w-7 cursor-pointer list-none items-center justify-center rounded-md bg-white/95 text-slate-500 shadow-sm transition hover:text-sky-700 [&::-webkit-details-marker]:hidden"
-                                    title="移动工作簿"
-                                    aria-label={`移动工作簿 ${workbook.name}`}
-                                    data-tooltip="移动工作簿"
-                                  >
-                                    <FolderInput className="h-3.5 w-3.5" />
-                                  </summary>
-                                  <div className="absolute right-0 top-8 z-30 max-h-56 w-48 overflow-y-auto rounded-lg border border-slate-200 bg-white p-1 text-left shadow-xl">
-                                    {currentFolderId !== null && (
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          void handleMoveWorkbookToFolder(
-                                            workbook.id,
-                                            null,
-                                          )
-                                        }
-                                        className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                                      >
-                                        <FolderIcon className="h-4 w-4 text-slate-400" />
-                                        <span className="truncate">根目录</span>
-                                      </button>
-                                    )}
-                                    {writableFolders.map((folder) => (
-                                      <button
-                                        key={folder.id}
-                                        type="button"
-                                        onClick={() =>
-                                          void handleMoveWorkbookToFolder(
-                                            workbook.id,
-                                            folder.id,
-                                          )
-                                        }
-                                        className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                                      >
-                                        <FolderIcon className="h-4 w-4 text-amber-500" />
-                                        <span className="truncate">
-                                          {folder.name}
-                                        </span>
-                                      </button>
-                                    ))}
-                                  </div>
-                                </details>
-                              )}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                router.push(`/sheets/${workbook.id}`)
-                              }
-                              className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/95 text-slate-500 shadow-sm transition hover:text-sky-700"
-                              title="打开工作簿"
-                              aria-label={`打开工作簿 ${workbook.name}`}
-                              data-tooltip="打开工作簿"
-                            >
-                              <ArrowRight className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {totalWorkbookPages > 1 && (
-                    <div className="flex items-center justify-between gap-3 border-t border-slate-200 pt-3">
-                      <div className="text-xs text-slate-500">
-                        {workbookPage} / {totalWorkbookPages}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setWorkbookPage((current) =>
-                              Math.max(1, current - 1),
-                            )
-                          }
-                          disabled={workbookPage <= 1}
-                          className="ui-tooltip inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 disabled:opacity-40"
-                          title="上一页"
-                          aria-label="上一页工作簿"
-                          data-tooltip="上一页"
-                        >
-                          <ChevronLeft className="h-4 w-4" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setWorkbookPage((current) =>
-                              Math.min(totalWorkbookPages, current + 1),
-                            )
-                          }
-                          disabled={workbookPage >= totalWorkbookPages}
-                          className="ui-tooltip inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 disabled:opacity-40"
-                          title="下一页"
-                          aria-label="下一页工作簿"
-                          data-tooltip="下一页"
-                        >
-                          <ChevronRight className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-            {folderLoading && (
-              <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-14 text-center text-slate-500">
-                正在加载工作簿...
-              </div>
-            )}
-
-            {folderError && (
-              <div className="rounded-[24px] border border-rose-200 bg-rose-50 px-6 py-6 text-sm font-medium text-rose-700">
-                {folderError}
-              </div>
-            )}
-
-            {!folderLoading &&
-              !folderError &&
-              directoryWorkbooks.length === 0 &&
-              directoryFolders.length === 0 && (
-                <div className="rounded-[24px] border border-dashed border-slate-300 bg-[linear-gradient(180deg,rgba(248,250,252,0.95),rgba(255,255,255,0.98))] px-6 py-14 text-center">
-                  <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-3xl bg-slate-900 text-white">
-                    <FolderKanban className="h-7 w-7" />
-                  </div>
-                  <h3 className="text-2xl font-semibold text-slate-950">
-                    {showOnlyOwnResources
-                      ? "还没有自己的工作簿或文件夹"
-                      : "还没有工作簿"}
-                  </h3>
-                  <p className="mt-3 text-sm leading-7 text-slate-500">
-                    {showOnlyOwnResources
-                      ? "可以新建自己的文件夹或工作簿，关闭筛选后仍可查看其他有权限的资源。"
-                      : "从一个基础业务台账开始，后续可以逐步延展成销售、库存、采购和人事模块。"}
-                  </p>
-                </div>
-              )}
-
-            {!folderLoading &&
-              !folderError &&
-              directoryWorkbooks.length > 0 &&
-              (workbookViewMode === "list" || directoryFolders.length === 0) &&
-              filteredWorkbooks.length === 0 && (
-                <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-14 text-center">
-                  <Search className="mx-auto mb-3 h-8 w-8 text-slate-300" />
-                  <h3 className="text-lg font-semibold text-slate-700">
-                    没有找到匹配的工作簿
-                  </h3>
-                  <p className="mt-2 text-sm text-slate-400">
-                    试试其他关键词，或清除搜索条件查看全部。
-                  </p>
-                </div>
-              )}
-
-            {!folderLoading &&
-              !folderError &&
-              workbookViewMode === "list" &&
-              paginatedWorkbooks.length > 0 && (
-                <div className="space-y-6">
-                  {adminMode && visibleAssignedTaskWorkbooks.length > 0 && (
-                    <div className="rounded-[24px] border border-amber-200 bg-amber-50/80 p-4">
-                      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                        <div>
-                          <div className="text-sm font-semibold text-slate-900">
-                            批量回收任务工作簿
-                          </div>
-                          <div className="mt-1 text-xs leading-6 text-slate-600">
-                            当前页共有 {visibleAssignedTaskWorkbooks.length}{" "}
-                            个任务工作簿，已选{" "}
-                            {selectedReclaimWorkbookIds.length} 个。
-                          </div>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={handleSelectAllVisibleTaskWorkbooks}
-                            className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
-                          >
-                            {visibleAssignedTaskWorkbooks.every((workbook) =>
-                              selectedReclaimWorkbookIds.includes(workbook.id),
-                            ) ? (
-                              <CheckSquare className="h-3.5 w-3.5" />
-                            ) : (
-                              <Square className="h-3.5 w-3.5" />
-                            )}
-                            {visibleAssignedTaskWorkbooks.every((workbook) =>
-                              selectedReclaimWorkbookIds.includes(workbook.id),
-                            )
-                              ? "取消全选当前页"
-                              : "全选当前页任务"}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void handleBatchUpdateWorkbookState("lock")
-                            }
-                            disabled={
-                              batchWorkbookActionLoading ||
-                              selectedReclaimWorkbookIds.length === 0
-                            }
-                            className="rounded-full border border-amber-200 bg-white px-3 py-2 text-xs font-semibold text-amber-700 transition hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            批量锁定
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void handleBatchUpdateWorkbookState("hide")
-                            }
-                            disabled={
-                              batchWorkbookActionLoading ||
-                              selectedReclaimWorkbookIds.length === 0
-                            }
-                            className="rounded-full border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            批量设为不可见
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void handleBatchUpdateWorkbookState("unlock")
-                            }
-                            disabled={
-                              batchWorkbookActionLoading ||
-                              selectedReclaimWorkbookIds.length === 0
-                            }
-                            className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            批量解除锁定
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void handleBatchUpdateWorkbookState("unhide")
-                            }
-                            disabled={
-                              batchWorkbookActionLoading ||
-                              selectedReclaimWorkbookIds.length === 0
-                            }
-                            className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            批量恢复可见
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {workbookGroups.map((group) => (
-                    <div key={group.label || "default"} className="space-y-3">
-                      {group.label && (
-                        <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-                          <Users className="h-4 w-4 text-sky-600" />
-                          {group.label}
-                          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
-                            {group.items.length} 个工作簿
-                          </span>
-                        </div>
-                      )}
-                      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
-                        <div className="overflow-x-auto">
-                          <div className="min-w-[1160px]">
-                            <div className="grid grid-cols-[minmax(340px,1.6fr)_170px_140px_170px_365px] items-center border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-500">
-                              <div>名称</div>
-                              <div>归属 / 状态</div>
-                              <div>创建时间</div>
-                              <div>更新时间</div>
-                              <div className="text-right">操作</div>
-                            </div>
-                            <div className="divide-y divide-slate-100">
-                              {group.items.map((workbook) => (
-                                <div
-                                  key={workbook.id}
-                                  draggable={canManageWorkbook(workbook)}
-                                  onDragStart={(event) =>
-                                    canManageWorkbook(workbook) &&
-                                    handleInternalWorkbookDragStart(
-                                      event,
-                                      workbook.id,
-                                    )
-                                  }
-                                  onDragEnd={handleInternalWorkbookDragEnd}
-                                  onDoubleClick={() =>
-                                    router.push(`/sheets/${workbook.id}`)
-                                  }
-                                  className={`grid grid-cols-[minmax(340px,1.6fr)_170px_140px_170px_365px] items-center gap-3 px-4 py-2.5 text-sm transition ${
-                                    workbook.is_hidden
-                                      ? "bg-slate-50/70 text-slate-500 hover:bg-slate-100"
-                                      : "hover:bg-sky-50/50"
-                                  }`}
-                                >
-                                  <div className="flex min-w-0 items-center gap-3">
-                                    {adminMode &&
-                                      isAssignedTaskWorkbook(workbook) && (
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            toggleReclaimWorkbookSelection(
-                                              workbook.id,
-                                            );
-                                          }}
-                                          className="ui-tooltip inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 transition hover:border-slate-300 hover:bg-slate-50"
-                                          title={
-                                            selectedReclaimWorkbookIds.includes(
-                                              workbook.id,
-                                            )
-                                              ? "取消选择"
-                                              : "选择用于批量回收"
-                                          }
-                                          aria-label={
-                                            selectedReclaimWorkbookIds.includes(
-                                              workbook.id,
-                                            )
-                                              ? `取消选择 ${workbook.name}`
-                                              : `选择 ${workbook.name} 用于批量回收`
-                                          }
-                                          data-tooltip={
-                                            selectedReclaimWorkbookIds.includes(
-                                              workbook.id,
-                                            )
-                                              ? "取消选择"
-                                              : "选择用于批量回收"
-                                          }
-                                          data-tooltip-side="top"
-                                        >
-                                          {selectedReclaimWorkbookIds.includes(
-                                            workbook.id,
-                                          ) ? (
-                                            <CheckSquare className="h-4 w-4" />
-                                          ) : (
-                                            <Square className="h-4 w-4" />
-                                          )}
-                                        </button>
-                                      )}
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        router.push(`/sheets/${workbook.id}`)
-                                      }
-                                      className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                                    >
-                                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-50 text-sky-600">
-                                        <FolderKanban className="h-4 w-4" />
-                                      </span>
-                                      <span className="min-w-0">
-                                        <span className="block truncate font-semibold text-slate-900">
-                                          {workbook.name}
-                                        </span>
-                                        <span className="block truncate text-xs leading-5 text-slate-500">
-                                          {workbook.description?.trim() ||
-                                            `工作簿 #${workbook.id}`}
-                                        </span>
-                                      </span>
-                                    </button>
-                                  </div>
-                                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                                    {adminMode && workbook.owner_name && (
-                                      <span className="max-w-[150px] truncate rounded-full border border-slate-200 bg-white px-2 py-0.5 text-xs font-medium text-slate-600">
-                                        {workbook.owner_name}
-                                      </span>
-                                    )}
-                                    {workbook.is_locked && (
-                                      <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
-                                        <Lock className="h-3 w-3" />
-                                        锁定
-                                      </span>
-                                    )}
-                                    {workbook.is_hidden && (
-                                      <span className="inline-flex items-center gap-1 rounded-full border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
-                                        <EyeOff className="h-3 w-3" />
-                                        不可见
-                                      </span>
-                                    )}
-                                    {workbook.is_public && (
-                                      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                        <Globe2 className="h-3 w-3" />
-                                        公共
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="text-xs text-slate-500">
-                                    {new Date(
-                                      workbook.created_at,
-                                    ).toLocaleDateString("zh-CN")}
-                                  </div>
-                                  <div className="text-xs text-slate-500">
-                                    {new Date(
-                                      workbook.updated_at,
-                                    ).toLocaleString("zh-CN")}
-                                  </div>
-                                  <div className="flex items-center justify-end gap-1.5">
-                                    {currentFolderId !== null &&
-                                      canManageWorkbook(workbook) && (
-                                        <button
-                                          type="button"
-                                          onClick={() =>
-                                            void handleMoveWorkbookToFolder(
-                                              workbook.id,
-                                              null,
-                                            )
-                                          }
-                                          disabled={
-                                            movingWorkbookId === workbook.id
-                                          }
-                                          className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50"
-                                          title="移出当前文件夹到根目录"
-                                        >
-                                          {movingWorkbookId === workbook.id
-                                            ? "移动中"
-                                            : "移出"}
-                                        </button>
-                                      )}
-                                    {canManageWorkbook(workbook) && (
-                                      <button
-                                        type="button"
-                                        onClick={(event) =>
-                                          void handleDuplicateWorkbook(
-                                            event,
-                                            workbook,
-                                          )
-                                        }
-                                        disabled={
-                                          duplicatingWorkbookId !== null
-                                        }
-                                        className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-sky-200 bg-sky-50 text-sky-700 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
-                                        title="复制工作簿"
-                                        aria-label={`复制工作簿 ${workbook.name}`}
-                                        data-tooltip={
-                                          duplicatingWorkbookId === workbook.id
-                                            ? "正在复制工作簿"
-                                            : "复制工作簿"
-                                        }
-                                        data-tooltip-side="top"
-                                      >
-                                        <Copy className="h-3.5 w-3.5" />
-                                      </button>
-                                    )}
-                                    <button
-                                      type="button"
-                                      onClick={(e) =>
-                                        void handleDownloadWorkbookSource(
-                                          e,
-                                          workbook,
-                                        )
-                                      }
-                                      disabled={
-                                        downloadingSourceWorkbookId !== null
-                                      }
-                                      className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
-                                      title={
-                                        hasWorkbookSourceXlsx(workbook)
-                                          ? "下载原始 Excel"
-                                          : "导出 Excel"
-                                      }
-                                      aria-label={`${hasWorkbookSourceXlsx(workbook) ? "下载原始 Excel" : "导出 Excel"} ${workbook.name}`}
-                                      data-tooltip={
-                                        hasWorkbookSourceXlsx(workbook)
-                                          ? "下载原始 Excel"
-                                          : "导出 Excel"
-                                      }
-                                      data-tooltip-side="top"
-                                    >
-                                      <Download className="h-3.5 w-3.5" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        setWhatsAppResource({
-                                          workbookId: workbook.id,
-                                          title: workbook.name,
-                                          defaultContent: `工作簿：${workbook.name}`,
-                                        });
-                                      }}
-                                      className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-emerald-200 bg-white text-emerald-600 transition hover:bg-emerald-50"
-                                      title="发送工作簿到 WhatsApp"
-                                      aria-label={`发送 ${workbook.name} 到 WhatsApp`}
-                                      data-tooltip="发送到 WhatsApp"
-                                      data-tooltip-side="top"
-                                    >
-                                      <MessageCircle className="h-3.5 w-3.5" />
-                                    </button>
-                                    {canManageWorkbook(workbook) && (
-                                      <button
-                                        type="button"
-                                        onClick={(e) =>
-                                          handleUpdateWorkbookState(
-                                            e,
-                                            workbook.id,
-                                            workbook.is_public
-                                              ? "unpublish"
-                                              : "publish",
-                                          )
-                                        }
-                                        className={`ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border transition ${workbook.is_public ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"}`}
-                                        title={
-                                          workbook.is_public
-                                            ? "取消公共访问"
-                                            : "设为公共工作簿"
-                                        }
-                                        aria-label={`${workbook.is_public ? "取消公共访问" : "设为公共工作簿"} ${workbook.name}`}
-                                        data-tooltip={
-                                          workbook.is_public
-                                            ? "取消公共访问"
-                                            : "设为公共工作簿"
-                                        }
-                                        data-tooltip-side="top"
-                                      >
-                                        <Globe2 className="h-3.5 w-3.5" />
-                                      </button>
-                                    )}
-                                    {adminMode && (
-                                      <button
-                                        type="button"
-                                        onClick={(e) =>
-                                          handleUpdateWorkbookState(
-                                            e,
-                                            workbook.id,
-                                            workbook.is_locked
-                                              ? "unlock"
-                                              : "lock",
-                                          )
-                                        }
-                                        className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-amber-200 bg-amber-50 text-amber-700 transition hover:bg-amber-100"
-                                        title={
-                                          workbook.is_locked
-                                            ? "解除工作簿锁定"
-                                            : "锁定工作簿"
-                                        }
-                                        aria-label={`${workbook.is_locked ? "解除锁定" : "锁定"} ${workbook.name}`}
-                                        data-tooltip={
-                                          workbook.is_locked
-                                            ? "解除工作簿锁定"
-                                            : "锁定工作簿"
-                                        }
-                                        data-tooltip-side="top"
-                                      >
-                                        {workbook.is_locked ? (
-                                          <Unlock className="h-3.5 w-3.5" />
-                                        ) : (
-                                          <Lock className="h-3.5 w-3.5" />
-                                        )}
-                                      </button>
-                                    )}
-                                    {adminMode && (
-                                      <button
-                                        type="button"
-                                        onClick={(e) =>
-                                          handleUpdateWorkbookState(
-                                            e,
-                                            workbook.id,
-                                            workbook.is_hidden
-                                              ? "unhide"
-                                              : "hide",
-                                          )
-                                        }
-                                        className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 bg-slate-100 text-slate-600 transition hover:bg-slate-200"
-                                        title={
-                                          workbook.is_hidden
-                                            ? "恢复工作簿可见"
-                                            : "设为不可见"
-                                        }
-                                        aria-label={`${workbook.is_hidden ? "恢复可见" : "设为不可见"} ${workbook.name}`}
-                                        data-tooltip={
-                                          workbook.is_hidden
-                                            ? "恢复工作簿可见"
-                                            : "设为不可见"
-                                        }
-                                        data-tooltip-side="top"
-                                      >
-                                        <EyeOff className="h-3.5 w-3.5" />
-                                      </button>
-                                    )}
-                                    {adminMode && (
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setAssigningWorkbook(workbook);
-                                          setSelectedAssigneeIds([]);
-                                          setAssignmentMessage("");
-                                        }}
-                                        className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-sky-200 bg-sky-50 text-sky-600 transition hover:bg-sky-100"
-                                        title="发放任务"
-                                        aria-label={`发放任务 ${workbook.name}`}
-                                        data-tooltip="发放任务"
-                                        data-tooltip-side="top"
-                                      >
-                                        <UserRoundPlus className="h-3.5 w-3.5" />
-                                      </button>
-                                    )}
-                                    {canManageWorkbook(workbook) && (
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setEditingWorkbook({
-                                            id: workbook.id,
-                                            name: workbook.name,
-                                          });
-                                          setEditWorkbookName(workbook.name);
-                                        }}
-                                        className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
-                                        title="重命名"
-                                        aria-label={`重命名 ${workbook.name}`}
-                                        data-tooltip="重命名工作簿"
-                                        data-tooltip-side="top"
-                                      >
-                                        <PencilLine className="h-3.5 w-3.5" />
-                                      </button>
-                                    )}
-                                    {canManageWorkbook(workbook) &&
-                                      canDeleteWorkbook(workbook) && (
-                                        <button
-                                          type="button"
-                                          onClick={(e) =>
-                                            handleDeleteWorkbook(e, workbook.id)
-                                          }
-                                          className="ui-tooltip inline-flex h-7 w-7 items-center justify-center rounded-lg border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
-                                          title="删除工作簿"
-                                          aria-label={`删除 ${workbook.name}`}
-                                          data-tooltip="删除工作簿"
-                                          data-tooltip-side="top"
-                                        >
-                                          <Trash2 className="h-3.5 w-3.5" />
-                                        </button>
-                                      )}
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        router.push(`/sheets/${workbook.id}`)
-                                      }
-                                      className="inline-flex h-7 items-center gap-1 rounded-lg px-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-50"
-                                    >
-                                      打开
-                                      <ArrowRight className="h-3.5 w-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-
-                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/90 px-4 py-3">
-                    <div className="text-sm text-slate-500">
-                      共 {sortedWorkbooks.length} 个工作簿，当前第{" "}
-                      {workbookPage} / {totalWorkbookPages} 页
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setWorkbookPage((current) => Math.max(1, current - 1))
-                        }
-                        disabled={workbookPage <= 1}
-                        className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        上一页
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setWorkbookPage((current) =>
-                            Math.min(totalWorkbookPages, current + 1),
-                          )
-                        }
-                        disabled={workbookPage >= totalWorkbookPages}
-                        className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        下一页
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-          </section>
-
-          {folderBeingRenamed && (
-            <div
-              className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="rename-folder-title"
-            >
-              <form
-                className="w-full max-w-md rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void handleRenameFolder();
-                }}
-              >
-                <div className="mb-6 flex items-start justify-between gap-4">
-                  <div>
-                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                      Rename Folder
-                    </div>
-                    <h2
-                      id="rename-folder-title"
-                      className="mt-2 text-2xl font-semibold text-slate-950"
-                    >
-                      重命名文件夹
-                    </h2>
-                    <p className="mt-2 text-sm text-slate-500">
-                      修改后，文件夹内的工作簿和共享设置不会改变。
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={closeFolderRenameDialog}
-                    disabled={folderRenameSaving}
-                    className="ui-tooltip rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
-                    title="关闭重命名"
-                    aria-label="关闭重命名"
-                    data-tooltip="关闭"
-                    data-tooltip-side="left"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-
-                <label
-                  htmlFor="folder-rename-name"
-                  className="mb-2 block text-sm font-semibold text-slate-700"
-                >
-                  文件夹名称
-                </label>
-                <input
-                  id="folder-rename-name"
-                  type="text"
-                  value={folderRenameName}
-                  onChange={(event) => {
-                    setFolderRenameName(event.target.value);
-                    if (folderRenameError) setFolderRenameError("");
-                  }}
-                  maxLength={256}
-                  disabled={folderRenameSaving}
-                  className="h-11 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100 disabled:cursor-not-allowed disabled:opacity-60"
-                  autoFocus
-                />
-                <div className="mt-2 flex min-h-5 items-start justify-between gap-3 text-xs">
-                  <span className="text-rose-600">{folderRenameError}</span>
-                  <span className="flex-shrink-0 text-slate-400">
-                    {[...folderRenameName].length}/256
-                  </span>
-                </div>
-
-                <div className="mt-5 flex justify-end gap-3">
-                  <button
-                    type="button"
-                    onClick={closeFolderRenameDialog}
-                    disabled={folderRenameSaving}
-                    className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={folderRenameSaving || !folderRenameName.trim()}
-                    className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {folderRenameSaving ? "保存中..." : "保存名称"}
-                  </button>
-                </div>
-              </form>
-            </div>
-          )}
-
-          {sharingFolder && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">
-              <div className="w-full max-w-2xl rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8">
-                <div className="mb-6 flex items-start justify-between gap-4">
-                  <div>
-                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                      Folder Sharing
-                    </div>
-                    <h2 className="mt-2 text-2xl font-semibold text-slate-950">
-                      共享文件夹
-                    </h2>
-                    <p className="mt-2 text-sm text-slate-500">
-                      文件夹「{sharingFolder.name}
-                      」默认仅创建者和管理员可见。你可以按用户分别设置为只读共享或可写共享。
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSharingFolder(null);
-                      setShareableUsers([]);
-                      setSelectedShares({});
-                      setShareMessage("");
-                    }}
-                    className="ui-tooltip rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                    title="关闭共享设置"
-                    aria-label="关闭共享设置"
-                    data-tooltip="关闭"
-                    data-tooltip-side="left"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-
-                {shareMessage && (
-                  <div className="mb-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium text-sky-700">
-                    {shareMessage}
-                  </div>
-                )}
-
-                <div className="max-h-[380px] space-y-3 overflow-y-auto pr-1">
-                  {shareLoading ? (
-                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
-                      正在加载可共享用户...
-                    </div>
-                  ) : shareableUsers.length === 0 ? (
-                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
-                      当前没有可共享的启用账号。
-                    </div>
-                  ) : (
-                    shareableUsers.map((user) => {
-                      const accessLevel = selectedShares[user.id];
-                      const checked = Boolean(accessLevel);
-
-                      return (
-                        <label
-                          key={user.id}
-                          className={`flex cursor-pointer items-center gap-3 rounded-2xl border px-4 py-3 transition ${
-                            checked
-                              ? "border-sky-200 bg-sky-50"
-                              : "border-slate-200 bg-slate-50/60 hover:bg-white"
-                          }`}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(event) => {
-                              setSelectedShares((current) => {
-                                const next = { ...current };
-                                if (event.target.checked) {
-                                  next[user.id] = next[user.id] || "view";
-                                } else {
-                                  delete next[user.id];
-                                }
-                                return next;
-                              });
-                            }}
-                            className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="font-semibold text-slate-900">
-                              {user.username}
-                            </div>
-                            <div className="truncate text-sm text-slate-500">
-                              {user.email}
-                            </div>
-                          </div>
-                          <select
-                            value={accessLevel || "view"}
-                            disabled={!checked}
-                            onChange={(event) => {
-                              const value = event.target.value as
-                                | "view"
-                                | "edit";
-                              setSelectedShares((current) => ({
-                                ...current,
-                                [user.id]: value,
-                              }));
-                            }}
-                            className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            <option value="view">只读共享</option>
-                            <option value="edit">可写共享</option>
-                          </select>
-                        </label>
-                      );
-                    })
-                  )}
-                </div>
-
-                <div className="mt-6 flex items-center justify-between gap-3">
-                  <div className="text-sm text-slate-500">
-                    已共享给 {Object.keys(selectedShares).length} 位用户
-                  </div>
-                  <div className="flex gap-3">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSharingFolder(null);
-                        setShareableUsers([]);
-                        setSelectedShares({});
-                        setShareMessage("");
-                      }}
-                      className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                    >
-                      关闭
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleSaveFolderShares}
-                      disabled={shareSaving || shareLoading || shareLoadFailed}
-                      className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {shareSaving ? "保存中..." : "保存共享设置"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {assigningWorkbook && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">
-              <div className="w-full max-w-2xl rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8">
-                <div className="mb-6 flex items-start justify-between gap-4">
-                  <div>
-                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                      Task Assignment
-                    </div>
-                    <h2 className="mt-2 text-2xl font-semibold text-slate-950">
-                      发放任务工作簿
-                    </h2>
-                    <p className="mt-2 text-sm text-slate-500">
-                      将工作簿「{assigningWorkbook.name}
-                      」复制给选中的员工，作为待执行任务模板。
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAssigningWorkbook(null);
-                      setSelectedAssigneeIds([]);
-                    }}
-                    className="ui-tooltip rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                    title="关闭任务发放"
-                    aria-label="关闭任务发放"
-                    data-tooltip="关闭"
-                    data-tooltip-side="left"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-
-                {assignmentMessage && (
-                  <div className="mb-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium text-sky-700">
-                    {assignmentMessage}
-                  </div>
-                )}
-
-                <div className="max-h-[380px] space-y-3 overflow-y-auto pr-1">
-                  {assignableUsers.map((user) => {
-                    const checked = selectedAssigneeIds.includes(user.id);
-
-                    return (
-                      <label
-                        key={user.id}
-                        className={`flex cursor-pointer items-center gap-3 rounded-2xl border px-4 py-3 transition ${
-                          checked
-                            ? "border-sky-200 bg-sky-50"
-                            : "border-slate-200 bg-slate-50/60 hover:bg-white"
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={(event) => {
-                            setSelectedAssigneeIds((current) =>
-                              event.target.checked
-                                ? [...current, user.id]
-                                : current.filter((id) => id !== user.id),
-                            );
-                          }}
-                          className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                        />
-                        <div className="min-w-0 flex-1">
-                          <div className="font-semibold text-slate-900">
-                            {user.username}
-                          </div>
-                          <div className="truncate text-sm text-slate-500">
-                            {user.email}
-                          </div>
-                        </div>
-                      </label>
-                    );
-                  })}
-                  {assignableUsers.length === 0 && (
-                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
-                      暂无可发放任务的员工账号。
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-6 flex items-center justify-between gap-3">
-                  <div className="text-sm text-slate-500">
-                    已选择 {selectedAssigneeIds.length} 位员工
-                  </div>
-                  <div className="flex gap-3">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setAssigningWorkbook(null);
-                        setSelectedAssigneeIds([]);
-                      }}
-                      className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleAssignWorkbook}
-                      disabled={
-                        assignmentLoading || selectedAssigneeIds.length === 0
-                      }
-                      className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {assignmentLoading ? "发放中..." : "发放任务"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Rename Workbook Dialog */}
-          {editingWorkbook && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">
-              <div className="w-full max-w-md rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8">
-                <div className="mb-6">
-                  <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                    Rename
-                  </div>
-                  <h2 className="mt-2 text-2xl font-semibold text-slate-950">
-                    重命名工作簿
-                  </h2>
-                </div>
-                <div>
-                  <label className="mb-2 block text-sm font-semibold text-slate-700">
-                    工作簿名称
-                  </label>
-                  <input
-                    type="text"
-                    value={editWorkbookName}
-                    onChange={(e) => setEditWorkbookName(e.target.value)}
-                    onKeyDown={(e) =>
-                      e.key === "Enter" && handleRenameWorkbook()
-                    }
-                    className="h-11 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
-                    autoFocus
-                  />
-                </div>
-                <div className="mt-6 flex justify-end gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setEditingWorkbook(null)}
-                    className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRenameWorkbook}
-                    className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
-                  >
-                    保存
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-          <WhatsAppSendDialog
-            open={Boolean(whatsAppResource)}
-            resource={whatsAppResource}
-            onClose={() => setWhatsAppResource(null)}
-          />
-        </div>
+          {appsSection}
+          {quickAccessStrip}
+          <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
+            {browserSection}
+            {aside}
+          </div>
+        </main>
+        {selectionBar}
+        {fab}
+        {toast}
+        {dialogs}
       </div>
     </AuthGuard>
   );

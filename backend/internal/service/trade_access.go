@@ -8,22 +8,6 @@ import (
 	"yaerp/internal/model"
 )
 
-var tradeSheetNames = []string{
-	"订单总览", "询价明细", "供应商询价", "报价单", "采购跟进",
-	"仓库到货", "质检记录", "装箱清单", "发货跟踪",
-}
-
-var tradePrimarySheetByStage = map[string]string{
-	model.TradeStageInquiry:       "询价明细",
-	model.TradeStageSupplierQuote: "供应商询价",
-	model.TradeStageQuotation:     "报价单",
-	model.TradeStagePurchase:      "采购跟进",
-	model.TradeStageReceiving:     "仓库到货",
-	model.TradeStageInspection:    "质检记录",
-	model.TradeStagePacking:       "装箱清单",
-	model.TradeStageShipment:      "发货跟踪",
-}
-
 type tradeUserAccess struct {
 	profile       model.TradeAccessProfile
 	positionCodes map[string]bool
@@ -139,7 +123,10 @@ func tradeOrderScopeStages(access *tradeUserAccess) []string {
 }
 
 func tradeCustomerAccessScope(full, owner, currentTask bool, codes map[string]bool) (bool, bool, bool) {
-	customerTask := currentTask && (codes["sales"] || codes["quotation"])
+	// Sales colleagues share the inquiry stage, so a sales seat alone must not
+	// reveal another salesperson's customer; only the owner or the quotation
+	// desk working the current task may see it.
+	customerTask := currentTask && codes["quotation"]
 	allowed := full || owner || customerTask
 	return allowed, allowed, allowed
 }
@@ -184,12 +171,15 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		full, owner, access.stageAccess[order.Stage], codes,
 	)
 	canViewSupplier, canViewSupplierPricing := tradeSupplierAccessScope(full, order.Stage, codes)
+	// Seeing both the selling price and the purchase cost reveals the margin,
+	// which is reserved for admins and the manager position.
+	if !full && canViewCustomerPricing {
+		canViewSupplierPricing = false
+	}
 	canViewPayments, canViewAllPayments, canUploadPaymentProofs, canManagePaymentStatus := tradePaymentRecordScope(
 		full, owner, access.stageAccess[order.Stage], access.profile.PaymentRecordAccess,
 	)
 	result := &model.TradeOrderAccess{
-		VisibleSheetNames:        []string{},
-		EditableSheetNames:       []string{},
 		CanViewCustomer:          canViewCustomer,
 		CanViewCustomerContact:   canViewCustomerContact,
 		CanViewCustomerPricing:   canViewCustomerPricing,
@@ -201,7 +191,6 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		CanViewShipment:          full || owner || codes["sales"] || codes["logistics"],
 		CanViewProfit:            full,
 		CanViewTimeline:          full || owner || access.profile.CanViewOrderProgress,
-		CanSyncWorkbook:          full,
 		CanViewPI:                full || owner,
 		CanGeneratePI:            full || owner,
 		CanViewPaymentRecords:    canViewPayments,
@@ -220,51 +209,6 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		result.ScopeLabel = "流程进度可见：详细数据按岗位权限隐藏"
 	}
 
-	visible := map[string]bool{"订单总览": true}
-	if full {
-		for _, name := range tradeSheetNames {
-			visible[name] = true
-		}
-	} else {
-		if owner || codes["sales"] {
-			visible["询价明细"] = true
-			visible["报价单"] = true
-			visible["发货跟踪"] = true
-		}
-		if codes["sourcing"] {
-			visible["询价明细"] = true
-			visible["供应商询价"] = true
-		}
-		if codes["quotation"] {
-			visible["询价明细"] = true
-			visible["供应商询价"] = true
-			visible["报价单"] = true
-		}
-		if codes["purchasing"] {
-			visible["供应商询价"] = true
-			visible["采购跟进"] = true
-		}
-		if codes["warehouse"] {
-			visible["仓库到货"] = true
-		}
-		if codes["quality"] {
-			visible["仓库到货"] = true
-			visible["质检记录"] = true
-		}
-		if codes["packing"] {
-			visible["质检记录"] = true
-			visible["装箱清单"] = true
-		}
-		if codes["logistics"] {
-			visible["装箱清单"] = true
-			visible["发货跟踪"] = true
-		}
-	}
-	for _, name := range tradeSheetNames {
-		if visible[name] {
-			result.VisibleSheetNames = append(result.VisibleSheetNames, name)
-		}
-	}
 	canOperate := full
 	if !full {
 		var err error
@@ -276,13 +220,9 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	earlyStage := order.Stage == model.TradeStageInquiry || order.Stage == model.TradeStageSupplierQuote || order.Stage == model.TradeStageQuotation
 	activeStage := order.Stage != model.TradeStageCompleted && order.Stage != model.TradeStageCancelled
 	result.CanAddItems = activeStage && (full || (earlyStage && (owner || canOperate)))
-	if full {
-		result.EditableSheetNames = append(result.EditableSheetNames, tradeSheetNames...)
-	} else if primary := tradePrimarySheetByStage[order.Stage]; primary != "" {
-		if canOperate && visible[primary] {
-			result.EditableSheetNames = []string{primary}
-		}
-	}
+	// Inquiry images are what the customer sent; real goods photos are taken
+	// at inspection through the inspection-photo flow.
+	result.CanManageItemImages = activeStage && (full || (earlyStage && (owner || canOperate)))
 	return result, nil
 }
 
@@ -375,15 +315,6 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.AISourceText = ""
 	}
 	order.Access = orderAccess
-	if order.WorkbookID != nil {
-		if sheetID, sheetErr := s.repo.FirstSheetIDByNames(*order.WorkbookID, orderAccess.VisibleSheetNames); sheetErr == nil {
-			order.WorkbookSheetID = &sheetID
-		} else if errors.Is(sheetErr, sql.ErrNoRows) {
-			order.WorkbookSheetID = nil
-		} else {
-			return sheetErr
-		}
-	}
 	if !orderAccess.CanViewCustomer {
 		order.CustomerID = 0
 		order.CustomerName = "受限客户"
@@ -399,9 +330,15 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	}
 	redactTradePaymentRecords(userID, order.CustomerQuotes, orderAccess)
 	redactTradePIBankImages(order.CustomerQuotes, orderAccess)
-	if !orderAccess.CanViewSupplierPricing {
+	if !orderAccess.CanViewProfit {
 		for index := range order.CustomerQuotes {
 			order.CustomerQuotes[index].ProfitMarginPercent = 0
+		}
+		if order.Shipment != nil {
+			order.Shipment.ActualFreightCurrency = ""
+			order.Shipment.ActualFreightAmount = 0
+			order.Shipment.ActualFreightToCNYRate = 0
+			order.Shipment.ActualFreightNotes = ""
 		}
 	}
 	if !orderAccess.CanViewCustomerPricing {
@@ -451,6 +388,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 			quote := &order.SupplierQuotes[index]
 			quote.Currency = ""
 			quote.UnitPrice = 0
+			quote.Notes = ""
 		}
 	}
 	for index := range order.Items {
@@ -480,6 +418,15 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 			item.NetWeight = 0
 		}
 		redactTradeWorkflowData(item, orderAccess)
+		if !orderAccess.CanViewInspection && len(item.Images) > 0 {
+			inquiryImages := item.Images[:0]
+			for _, image := range item.Images {
+				if image.Source == "inquiry" {
+					inquiryImages = append(inquiryImages, image)
+				}
+			}
+			item.Images = inquiryImages
+		}
 	}
 	if orderAccess.CanViewTimeline && !access.profile.CanViewAllOrders && order.OwnerID != userID {
 		redactTradeTimelineDetails(order.Events, order.Stage, access.stageAccess[order.Stage])
@@ -592,66 +539,6 @@ func redactTradeCustomerContact(customer *model.TradeCustomer) {
 	customer.Notes = ""
 }
 
-func (s *TradeService) TradeSheetPermissionMatrix(userID, sheetID int64) (bool, *model.PermissionMatrix, error) {
-	orderID, sheetName, err := s.repo.FindOrderBySheetID(sheetID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil, nil
-	}
-	if err != nil {
-		return true, nil, err
-	}
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
-		return true, nil, err
-	}
-	userAccess, err := s.loadTradeUserAccess(userID)
-	if err != nil {
-		return true, nil, err
-	}
-	if !s.canViewTradeOrder(userID, order, userAccess) {
-		return true, emptyPermissionMatrix(), nil
-	}
-	orderAccess, err := s.orderAccessForUser(userID, order, userAccess)
-	if err != nil {
-		return true, nil, err
-	}
-	if !containsTradeLabel(orderAccess.VisibleSheetNames, sheetName) {
-		return true, emptyPermissionMatrix(), nil
-	}
-	canEdit := containsTradeLabel(orderAccess.EditableSheetNames, sheetName)
-	matrix := emptyPermissionMatrix()
-	matrix.Sheet = model.SheetPerm{CanView: true, CanEdit: canEdit, CanExport: true}
-	matrix.DefaultPermission = "read"
-	applyTradeSheetWriteScope(matrix, sheetName, canEdit)
-	applyTradeSheetColumnScope(matrix, sheetName, orderAccess)
-	sheet, sheetErr := s.sheetRepo.GetSheet(sheetID)
-	if sheetErr != nil {
-		return true, nil, sheetErr
-	}
-	applySheetStateToPermissionMatrix(sheet, matrix)
-	return true, matrix, nil
-}
-
-func applyTradeSheetWriteScope(matrix *model.PermissionMatrix, sheetName string, canEdit bool) {
-	if matrix == nil || !canEdit {
-		return
-	}
-	writable := map[string][]string{
-		"订单总览":  {"priority", "currency", "destination_country", "destination_port", "quote_deadline", "payment_method", "additional_cost", "additional_cost_notes", "notes"},
-		"询价明细":  {"sku", "product_name", "specification", "quantity", "unit", "target_price", "customer_notes", "status"},
-		"供应商询价": {"supplier", "currency", "unit_price", "moq", "lead_time_days", "valid_until", "selected", "notes"},
-		"报价单":   {"unit_price", "quote_status"},
-		"采购跟进":  {"supplier", "purchase_currency", "purchase_price", "cost_exchange_rate", "purchase_status"},
-		"仓库到货":  {"received_qty", "warehouse_location", "received_date", "receipt_status"},
-		"质检记录":  {"sample_qty", "passed_qty", "result", "issue", "inspector", "inspection_date"},
-		"装箱清单":  {"carton_no", "quantity", "carton_count", "carton_size", "gross_weight", "net_weight", "marks"},
-		"发货跟踪":  {"booking_no", "carrier", "vessel_flight", "etd", "eta", "bl_no", "shipping_status", "actual_freight_currency", "actual_freight_amount", "actual_freight_to_cny_rate", "actual_freight_notes", "notes"},
-	}
-	for _, column := range writable[sheetName] {
-		matrix.Columns[column] = "write"
-	}
-}
-
 func redactTradeWorkflowData(item *model.TradeOrderItem, access *model.TradeOrderAccess) {
 	if item == nil || item.WorkflowData == nil || access == nil {
 		return
@@ -676,112 +563,4 @@ func redactTradeWorkflowData(item *model.TradeOrderItem, access *model.TradeOrde
 	if len(item.WorkflowData) == 0 {
 		item.WorkflowData = nil
 	}
-}
-
-func applyTradeSheetColumnScope(matrix *model.PermissionMatrix, sheetName string, access *model.TradeOrderAccess) {
-	if matrix == nil || access == nil {
-		return
-	}
-	if sheetName == "询价明细" && !access.CanViewCustomerPricing {
-		matrix.Columns["target_price"] = "none"
-	}
-	if sheetName == "供应商询价" {
-		if !access.CanViewSupplier {
-			matrix.Columns["supplier"] = "none"
-		}
-		if !access.CanViewSupplierPricing {
-			matrix.Columns["currency"] = "none"
-			matrix.Columns["unit_price"] = "none"
-		}
-		return
-	}
-	if sheetName == "采购跟进" {
-		if !access.CanViewSupplier {
-			matrix.Columns["supplier"] = "none"
-		}
-		if !access.CanViewSupplierPricing {
-			for _, column := range []string{"supplier_quote", "purchase_currency", "purchase_price", "cost_exchange_rate"} {
-				matrix.Columns[column] = "none"
-			}
-		}
-		return
-	}
-	if sheetName != "订单总览" {
-		return
-	}
-	allowed := map[string]bool{
-		"order_no": true, "stage": true, "priority": true, "owner": true, "stage_updated_at": true,
-	}
-	if access.CanViewCustomer {
-		allowed["customer"] = true
-	}
-	if access.CanViewCustomerPricing || access.CanViewSupplierPricing {
-		allowed["currency"] = true
-		allowed["quote_deadline"] = true
-		allowed["payment_method"] = true
-	}
-	if access.CanViewCustomerPricing {
-		allowed["goods_amount"] = true
-		allowed["quoted_freight"] = true
-		allowed["quote_exchange_rate_cny"] = true
-	}
-	if access.CanViewProfit {
-		allowed["sales_amount"] = true
-		allowed["product_cost"] = true
-		allowed["actual_freight"] = true
-		allowed["freight_profit"] = true
-		allowed["additional_cost"] = true
-		allowed["gross_profit"] = true
-		allowed["profit_margin"] = true
-		allowed["profit_cny"] = true
-		allowed["additional_cost_notes"] = true
-	}
-	if access.CanViewCustomer || access.CanViewShipment {
-		allowed["destination_country"] = true
-		allowed["destination_port"] = true
-	}
-	if access.CanViewCustomerContact {
-		allowed["notes"] = true
-	}
-	for _, column := range []string{
-		"order_no", "customer", "stage", "priority", "owner", "currency", "destination_country",
-		"destination_port", "quote_deadline", "payment_method", "goods_amount", "quoted_freight",
-		"quote_exchange_rate_cny", "sales_amount", "product_cost", "actual_freight", "freight_profit",
-		"additional_cost", "gross_profit", "profit_margin", "profit_cny", "additional_cost_notes", "stage_updated_at", "notes",
-	} {
-		if !allowed[column] {
-			matrix.Columns[column] = "none"
-		}
-	}
-}
-
-func (s *TradeService) TradeWorkbookPermission(userID, workbookID int64, action string) (bool, bool, error) {
-	orderID, err := s.repo.FindOrderByWorkbookID(workbookID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, false, nil
-	}
-	if err != nil {
-		return true, false, err
-	}
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
-		return true, false, err
-	}
-	access, err := s.loadTradeUserAccess(userID)
-	if err != nil {
-		return true, false, err
-	}
-	if action == "manage" {
-		return true, access.profile.CanViewAllOrders, nil
-	}
-	return true, s.canViewTradeOrder(userID, order, access), nil
-}
-
-func containsTradeLabel(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
 }

@@ -11,3 +11,4 @@ ui_pkg_062
 .git
 .gitignore
 Dockerfile
+.next-*

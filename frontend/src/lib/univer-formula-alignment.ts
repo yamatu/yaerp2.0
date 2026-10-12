@@ -1,7 +1,16 @@
 import type { IRange } from '@univerjs/core'
 import { ICommandService } from '@univerjs/core'
-import { InsertRangeMoveDownCommand, InsertRangeMoveRightCommand } from '@univerjs/sheets'
+import { DeleteRangeMoveUpCommand, InsertRangeMoveDownCommand, InsertRangeMoveRightCommand } from '@univerjs/sheets'
 import { LexerTreeBuilder } from '@univerjs/engine-formula'
+import {
+  findInconsistentFormulaColumns,
+  groupRepairsIntoRuns,
+  planVerticalShiftRepairs,
+  type FormulaGrid,
+  type FormulaRepair,
+  type InconsistentColumnResult,
+  type MoveFormula,
+} from './univer-formula-consistency'
 
 /**
  * "Insert cells and shift down / shift right" (`下移` / `右移`) only moves the
@@ -30,7 +39,7 @@ import { LexerTreeBuilder } from '@univerjs/engine-formula'
  * - one-off formulas (`=SUM(E2:E5)`, subtotals, lookups, ...) do not match a
  *   uniform column pattern and are left alone.
  */
-export type CellShiftDirection = 'down' | 'right'
+export type CellShiftDirection = 'down' | 'right' | 'up'
 
 export type CellShiftCommand = { range: IRange; direction: CellShiftDirection }
 
@@ -74,7 +83,9 @@ export function readCellShiftCommand(
       ? 'down'
       : commandId === InsertRangeMoveRightCommand.id
         ? 'right'
-        : null
+        : commandId === DeleteRangeMoveUpCommand.id
+          ? 'up'
+          : null
   if (!direction) return null
 
   // The context menu dispatches these commands without params: the handler
@@ -147,27 +158,41 @@ export function registerCellShiftFormulaRepair(
     const commandService = getInjector(univer)?.get<CommandServiceLike | null | undefined>(ICommandService)
     if (!commandService || typeof commandService.onCommandExecuted !== 'function') return null
 
-    const pendingShifts = new Map<string, CellShiftCommand>()
-    const shiftCommandIds = new Set<string>([InsertRangeMoveDownCommand.id, InsertRangeMoveRightCommand.id])
+    const pendingShifts = new Map<string, { shift: CellShiftCommand; before: VerticalShiftCapture | null }>()
+    const shiftCommandIds = new Set<string>([
+      InsertRangeMoveDownCommand.id,
+      InsertRangeMoveRightCommand.id,
+      DeleteRangeMoveUpCommand.id,
+    ])
 
     const before = commandService.beforeCommandExecuted?.((info) => {
       const commandId = info?.id ?? ''
       // Checked first: `beforeCommandExecuted` fires for every mutation, and a
       // large paste dispatches thousands of them.
       if (!shiftCommandIds.has(commandId)) return
-      const shift = readCellShiftCommand(commandId, info?.params, readSelectedRange(resolveSheet()))
-      if (shift) pendingShifts.set(commandId, shift)
+      const sheet = resolveSheet()
+      const shift = readCellShiftCommand(commandId, info?.params, readSelectedRange(sheet as FormulaSelectionSheetLike))
+      if (!shift) return
+      // Vertical shifts are repaired from a before/after comparison, so the
+      // formulas have to be read while the sheet still holds the old layout.
+      const capture = shift.direction === 'right' ? null : captureVerticalShift(sheet, shift)
+      pendingShifts.set(commandId, { shift, before: capture })
     })
 
     const after = commandService.onCommandExecuted((info) => {
       const commandId = info?.id ?? ''
-      const shift = pendingShifts.get(commandId)
-      if (!shift) return
+      const pending = pendingShifts.get(commandId)
+      if (!pending) return
       pendingShifts.delete(commandId)
       // Run right after the mutations of the shift are applied, but still well
       // inside the save debounce so the repair is persisted together with it.
       window.setTimeout(() => {
-        const repaired = realignShiftedCellFormulas(resolveSheet(), shift)
+        const sheet = resolveSheet()
+        const repaired = pending.before
+          ? repairVerticalShift(sheet, pending.shift, pending.before)
+          : pending.shift.direction === 'up'
+            ? 0
+            : realignShiftedCellFormulas(sheet, pending.shift)
         if (repaired > 0) onRepaired?.(repaired)
       }, 0)
     })
@@ -289,4 +314,143 @@ export function realignShiftedCellFormulas(
   }
 
   return repaired
+}
+
+/** Facade methods used to read a block of formulas and the used area. */
+type FormulaGridSheetLike = FormulaSheetLike & {
+  getMaxRows?: () => number
+  getMaxColumns?: () => number
+  getDataRange?: () => { getLastRow?: () => number; getLastColumn?: () => number } | null | undefined
+}
+
+/** Formulas of the band a vertical shift touches, read before it ran. */
+export type VerticalShiftCapture = { grid: FormulaGrid; lastRow: number; lastColumn: number }
+
+/** Rows x columns read for one repair; larger sheets fall back to no repair. */
+const MAX_CAPTURED_CELLS = 1_500_000
+
+function createMove(): MoveFormula | null {
+  try {
+    const lexer = new LexerTreeBuilder()
+    return (formula, columnOffset, rowOffset) => lexer.moveFormulaRefOffset(formula, columnOffset, rowOffset)
+  } catch {
+    return null
+  }
+}
+
+function readUsedExtent(sheet: FormulaGridSheetLike) {
+  let lastRow = 0
+  let lastColumn = 0
+  try {
+    const used = sheet.getDataRange?.()
+    lastRow = Math.max(0, Math.floor(Number(used?.getLastRow?.() ?? 0)) || 0)
+    lastColumn = Math.max(0, Math.floor(Number(used?.getLastColumn?.() ?? 0)) || 0)
+  } catch {
+    // Fall back to the grid size below.
+  }
+  const maxRows = Math.floor(Number(sheet.getMaxRows?.() ?? 0)) || lastRow + 1
+  const maxColumns = Math.floor(Number(sheet.getMaxColumns?.() ?? 0)) || lastColumn + 1
+  return {
+    lastRow: Math.min(lastRow, maxRows - 1),
+    lastColumn: Math.min(lastColumn, maxColumns - 1),
+    maxRows,
+    maxColumns,
+  }
+}
+
+/** Reads `formulas[row][column]` of a block (`''` where a cell has none). */
+export function readFormulaGrid(
+  sheet: FormulaSheetLike | null | undefined,
+  top: number,
+  bottom: number,
+  left: number,
+  right: number
+): FormulaGrid | null {
+  if (!sheet || bottom < top || right < left) return null
+  try {
+    const range = sheet.getRange(top, left, bottom - top + 1, right - left + 1) as FormulaRangeLike & {
+      getFormulas?: () => unknown
+    }
+    const formulas = normalizeMatrix(range.getFormulas?.(), bottom - top + 1, right - left + 1)
+    return { top, left, formulas }
+  } catch {
+    return null
+  }
+}
+
+function captureVerticalShift(sheet: FormulaSheetLike | null | undefined, shift: CellShiftCommand): VerticalShiftCapture | null {
+  if (!sheet) return null
+  const grid = sheet as FormulaGridSheetLike
+  const extent = readUsedExtent(grid)
+  const lastRow = Math.max(extent.lastRow, shift.range.endRow)
+  const lastColumn = Math.max(extent.lastColumn, shift.range.endColumn)
+  const top = Math.max(0, shift.range.startRow - 1)
+  if ((lastRow - top + 1) * (lastColumn + 1) > MAX_CAPTURED_CELLS) return null
+  const before = readFormulaGrid(sheet, top, lastRow, 0, lastColumn)
+  return before ? { grid: before, lastRow, lastColumn } : null
+}
+
+/** Writes repairs run by run; returns the number of rewritten cells. */
+export function applyFormulaRepairs(sheet: FormulaSheetLike | null | undefined, repairs: FormulaRepair[]): number {
+  if (!sheet || repairs.length === 0) return 0
+  let written = 0
+  groupRepairsIntoRuns(repairs).forEach((run) => {
+    try {
+      const range = sheet.getRange(run.startRow, run.column, run.formulas.length, 1) as FormulaRangeLike & {
+        setValues?: (values: Array<Array<{ f: string }>>) => unknown
+      }
+      if (typeof range.setValues === 'function') {
+        range.setValues(run.formulas.map((formula) => [{ f: formula }]))
+      } else {
+        run.formulas.forEach((formula, index) => sheet.getRange(run.startRow + index, run.column, 1, 1).setValue({ f: formula }))
+      }
+      written += run.formulas.length
+    } catch (error) {
+      console.warn('Failed to rewrite shifted formulas:', error)
+    }
+  })
+  return written
+}
+
+function repairVerticalShift(
+  sheet: FormulaSheetLike | null | undefined,
+  shift: CellShiftCommand,
+  capture: VerticalShiftCapture
+): number {
+  if (!sheet || (shift.direction !== 'down' && shift.direction !== 'up')) return 0
+  const move = createMove()
+  if (!move) return 0
+  const extent = readUsedExtent(sheet as FormulaGridSheetLike)
+  const count = shift.range.endRow - shift.range.startRow + 1
+  const bottom = Math.min(extent.maxRows - 1, capture.lastRow + (shift.direction === 'down' ? count : 0))
+  const after = readFormulaGrid(sheet, capture.grid.top, bottom, 0, capture.lastColumn)
+  if (!after) return 0
+  const repairs = planVerticalShiftRepairs(
+    capture.grid,
+    after,
+    {
+      direction: shift.direction,
+      startRow: shift.range.startRow,
+      endRow: shift.range.endRow,
+      startColumn: shift.range.startColumn,
+      endColumn: shift.range.endColumn,
+    },
+    move
+  )
+  return applyFormulaRepairs(sheet, repairs)
+}
+
+/**
+ * Scans the used area for fill-down formula columns in which some cells
+ * reference another row (or `#REF!`). The editor offers to repair them.
+ */
+export function scanInconsistentFormulaColumns(sheet: FormulaSheetLike | null | undefined): InconsistentColumnResult | null {
+  if (!sheet) return null
+  const move = createMove()
+  if (!move) return null
+  const extent = readUsedExtent(sheet as FormulaGridSheetLike)
+  if ((extent.lastRow + 1) * (extent.lastColumn + 1) > MAX_CAPTURED_CELLS) return null
+  const grid = readFormulaGrid(sheet, 0, extent.lastRow, 0, extent.lastColumn)
+  if (!grid) return null
+  return findInconsistentFormulaColumns(grid, move)
 }

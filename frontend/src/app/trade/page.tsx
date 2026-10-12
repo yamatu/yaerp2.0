@@ -6,10 +6,12 @@ import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   BarChart3,
+  BookOpen,
   Bot,
   Boxes,
   BriefcaseBusiness,
   Calculator,
+  Camera,
   CalendarDays,
   Check,
   ChevronDown,
@@ -23,7 +25,6 @@ import {
   Download,
   Eye,
   FileText,
-  FileSpreadsheet,
   History,
   ImagePlus,
   Images,
@@ -58,12 +59,23 @@ import {
 import { AuthGuard } from "@/components/auth/AuthGuard";
 import { CurrencySearchEnhancer } from "@/components/trade/CurrencyCombobox";
 import { CustomerCombobox } from "@/components/trade/CustomerCombobox";
-import { FolderCombobox } from "@/components/trade/FolderCombobox";
-import { OrderItemCombobox } from "@/components/trade/OrderItemCombobox";
+import {
+  OrderItemsEditor,
+  isFilledOrderItem,
+  newOrderItem,
+  orderItemPayload,
+  type OrderItemDraft,
+} from "@/components/trade/OrderItemsEditor";
 import { PackingGroupsModal } from "@/components/trade/PackingGroupsModal";
 import { PaymentProofPanel } from "@/components/trade/PaymentProofPanel";
+import { PhotoCaptureSheet } from "@/components/trade/PhotoCaptureSheet";
+import { QuoteHistoryView } from "@/components/trade/QuoteHistoryView";
 import { StageFlowActions } from "@/components/trade/StageFlowActions";
-import { SupplierCombobox } from "@/components/trade/SupplierCombobox";
+import {
+  SupplierQuoteBatchModal,
+  isFilledSupplierQuote,
+  type SupplierQuoteDraft,
+} from "@/components/trade/SupplierQuoteBatchModal";
 import { WhatsAppAvatarImage } from "@/components/whatsapp/WhatsAppAvatarImage";
 import api from "@/lib/api";
 import { getStoredUser, isAdmin } from "@/lib/auth";
@@ -98,7 +110,6 @@ import type {
   TradeSettings,
   TradeStage,
   TradeSupplier,
-  FolderOption,
   User,
   WhatsAppAccount,
   WhatsAppChat,
@@ -131,17 +142,6 @@ interface CustomerDraft {
   whatsapp_chat_id: string;
   whatsapp_chat_name: string;
   avatar_url: string;
-  workbook_folder_id?: number;
-}
-
-interface OrderItemDraft {
-  sku: string;
-  product_name: string;
-  specification: string;
-  quantity: string;
-  unit: string;
-  target_price: string;
-  description: string;
 }
 
 interface OrderDraft {
@@ -154,9 +154,6 @@ interface OrderDraft {
   destination_port: string;
   payment_method: string;
   notes: string;
-  create_workspace: boolean;
-  shared_workspace: boolean;
-  workbook_folder_id?: number;
 }
 
 interface SupplierDraft {
@@ -169,17 +166,6 @@ interface SupplierDraft {
   country: string;
   default_currency: string;
   payment_method: string;
-  notes: string;
-}
-
-interface SupplierQuoteDraft {
-  order_item_id: number;
-  supplier_id: number;
-  currency: string;
-  unit_price: string;
-  moq: string;
-  lead_time_days: string;
-  valid_until: string;
   notes: string;
 }
 
@@ -271,7 +257,7 @@ interface UploadedAttachment {
   size: number;
 }
 
-type TradeView = "orders" | "customers" | "suppliers" | "boss";
+type TradeView = "orders" | "products" | "customers" | "suppliers" | "boss";
 type SettingsTab = "positions" | "payment_permissions" | "payments" | "pi";
 
 const TRADE_STATE_KEY = "yaerp:trade:workspace-state:v3";
@@ -339,6 +325,19 @@ function formatTradeDestination(...values: Array<string | undefined>) {
       return true;
     })
     .join(" · ");
+}
+
+function itemSKU(item: { sku?: string; product_name?: string; line_no?: number }) {
+  return (
+    item.sku?.trim() ||
+    item.product_name?.trim() ||
+    (item.line_no ? `第 ${item.line_no} 行` : "-")
+  );
+}
+
+function itemExtraName(item: { sku?: string; product_name?: string }) {
+  const name = item.product_name?.trim() || "";
+  return name && name !== (item.sku?.trim() || "") ? name : "";
 }
 
 function formatTradeMonth(value: string) {
@@ -488,19 +487,6 @@ function newCustomerDraft(): CustomerDraft {
     whatsapp_chat_id: "",
     whatsapp_chat_name: "",
     avatar_url: "",
-    workbook_folder_id: undefined,
-  };
-}
-
-function newOrderItem(): OrderItemDraft {
-  return {
-    sku: "",
-    product_name: "",
-    specification: "",
-    quantity: "1",
-    unit: "件",
-    target_price: "",
-    description: "",
   };
 }
 
@@ -522,7 +508,6 @@ function newAIImportItem(): AITradeOrderImportItem {
 function newOrderDraft(
   customerId = 0,
   paymentMethod = "T/T 电汇",
-  workbookFolderID?: number,
 ): OrderDraft {
   const deadline = new Date();
   deadline.setDate(deadline.getDate() + 3);
@@ -536,9 +521,6 @@ function newOrderDraft(
     destination_port: "",
     payment_method: paymentMethod,
     notes: "",
-    create_workspace: true,
-    shared_workspace: false,
-    workbook_folder_id: workbookFolderID,
   };
 }
 
@@ -571,20 +553,17 @@ function defaultSupplierQuoteCurrency(supplier?: TradeSupplier) {
   return supplier.default_currency?.trim().toUpperCase() || "CNY";
 }
 
-function newSupplierQuoteDraft(
-  order?: TradeOrder,
-  suppliers: TradeSupplier[] = [],
-): SupplierQuoteDraft {
-  const today = new Date().toISOString().slice(0, 10);
-  const supplier = suppliers[0];
+function supplierQuoteDraftForItem(itemID: number): SupplierQuoteDraft {
+  const validUntil = new Date();
+  validUntil.setDate(validUntil.getDate() + 30);
   return {
-    order_item_id: order?.items?.[0]?.id || 0,
-    supplier_id: supplier?.id || 0,
-    currency: defaultSupplierQuoteCurrency(supplier),
+    order_item_id: itemID,
+    supplier_id: 0,
+    currency: "CNY",
     unit_price: "",
     moq: "",
     lead_time_days: "3",
-    valid_until: today,
+    valid_until: formatTradeInputDate(validUntil),
     notes: "",
   };
 }
@@ -723,7 +702,6 @@ const customerQuoteStatusStyles: Record<TradeCustomerQuoteStatus, string> = {
 const STAGE_DATA_FIELDS: Partial<Record<TradeStage, StageDataField[]>> = {
   inquiry: [
     { key: "sku", label: "SKU", source: "item" },
-    { key: "product_name", label: "产品名称", source: "item" },
     { key: "specification", label: "规格", source: "item" },
     { key: "quantity", label: "数量", source: "item", type: "number" },
     { key: "unit", label: "单位", source: "item" },
@@ -1013,7 +991,6 @@ export default function TradeWorkspacePage() {
     pi_profile: defaultTradePIProfile(),
   });
   const [users, setUsers] = useState<User[]>([]);
-  const [folderOptions, setFolderOptions] = useState<FolderOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [activeView, setActiveView] = useState<TradeView>("orders");
@@ -1088,30 +1065,10 @@ export default function TradeWorkspacePage() {
   );
 
   const [quoteModalOpen, setQuoteModalOpen] = useState(false);
-  const [quoteDrafts, setQuoteDrafts] = useState<SupplierQuoteDraft[]>([
-    newSupplierQuoteDraft(),
-  ]);
-  const [activeQuoteDraftIndex, setActiveQuoteDraftIndex] = useState(0);
+  const [quoteDrafts, setQuoteDrafts] = useState<SupplierQuoteDraft[]>([]);
   const [editingSupplierQuoteID, setEditingSupplierQuoteID] = useState<
     number | null
   >(null);
-  const quoteDraft =
-    quoteDrafts[activeQuoteDraftIndex] ||
-    quoteDrafts[0] ||
-    newSupplierQuoteDraft();
-  const setQuoteDraft = (
-    update:
-      | SupplierQuoteDraft
-      | ((current: SupplierQuoteDraft) => SupplierQuoteDraft),
-  ) => {
-    setQuoteDrafts((current) => {
-      const next = current.length ? [...current] : [newSupplierQuoteDraft()];
-      const index = Math.min(activeQuoteDraftIndex, next.length - 1);
-      next[index] =
-        typeof update === "function" ? update(next[index]) : update;
-      return next;
-    });
-  };
   const [savingQuote, setSavingQuote] = useState(false);
   const [customerQuoteModalOpen, setCustomerQuoteModalOpen] = useState(false);
   const [customerQuoteDraft, setCustomerQuoteDraft] =
@@ -1158,13 +1115,16 @@ export default function TradeWorkspacePage() {
   const [flowing, setFlowing] = useState(false);
   const [completingAIImport, setCompletingAIImport] = useState(false);
   const [advanceNote, setAdvanceNote] = useState("");
-  const [syncingWorkbook, setSyncingWorkbook] = useState(false);
   const [inspectionItemID, setInspectionItemID] = useState<
     number | "" | null
   >(null);
   const [inspectionNote, setInspectionNote] = useState("");
-  const [inspectionFiles, setInspectionFiles] = useState<File[]>([]);
+  const [photoSheet, setPhotoSheet] = useState<{
+    kind: "inspection" | "inquiry";
+    itemID: number | null;
+  } | null>(null);
   const [uploadingInspection, setUploadingInspection] = useState(false);
+
   const [galleryPickerOpen, setGalleryPickerOpen] = useState(false);
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([]);
   const [gallerySelectedIDs, setGallerySelectedIDs] = useState<number[]>([]);
@@ -1208,26 +1168,6 @@ export default function TradeWorkspacePage() {
     "preview" | "download" | "send" | null
   >(null);
 
-  const createWorkbookFolder = useCallback(
-    async (name: string, parentID?: number) => {
-      const createResponse = await api.post<{ id: number }>("/folders", {
-        name,
-        parent_id: parentID,
-      });
-      if (createResponse.code !== 0 || !createResponse.data?.id) {
-        throw new Error(createResponse.message || "创建文件夹失败");
-      }
-
-      const optionsResponse = await api.get<FolderOption[]>("/folders/options");
-      if (optionsResponse.code !== 0) {
-        throw new Error(optionsResponse.message || "刷新文件夹列表失败");
-      }
-      setFolderOptions(optionsResponse.data || []);
-      return createResponse.data.id;
-    },
-    [],
-  );
-
   const loadData = useCallback(
     async (quiet = false) => {
       if (quiet) setRefreshing(true);
@@ -1245,7 +1185,6 @@ export default function TradeWorkspacePage() {
           api.get<TradeCustomerDeleteRequest[]>(
             "/trade/customer-delete-requests?status=pending",
           ),
-          api.get<FolderOption[]>("/folders/options"),
         ] as const;
         const [
           accessResponse,
@@ -1256,7 +1195,6 @@ export default function TradeWorkspacePage() {
           positionResponse,
           settingsResponse,
           customerDeleteResponse,
-          folderOptionsResponse,
         ] = await Promise.all(requests);
         const responses = [
           accessResponse,
@@ -1267,7 +1205,6 @@ export default function TradeWorkspacePage() {
           positionResponse,
           settingsResponse,
           customerDeleteResponse,
-          folderOptionsResponse,
         ];
         const failed = responses.find((response) => response.code !== 0);
         if (failed) throw new Error(failed.message || "加载外贸业务数据失败");
@@ -1278,7 +1215,6 @@ export default function TradeWorkspacePage() {
         setSuppliers(supplierResponse.data || []);
         setPositions(positionResponse.data || []);
         setCustomerDeleteRequests(customerDeleteResponse.data || []);
-        setFolderOptions(folderOptionsResponse.data || []);
         if (accessResponse.data?.can_view_all_orders) {
           const bossResponse = await api.get<TradeBossDashboard>(
             "/trade/boss-dashboard",
@@ -1593,6 +1529,7 @@ export default function TradeWorkspacePage() {
         order.destination_country,
         order.destination_port,
         order.owner_name,
+        order.sku_preview,
       ].some((value) => value?.toLowerCase().includes(keyword));
     });
   }, [
@@ -1790,7 +1727,6 @@ export default function TradeWorkspacePage() {
       whatsapp_chat_id: customer.whatsapp_chat_id,
       whatsapp_chat_name: customer.whatsapp_chat_name,
       avatar_url: customer.avatar_url,
-      workbook_folder_id: customer.workbook_folder_id,
     });
     setCustomerModalOpen(true);
     setError("");
@@ -1958,16 +1894,7 @@ export default function TradeWorkspacePage() {
       return;
     }
     const selectedID = customerID || orderDraft.customer_id || customers[0].id;
-    const selectedCustomer = customers.find(
-      (customer) => customer.id === selectedID,
-    );
-    setOrderDraft(
-      newOrderDraft(
-        selectedID,
-        settings.payment_methods[0],
-        selectedCustomer?.workbook_folder_id,
-      ),
-    );
+    setOrderDraft(newOrderDraft(selectedID, settings.payment_methods[0]));
     setOrderItems([newOrderItem()]);
     setOrderModalOpen(true);
     setError("");
@@ -2061,17 +1988,26 @@ export default function TradeWorkspacePage() {
       !aiImportDraft.title.trim() ||
       aiImportDraft.items.length === 0 ||
       aiImportDraft.items.some(
-        (item) => !item.product_name.trim() || Number(item.quantity) <= 0,
+        (item) =>
+          !(item.sku.trim() || item.product_name.trim()) ||
+          Number(item.quantity) <= 0,
       )
     ) {
-      setError("请补全订单主题、产品名称和有效数量后再创建。");
+      setError("请补全订单主题、产品 SKU 和有效数量后再创建。");
       return;
     }
     setApplyingAIImport(true);
     setError("");
     try {
       const response = await api.post<TradeOrder>("/ai/erp/import/apply", {
-        draft: { ...aiImportDraft, shared_workspace: false },
+        draft: {
+          ...aiImportDraft,
+          items: aiImportDraft.items.map((item) => ({
+            ...item,
+            sku: item.sku.trim() || item.product_name.trim(),
+            product_name: item.product_name.trim() || item.sku.trim(),
+          })),
+        },
       });
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "AI 建单失败");
@@ -2092,18 +2028,6 @@ export default function TradeWorkspacePage() {
     }
   };
 
-  const updateOrderItem = (
-    index: number,
-    key: keyof OrderItemDraft,
-    value: string,
-  ) => {
-    setOrderItems((current) =>
-      current.map((item, itemIndex) =>
-        itemIndex === index ? { ...item, [key]: value } : item,
-      ),
-    );
-  };
-
   const openAddItems = () => {
     if (!detailOrder?.access?.can_add_items) {
       setError("当前流程阶段或岗位没有新增产品的权限。");
@@ -2114,25 +2038,11 @@ export default function TradeWorkspacePage() {
     setError("");
   };
 
-  const updateAdditionalItem = (
-    index: number,
-    key: keyof OrderItemDraft,
-    value: string,
-  ) => {
-    setAdditionalItems((current) =>
-      current.map((item, itemIndex) =>
-        itemIndex === index ? { ...item, [key]: value } : item,
-      ),
-    );
-  };
-
   const saveAdditionalItems = async () => {
     if (!detailOrder) return;
-    const validItems = additionalItems.filter(
-      (item) => item.product_name.trim() && Number(item.quantity) > 0,
-    );
+    const validItems = additionalItems.filter(isFilledOrderItem);
     if (validItems.length === 0) {
-      setError("请至少填写一行有效的产品名称和数量。");
+      setError("请至少填写一行有效的 SKU 和数量。");
       return;
     }
     setSavingItems(true);
@@ -2144,32 +2054,25 @@ export default function TradeWorkspacePage() {
       const response = await api.post<TradeOrder>(
         `/trade/orders/${detailOrder.id}/items`,
         {
-          items: validItems.map((item) => ({
-            ...item,
-            quantity: Number(item.quantity),
-            target_price: Number(item.target_price || 0),
-          })),
+          items: validItems.map(orderItemPayload),
         },
       );
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "新增产品失败");
-      const firstAddedItem = (response.data.items || []).find(
+      const addedItems = (response.data.items || []).filter(
         (item) => !existingIDs.has(item.id),
       );
       setDetailOrder(response.data);
       setItemModalOpen(false);
       setAdditionalItems([newOrderItem()]);
-      if (quoteModalOpen && firstAddedItem) {
+      if (quoteModalOpen && addedItems.length > 0) {
         setQuoteDrafts((current) => [
           ...current,
-          {
-            ...newSupplierQuoteDraft(detailOrder, suppliers),
-            order_item_id: firstAddedItem.id,
-          },
+          ...addedItems.map((item) => supplierQuoteDraftForItem(item.id)),
         ]);
       }
       setNotice(
-        `已新增 ${validItems.length} 个产品，并同步到报价、采购、到货、质检和装箱工作表。`,
+        `已新增 ${validItems.length} 个产品，后续报价、采购、到货、质检和装箱环节会自动带出。`,
       );
       await loadData(true);
     } catch (saveError) {
@@ -2278,6 +2181,9 @@ export default function TradeWorkspacePage() {
         if (field.source === "workflow") workflowData[field.key] = value;
         else payload[field.key] = value;
       });
+      if (typeof payload.sku === "string" && !itemExtraName(item)) {
+        payload.product_name = payload.sku;
+      }
       return payload;
     });
     setSavingStageData(true);
@@ -2307,7 +2213,7 @@ export default function TradeWorkspacePage() {
         throw new Error(response.message || "保存环节数据失败");
       setDetailOrder(response.data);
       setStageDataModalOpen(false);
-      setNotice("环节数据已保存，并同步到 ERP 与流程工作簿。");
+      setNotice("环节数据已保存。");
       await loadData(true);
     } catch (saveError) {
       setError(
@@ -2335,7 +2241,7 @@ export default function TradeWorkspacePage() {
         return next;
       });
       setOrderItemDeleteTarget(null);
-      setNotice("产品已从订单中删除，行号、订单金额和流程工作簿已同步更新。");
+      setNotice("产品已从订单中删除，行号和订单金额已同步更新。");
       await loadData(true);
     } catch (deleteError) {
       setError(
@@ -2349,9 +2255,7 @@ export default function TradeWorkspacePage() {
   };
 
   const saveOrder = async () => {
-    const validItems = orderItems.filter(
-      (item) => item.product_name.trim() && Number(item.quantity) > 0,
-    );
+    const validItems = orderItems.filter(isFilledOrderItem);
     if (
       !orderDraft.customer_id ||
       !orderDraft.title.trim() ||
@@ -2365,11 +2269,7 @@ export default function TradeWorkspacePage() {
         ...orderDraft,
         title: orderDraft.title.trim(),
         payment_terms: orderDraft.payment_method,
-        items: validItems.map((item) => ({
-          ...item,
-          quantity: Number(item.quantity),
-          target_price: Number(item.target_price || 0),
-        })),
+        items: validItems.map(orderItemPayload),
       });
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "创建询价业务单失败");
@@ -2377,7 +2277,7 @@ export default function TradeWorkspacePage() {
       setDetailOrder(response.data);
       detailOrderIDRef.current = response.data.id;
       setNotice(
-        `业务单 ${response.data.order_no} 已创建，九张流程工作表已就绪。`,
+        `业务单 ${response.data.order_no} 已创建，共 ${validItems.length} 个产品，已推送给下一环节负责人。`,
       );
       await loadData(true);
     } catch (saveError) {
@@ -2411,18 +2311,6 @@ export default function TradeWorkspacePage() {
         `供应商「${response.data.name}」已${isEditing ? "更新" : "录入"}。`,
       );
       await loadData(true);
-      if (!isEditing && quoteModalOpen)
-        setQuoteDrafts((current) =>
-          current.map((draft, index) =>
-            index === activeQuoteDraftIndex
-              ? {
-                  ...draft,
-                  supplier_id: response.data!.id,
-                  currency: defaultSupplierQuoteCurrency(response.data!),
-                }
-              : draft,
-          ),
-        );
     } catch (saveError) {
       setError(
         saveError instanceof Error
@@ -2496,7 +2384,6 @@ export default function TradeWorkspacePage() {
     detailOrderIDRef.current = order.id;
     setAdvanceNote("");
     setInspectionItemID(null);
-    setInspectionFiles([]);
     setInspectionNote("");
     setTimelineExpanded(false);
     await loadOrderDetail(order.id);
@@ -2813,7 +2700,7 @@ export default function TradeWorkspacePage() {
       setDetailOrder(response.data);
       setProfitSettingsOpen(false);
       setProfitSettingsDraft(null);
-      setNotice("成本、汇率和利润汇总已更新，并同步到流程工作簿。");
+      setNotice("成本、汇率和利润汇总已更新。");
       await loadData(true);
     } catch (saveError) {
       setError(
@@ -2932,17 +2819,13 @@ export default function TradeWorkspacePage() {
 
   const saveSupplierQuote = async () => {
     if (!detailOrder) return;
-    if (
-      quoteDrafts.length === 0 ||
-      quoteDrafts.some(
-        (draft) => !draft.order_item_id || !draft.supplier_id,
-      )
-    )
-      return setError("每条报价都需要选择产品和供应商。");
+    const filledDrafts = quoteDrafts.filter(isFilledSupplierQuote);
+    if (filledDrafts.length === 0)
+      return setError("请至少为一个产品选择供应商并填写单价。");
     setSavingQuote(true);
     setError("");
     try {
-      const quotes = quoteDrafts.map((draft) => ({
+      const quotes = filledDrafts.map((draft) => ({
           ...draft,
           unit_price: Number(draft.unit_price || 0),
           moq: Number(draft.moq || 0),
@@ -2964,8 +2847,8 @@ export default function TradeWorkspacePage() {
       setEditingSupplierQuoteID(null);
       setNotice(
         editingSupplierQuoteID
-          ? "供应商报价已更新并同步到流程工作簿。"
-          : `已保存 ${quotes.length} 条供应商报价并同步到流程工作簿。`,
+          ? "供应商报价已更新。"
+          : `已保存 ${quotes.length} 条供应商报价。`,
       );
       await loadData(true);
     } catch (quoteError) {
@@ -2988,7 +2871,7 @@ export default function TradeWorkspacePage() {
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "删除供应商报价失败");
       setDetailOrder(response.data);
-      setNotice("供应商报价已删除并同步到流程工作簿。");
+      setNotice("供应商报价已删除。");
       await loadData(true);
     } catch (deleteError) {
       setError(
@@ -3306,72 +3189,88 @@ export default function TradeWorkspacePage() {
     }
   };
 
-  const syncWorkbook = async () => {
-    if (!detailOrder) return;
-    setSyncingWorkbook(true);
-    setError("");
-    try {
-      const response = await api.post<TradeOrder>(
-        `/trade/orders/${detailOrder.id}/sync-workbook`,
-      );
-      if (response.code !== 0 || !response.data)
-        throw new Error(response.message || "同步流程工作簿失败");
-      setDetailOrder(response.data);
-      setNotice("流程工作簿已按当前 ERP 数据补齐并校准。");
-    } catch (syncError) {
-      setError(
-        syncError instanceof Error ? syncError.message : "同步流程工作簿失败",
-      );
-    } finally {
-      setSyncingWorkbook(false);
-    }
-  };
 
-  const uploadInspectionPhotos = async () => {
-    if (!detailOrder || inspectionFiles.length === 0)
-      return setError("请选择至少一张质检图片。");
-    const effectiveItemID = resolveInspectionItemID(
-      detailOrder,
-      inspectionItemID,
-    );
-    if (effectiveItemID !== inspectionItemID)
-      setInspectionItemID(effectiveItemID);
+  const uploadInspectionFiles = async (
+    files: File[],
+    itemID: number | null,
+    note: string,
+    onProgress: (done: number) => void,
+  ) => {
+    if (!detailOrder) return;
     setUploadingInspection(true);
     setError("");
     try {
-      for (const file of inspectionFiles) {
+      for (const [index, file] of files.entries()) {
         const body = new FormData();
         body.append("file", file);
-        if (effectiveItemID)
-          body.append("order_item_id", String(effectiveItemID));
-        body.append("note", inspectionNote.trim());
+        if (itemID) body.append("order_item_id", String(itemID));
+        body.append("note", note);
         const response = await api.form<TradeInspectionPhoto>(
           `/trade/orders/${detailOrder.id}/inspection-photos`,
           body,
         );
         if (response.code !== 0)
-          throw new Error(response.message || `上传 ${file.name} 失败`);
+          throw new Error(response.message || `上传第 ${index + 1} 张照片失败`);
+        onProgress(index + 1);
       }
-      setInspectionFiles([]);
-      setInspectionNote("");
       await loadOrderDetail(detailOrder.id, false);
-      setNotice(
-        `已上传 ${inspectionFiles.length} 张质检图片，并保存到订单质检图库目录。`,
-      );
-    } catch (uploadError) {
-      setError(
-        uploadError instanceof Error ? uploadError.message : "上传质检图片失败",
-      );
+      setNotice(`已上传 ${files.length} 张到货/质检照片，产品报价库会优先展示这些实拍图。`);
     } finally {
       setUploadingInspection(false);
     }
   };
 
-  const openInspectionGalleryPicker = async () => {
+  const uploadInquiryFiles = async (
+    files: File[],
+    itemID: number | null,
+    _note: string,
+    onProgress: (done: number) => void,
+  ) => {
+    if (!detailOrder || !itemID) throw new Error("请选择对应的产品 SKU");
+    let latest: TradeOrder | null = null;
+    for (const [index, file] of files.entries()) {
+      const body = new FormData();
+      body.append("file", file);
+      const response = await api.form<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/items/${itemID}/images`,
+        body,
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || `上传第 ${index + 1} 张图片失败`);
+      latest = response.data;
+      onProgress(index + 1);
+    }
+    if (latest) setDetailOrder(latest);
+    setNotice("客户询价图片已保存。");
+  };
+
+  const deleteItemImage = async (itemID: number, imageID: number) => {
     if (!detailOrder) return;
+    if (!window.confirm("确认移除这张客户询价图片吗？")) return;
+    setError("");
+    try {
+      const response = await api.delete<TradeOrder>(
+        `/trade/orders/${detailOrder.id}/items/${itemID}/images/${imageID}`,
+      );
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "移除询价图片失败");
+      setDetailOrder(response.data);
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error ? deleteError.message : "移除询价图片失败",
+      );
+    }
+  };
+
+  const openInspectionGalleryPicker = async (
+    itemOverride?: number | null,
+    noteOverride?: string,
+  ) => {
+    if (!detailOrder) return;
+    if (noteOverride !== undefined) setInspectionNote(noteOverride);
     const effectiveItemID = resolveInspectionItemID(
       detailOrder,
-      inspectionItemID,
+      itemOverride === undefined ? inspectionItemID : itemOverride ?? "",
     );
     if (effectiveItemID !== inspectionItemID)
       setInspectionItemID(effectiveItemID);
@@ -3673,11 +3572,11 @@ export default function TradeWorkspacePage() {
               >
                 <ArrowLeft className="h-4 w-4" />
               </Link>
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white">
+              <div className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white sm:flex">
                 <BriefcaseBusiness className="h-5 w-5" />
               </div>
               <div className="min-w-0">
-                <h1 className="truncate text-lg font-semibold">外贸业务中心</h1>
+                <h1 className="truncate text-base font-semibold sm:text-lg">外贸业务中心</h1>
                 <p className="truncate text-xs text-slate-500">
                   {tradeAccess?.scope_label ||
                     "客户询价 · 供应商比价 · 报价 · 采购 · 仓库 · 质检 · 装箱 · 发货"}
@@ -3685,6 +3584,14 @@ export default function TradeWorkspacePage() {
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <Link
+                href="/trade/guide"
+                className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                title="外贸 ERP 使用教程"
+              >
+                <BookOpen className="h-4 w-4" />
+                <span className="hidden lg:inline">使用教程</span>
+              </Link>
               <button
                 type="button"
                 onClick={() => void loadData(true)}
@@ -3724,14 +3631,13 @@ export default function TradeWorkspacePage() {
                 >
                   <Sparkles className="h-4 w-4" />
                   <span className="hidden sm:inline">AI 智能建单</span>
-                  <span className="sm:hidden">AI 建单</span>
                 </button>
               )}
               {tradeAccess?.can_create_orders && (
                 <button
                   type="button"
                   onClick={() => openOrderModal()}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white hover:bg-slate-700"
+                  className="hidden h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white hover:bg-slate-700 sm:inline-flex"
                 >
                   <Plus className="h-4 w-4" />
                   新建询价
@@ -3741,7 +3647,18 @@ export default function TradeWorkspacePage() {
           </div>
         </header>
 
-        <main className="mx-auto max-w-[1600px] p-3 md:p-5">
+        {tradeAccess?.can_create_orders && !detailOrder && (
+          <button
+            type="button"
+            onClick={() => openOrderModal()}
+            className="fixed inset-x-0 bottom-[calc(var(--mobile-tabbar-offset)+16px)] z-40 mx-auto flex h-12 w-fit items-center gap-2 rounded-full bg-slate-900 px-5 text-sm font-semibold text-white shadow-xl active:scale-95 sm:hidden"
+          >
+            <Plus className="h-5 w-5" />
+            新建询价
+          </button>
+        )}
+
+        <main className="mx-auto max-w-[1600px] p-3 pb-24 sm:pb-3 md:p-5">
           {(error || notice) && (
             <div
               className={`mb-3 flex items-start justify-between gap-3 rounded-lg border px-4 py-3 text-sm ${error ? "border-rose-200 bg-rose-50 text-rose-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}
@@ -3760,13 +3677,13 @@ export default function TradeWorkspacePage() {
             </div>
           )}
 
-          <section className="grid grid-cols-2 overflow-hidden rounded-lg border border-slate-200 bg-white md:grid-cols-4 xl:grid-cols-8">
+          <section className="flex overflow-x-auto rounded-lg border border-slate-200 bg-white [scrollbar-width:none] md:grid md:grid-cols-4 md:overflow-hidden xl:grid-cols-8">
             {metrics.map((metric, index) => {
               const Icon = metric.icon;
               return (
                 <div
                   key={metric.label}
-                  className={`flex min-h-20 items-center gap-3 px-4 py-3 ${index % 2 === 0 ? "border-r border-slate-100" : ""} md:border-r md:last:border-r-0`}
+                  className="flex min-h-16 min-w-[128px] shrink-0 items-center gap-3 border-r border-slate-100 px-4 py-3 last:border-r-0 md:min-h-20 md:min-w-0"
                 >
                   <Icon className={`h-5 w-5 shrink-0 ${metric.color}`} />
                   <div>
@@ -3789,6 +3706,14 @@ export default function TradeWorkspacePage() {
                   className={`h-8 shrink-0 rounded-md px-3 text-sm font-medium ${activeView === "orders" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
                 >
                   业务单
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveView("products")}
+                  className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm font-medium ${activeView === "products" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                >
+                  <History className="h-3.5 w-3.5" />
+                  产品报价库
                 </button>
                 {tradeAccess?.can_view_customers && (
                   <button
@@ -3820,7 +3745,7 @@ export default function TradeWorkspacePage() {
                 )}
               </div>
               <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
-                {activeView !== "boss" && (
+                {activeView !== "boss" && activeView !== "products" && (
                   <label className="flex h-9 min-w-[180px] flex-1 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500 lg:max-w-sm">
                     <Search className="h-4 w-4 shrink-0" />
                     <input
@@ -3828,7 +3753,7 @@ export default function TradeWorkspacePage() {
                       onChange={(event) => setSearch(event.target.value)}
                       placeholder={
                         activeView === "orders"
-                          ? "搜索业务单、客户、目的港..."
+                          ? "搜索业务单、客户、SKU、目的港..."
                           : activeView === "customers"
                             ? "搜索客户、公司、电话..."
                             : "搜索供应商、联系人、电话..."
@@ -3881,7 +3806,7 @@ export default function TradeWorkspacePage() {
                     ))}
                   </select>
                 )}
-                {activeView !== "boss" && (
+                {activeView !== "boss" && activeView !== "products" && (
                   <button
                     type="button"
                     onClick={() => {
@@ -3967,7 +3892,73 @@ export default function TradeWorkspacePage() {
                     })}
                   </div>
                 </div>
-                <div className="overflow-x-auto">
+                <div className="divide-y divide-slate-100 md:hidden">
+                  {loading ? (
+                    <div className="flex h-48 items-center justify-center text-sm text-slate-400">
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      加载业务单...
+                    </div>
+                  ) : filteredOrders.length === 0 ? (
+                    <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+                      没有匹配的业务单
+                    </div>
+                  ) : (
+                    filteredOrders.map((order) => {
+                      const stage = stageDefinition(order.stage);
+                      const StageIcon = stage?.icon || BriefcaseBusiness;
+                      return (
+                        <button
+                          key={order.id}
+                          type="button"
+                          onClick={() => void openOrderDetail(order)}
+                          className="block w-full px-3 py-3 text-left active:bg-slate-50"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                                <span className="font-semibold">{order.order_no}</span>
+                                <span
+                                  className={`rounded px-1 py-px text-[10px] font-semibold ${priorityClass(order.priority)}`}
+                                >
+                                  {PRIORITY_LABELS[order.priority]}
+                                </span>
+                              </div>
+                              <div className="mt-0.5 truncate font-semibold text-slate-900">
+                                {order.title}
+                              </div>
+                              <div className="truncate text-xs text-slate-500">
+                                {order.customer_name}
+                                {order.owner_name ? ` · ${order.owner_name}` : ""}
+                              </div>
+                            </div>
+                            <span
+                              className={`inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold ${stage?.background || "bg-slate-100"} ${stage?.color || "text-slate-600"}`}
+                            >
+                              <StageIcon className="h-3 w-3" />
+                              {stage?.shortLabel || order.stage}
+                            </span>
+                          </div>
+                          <div className="mt-2 flex items-center justify-between gap-2 text-xs">
+                            <span className="min-w-0 truncate text-slate-500">
+                              {order.item_count} 个 SKU
+                              {order.sku_preview ? ` · ${order.sku_preview}` : ""}
+                            </span>
+                            {order.can_operate_stage ? (
+                              <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 font-semibold text-emerald-700">
+                                待我处理
+                              </span>
+                            ) : (
+                              <span className="shrink-0 text-slate-400">
+                                {order.required_position_name || "业务负责人"}
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+                <div className="hidden overflow-x-auto md:block">
                   <table className="w-full min-w-[1120px] text-sm">
                     <thead className="bg-slate-50 text-left text-xs text-slate-500">
                       <tr>
@@ -4072,8 +4063,19 @@ export default function TradeWorkspacePage() {
                                   </div>
                                 )}
                               </td>
-                              <td className="px-4 py-3 tabular-nums">
-                                {order.item_count} 项
+                              <td className="max-w-56 px-4 py-3">
+                                <div className="tabular-nums font-medium">
+                                  {order.item_count} 个 SKU
+                                </div>
+                                {order.sku_preview && (
+                                  <div
+                                    className="mt-0.5 truncate text-xs text-slate-400"
+                                    title={order.sku_preview}
+                                  >
+                                    {order.sku_preview}
+                                    {order.item_count > 4 && " …"}
+                                  </div>
+                                )}
                               </td>
                               <td className="px-4 py-3">
                                 {formatTradeDestination(
@@ -4087,21 +4089,6 @@ export default function TradeWorkspacePage() {
                               <td className="px-4 py-3">{order.owner_name}</td>
                               <td className="px-4 py-3">
                                 <div className="flex justify-end gap-1">
-                                  {order.workbook_id &&
-                                    order.workbook_sheet_id && (
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          rememberAndNavigate(
-                                            `/sheets/${order.workbook_id}/${order.workbook_sheet_id}`,
-                                          )
-                                        }
-                                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-emerald-700 hover:bg-emerald-50"
-                                        title="打开流程工作簿"
-                                      >
-                                        <FileSpreadsheet className="h-4 w-4" />
-                                      </button>
-                                    )}
                                   {order.channel_id && (
                                     <button
                                       type="button"
@@ -4142,6 +4129,13 @@ export default function TradeWorkspacePage() {
                   </table>
                 </div>
               </>
+            )}
+
+            {activeView === "products" && (
+              <QuoteHistoryView
+                customers={tradeAccess?.can_view_customers ? customers : []}
+                onOpenOrder={(orderID) => void openOrderByID(orderID)}
+              />
             )}
 
             {activeView === "boss" && (
@@ -4832,7 +4826,44 @@ export default function TradeWorkspacePage() {
             )}
 
             {activeView === "suppliers" && (
-              <div className="overflow-x-auto">
+              <div className="divide-y divide-slate-100 md:hidden">
+                {filteredSuppliers.length === 0 ? (
+                  <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+                    暂无供应商，先录入供应商后再进行比价。
+                  </div>
+                ) : (
+                  filteredSuppliers.map((supplier) => (
+                    <div key={supplier.id} className="flex items-start justify-between gap-3 px-3 py-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-semibold">{supplier.name}</div>
+                        <div className="truncate text-xs text-slate-400">
+                          {[supplier.contact_name, supplier.phone || supplier.whatsapp, supplier.country]
+                            .filter(Boolean)
+                            .join(" · ") || supplier.supplier_code}
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          {supplier.default_currency}
+                          {supplier.payment_method ? ` · ${supplier.payment_method}` : ""}
+                        </div>
+                      </div>
+                      {tradeAccess?.can_manage_suppliers && (
+                        <button
+                          type="button"
+                          onClick={() => openEditSupplierModal(supplier)}
+                          className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-600"
+                          aria-label="编辑供应商"
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+
+            {activeView === "suppliers" && (
+              <div className="hidden overflow-x-auto md:block">
                 <table className="w-full min-w-[900px] text-sm">
                   <thead className="bg-slate-50 text-left text-xs text-slate-500">
                     <tr>
@@ -4899,6 +4930,7 @@ export default function TradeWorkspacePage() {
                                   <Pencil className="h-3.5 w-3.5" />
                                   编辑
                                 </button>
+                                {tradeAccess?.can_view_all_orders && (
                                 <button
                                   type="button"
                                   onClick={() => void deleteSupplier(supplier)}
@@ -4913,6 +4945,7 @@ export default function TradeWorkspacePage() {
                                   )}
                                   删除
                                 </button>
+                                )}
                               </div>
                             ) : (
                               <span className="text-slate-400">-</span>
@@ -4930,7 +4963,7 @@ export default function TradeWorkspacePage() {
 
         {customerModalOpen && (
           <div
-            className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingCustomer) {
                 setCustomerModalOpen(false);
@@ -5220,25 +5253,6 @@ export default function TradeWorkspacePage() {
                       placeholder="批发商, 欧洲, 重点跟进"
                     />
                   </label>
-                  <div className="sm:col-span-2">
-                    <div className="mb-1.5 text-sm font-medium text-slate-700">
-                      默认流程工作簿文件夹
-                    </div>
-                    <FolderCombobox
-                      folders={folderOptions}
-                      value={customerDraft.workbook_folder_id}
-                      onCreateFolder={createWorkbookFolder}
-                      onChange={(folderID) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          workbook_folder_id: folderID,
-                        }))
-                      }
-                    />
-                    <p className="mt-1 text-xs text-slate-400">
-                      此客户后续新建的询价工作簿默认放入该目录，单笔订单仍可另选。
-                    </p>
-                  </div>
                   <label className="text-sm font-medium text-slate-700 sm:col-span-2">
                     备注
                     <textarea
@@ -5304,7 +5318,7 @@ export default function TradeWorkspacePage() {
 
         {customerDeleteApprovalsOpen && tradeAccess?.is_admin && (
           <div
-            className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget)
                 setCustomerDeleteApprovalsOpen(false);
@@ -5398,13 +5412,13 @@ export default function TradeWorkspacePage() {
 
         {customerDeleteTarget && (
           <div
-            className="fixed inset-0 z-[60] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            className="fixed inset-0 z-[63] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !deletingCustomer)
                 setCustomerDeleteTarget(null);
             }}
           >
-            <div className="w-full max-w-lg overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">
@@ -5515,7 +5529,7 @@ export default function TradeWorkspacePage() {
                   <div className="min-w-0">
                     <h2 className="font-semibold">AI 智能建单</h2>
                     <p className="mt-0.5 text-xs text-slate-500">
-                      先识别为可编辑草稿；确认后创建私有流程工作簿，并进入仓库到货。
+                      先识别为可编辑草稿；确认后创建业务单，并直接进入仓库到货。
                     </p>
                   </div>
                 </div>
@@ -5649,9 +5663,6 @@ export default function TradeWorkspacePage() {
                                       destination_country:
                                         current.destination_country ||
                                         customer.country,
-                                      workbook_folder_id:
-                                        current.workbook_folder_id ||
-                                        customer.workbook_folder_id,
                                     }
                                   : current,
                               )
@@ -5869,20 +5880,8 @@ export default function TradeWorkspacePage() {
                               onChange={(event) =>
                                 updateAIImportItem(index, "sku", event.target.value)
                               }
-                              placeholder="SKU"
-                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-2"
-                            />
-                            <input
-                              value={item.product_name}
-                              onChange={(event) =>
-                                updateAIImportItem(
-                                  index,
-                                  "product_name",
-                                  event.target.value,
-                                )
-                              }
-                              placeholder="产品名称 *"
-                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-3"
+                              placeholder="SKU *"
+                              className="h-9 rounded-lg border border-slate-200 px-3 text-sm font-medium outline-none lg:col-span-5"
                             />
                             <input
                               value={item.specification}
@@ -6013,52 +6012,6 @@ export default function TradeWorkspacePage() {
                       </div>
                     </div>
 
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <div className="text-sm font-medium text-slate-700">
-                        流程工作簿文件夹
-                        <div className="mt-1.5">
-                          <FolderCombobox
-                            folders={folderOptions}
-                            value={aiImportDraft.workbook_folder_id}
-                            onCreateFolder={createWorkbookFolder}
-                            onChange={(folderID) =>
-                              setAIImportDraft((current) =>
-                                current
-                                  ? {
-                                      ...current,
-                                      workbook_folder_id: folderID,
-                                    }
-                                  : current,
-                              )
-                            }
-                          />
-                        </div>
-                      </div>
-                      <label className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
-                        <input
-                          type="checkbox"
-                          checked={aiImportDraft.create_workspace}
-                          onChange={(event) =>
-                            setAIImportDraft((current) =>
-                              current
-                                ? {
-                                    ...current,
-                                    create_workspace: event.target.checked,
-                                    shared_workspace: false,
-                                  }
-                                : current,
-                            )
-                          }
-                          className="h-4 w-4 accent-slate-900"
-                        />
-                        <span>
-                          <span className="block font-medium">生成私有流程工作簿</span>
-                          <span className="mt-0.5 block text-xs text-slate-400">
-                            默认不向内部共享，可在创建后按需授权。
-                          </span>
-                        </span>
-                      </label>
-                    </div>
                   </div>
                 )}
               </div>
@@ -6097,18 +6050,18 @@ export default function TradeWorkspacePage() {
 
         {orderModalOpen && (
           <div
-            className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingOrder)
                 setOrderModalOpen(false);
             }}
           >
-            <div className="flex max-h-[94vh] w-full max-w-5xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="flex max-h-[94vh] w-full max-w-6xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">新建客户询价</h2>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    保存后生成九张流程工作表，并按职位推送下一步任务。
+                    保存后按职位推送给下一环节负责人。
                   </p>
                 </div>
                 <button
@@ -6127,13 +6080,11 @@ export default function TradeWorkspacePage() {
                       <CustomerCombobox
                         customers={customers}
                         value={orderDraft.customer_id}
-                        onChange={(customerID, customer) =>
-                        setOrderDraft((current) => ({
-                          ...current,
+                        onChange={(customerID) =>
+                          setOrderDraft((current) => ({
+                            ...current,
                             customer_id: customerID,
-                            workbook_folder_id:
-                              customer.workbook_folder_id,
-                        }))
+                          }))
                         }
                       />
                     </div>
@@ -6230,203 +6181,27 @@ export default function TradeWorkspacePage() {
                       className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
                     />
                   </label>
-                  <div className="text-sm font-medium text-slate-700 sm:col-span-2">
-                    流程工作簿文件夹
-                    <div className="mt-1.5">
-                      <FolderCombobox
-                        folders={folderOptions}
-                        value={orderDraft.workbook_folder_id}
-                        onCreateFolder={createWorkbookFolder}
-                        onChange={(folderID) =>
-                          setOrderDraft((current) => ({
-                            ...current,
-                            workbook_folder_id: folderID,
-                          }))
-                        }
-                      />
-                    </div>
-                    <p className="mt-1 text-xs font-normal text-slate-400">
-                      此客户之后的新询价会默认沿用该目录。
-                    </p>
-                  </div>
+                  <label className="text-sm font-medium text-slate-700 sm:col-span-2">
+                    业务备注
+                    <input
+                      value={orderDraft.notes}
+                      onChange={(event) =>
+                        setOrderDraft((current) => ({
+                          ...current,
+                          notes: event.target.value,
+                        }))
+                      }
+                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
+                      placeholder="内部可见，例如客户背景、交期要求"
+                    />
+                  </label>
                 </div>
-                <div className="mt-6 flex items-center justify-between">
-                  <div>
-                    <h3 className="text-sm font-semibold">询价产品</h3>
-                    <p className="mt-0.5 text-xs text-slate-400">
-                      产品资料会贯穿供应商询价、报价、采购、到货、质检和装箱。
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setOrderItems((current) => [...current, newOrderItem()])
-                    }
-                    className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    添加产品
-                  </button>
-                </div>
-                <div className="mt-3 space-y-3">
-                  {orderItems.map((item, index) => (
-                    <div
-                      key={index}
-                      className="relative grid gap-3 rounded-lg border border-slate-200 p-3 sm:grid-cols-2 lg:grid-cols-12"
-                    >
-                      <div className="absolute -left-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-slate-900 text-[11px] font-semibold text-white">
-                        {index + 1}
-                      </div>
-                      <input
-                        value={item.sku}
-                        onChange={(event) =>
-                          updateOrderItem(index, "sku", event.target.value)
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-2"
-                        placeholder="SKU"
-                      />
-                      <input
-                        value={item.product_name}
-                        onChange={(event) =>
-                          updateOrderItem(
-                            index,
-                            "product_name",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-3"
-                        placeholder="产品名称 *"
-                      />
-                      <input
-                        value={item.specification}
-                        onChange={(event) =>
-                          updateOrderItem(
-                            index,
-                            "specification",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-3"
-                        placeholder="规格/材质/颜色"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        step="any"
-                        value={item.quantity}
-                        onChange={(event) =>
-                          updateOrderItem(index, "quantity", event.target.value)
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-1"
-                        placeholder="数量"
-                      />
-                      <input
-                        value={item.unit}
-                        onChange={(event) =>
-                          updateOrderItem(index, "unit", event.target.value)
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-1"
-                        placeholder="单位"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        step="any"
-                        value={item.target_price}
-                        onChange={(event) =>
-                          updateOrderItem(
-                            index,
-                            "target_price",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none lg:col-span-1"
-                        placeholder="目标价"
-                      />
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setOrderItems((current) =>
-                            current.length === 1
-                              ? [newOrderItem()]
-                              : current.filter(
-                                  (_, itemIndex) => itemIndex !== index,
-                                ),
-                          )
-                        }
-                        className="inline-flex h-9 items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 lg:col-span-1"
-                        title="删除产品"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                      <input
-                        value={item.description}
-                        onChange={(event) =>
-                          updateOrderItem(
-                            index,
-                            "description",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none sm:col-span-2 lg:col-span-12"
-                        placeholder="客户要求、包装或其他说明"
-                      />
-                    </div>
-                  ))}
-                </div>
-                <label className="mt-4 block text-sm font-medium text-slate-700">
-                  业务备注
-                  <textarea
-                    value={orderDraft.notes}
-                    onChange={(event) =>
-                      setOrderDraft((current) => ({
-                        ...current,
-                        notes: event.target.value,
-                      }))
-                    }
-                    className="mt-1.5 min-h-20 w-full resize-y rounded-lg border border-slate-200 px-3 py-2 outline-none"
+                <div className="mt-5">
+                  <OrderItemsEditor
+                    items={orderItems}
+                    onChange={setOrderItems}
+                    onError={setError}
                   />
-                </label>
-                <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                  <label className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={orderDraft.create_workspace}
-                      onChange={(event) =>
-                        setOrderDraft((current) => ({
-                          ...current,
-                          create_workspace: event.target.checked,
-                        }))
-                      }
-                      className="h-4 w-4 accent-slate-900"
-                    />
-                    <span>
-                      <span className="font-medium">生成流程工作簿</span>
-                      <span className="ml-2 text-xs text-slate-400">
-                        九张标准工作表
-                      </span>
-                    </span>
-                  </label>
-                  <label className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={orderDraft.shared_workspace}
-                      disabled={!orderDraft.create_workspace}
-                      onChange={(event) =>
-                        setOrderDraft((current) => ({
-                          ...current,
-                          shared_workspace: event.target.checked,
-                        }))
-                      }
-                      className="h-4 w-4 accent-slate-900"
-                    />
-                    <span>
-                      <span className="font-medium">内部共享编辑</span>
-                      <span className="ml-2 text-xs text-slate-400">
-                        工作表修改自动写回 ERP
-                      </span>
-                    </span>
-                  </label>
                 </div>
               </div>
               <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
@@ -6459,7 +6234,7 @@ export default function TradeWorkspacePage() {
                 closeSupplierModal();
             }}
           >
-            <div className="w-full max-w-2xl rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-2xl overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">
@@ -6639,256 +6414,57 @@ export default function TradeWorkspacePage() {
           </div>
         )}
 
+        {photoSheet && detailOrder && (
+          <PhotoCaptureSheet
+            title={
+              photoSheet.kind === "inspection"
+                ? "上传到货 / 质检照片"
+                : "上传客户询价图片"
+            }
+            description={
+              photoSheet.kind === "inspection"
+                ? `${detailOrder.order_no} · 实拍图会作为产品报价库的主图`
+                : `${detailOrder.order_no} · 客户发来的参考图，到货后请在质检环节上传实拍`
+            }
+            items={(detailOrder.items || []).map((item) => ({
+              id: item.id,
+              label: `${item.line_no}. ${itemSKU(item)}`,
+            }))}
+            initialItemID={photoSheet.itemID}
+            allowWholeOrder={photoSheet.kind === "inspection"}
+            allowNote={photoSheet.kind === "inspection"}
+            onUpload={
+              photoSheet.kind === "inspection"
+                ? uploadInspectionFiles
+                : uploadInquiryFiles
+            }
+            onPickFromGallery={
+              photoSheet.kind === "inspection"
+                ? (itemID, note) => {
+                    setPhotoSheet(null);
+                    void openInspectionGalleryPicker(itemID, note);
+                  }
+                : undefined
+            }
+            onClose={() => setPhotoSheet(null)}
+          />
+        )}
+
         {quoteModalOpen && detailOrder && (
-          <div className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4">
-            <div className="w-full max-w-2xl rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
-              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                <div>
-                  <h2 className="font-semibold">录入供应商报价</h2>
-                  <p className="mt-0.5 text-xs text-slate-500">
-                    报价保存后会写入“供应商询价”工作表。
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setQuoteModalOpen(false)}
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-              <div className="p-4">
-                {!editingSupplierQuoteID && (
-                  <div className="mb-4 rounded-lg border border-sky-100 bg-sky-50/60 p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-800">
-                          批量报价明细
-                        </p>
-                        <p className="mt-0.5 text-xs text-slate-500">
-                          可以一次填写多个产品或供应商，保存时一次性提交。
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setQuoteDrafts((current) => [
-                            ...current,
-                            newSupplierQuoteDraft(detailOrder, suppliers),
-                          ]);
-                          setActiveQuoteDraftIndex(quoteDrafts.length);
-                        }}
-                        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-sky-200 bg-white px-3 text-xs font-semibold text-sky-700 hover:bg-sky-50"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        添加一条
-                      </button>
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {quoteDrafts.map((draft, index) => (
-                        <button
-                          key={`${index}-${draft.order_item_id}`}
-                          type="button"
-                          onClick={() => setActiveQuoteDraftIndex(index)}
-                          className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs ${index === activeQuoteDraftIndex ? "bg-sky-600 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200"}`}
-                        >
-                          {index + 1}. {draft.supplier_id ? "已选供应商" : "待填写"}
-                          {quoteDrafts.length > 1 && (
-                            <span
-                              role="button"
-                              tabIndex={0}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                setQuoteDrafts((current) =>
-                                  current.filter((_, itemIndex) => itemIndex !== index),
-                                );
-                                setActiveQuoteDraftIndex((current) =>
-                                  Math.max(0, Math.min(current, quoteDrafts.length - 2)),
-                                );
-                              }}
-                              className="ml-1 opacity-70 hover:opacity-100"
-                              title="移除这条报价"
-                            >
-                              ×
-                            </span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="text-sm font-medium">
-                    <div className="flex items-center justify-between gap-2">
-                      <span>产品</span>
-                      {detailOrder.access?.can_add_items && (
-                        <button
-                          type="button"
-                          onClick={openAddItems}
-                          className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:text-emerald-800"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                          添加产品
-                        </button>
-                      )}
-                    </div>
-                    <div className="mt-1.5">
-                      <OrderItemCombobox
-                        items={detailOrder.items || []}
-                        value={quoteDraft.order_item_id}
-                        onChange={(itemID) =>
-                          setQuoteDraft((current) => ({
-                            ...current,
-                            order_item_id: itemID,
-                          }))
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="text-sm font-medium">
-                    <div>供应商</div>
-                    <div className="mt-1.5 flex gap-2">
-                      <SupplierCombobox
-                        suppliers={suppliers}
-                        value={quoteDraft.supplier_id}
-                        onChange={(supplierID, supplier) =>
-                          setQuoteDraft((current) => ({
-                            ...current,
-                            supplier_id: supplierID,
-                            currency: defaultSupplierQuoteCurrency(supplier),
-                          }))
-                        }
-                      />
-                      <button
-                        type="button"
-                        onClick={() => openNewSupplierModal(paymentOptions[0])}
-                        className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200"
-                        title="新增供应商"
-                      >
-                        <Plus className="h-4 w-4" />
-                      </button>
-                    </div>
-                  </div>
-                  <label className="text-sm font-medium">
-                    币种
-                    <input
-                      list="trade-currency-options"
-                      value={quoteDraft.currency}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          currency: event.target.value.toUpperCase(),
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 uppercase"
-                    />
-                  </label>
-                  <label className="text-sm font-medium">
-                    供应商单价
-                    <input
-                      type="number"
-                      min="0"
-                      step="any"
-                      value={quoteDraft.unit_price}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          unit_price: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3"
-                    />
-                  </label>
-                  <label className="text-sm font-medium">
-                    MOQ
-                    <input
-                      type="number"
-                      min="0"
-                      step="any"
-                      value={quoteDraft.moq}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          moq: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3"
-                    />
-                  </label>
-                  <label className="text-sm font-medium">
-                    交期
-                    <select
-                      value={quoteDraft.lead_time_days}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          lead_time_days: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3"
-                    >
-                      {[2, 3, 4, 7, 10, 15, 30].map((days, index) => (
-                        <option key={days} value={days}>
-                          {index === 0
-                            ? "1-2 天"
-                            : index === 1
-                              ? "2-3 天"
-                              : index === 2
-                                ? "3-4 天"
-                                : `${Math.max(1, days - 2)}-${days} 天`}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="text-sm font-medium">
-                    报价有效期
-                    <input
-                      type="date"
-                      value={quoteDraft.valid_until}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          valid_until: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3"
-                    />
-                  </label>
-                  <label className="text-sm font-medium sm:col-span-2">
-                    供应商备注
-                    <textarea
-                      value={quoteDraft.notes}
-                      onChange={(event) =>
-                        setQuoteDraft((current) => ({
-                          ...current,
-                          notes: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 min-h-20 w-full rounded-lg border border-slate-200 px-3 py-2"
-                    />
-                  </label>
-                </div>
-              </div>
-              <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
-                <button
-                  type="button"
-                  onClick={() => setQuoteModalOpen(false)}
-                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm"
-                >
-                  取消
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void saveSupplierQuote()}
-                  disabled={savingQuote}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
-                >
-                  {savingQuote && <Loader2 className="h-4 w-4 animate-spin" />}
-                  保存报价
-                </button>
-              </div>
-            </div>
-          </div>
+          <SupplierQuoteBatchModal
+            order={detailOrder}
+            suppliers={suppliers}
+            drafts={quoteDrafts}
+            onChange={setQuoteDrafts}
+            editing={editingSupplierQuoteID !== null}
+            saving={savingQuote}
+            canAddItems={Boolean(detailOrder.access?.can_add_items)}
+            defaultCurrency={defaultSupplierQuoteCurrency}
+            onAddItems={openAddItems}
+            onCreateSupplier={() => openNewSupplierModal(paymentOptions[0])}
+            onClose={() => setQuoteModalOpen(false)}
+            onSave={() => void saveSupplierQuote()}
+          />
         )}
 
         {customerQuoteModalOpen && detailOrder && customerQuoteDraft && (
@@ -7143,11 +6719,13 @@ export default function TradeWorkspacePage() {
                           >
                             <td className="px-3 py-2">
                               <div className="font-medium">
-                                {item.sku || item.product_name}
+                                {itemSKU(item)}
                               </div>
-                              <div className="text-xs text-slate-400">
-                                {item.product_name}
-                              </div>
+                              {itemExtraName(item) && (
+                                <div className="text-xs text-slate-400">
+                                  {itemExtraName(item)}
+                                </div>
+                              )}
                             </td>
                             <td className="px-3 py-2 text-right">
                               {item.quantity} {item.unit}
@@ -7341,7 +6919,7 @@ export default function TradeWorkspacePage() {
 
         {customerQuoteStatusDraft && detailOrder && (
           <div className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
-            <div className="w-full max-w-lg rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">更新客户反馈</h2>
@@ -7446,7 +7024,7 @@ export default function TradeWorkspacePage() {
 
         {paymentQuoteID && detailOrder && (
           <div className="fixed inset-0 z-[105] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
-            <div className="w-full max-w-md rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-md overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">登记客户付款</h2>
@@ -7528,13 +7106,13 @@ export default function TradeWorkspacePage() {
 
         {itemModalOpen && detailOrder && (
           <div className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
-            <div className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">向业务单添加产品</h2>
                   <p className="mt-0.5 text-xs text-slate-500">
                     {detailOrder.order_no} ·
-                    新产品会同步到当前流程工作簿，并可立即录入供应商报价。
+                    新产品会进入当前业务单的后续环节，并可立即录入供应商报价。
                   </p>
                 </div>
                 <button
@@ -7548,141 +7126,12 @@ export default function TradeWorkspacePage() {
                 </button>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-semibold">追加产品明细</h3>
-                    <p className="mt-0.5 text-xs text-slate-400">
-                      产品名称和数量为必填项，可一次添加多行。
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setAdditionalItems((current) => [
-                        ...current,
-                        newOrderItem(),
-                      ])
-                    }
-                    className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    添加一行
-                  </button>
-                </div>
-                <div className="mt-3 space-y-3">
-                  {additionalItems.map((item, index) => (
-                    <div
-                      key={index}
-                      className="relative grid gap-3 rounded-lg border border-slate-200 p-3 sm:grid-cols-2 lg:grid-cols-12"
-                    >
-                      <div className="absolute -left-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-700 text-[11px] font-semibold text-white">
-                        {index + 1}
-                      </div>
-                      <input
-                        value={item.sku}
-                        onChange={(event) =>
-                          updateAdditionalItem(index, "sku", event.target.value)
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 lg:col-span-2"
-                        placeholder="SKU"
-                      />
-                      <input
-                        value={item.product_name}
-                        onChange={(event) =>
-                          updateAdditionalItem(
-                            index,
-                            "product_name",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 lg:col-span-3"
-                        placeholder="产品名称 *"
-                      />
-                      <input
-                        value={item.specification}
-                        onChange={(event) =>
-                          updateAdditionalItem(
-                            index,
-                            "specification",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 lg:col-span-3"
-                        placeholder="规格/材质/颜色"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        step="any"
-                        value={item.quantity}
-                        onChange={(event) =>
-                          updateAdditionalItem(
-                            index,
-                            "quantity",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 lg:col-span-1"
-                        placeholder="数量"
-                      />
-                      <input
-                        value={item.unit}
-                        onChange={(event) =>
-                          updateAdditionalItem(
-                            index,
-                            "unit",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 lg:col-span-1"
-                        placeholder="单位"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        step="any"
-                        value={item.target_price}
-                        onChange={(event) =>
-                          updateAdditionalItem(
-                            index,
-                            "target_price",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 lg:col-span-1"
-                        placeholder="目标价"
-                      />
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setAdditionalItems((current) =>
-                            current.length === 1
-                              ? [newOrderItem()]
-                              : current.filter(
-                                  (_, itemIndex) => itemIndex !== index,
-                                ),
-                          )
-                        }
-                        className="inline-flex h-9 items-center justify-center rounded-lg text-rose-500 hover:bg-rose-50 lg:col-span-1"
-                        title="删除这一行"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                      <input
-                        value={item.description}
-                        onChange={(event) =>
-                          updateAdditionalItem(
-                            index,
-                            "description",
-                            event.target.value,
-                          )
-                        }
-                        className="h-9 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-400 sm:col-span-2 lg:col-span-12"
-                        placeholder="客户要求、包装或其他说明"
-                      />
-                    </div>
-                  ))}
-                </div>
+                <OrderItemsEditor
+                  items={additionalItems}
+                  onChange={setAdditionalItems}
+                  onError={setError}
+                  maxHeightClass="max-h-[60vh]"
+                />
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
                 <button
@@ -7700,7 +7149,7 @@ export default function TradeWorkspacePage() {
                   className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-700 px-4 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-40"
                 >
                   {savingItems && <Loader2 className="h-4 w-4 animate-spin" />}
-                  保存并同步
+                  保存产品
                 </button>
               </div>
             </div>
@@ -8166,7 +7615,7 @@ export default function TradeWorkspacePage() {
 
         {detailOrder && (
           <div
-            className="fixed inset-0 z-40 bg-slate-950/35"
+            className="fixed inset-0 z-[61] bg-slate-950/35"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !flowing)
                 closeOrderDetail();
@@ -8251,18 +7700,14 @@ export default function TradeWorkspacePage() {
                         })}
                       </div>
                     </div>
-                    {detailOrder.access && (
-                      <div className="border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-medium text-slate-600">
-                        {detailOrder.access.scope_label} · 可查看{" "}
-                        {(detailOrder.access.visible_sheet_names || []).length}{" "}
-                        张流程工作表
-                        {(detailOrder.access.editable_sheet_names || []).length >
-                          0 &&
-                          `，可编辑 ${(detailOrder.access.editable_sheet_names || []).join("、")}`}
-                      </div>
-                    )}
                     <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-sky-50/70 px-4 py-2.5 text-xs text-sky-800">
                       <span>
+                        {detailOrder.access?.scope_label && (
+                          <span className="mr-2 inline-flex items-center gap-1 rounded bg-white px-1.5 py-0.5 font-medium text-slate-600 ring-1 ring-slate-200">
+                            <ShieldCheck className="h-3 w-3" />
+                            {detailOrder.access.scope_label}
+                          </span>
+                        )}
                         正在查看：
                         <strong className="ml-1">
                           {stageDefinition(detailViewStage)?.label || detailViewStage}
@@ -8322,7 +7767,7 @@ export default function TradeWorkspacePage() {
                           )}
                         </div>
                       )}
-                    <div className="grid gap-px border-b border-slate-200 bg-slate-200 sm:grid-cols-4">
+                    <div className="grid grid-cols-2 gap-px border-b border-slate-200 bg-slate-200 sm:grid-cols-4">
                       <div className="bg-white px-4 py-3">
                         <div className="text-xs text-slate-400">币种</div>
                         <div className="mt-1 text-sm font-semibold">
@@ -8363,36 +7808,6 @@ export default function TradeWorkspacePage() {
                     </div>
                     <div className="p-4">
                       <div className="flex flex-wrap gap-2">
-                        {detailOrder.workbook_id &&
-                          detailOrder.workbook_sheet_id && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                rememberAndNavigate(
-                                  `/sheets/${detailOrder.workbook_id}/${detailOrder.workbook_sheet_id}`,
-                                )
-                              }
-                              className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-700 px-3 text-sm font-semibold text-white hover:bg-emerald-600"
-                            >
-                              <FileSpreadsheet className="h-4 w-4" />
-                              打开流程工作簿
-                            </button>
-                          )}
-                        {detailOrder.access?.can_sync_workbook && (
-                          <button
-                            type="button"
-                            onClick={() => void syncWorkbook()}
-                            disabled={syncingWorkbook}
-                            className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 px-3 text-sm font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-40"
-                          >
-                            {syncingWorkbook ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <RotateCcw className="h-4 w-4" />
-                            )}
-                            校准工作簿
-                          </button>
-                        )}
                         {detailOrder.channel_id && (
                           <button
                             type="button"
@@ -8479,7 +7894,7 @@ export default function TradeWorkspacePage() {
                                 编辑成本
                               </button>
                             </div>
-                            <div className="grid gap-px bg-slate-200 sm:grid-cols-3 xl:grid-cols-5">
+                            <div className="grid grid-cols-2 gap-px bg-slate-200 sm:grid-cols-3 xl:grid-cols-5">
                               {[
                                 [
                                   "商品收入",
@@ -8601,7 +8016,7 @@ export default function TradeWorkspacePage() {
                             产品与流程数据
                           </h3>
                           <p className="mt-0.5 text-xs text-slate-400">
-                            新增产品后会自动进入当前业务单的全部后续流程工作表。
+                            新增产品后会自动进入当前业务单的全部后续环节。
                           </p>
                         </div>
                         <div className="flex flex-wrap justify-end gap-2">
@@ -8632,12 +8047,86 @@ export default function TradeWorkspacePage() {
                           )}
                         </div>
                       </div>
-                      <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
-                        <table className="w-full min-w-[680px] text-sm">
+                      <div className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200 md:hidden">
+                        {(detailOrder.items || []).map((item) => {
+                          const cover = (item.images || [])[0];
+                          const extras: string[] = [];
+                          if (detailViewStage === "quotation" && detailOrder.access?.can_view_customer_pricing)
+                            extras.push(`报价 ${formatMoney(detailOrder.currency, item.quoted_price)}`);
+                          if (["supplier_quote", "purchase"].includes(detailViewStage) && detailOrder.access?.can_view_supplier && item.supplier_name)
+                            extras.push(item.supplier_name);
+                          if (["supplier_quote", "purchase"].includes(detailViewStage) && detailOrder.access?.can_view_supplier_pricing && item.purchase_price)
+                            extras.push(`采购 ${formatMoney(item.purchase_currency || detailOrder.currency, item.purchase_price)}`);
+                          if (detailViewStage === "receiving" && detailOrder.access?.can_view_receiving)
+                            extras.push(`到货 ${item.received_quantity || 0}`);
+                          if (detailViewStage === "inspection" && detailOrder.access?.can_view_inspection)
+                            extras.push(`合格 ${item.accepted_quantity || 0}`);
+                          if (detailViewStage === "packing" && detailOrder.access?.can_view_packing)
+                            extras.push(`装箱 ${item.packed_quantity || 0}`);
+                          const canInspect = detailOrder.stage === "inspection" && detailOrder.can_operate_stage;
+                          const canInquiryImage = !canInspect && detailOrder.access?.can_manage_item_images;
+                          return (
+                            <div key={item.id} className="flex items-center gap-3 p-2.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (canInspect) setPhotoSheet({ kind: "inspection", itemID: item.id });
+                                  else if (canInquiryImage) setPhotoSheet({ kind: "inquiry", itemID: item.id });
+                                  else if (cover) window.open(cover.url, "_blank");
+                                }}
+                                className="relative flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 text-slate-300"
+                                aria-label={canInspect ? "拍摄质检照片" : "查看图片"}
+                              >
+                                {cover ? (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img src={cover.thumbnail_url || cover.url} alt="" className="h-full w-full object-cover" />
+                                ) : canInspect ? (
+                                  <Camera className="h-5 w-5 text-teal-600" />
+                                ) : (
+                                  <ImagePlus className="h-5 w-5" />
+                                )}
+                                {(item.images || []).length > 1 && (
+                                  <span className="absolute bottom-0 right-0 rounded-tl bg-slate-900/70 px-1 text-[10px] text-white">
+                                    {(item.images || []).length}
+                                  </span>
+                                )}
+                              </button>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="truncate font-semibold text-slate-900">
+                                    {item.line_no}. {itemSKU(item)}
+                                  </span>
+                                  <span className="shrink-0 text-xs tabular-nums text-slate-600">
+                                    {item.quantity} {item.unit}
+                                  </span>
+                                </div>
+                                {(item.specification || itemExtraName(item)) && (
+                                  <div className="truncate text-xs text-slate-400">
+                                    {[itemExtraName(item), item.specification].filter(Boolean).join(" · ")}
+                                  </div>
+                                )}
+                                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
+                                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-medium text-slate-600">
+                                    {stageItemStatus(detailViewStage, item)}
+                                  </span>
+                                  {extras.map((extra) => (
+                                    <span key={extra} className="text-slate-500">
+                                      {extra}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div className="mt-2 hidden overflow-x-auto rounded-lg border border-slate-200 md:block">
+                        <table className="w-full min-w-[760px] text-sm">
                           <thead className="bg-slate-50 text-left text-xs text-slate-500">
                             <tr>
                               <th className="px-3 py-2">序号</th>
-                              <th className="px-3 py-2">SKU / 产品</th>
+                              <th className="px-3 py-2">图片</th>
+                              <th className="px-3 py-2">SKU</th>
                               <th className="px-3 py-2">规格</th>
                               <th className="px-3 py-2 text-right">询价数量</th>
                               <th className="px-3 py-2">当前环节状态</th>
@@ -8682,12 +8171,80 @@ export default function TradeWorkspacePage() {
                               >
                                 <td className="px-3 py-2">{item.line_no}</td>
                                 <td className="px-3 py-2">
+                                  <div className="flex items-center gap-1">
+                                    {(item.images || []).slice(0, 3).map((image) => (
+                                      <span
+                                        key={`${image.source}-${image.id}`}
+                                        className="group relative h-9 w-9 shrink-0 overflow-hidden rounded border border-slate-200 bg-slate-50"
+                                      >
+                                        <a
+                                          href={image.url}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          title={image.source === "inspection" ? "到货/质检实拍" : "客户询价图片"}
+                                        >
+                                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                                          <img
+                                            src={image.thumbnail_url || image.url}
+                                            alt=""
+                                            className="h-full w-full object-cover"
+                                          />
+                                        </a>
+                                        {image.source === "inquiry" &&
+                                          detailOrder.access?.can_manage_item_images && (
+                                            <button
+                                              type="button"
+                                              onClick={() => void deleteItemImage(item.id, image.id)}
+                                              className="absolute right-0 top-0 hidden h-4 w-4 items-center justify-center rounded-bl bg-rose-600 text-white group-hover:flex"
+                                              title="移除图片"
+                                            >
+                                              <X className="h-3 w-3" />
+                                            </button>
+                                          )}
+                                      </span>
+                                    ))}
+                                    {(item.images || []).length > 3 && (
+                                      <span className="text-[10px] text-slate-400">
+                                        +{(item.images || []).length - 3}
+                                      </span>
+                                    )}
+                                    {detailOrder.stage === "inspection" &&
+                                    detailOrder.can_operate_stage ? (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setPhotoSheet({ kind: "inspection", itemID: item.id })
+                                        }
+                                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded border border-dashed border-teal-400 text-teal-600 hover:bg-teal-50"
+                                        title="拍摄该 SKU 的到货/质检照片"
+                                      >
+                                        <Camera className="h-3.5 w-3.5" />
+                                      </button>
+                                    ) : (
+                                      detailOrder.access?.can_manage_item_images && (
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setPhotoSheet({ kind: "inquiry", itemID: item.id })
+                                          }
+                                          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded border border-dashed border-slate-300 text-slate-400 hover:border-sky-400 hover:text-sky-600"
+                                          title="上传客户发来的询价图片"
+                                        >
+                                          <ImagePlus className="h-3.5 w-3.5" />
+                                        </button>
+                                      )
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="px-3 py-2">
                                   <div className="font-medium">
-                                    {item.sku || "-"}
+                                    {itemSKU(item)}
                                   </div>
-                                  <div className="text-xs text-slate-400">
-                                    {item.product_name}
-                                  </div>
+                                  {itemExtraName(item) && (
+                                    <div className="text-xs text-slate-400">
+                                      {itemExtraName(item)}
+                                    </div>
+                                  )}
                                 </td>
                                 <td className="px-3 py-2 text-slate-500">
                                   {item.specification || "-"}
@@ -8992,12 +8549,13 @@ export default function TradeWorkspacePage() {
                                             >
                                               <td className="px-3 py-2">
                                                 <span className="font-medium text-slate-700">
-                                                  {item.sku ||
-                                                    item.product_name}
+                                                  {itemSKU(item)}
                                                 </span>
-                                                <span className="ml-1 text-slate-400">
-                                                  {item.product_name}
-                                                </span>
+                                                {itemExtraName(item) && (
+                                                  <span className="ml-1 text-slate-400">
+                                                    {itemExtraName(item)}
+                                                  </span>
+                                                )}
                                               </td>
                                               <td className="px-3 py-2 text-right">
                                                 {item.quantity} {item.unit}
@@ -9216,14 +8774,12 @@ export default function TradeWorkspacePage() {
                                 <button
                                   type="button"
                                   onClick={() => {
-                                    setQuoteDrafts([
-                                      newSupplierQuoteDraft(
-                                        detailOrder,
-                                        suppliers,
+                                    setQuoteDrafts(
+                                      (detailOrder.items || []).map((item) =>
+                                        supplierQuoteDraftForItem(item.id),
                                       ),
-                                    ]);
+                                    );
                                     setEditingSupplierQuoteID(null);
-                                    setActiveQuoteDraftIndex(0);
                                     setQuoteModalOpen(true);
                                   }}
                                   className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pink-700 px-3 text-xs font-semibold text-white"
@@ -9267,12 +8823,13 @@ export default function TradeWorkspacePage() {
                                       >
                                         <td className="px-3 py-2">
                                           <div className="font-medium">
-                                            {quote.sku ||
-                                              `第 ${quote.line_no} 行`}
+                                            {itemSKU(quote)}
                                           </div>
-                                          <div className="text-xs text-slate-400">
-                                            {quote.product_name}
-                                          </div>
+                                          {itemExtraName(quote) && (
+                                            <div className="text-xs text-slate-400">
+                                              {itemExtraName(quote)}
+                                            </div>
+                                          )}
                                         </td>
                                         <td className="px-3 py-2">
                                           <div className="font-medium">
@@ -9354,7 +8911,6 @@ export default function TradeWorkspacePage() {
                                                       notes: quote.notes,
                                                     },
                                                   ]);
-                                                  setActiveQuoteDraftIndex(0);
                                                   setEditingSupplierQuoteID(
                                                     quote.id,
                                                   );
@@ -9457,7 +9013,7 @@ export default function TradeWorkspacePage() {
                                             className="flex items-center justify-between gap-3 text-xs"
                                           >
                                             <span className="min-w-0 truncate text-slate-600">
-                                              {item.line_no}. {item.sku || item.product_name}
+                                              {item.line_no}. {itemSKU(item)}
                                             </span>
                                             <span className="shrink-0 font-semibold tabular-nums text-slate-800">
                                               每箱 {item.quantity}
@@ -9494,80 +9050,26 @@ export default function TradeWorkspacePage() {
                           </div>
                           {detailOrder.can_operate_stage &&
                             detailOrder.stage === "inspection" && (
-                              <div className="mt-3 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[180px_1fr_auto_auto]">
-                                <select
-                                  value={inspectionItemID ?? ""}
-                                  onChange={(event) =>
-                                    setInspectionItemID(
-                                      event.target.value
-                                        ? Number(event.target.value)
-                                        : "",
-                                    )
-                                  }
-                                  className="h-9 rounded-lg border border-slate-200 bg-white px-2 text-sm"
-                                >
-                                  <option value="">整单质检</option>
-                                  {(detailOrder.items || []).map((item) => (
-                                    <option key={item.id} value={item.id}>
-                                      {item.line_no}.{" "}
-                                      {item.sku || item.product_name}
-                                    </option>
-                                  ))}
-                                </select>
-                                <input
-                                  value={inspectionNote}
-                                  onChange={(event) =>
-                                    setInspectionNote(event.target.value)
-                                  }
-                                  className="h-9 rounded-lg border border-slate-200 bg-white px-3 text-sm"
-                                  placeholder="质检说明、问题或处理意见"
-                                />
-                                <label className="inline-flex h-9 cursor-pointer items-center justify-center gap-2 rounded-lg border border-teal-200 bg-white px-3 text-sm font-semibold text-teal-700">
-                                  <ImagePlus className="h-4 w-4" />
-                                  选择图片
-                                  <input
-                                    type="file"
-                                    accept="image/*"
-                                    multiple
-                                    className="hidden"
-                                    onChange={(event) =>
-                                      setInspectionFiles(
-                                        Array.from(event.target.files || []),
-                                      )
-                                    }
-                                  />
-                                </label>
+                              <div className="mt-3 flex flex-col gap-2 rounded-lg border border-teal-100 bg-teal-50/60 p-3 sm:flex-row sm:items-center sm:justify-between">
+                                <p className="text-xs leading-5 text-teal-900">
+                                  手机可直接调用相机拍照或从相册选图，上传前可旋转方向；照片会作为该 SKU 的到货实拍图展示在产品报价库。
+                                </p>
                                 <button
                                   type="button"
-                                  onClick={() => void openInspectionGalleryPicker()}
-                                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-sky-200 bg-white px-3 text-sm font-semibold text-sky-700 hover:bg-sky-50"
-                                >
-                                  <Images className="h-4 w-4" />
-                                  从图库选择
-                                </button>
-                                {inspectionFiles.length > 0 && (
-                                  <div className="text-xs text-slate-500 sm:col-span-3">
-                                    已选择 {inspectionFiles.length} 张：
-                                    {inspectionFiles
-                                      .map((file) => file.name)
-                                      .join("、")}
-                                  </div>
-                                )}
-                                <button
-                                  type="button"
-                                  onClick={() => void uploadInspectionPhotos()}
-                                  disabled={
-                                    uploadingInspection ||
-                                    inspectionFiles.length === 0
+                                  onClick={() =>
+                                    setPhotoSheet({
+                                      kind: "inspection",
+                                      itemID:
+                                        typeof inspectionItemID === "number"
+                                          ? inspectionItemID
+                                          : null,
+                                    })
                                   }
-                                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-teal-700 px-3 text-sm font-semibold text-white disabled:opacity-40 sm:col-start-4"
+                                  disabled={uploadingInspection}
+                                  className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-lg bg-teal-700 px-4 text-sm font-semibold text-white active:scale-[0.98] disabled:opacity-40"
                                 >
-                                  {uploadingInspection ? (
-                                    <Loader2 className="h-4 w-4 animate-spin" />
-                                  ) : (
-                                    <ImagePlus className="h-4 w-4" />
-                                  )}
-                                  上传
+                                  <Camera className="h-4 w-4" />
+                                  拍照 / 选图上传
                                 </button>
                               </div>
                             )}
@@ -10483,8 +9985,8 @@ export default function TradeWorkspacePage() {
                         >
                           <div className="min-w-0">
                             <div className="truncate text-sm font-medium text-slate-800">
-                              {item.line_no}. {item.sku || item.product_name} ·{" "}
-                              {item.product_name}
+                              {item.line_no}. {itemSKU(item)}
+                              {itemExtraName(item) && ` · ${itemExtraName(item)}`}
                             </div>
                             <div className="mt-0.5 text-xs text-slate-400">
                               采购价{" "}
@@ -10568,7 +10070,7 @@ export default function TradeWorkspacePage() {
                 setDeleteTarget(null);
             }}
           >
-            <div className="w-full max-w-md rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-md overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-4 py-3">
                 <div>
                   <h3 className="text-sm font-semibold text-slate-900">
@@ -10644,8 +10146,7 @@ export default function TradeWorkspacePage() {
                     数据
                   </div>
                   <p className="mt-1 text-xs leading-5 text-slate-400">
-                    在 ERP
-                    或流程工作表中修改都会双向同步；身份字段和其他岗位数据保持只读。
+                    仅可修改本环节字段；产品 SKU 和其他岗位数据保持只读。
                   </p>
                 </div>
                 <button
@@ -10848,10 +10349,10 @@ export default function TradeWorkspacePage() {
                         <div className="mb-3 flex items-center justify-between gap-3">
                           <div className="min-w-0">
                             <div className="truncate text-sm font-semibold text-slate-900">
-                              {item.line_no}. {item.sku || item.product_name}
+                              {item.line_no}. {itemSKU(item)}
                             </div>
                             <div className="mt-0.5 truncate text-xs text-slate-400">
-                              {item.product_name}
+                              {itemExtraName(item) || item.specification}
                             </div>
                           </div>
                           <div className="flex shrink-0 items-center gap-1.5">
@@ -10876,7 +10377,7 @@ export default function TradeWorkspacePage() {
                                       ? "订单至少需要保留一个产品"
                                       : "从订单中删除这个产品"
                                   }
-                                  aria-label={`删除产品 ${item.sku || item.product_name}`}
+                                  aria-label={`删除产品 ${itemSKU(item)}`}
                                 >
                                   <Trash2 className="h-4 w-4" />
                                 </button>
@@ -11054,7 +10555,7 @@ export default function TradeWorkspacePage() {
                 setOrderItemDeleteTarget(null);
             }}
           >
-            <div className="w-full max-w-md overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-md overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="font-semibold">删除订单产品</h2>
@@ -11075,16 +10576,17 @@ export default function TradeWorkspacePage() {
               <div className="space-y-3 p-4">
                 <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
                   <div className="font-semibold text-slate-900">
-                    {orderItemDeleteTarget.sku ||
-                      orderItemDeleteTarget.product_name}
+                    {itemSKU(orderItemDeleteTarget)}
                   </div>
                   <div className="mt-1 text-sm text-slate-500">
-                    {orderItemDeleteTarget.product_name} ·{" "}
+                    {[itemExtraName(orderItemDeleteTarget), orderItemDeleteTarget.specification]
+                      .filter(Boolean)
+                      .join(" · ")}{" "}
                     {orderItemDeleteTarget.quantity} {orderItemDeleteTarget.unit}
                   </div>
                 </div>
                 <p className="text-sm leading-6 text-slate-600">
-                  删除后会同步移除该产品关联的供应商报价，重新排列剩余产品行号，并更新订单金额和流程工作簿。此操作不能撤销。
+                  删除后会同步移除该产品关联的供应商报价，重新排列剩余产品行号，并更新订单金额。此操作不能撤销。
                 </p>
               </div>
               <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
@@ -11122,7 +10624,7 @@ export default function TradeWorkspacePage() {
             onSaved={(updatedOrder) => {
               setDetailOrder(updatedOrder);
               setPackingGroupsOpen(false);
-              setNotice("装箱组合、产品装箱数量和流程工作簿已同步更新。");
+              setNotice("装箱组合和产品装箱数量已同步更新。");
               void loadData(true);
             }}
           />
@@ -11256,7 +10758,7 @@ export default function TradeWorkspacePage() {
                 setReturnToPurchaseOpen(false);
             }}
           >
-            <div className="w-full max-w-lg rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
+            <div className="max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-start justify-between border-b border-slate-200 px-4 py-3">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">

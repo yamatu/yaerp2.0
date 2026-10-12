@@ -155,6 +155,12 @@ type UpdateSheetRequest struct {
 	Frozen      *json.RawMessage `json:"frozen"`
 	Config      *json.RawMessage `json:"config"`
 	CellChanges []CellUpdate     `json:"cell_changes"`
+	// StructureChanged marks a save that inserted, deleted or moved rows,
+	// columns or cell ranges; BaseStructureRevision is the structure revision
+	// (config.structureRevision) the client edited. See
+	// service.PrepareSheetCellChangesWithOptions.
+	StructureChanged      bool   `json:"structure_changed"`
+	BaseStructureRevision *int64 `json:"base_structure_revision"`
 }
 
 type CellUpdate struct {

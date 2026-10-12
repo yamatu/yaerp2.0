@@ -2,6 +2,8 @@ import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
   output: 'standalone',
+  // Lets several dev servers run side by side without sharing a build dir.
+  distDir: process.env.NEXT_DIST_DIR || '.next',
   transpilePackages: [
     '@univerjs/core',
     '@univerjs/design',

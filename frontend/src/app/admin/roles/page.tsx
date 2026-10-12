@@ -1,386 +1,313 @@
 'use client'
 
-import {
-  PencilLine,
-  Plus,
-  Shield,
-  ShieldCheck,
-  Trash2,
-} from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { Lock, PencilLine, Plus, RefreshCw, Shield, ShieldCheck, Tags, Trash2, Users } from 'lucide-react'
+import Link from 'next/link'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AdminShell } from '@/components/admin/AdminShell'
+import { rolesHelp } from '@/components/admin/adminHelp'
+import { ensureOk, errorText } from '@/components/admin/adminApi'
+import { useConfirm, useToast } from '@/components/admin/feedback'
+import {
+  Button,
+  DataTable,
+  EmptyState,
+  Field,
+  IconButton,
+  Modal,
+  Notice,
+  SectionCard,
+  StatGrid,
+  StatusBadge,
+  TextInput,
+  Toolbar,
+  type DataColumn,
+} from '@/components/admin/ui'
 import api from '@/lib/api'
+import type { AuthUser, PageData, Role } from '@/types'
 
-interface Role {
-  id: number
-  name: string
-  code: string
-  description: string
+const BUILTIN_CODES = new Set(['admin', 'editor', 'viewer'])
+const ROLE_EFFECT: Record<string, string> = {
+  admin: '进入后台，查看并修改全部数据',
+  editor: '岗位标签，不自带表格权限',
+  viewer: '岗位标签，不自带表格权限',
+}
+const CODE_PATTERN = /^[a-z][a-z0-9_-]{1,31}$/
+
+interface RoleRow extends Role {
+  members: AuthUser[]
 }
 
 export default function RolesManagementPage() {
+  const toast = useToast()
+  const confirm = useConfirm()
   const [roles, setRoles] = useState<Role[]>([])
+  const [users, setUsers] = useState<AuthUser[]>([])
   const [loading, setLoading] = useState(true)
-  const [showCreateForm, setShowCreateForm] = useState(false)
-  const [newRole, setNewRole] = useState({ name: '', code: '', description: '' })
-  const [editingRole, setEditingRole] = useState<Role | null>(null)
-  const [editForm, setEditForm] = useState({ name: '', description: '' })
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
+  const [search, setSearch] = useState('')
 
-  const fetchRoles = useCallback(async () => {
+  const [formOpen, setFormOpen] = useState(false)
+  const [editing, setEditing] = useState<Role | null>(null)
+  const [form, setForm] = useState({ name: '', code: '', description: '' })
+  const [formError, setFormError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    setLoadError('')
     try {
-      const res = await api.get<Role[]>('/roles')
-      if (res.code === 0 && res.data) {
-        setRoles(res.data)
-      }
-    } catch (err) {
-      console.error('Failed to fetch roles:', err)
-      setError('加载角色列表失败')
+      const [rolesRes, usersRes] = await Promise.all([api.get<Role[]>('/roles'), api.get<PageData<AuthUser>>('/users?page=1&size=1000')])
+      ensureOk(rolesRes, '加载角色列表失败')
+      setRoles(Array.isArray(rolesRes.data) ? rolesRes.data : [])
+      setUsers(usersRes.code === 0 && usersRes.data?.list ? usersRes.data.list : [])
+    } catch (error) {
+      setLoadError(errorText(error, '加载角色列表失败'))
     } finally {
       setLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    fetchRoles()
-  }, [fetchRoles])
+    void loadData()
+  }, [loadData])
 
-  const handleCreate = async () => {
-    if (!newRole.name.trim() || !newRole.code.trim()) {
-      setError('角色名称和角色代码为必填项')
+  const rows = useMemo<RoleRow[]>(() => {
+    const keyword = search.trim().toLowerCase()
+    return roles
+      .map((role) => ({ ...role, members: users.filter((user) => (user.roles || []).some((item) => item.id === role.id)) }))
+      .filter((role) => !keyword || `${role.name} ${role.code} ${role.description || ''}`.toLowerCase().includes(keyword))
+  }, [roles, search, users])
+
+  const assignedUsers = users.filter((user) => (user.roles || []).length > 0).length
+
+  const openCreate = () => {
+    setEditing(null)
+    setForm({ name: '', code: '', description: '' })
+    setFormError('')
+    setFormOpen(true)
+  }
+
+  const openEdit = (role: Role) => {
+    setEditing(role)
+    setForm({ name: role.name, code: role.code, description: role.description || '' })
+    setFormError('')
+    setFormOpen(true)
+  }
+
+  const submit = async () => {
+    const name = form.name.trim()
+    const codeValue = form.code.trim()
+    if (!name) {
+      setFormError('请填写角色名称')
       return
     }
-
-    setSubmitting(true)
-    setError('')
-    try {
-      const res = await api.post('/roles', {
-        name: newRole.name.trim(),
-        code: newRole.code.trim(),
-        description: newRole.description.trim(),
-      })
-      if (res.code !== 0) {
-        setError(res.message || '创建角色失败')
-        return
-      }
-      setNewRole({ name: '', code: '', description: '' })
-      setShowCreateForm(false)
-      await fetchRoles()
-    } catch (err) {
-      console.error('Failed to create role:', err)
-      setError('创建角色失败')
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const handleEdit = (role: Role) => {
-    setEditingRole(role)
-    setEditForm({ name: role.name, description: role.description || '' })
-  }
-
-  const handleUpdate = async () => {
-    if (!editingRole || !editForm.name.trim()) {
-      setError('角色名称不能为空')
+    if (!editing && !CODE_PATTERN.test(codeValue)) {
+      setFormError('角色代码需以小写字母开头，只能包含小写字母、数字、下划线或短横线，长度 2–32')
       return
     }
-
-    setSubmitting(true)
-    setError('')
+    setSaving(true)
+    setFormError('')
     try {
-      const res = await api.put(`/roles/${editingRole.id}`, {
-        name: editForm.name.trim(),
-        description: editForm.description.trim(),
-      })
-      if (res.code !== 0) {
-        setError(res.message || '更新角色失败')
-        return
+      if (editing) {
+        ensureOk(await api.put(`/roles/${editing.id}`, { name, description: form.description.trim() }), '更新角色失败')
+        toast.success(`角色「${name}」已更新`)
+      } else {
+        ensureOk(await api.post('/roles', { name, code: codeValue, description: form.description.trim() }), '创建角色失败')
+        toast.success(`角色「${name}」已创建，可到「员工账号」中分配给员工`)
       }
-      setEditingRole(null)
-      await fetchRoles()
-    } catch (err) {
-      console.error('Failed to update role:', err)
-      setError('更新角色失败')
+      setFormOpen(false)
+      await loadData()
+    } catch (error) {
+      setFormError(errorText(error, editing ? '更新角色失败' : '创建角色失败'))
     } finally {
-      setSubmitting(false)
+      setSaving(false)
     }
   }
 
-  const handleDelete = async (roleId: number) => {
-    if (!confirm('确定要删除此角色吗？删除后相关用户的角色绑定也会失效。')) return
-
-    setSubmitting(true)
-    setError('')
+  const handleDelete = async (role: RoleRow) => {
+    const memberNames = role.members.map((user) => user.username)
+    const ok = await confirm({
+      title: `删除角色「${role.name}」？`,
+      message:
+        memberNames.length > 0
+          ? `该角色当前分配给 ${memberNames.length} 名员工：${memberNames.slice(0, 8).join('、')}${memberNames.length > 8 ? ' 等' : ''}。`
+          : '该角色目前没有分配给任何员工。',
+      consequences: ['所有员工身上的该角色立即被移除，员工账号本身不受影响', '按该角色配置过的旧表格权限、文件夹可见性规则一并删除', '此操作不可撤销'],
+      confirmText: '删除角色',
+      requireText: memberNames.length > 0 ? role.code : undefined,
+    })
+    if (!ok) return
+    setDeletingId(role.id)
     try {
-      const res = await api.delete(`/roles/${roleId}`)
-      if (res.code !== 0) {
-        setError(res.message || '删除角色失败')
-        return
-      }
-      await fetchRoles()
-    } catch (err) {
-      console.error('Failed to delete role:', err)
-      setError('删除角色失败')
+      ensureOk(await api.delete(`/roles/${role.id}`), '删除角色失败')
+      toast.success(`角色「${role.name}」已删除`)
+      await loadData()
+    } catch (error) {
+      toast.error(errorText(error, '删除角色失败'))
     } finally {
-      setSubmitting(false)
+      setDeletingId(null)
     }
   }
+
+  const columns: Array<DataColumn<RoleRow>> = [
+    {
+      key: 'name',
+      header: '角色',
+      mobile: 'title',
+      render: (role) => (
+        <div className="flex min-w-0 items-center gap-3">
+          <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${role.code === 'admin' ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'}`}>
+            {role.code === 'admin' ? <ShieldCheck className="h-4 w-4" /> : <Shield className="h-4 w-4" />}
+          </span>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-semibold text-slate-900">{role.name}</span>
+              {BUILTIN_CODES.has(role.code) && <StatusBadge>内置</StatusBadge>}
+            </div>
+            <div className="font-mono text-xs text-slate-400">{role.code}</div>
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: 'effect',
+      header: '实际作用',
+      render: (role) => (
+        <span className={role.code === 'admin' ? 'font-medium text-violet-700' : 'text-slate-600'}>{ROLE_EFFECT[role.code] || '岗位标签，不自带表格权限'}</span>
+      ),
+    },
+    {
+      key: 'description',
+      header: '说明',
+      render: (role) => <span className="text-slate-500">{role.description || '—'}</span>,
+    },
+    {
+      key: 'members',
+      header: '使用人数',
+      mobile: 'badge',
+      render: (role) => (
+        <span title={role.members.map((user) => user.username).join('、')}>
+          <StatusBadge tone={role.members.length ? 'sky' : 'slate'}>
+            <Users className="h-3 w-3" />
+            {role.members.length} 人
+          </StatusBadge>
+        </span>
+      ),
+    },
+    {
+      key: 'actions',
+      header: <span className="sr-only">操作</span>,
+      align: 'right',
+      mobile: 'actions',
+      render: (role) => (
+        <div className="flex justify-end gap-2">
+          <Button size="sm" icon={PencilLine} onClick={() => openEdit(role)}>
+            编辑
+          </Button>
+          <IconButton
+            icon={role.code === 'admin' ? Lock : Trash2}
+            label={role.code === 'admin' ? '管理员角色是系统内置角色，不能删除' : '删除角色'}
+            variant="danger-outline"
+            className="md:h-8 md:w-8"
+            disabled={role.code === 'admin' || deletingId !== null}
+            loading={deletingId === role.id}
+            onClick={() => void handleDelete(role)}
+          />
+        </div>
+      ),
+    },
+  ]
 
   return (
     <AdminShell
       title="角色管理"
-      description="维护角色定义，并与员工账号和权限矩阵联动"
-      summary={(
-        <div className="grid gap-3 sm:grid-cols-2">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
-                  <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-900 text-white">
-                    <Shield className="h-4 w-4" />
-                  </div>
-                  <div className="text-sm text-slate-500">角色总数</div>
-                  <div className="mt-1 text-2xl font-semibold text-slate-950">{roles.length}</div>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
-                  <div className="mb-3 inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700">
-                    <ShieldCheck className="h-4 w-4" />
-                  </div>
-                  <div className="text-sm text-slate-500">系统角色</div>
-                  <div className="mt-1 text-2xl font-semibold text-slate-950">
-                    {roles.filter((r) => r.code === 'admin').length}
-                  </div>
-                </div>
-        </div>
-      )}
+      description="管理员 / 编辑者 / 查看者等岗位角色"
+      help={rolesHelp}
+      actions={
+        <Button variant="primary" icon={Plus} onClick={openCreate}>
+          <span className="hidden sm:inline">新建角色</span>
+          <span className="sm:hidden">新建</span>
+        </Button>
+      }
     >
+      <StatGrid
+        items={[
+          { label: '角色总数', value: roles.length, icon: Tags },
+          { label: '自定义角色', value: roles.filter((role) => !BUILTIN_CODES.has(role.code)).length, icon: Shield, tone: 'sky' },
+          { label: '管理员人数', value: users.filter((user) => (user.roles || []).some((role) => role.code === 'admin')).length, icon: ShieldCheck, tone: 'violet' },
+          { label: '未分配角色的员工', value: users.length - assignedUsers, icon: Users, tone: users.length - assignedUsers ? 'amber' : 'slate' },
+        ]}
+      />
 
-          {/* Create Section */}
-          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-              <div>
-                <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                  Role Management
-                </div>
-                <h2 className="mt-2 text-2xl font-semibold text-slate-950">新建角色</h2>
-                <p className="mt-2 text-sm text-slate-500">
-                  角色代码(code)用于系统内部标识，建议使用英文小写，例如 editor、viewer。
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowCreateForm((prev) => !prev)}
-                className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800"
-              >
-                <Plus className="h-4 w-4" />
-                {showCreateForm ? '收起表单' : '新建角色'}
-              </button>
-            </div>
+      <Notice tone="info">
+        角色只决定“是否为管理员”。要控制普通员工能看 / 改哪些表格，请到
+        <Link href="/admin/permissions" className="mx-1 font-semibold underline underline-offset-2">部门与表格权限</Link>
+        配置。
+      </Notice>
 
-            {showCreateForm && (
-              <div className="mt-5 rounded-[24px] border border-slate-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.94),rgba(248,250,252,0.98))] p-5 shadow-sm">
-                <div className="grid gap-4 md:grid-cols-3">
-                  <div>
-                    <label className="mb-2 block text-sm font-semibold text-slate-700">角色名称 *</label>
-                    <input
-                      type="text"
-                      value={newRole.name}
-                      onChange={(e) => setNewRole((prev) => ({ ...prev, name: e.target.value }))}
-                      className="h-11 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                      placeholder="例如：编辑者"
-                      autoFocus
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-2 block text-sm font-semibold text-slate-700">角色代码 *</label>
-                    <input
-                      type="text"
-                      value={newRole.code}
-                      onChange={(e) => setNewRole((prev) => ({ ...prev, code: e.target.value }))}
-                      className="h-11 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                      placeholder="例如：editor"
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-2 block text-sm font-semibold text-slate-700">描述</label>
-                    <input
-                      type="text"
-                      value={newRole.description}
-                      onChange={(e) => setNewRole((prev) => ({ ...prev, description: e.target.value }))}
-                      className="h-11 w-full rounded-2xl border border-slate-200 bg-white px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:ring-2 focus:ring-sky-100"
-                      placeholder="可选，描述角色用途"
-                    />
-                  </div>
-                </div>
-                <div className="mt-4 flex justify-end">
-                  <button
-                    type="button"
-                    onClick={handleCreate}
-                    disabled={submitting}
-                    className="inline-flex items-center gap-2 rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    <Plus className="h-4 w-4" />
-                    {submitting ? '创建中...' : '创建角色'}
-                  </button>
-                </div>
-              </div>
-            )}
-          </section>
+      {loadError && (
+        <Notice tone="danger" action={<Button size="sm" icon={RefreshCw} onClick={() => void loadData()}>重试</Button>}>
+          {loadError}
+        </Notice>
+      )}
 
-          {/* Roles List */}
-          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-            <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-              <div>
-                <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                  Directory
-                </div>
-                <h2 className="mt-2 text-2xl font-semibold text-slate-950">角色列表</h2>
-              </div>
-            </div>
+      <SectionCard title="角色列表" description="内置角色可以改名和描述；角色代码创建后不能修改。" icon={Shield} flush>
+        <Toolbar search={search} onSearch={setSearch} placeholder="搜索角色名称、代码或说明" actions={<IconButton icon={RefreshCw} label="刷新" spin={loading} onClick={() => void loadData()} />} />
+        <DataTable
+          rows={rows}
+          columns={columns}
+          rowKey={(role) => role.id}
+          loading={loading}
+          loadingLabel="正在加载角色…"
+          empty={<EmptyState icon={Shield} title={roles.length ? '没有匹配的角色' : '还没有角色'} description={roles.length ? '换个关键词试试。' : '点击右上角“新建角色”。'} />}
+        />
+      </SectionCard>
 
-            {error && (
-              <div className="mb-5 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700">
-                {error}
-              </div>
-            )}
-
-            {loading ? (
-              <div className="rounded-[24px] border border-dashed border-slate-300 bg-slate-50/80 px-6 py-14 text-center text-slate-500">
-                正在加载角色列表...
-              </div>
-            ) : roles.length === 0 ? (
-              <div className="rounded-[24px] border border-dashed border-slate-300 bg-[linear-gradient(180deg,rgba(248,250,252,0.95),rgba(255,255,255,0.98))] px-6 py-14 text-center">
-                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-3xl bg-slate-900 text-white">
-                  <Shield className="h-7 w-7" />
-                </div>
-                <h3 className="text-2xl font-semibold text-slate-950">还没有角色</h3>
-                <p className="mt-3 text-sm leading-7 text-slate-500">
-                  先创建角色，再到员工管理中分配给对应用户。
-                </p>
-              </div>
-            ) : (
-              <div className="overflow-hidden rounded-[24px] border border-slate-200 bg-white shadow-sm">
-                <div className="overflow-x-auto">
-                  <table className="min-w-full text-sm">
-                    <thead className="bg-slate-50 text-slate-500">
-                      <tr>
-                        <th className="px-4 py-3 text-left font-semibold">角色</th>
-                        <th className="px-4 py-3 text-left font-semibold">代码</th>
-                        <th className="px-4 py-3 text-left font-semibold">描述</th>
-                        <th className="px-4 py-3 text-right font-semibold">操作</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {roles.map((role) => (
-                        <tr key={role.id} className="hover:bg-slate-50/80">
-                          <td className="px-4 py-4">
-                            <div className="flex items-center gap-3">
-                              <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-slate-900 text-white">
-                                <Shield className="h-4 w-4" />
-                              </div>
-                              <div>
-                                <div className="font-semibold text-slate-900">{role.name}</div>
-                                <div className="text-xs text-slate-400">ID #{role.id}</div>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="px-4 py-4">
-                            <span className="inline-flex rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600">
-                              {role.code}
-                            </span>
-                          </td>
-                          <td className="px-4 py-4 text-slate-600">{role.description || '-'}</td>
-                          <td className="px-4 py-4 text-right">
-                            <div className="flex justify-end gap-2">
-                              <button
-                                type="button"
-                                onClick={() => handleEdit(role)}
-                                className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                              >
-                                <PencilLine className="h-3.5 w-3.5" />
-                                编辑
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleDelete(role.id)}
-                                disabled={submitting}
-                                className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                                删除
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </section>
-
-          {/* Edit Dialog */}
-          {editingRole && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4 backdrop-blur-sm">
-              <div className="w-full max-w-lg rounded-[28px] border border-white/70 bg-white p-6 shadow-[0_24px_80px_-48px_rgba(15,23,42,0.75)] md:p-8">
-                <div className="mb-6 flex items-start justify-between gap-4">
-                  <div>
-                    <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                      Edit Role
-                    </div>
-                    <h2 className="mt-2 text-2xl font-semibold text-slate-950">
-                      编辑角色：{editingRole.name}
-                    </h2>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setEditingRole(null)}
-                    className="rounded-full border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-500 transition hover:border-slate-300 hover:text-slate-900"
-                  >
-                    关闭
-                  </button>
-                </div>
-
-                <div className="space-y-4">
-                  <div>
-                    <label className="mb-2 block text-sm font-semibold text-slate-700">角色名称</label>
-                    <input
-                      type="text"
-                      value={editForm.name}
-                      onChange={(e) => setEditForm((prev) => ({ ...prev, name: e.target.value }))}
-                      className="h-11 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-2 block text-sm font-semibold text-slate-700">描述</label>
-                    <input
-                      type="text"
-                      value={editForm.description}
-                      onChange={(e) => setEditForm((prev) => ({ ...prev, description: e.target.value }))}
-                      className="h-11 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100"
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-8 flex justify-end gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setEditingRole(null)}
-                    className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleUpdate}
-                    disabled={submitting}
-                    className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {submitting ? '保存中...' : '保存修改'}
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+      <Modal
+        open={formOpen}
+        onClose={() => setFormOpen(false)}
+        busy={saving}
+        title={editing ? `编辑角色：${editing.name}` : '新建角色'}
+        description={editing ? '角色代码不能修改；名称和描述修改后立即生效。' : '创建后到「员工账号」中把角色分配给员工。'}
+        icon={editing ? PencilLine : Plus}
+        footer={
+          <>
+            <Button onClick={() => setFormOpen(false)} disabled={saving}>取消</Button>
+            <Button variant="primary" loading={saving} onClick={() => void submit()}>
+              {editing ? '保存' : '创建角色'}
+            </Button>
+          </>
+        }
+      >
+        <form
+          className="space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void submit()
+          }}
+        >
+          {formError && <Notice tone="danger">{formError}</Notice>}
+          <Field label="角色名称" required hint="显示名称，不能与其他角色重复。">
+            <TextInput value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="例如：销售专员" maxLength={64} />
+          </Field>
+          <Field label="角色代码" required={!editing} hint={editing ? '代码是系统内部标识，创建后不可修改。' : '小写英文开头，可含数字、_、-，例如 sales、finance_mgr。创建后不可修改。'}>
+            <TextInput
+              value={form.code}
+              disabled={Boolean(editing)}
+              onChange={(event) => setForm((current) => ({ ...current, code: event.target.value.toLowerCase() }))}
+              placeholder="例如：sales"
+              className="font-mono"
+              maxLength={32}
+            />
+          </Field>
+          <Field label="说明" hint="可选，写明这个角色给哪些岗位使用。">
+            <TextInput value={form.description} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} placeholder="例如：负责客户询价与报价" />
+          </Field>
+          {editing?.code === 'admin' && <Notice tone="warning">这是管理员角色：拥有它的账号可以进入后台并修改全部数据。</Notice>}
+          <button type="submit" className="hidden" />
+        </form>
+      </Modal>
     </AdminShell>
   )
 }

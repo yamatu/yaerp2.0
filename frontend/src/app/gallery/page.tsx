@@ -3,8 +3,11 @@
 import { useEffect, useState, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react'
 import {
   ArrowLeft,
+  Camera,
   Check,
+  CheckSquare,
   Download,
+  FolderCog,
   FlipHorizontal2,
   FlipVertical2,
   FolderInput,
@@ -31,6 +34,7 @@ import api from '@/lib/api'
 import { getStoredUser, isAdmin } from '@/lib/auth'
 import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type ImageTransform } from '@/lib/imageTransform'
 import { FilePreviewModal, type FilePreviewItem } from '@/components/ui/FilePreviewModal'
+import { MOBILE_QUERY, useBodyClass, useHistoryLayer, useLongPress, useMediaQuery } from '@/hooks/useMobileGestures'
 import type { AuthUser, GalleryDirectory, GalleryDirectoryAccess, GalleryImage, User } from '@/types'
 
 interface GalleryImagesMoveResult {
@@ -73,7 +77,33 @@ export default function GalleryPage() {
   const [moveError, setMoveError] = useState('')
   const [moveNotice, setMoveNotice] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const cameraInputRef = useRef<HTMLInputElement>(null)
   const [whatsAppResource, setWhatsAppResource] = useState<WhatsAppSendResource | null>(null)
+
+  // Phones: a plain photo grid. Long press (or "选择") enters selection mode,
+  // where taps toggle photos and a bar above the tab bar holds the actions.
+  const isPhone = useMediaQuery(MOBILE_QUERY)
+  const [selectMode, setSelectMode] = useState(false)
+  const [directorySheetOpen, setDirectorySheetOpen] = useState(false)
+  const phoneSelecting = isPhone && (selectMode || selectedImageIds.length > 0)
+  const exitSelection = useCallback(() => {
+    setSelectMode(false)
+    setSelectedImageIds([])
+    setMoveDirectoryId('')
+    setMoveError('')
+  }, [])
+  const closeDirectorySheet = useCallback(() => setDirectorySheetOpen(false), [])
+  useHistoryLayer(phoneSelecting, exitSelection)
+  // The selection bar uses the corner where the AI launcher floats.
+  useBodyClass('fab-hidden', phoneSelecting)
+  useHistoryLayer(isPhone && directorySheetOpen, closeDirectorySheet)
+  const imageLongPress = useLongPress<GalleryImage>((image) => {
+    if (!image.can_manage || movingImages) return
+    setSelectMode(true)
+    setMoveError('')
+    setMoveNotice('')
+    setSelectedImageIds((current) => current.includes(image.id) ? current : [...current, image.id])
+  })
 
   const [profile] = useState<AuthUser | null>(getStoredUser())
   const admin = isAdmin(profile)
@@ -135,8 +165,10 @@ export default function GalleryPage() {
   }, [selectedDirectoryId])
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files
-    if (!files?.length) return
+    const input = e.target
+    // Copy first: clearing the input below empties the live FileList.
+    const files = Array.from(input.files || [])
+    if (!files.length) return
     setUploading(true)
     try {
       for (let i = 0; i < files.length; i++) {
@@ -152,7 +184,7 @@ export default function GalleryPage() {
       console.error('Upload failed:', err)
     } finally {
       setUploading(false)
-      if (fileInputRef.current) fileInputRef.current.value = ''
+      input.value = ''
     }
   }
 
@@ -447,39 +479,63 @@ export default function GalleryPage() {
     <AuthGuard>
       <div className="min-h-screen bg-[linear-gradient(180deg,#f8fafc_0%,#eff6ff_100%)]">
         {/* Header */}
-        <div className="mx-auto max-w-7xl px-3 py-5 sm:px-6 sm:py-8">
-          <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-4">
+        <div className={`mx-auto max-w-7xl px-2 sm:px-6 md:py-8 ${phoneSelecting ? 'pb-40' : 'pb-6'}`}>
+          <div className="sticky top-0 z-30 -mx-2 mb-2 flex items-center justify-between gap-2 border-b border-slate-200 bg-white/95 px-2 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))] backdrop-blur sm:-mx-6 sm:px-6 md:static md:mx-0 md:mb-6 md:border-0 md:bg-transparent md:p-0 md:backdrop-blur-none">
+            <div className="flex min-w-0 items-center gap-2 md:gap-4">
               <a
                 href="/"
-                className="inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm text-slate-500 transition hover:bg-white/80 hover:text-slate-900"
+                className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm text-slate-500 transition hover:bg-white/80 hover:text-slate-900 md:px-3"
+                aria-label="返回首页"
               >
                 <ArrowLeft className="h-4 w-4" />
-                返回首页
+                <span className="hidden md:inline">返回首页</span>
               </a>
-              <div className="h-6 w-px bg-slate-200" />
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-900 text-white">
+              <div className="hidden h-6 w-px bg-slate-200 md:block" />
+              <div className="flex min-w-0 items-center gap-3">
+                <div className="hidden h-10 w-10 items-center justify-center rounded-xl bg-slate-900 text-white md:flex">
                   <Images className="h-5 w-5" />
                 </div>
-                <div>
+                <div className="min-w-0">
                   <h1 className="text-lg font-bold text-slate-900">图库</h1>
-                  <p className="text-xs text-slate-500">
-                    共 {total} 张图片
+                  <p className="truncate text-xs text-slate-500">
+                    {uploading ? '正在上传...' : `共 ${total} 张图片`}
                   </p>
                 </div>
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-              className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50 sm:w-auto"
-            >
-              <ImagePlus className="h-4 w-4" />
-              {uploading ? '上传中...' : '上传图片'}
-            </button>
+            <div className="flex shrink-0 items-center gap-1 md:gap-2">
+              <button
+                type="button"
+                onClick={() => { if (phoneSelecting) exitSelection(); else setSelectMode(true) }}
+                disabled={movablePageImageIds.length === 0 && !phoneSelecting}
+                className={`inline-flex h-10 items-center gap-1.5 rounded-xl px-3 text-sm font-medium transition disabled:opacity-40 md:hidden ${phoneSelecting ? 'bg-sky-600 text-white' : 'text-slate-600 active:bg-slate-100'}`}
+              >
+                <CheckSquare className="h-4 w-4" />
+                {phoneSelecting ? '完成' : '选择'}
+              </button>
+              <button
+                type="button"
+                onClick={() => cameraInputRef.current?.click()}
+                disabled={uploading}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-700 transition active:bg-slate-100 disabled:opacity-50 md:hidden"
+                title="拍照上传"
+                aria-label="拍照上传"
+              >
+                <Camera className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="inline-flex h-10 w-10 items-center justify-center gap-2 rounded-xl bg-slate-900 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-50 md:w-auto md:px-4"
+                title="从相册或文件上传图片"
+                aria-label="上传图片"
+              >
+                {uploading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <ImagePlus className="h-5 w-5 md:h-4 md:w-4" />}
+                <span className="hidden md:inline">{uploading ? '上传中...' : '上传图片'}</span>
+              </button>
+            </div>
             <input
               ref={fileInputRef}
               type="file"
@@ -488,9 +544,18 @@ export default function GalleryPage() {
               onChange={handleUpload}
               className="hidden"
             />
+            <input
+              ref={cameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              onChange={handleUpload}
+              className="hidden"
+            />
           </div>
 
-          <div className="mb-8 grid gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm md:grid-cols-[220px_minmax(0,1fr)_140px_auto_auto]">
+          {/* Phones: directory picker plus a sheet for the management actions. */}
+          <div className="mb-2 flex items-center gap-2 md:hidden">
             <select
               value={selectedDirectoryId}
               onChange={(event) => {
@@ -498,7 +563,50 @@ export default function GalleryPage() {
                 setPage(1)
                 setDirectoryError('')
               }}
-              className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300"
+              className="h-10 min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 text-base text-slate-700 outline-none focus:border-sky-300"
+              aria-label="图库目录"
+            >
+              <option value="">全部图片</option>
+              {directories.map((directory) => (
+                <option key={directory.id} value={directory.id}>
+                  {directory.channel_id ? '频道 / ' : ''}{directory.name}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => setDirectorySheetOpen(true)}
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 active:bg-slate-50"
+              title="目录管理"
+              aria-label="目录管理"
+            >
+              <FolderCog className="h-5 w-5" />
+            </button>
+          </div>
+
+          <div
+            className={`${directorySheetOpen ? 'fixed inset-0 z-[90] flex items-end bg-slate-950/40' : 'hidden'} md:static md:z-auto md:mb-8 md:block md:bg-transparent`}
+            onClick={() => setDirectorySheetOpen(false)}
+          >
+          <div
+            className="grid w-full gap-3 rounded-t-2xl bg-white p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shadow-sm md:grid-cols-[220px_minmax(0,1fr)_140px_auto_auto] md:rounded-lg md:border md:border-slate-200 md:p-3"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between md:hidden">
+              <div>
+                <div className="text-base font-semibold text-slate-900">目录管理</div>
+                <div className="mt-0.5 text-xs text-slate-500">当前：{selectedDirectory ? selectedDirectory.name : '全部图片'}</div>
+              </div>
+              <button type="button" onClick={() => setDirectorySheetOpen(false)} className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-400 active:bg-slate-100" aria-label="关闭"><X className="h-5 w-5" /></button>
+            </div>
+            <select
+              value={selectedDirectoryId}
+              onChange={(event) => {
+                setSelectedDirectoryId(event.target.value)
+                setPage(1)
+                setDirectoryError('')
+              }}
+              className="hidden h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300 md:block"
             >
               <option value="">全部图片</option>
               {directories.map((directory) => (
@@ -512,22 +620,22 @@ export default function GalleryPage() {
               value={newDirectoryName}
               onChange={(event) => setNewDirectoryName(event.target.value)}
               placeholder="新建图库目录，例如：销售频道素材"
-              className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-300"
+              className="h-11 min-w-0 rounded-xl border border-slate-200 bg-white px-3 text-base outline-none focus:border-sky-300 md:h-10 md:text-sm"
             />
             <button
               type="button"
               onClick={() => void handleCreateDirectory()}
               disabled={!newDirectoryName.trim() || creatingDirectory}
-              className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex h-11 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 md:h-10"
             >
               <FolderPlus className="h-4 w-4" />
               新建目录
             </button>
             <button
               type="button"
-              onClick={() => { if (selectedDirectory) void openDirectoryAccess(selectedDirectory) }}
+              onClick={() => { if (selectedDirectory) { setDirectorySheetOpen(false); void openDirectoryAccess(selectedDirectory) } }}
               disabled={!selectedDirectory?.can_manage}
-              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40 md:h-10"
               title={selectedDirectory?.can_manage ? '管理当前目录权限' : '选择你可以管理的目录'}
             >
               <ShieldCheck className="h-4 w-4" />
@@ -538,7 +646,7 @@ export default function GalleryPage() {
                 type="button"
                 onClick={() => void handleDeleteDirectory()}
                 disabled={!selectedDirectory || deletingDirectory}
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40 md:h-10"
                 title={selectedDirectory ? '删除当前图库目录，图片会保留' : '请先选择要删除的目录'}
               >
                 <Trash2 className="h-4 w-4" />
@@ -547,15 +655,16 @@ export default function GalleryPage() {
             )}
             {directoryError && <div className="md:col-span-full rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{directoryError}</div>}
           </div>
+          </div>
 
           {(images.length > 0 || selectedImageIds.length > 0) && (
-            <div className="mb-5 flex flex-col gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm lg:flex-row lg:items-center lg:justify-between">
+            <div className={`${phoneSelecting ? 'fixed inset-x-0 bottom-[var(--mobile-tabbar-offset)] z-40 flex rounded-none border-x-0 border-b-0 shadow-[0_-6px_16px_rgba(15,23,42,0.08)]' : 'hidden'} flex-col gap-2 border border-slate-200 bg-white p-3 md:static md:z-auto md:mb-5 md:flex md:gap-3 md:rounded-lg md:border md:shadow-sm lg:flex-row lg:items-center lg:justify-between`}>
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={toggleCurrentPageSelection}
                   disabled={movablePageImageIds.length === 0 || movingImages}
-                  className={`inline-flex h-9 items-center gap-2 rounded-lg border px-3 text-sm font-medium transition ${allMovablePageImagesSelected ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} disabled:cursor-not-allowed disabled:opacity-40`}
+                  className={`inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm font-medium transition md:h-9 ${allMovablePageImagesSelected ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} disabled:cursor-not-allowed disabled:opacity-40`}
                 >
                   <span className={`flex h-4 w-4 items-center justify-center rounded border ${allMovablePageImagesSelected ? 'border-sky-500 bg-sky-500 text-white' : 'border-slate-300'}`}>
                     {allMovablePageImagesSelected && <Check className="h-3 w-3" />}
@@ -566,7 +675,7 @@ export default function GalleryPage() {
                   type="button"
                   onClick={() => void selectAllMovableImages()}
                   disabled={selectingAllImages || movingImages || total === 0}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40 md:h-9"
                 >
                   {selectingAllImages ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Images className="h-4 w-4" />}
                   {selectingAllImages ? '正在全选...' : selectedDirectory ? '全选当前目录' : '全选全部图片'}
@@ -576,12 +685,12 @@ export default function GalleryPage() {
                 </span>
               </div>
 
-              <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="flex min-w-0 items-center gap-2">
                 <select
                   value={moveDirectoryId}
                   onChange={(event) => { setMoveDirectoryId(event.target.value); setMoveError(''); setMoveNotice('') }}
                   disabled={editableMoveDirectories.length === 0 || movingImages}
-                  className="h-9 min-w-0 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300 sm:w-56"
+                  className="h-10 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-sky-300 md:h-9 md:w-56 md:flex-none"
                   aria-label="选择图片目标目录"
                 >
                   <option value="">选择目标目录</option>
@@ -593,7 +702,7 @@ export default function GalleryPage() {
                   type="button"
                   onClick={() => void handleMoveImages()}
                   disabled={selectedImageIds.length === 0 || !moveDirectoryId || movingImages}
-                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 md:h-9"
                 >
                   {movingImages ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FolderInput className="h-4 w-4" />}
                   {movingImages ? '移动中...' : '移动图片'}
@@ -602,7 +711,7 @@ export default function GalleryPage() {
                   type="button"
                   onClick={() => { setSelectedImageIds([]); setMoveDirectoryId(''); setMoveError(''); setMoveNotice('') }}
                   disabled={selectedImageIds.length === 0 || movingImages}
-                  className="inline-flex h-9 w-9 shrink-0 self-end items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition hover:bg-slate-50 hover:text-slate-700 disabled:opacity-40 sm:self-auto"
+                  className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition hover:bg-slate-50 hover:text-slate-700 disabled:opacity-40 md:h-9 md:w-9"
                   title="清除图片选择"
                   aria-label="清除图片选择"
                 >
@@ -628,44 +737,62 @@ export default function GalleryPage() {
               </div>
             </div>
           ) : images.length === 0 ? (
-            <div className="flex min-h-[400px] items-center justify-center">
+            <div className="flex min-h-[50dvh] items-center justify-center md:min-h-[400px]">
               <div className="text-center">
                 <Images className="mx-auto mb-4 h-16 w-16 text-slate-300" />
                 <h2 className="text-xl font-semibold text-slate-900">
                   还没有图片
                 </h2>
                 <p className="mt-2 text-sm text-slate-500">
-                  点击右上角「上传图片」开始使用。
+                  <span className="md:hidden">点右上角拍照，或从相册选择图片上传。</span>
+                  <span className="hidden md:inline">点击右上角「上传图片」开始使用。</span>
                 </p>
               </div>
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 sm:gap-4 md:grid-cols-4 lg:grid-cols-5">
+              {/* Phones get an edge-to-edge photo grid; the card details and
+                  per-image actions live in the full-screen viewer instead. */}
+              <div className="-mx-2 grid grid-cols-3 gap-0.5 sm:mx-0 sm:gap-2 md:grid-cols-4 md:gap-4 lg:grid-cols-5">
                 {images.map((img) => (
                   <div
                     key={img.id}
-                    className={`group relative overflow-hidden rounded-lg border bg-white shadow-sm transition hover:shadow-md ${selectedImageIdSet.has(img.id) ? 'border-sky-400 ring-2 ring-sky-100' : 'border-slate-200/80 hover:border-sky-200'}`}
+                    {...imageLongPress.bind(img)}
+                    onContextMenu={(event) => { if (isPhone) event.preventDefault() }}
+                    className={`group relative overflow-hidden bg-white transition [-webkit-touch-callout:none] md:rounded-lg md:border md:shadow-sm md:hover:shadow-md ${selectedImageIdSet.has(img.id) ? 'md:border-sky-400 md:ring-2 md:ring-sky-100' : 'md:border-slate-200/80 md:hover:border-sky-200'}`}
                   >
                     {img.can_manage ? (
-                      <button type="button" onClick={() => toggleImageSelection(img)} className={`absolute left-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg border shadow-sm transition ${selectedImageIdSet.has(img.id) ? 'border-sky-500 bg-sky-500 text-white' : 'border-white/80 bg-white/95 text-slate-400 hover:text-sky-600'}`} title={selectedImageIdSet.has(img.id) ? '取消选择图片' : '选择图片'} aria-label={`${selectedImageIdSet.has(img.id) ? '取消选择' : '选择'} ${img.filename}`}>
+                      <button type="button" onClick={() => toggleImageSelection(img)} className={`absolute left-1.5 top-1.5 z-10 h-7 w-7 items-center justify-center rounded-full border shadow-sm transition md:left-2 md:top-2 md:inline-flex md:h-8 md:w-8 md:rounded-lg ${phoneSelecting ? 'pointer-events-none inline-flex' : 'hidden'} ${selectedImageIdSet.has(img.id) ? 'border-sky-500 bg-sky-500 text-white' : 'border-white/80 bg-white/95 text-slate-400 hover:text-sky-600'}`} title={selectedImageIdSet.has(img.id) ? '取消选择图片' : '选择图片'} aria-label={`${selectedImageIdSet.has(img.id) ? '取消选择' : '选择'} ${img.filename}`}>
                         {selectedImageIdSet.has(img.id) && <Check className="h-4 w-4" />}
                       </button>
                     ) : (
-                      <span className="absolute left-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-400 shadow-sm" title="仅可查看，不能移动"><LockKeyhole className="h-3.5 w-3.5" /></span>
+                      <span className={`absolute left-1.5 top-1.5 z-10 h-7 w-7 items-center justify-center rounded-full bg-white/95 text-slate-400 shadow-sm md:left-2 md:top-2 md:inline-flex md:h-8 md:w-8 md:rounded-lg ${phoneSelecting ? 'inline-flex' : 'hidden'}`} title="仅可查看，不能移动"><LockKeyhole className="h-3.5 w-3.5" /></span>
                     )}
-                    {img.can_manage && <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600" title="重命名图片">
+                    {img.can_manage && <button type="button" onClick={(event) => openRename(img, event)} className="absolute right-2 top-2 z-10 hidden h-8 w-8 items-center justify-center rounded-lg bg-white/95 text-slate-600 shadow-sm transition hover:text-sky-600 md:inline-flex" title="重命名图片">
                       <Pencil className="h-3.5 w-3.5" />
                     </button>}
-                    <button type="button" onClick={() => { setPreview(img); setTransformError('') }} className="block aspect-square w-full overflow-hidden bg-slate-100 text-left" title="查看图片">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (phoneSelecting) {
+                          toggleImageSelection(img)
+                          return
+                        }
+                        setPreview(img)
+                        setTransformError('')
+                      }}
+                      className="block aspect-square w-full select-none overflow-hidden bg-slate-100 text-left"
+                      title="查看图片"
+                    >
                       <img
                         src={img.thumbnail_url || imageThumbnailUrl(img.url, 320)}
                         alt={img.filename}
-                        className="h-full w-full object-cover transition group-hover:scale-105"
+                        draggable={false}
+                        className={`h-full w-full object-cover transition [-webkit-touch-callout:none] md:group-hover:scale-105 ${phoneSelecting && selectedImageIdSet.has(img.id) ? 'scale-90 rounded-lg opacity-80' : ''}`}
                         loading="lazy"
                       />
                     </button>
-                    <div className="p-2 sm:p-3">
+                    <div className="hidden p-2 sm:p-3 md:block">
                       <p className="truncate text-xs font-semibold text-slate-800">{img.filename}</p>
                       <p className="mt-1 truncate text-[11px] text-slate-500">上传者：{img.uploader_name || `用户 #${img.uploader_id}`}</p>
                       <span className="mt-1.5 block text-[10px] text-slate-400">{formatSize(img.size)}</span>
@@ -682,12 +809,12 @@ export default function GalleryPage() {
 
               {/* Pagination */}
               {totalPages > 1 && (
-                <div className="mt-8 flex items-center justify-center gap-2">
+                <div className="mt-4 flex items-center justify-center gap-2 md:mt-8">
                   <button
                     type="button"
                     onClick={() => setPage((p) => Math.max(1, p - 1))}
                     disabled={page <= 1}
-                    className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-white disabled:opacity-40"
+                    className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-600 transition hover:bg-white disabled:opacity-40"
                   >
                     上一页
                   </button>
@@ -698,7 +825,7 @@ export default function GalleryPage() {
                     type="button"
                     onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
                     disabled={page >= totalPages}
-                    className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-white disabled:opacity-40"
+                    className="h-10 rounded-xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-600 transition hover:bg-white disabled:opacity-40"
                   >
                     下一页
                   </button>
@@ -709,8 +836,8 @@ export default function GalleryPage() {
         </div>
 
         {accessDirectory && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/40 p-3 sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setAccessDirectory(null) }}>
-            <div className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[95] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setAccessDirectory(null) }}>
+            <div className="flex max-h-[92dvh] sm:max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
                 <div className="min-w-0">
                   <div className="truncate text-base font-semibold text-slate-900">目录权限 · {accessDirectory.name}</div>
@@ -799,7 +926,7 @@ export default function GalleryPage() {
             dimmed={Boolean(transformingImage)}
             errorMessage={transformError || undefined}
             showDownload={false}
-            zIndexClass="z-50"
+            zIndexClass="z-[100]"
             footer={
               <>
                 <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
@@ -809,15 +936,21 @@ export default function GalleryPage() {
                   <button type="button" onClick={() => void handleTransformImage('flip-vertical')} disabled={Boolean(transformingImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存" aria-label="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
                 </div>
                 {transformingImage && <span className="inline-flex h-9 items-center gap-2 px-2 text-xs text-white/75"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingImage)}并保存中...</span>}
-                <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"><Download className="h-4 w-4" />下载图片</a>
+                {/* Per-image actions that the phone grid no longer shows on each tile. */}
+                <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1 md:hidden">
+                  {preview.can_manage && <button type="button" onClick={() => openRename(preview)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80" title="重命名图片" aria-label="重命名图片"><Pencil className="h-4 w-4" /></button>}
+                  <button type="button" onClick={() => { const image = preview; closePreview(); setWhatsAppResource({ attachmentId: image.id, title: image.filename, defaultContent: image.filename }) }} disabled={Boolean(transformingImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-emerald-300 disabled:opacity-40" title="发送到 WhatsApp" aria-label="发送到 WhatsApp"><MessageCircle className="h-4 w-4" /></button>
+                  {admin && <button type="button" onClick={() => { const image = preview; closePreview(); void handleDelete(image.id) }} disabled={Boolean(transformingImage) || deleting === preview.id} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-300 disabled:opacity-40" title="删除图片" aria-label="删除图片"><Trash2 className="h-4 w-4" /></button>}
+                </div>
+                <a href={downloadURL(preview)} download={preview.filename} className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100 md:h-9"><Download className="h-4 w-4" /><span className="max-[380px]:hidden">下载图片</span></a>
               </>
             }
           />
         )}
 
         {renaming && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setRenaming(null) }}>
-            <div className="w-full max-w-md rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[120] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setRenaming(null) }}>
+            <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">重命名图片</div>

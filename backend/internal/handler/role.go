@@ -26,7 +26,7 @@ func (h *RoleHandler) ListRoles(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var roles []model.Role
+	roles := make([]model.Role, 0)
 	for rows.Next() {
 		var r model.Role
 		if err := rows.Scan(&r.ID, &r.Name, &r.Code, &r.Description, &r.CreatedAt); err != nil {
@@ -94,6 +94,22 @@ func (h *RoleHandler) DeleteRole(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "invalid role id")
+		return
+	}
+
+	// The admin role gates the whole admin console (RequireAdmin) and full data
+	// access. Deleting it would lock every administrator out, so it is fixed.
+	var code string
+	if err := h.db.QueryRow("SELECT code FROM roles WHERE id = $1", id).Scan(&code); err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "role not found")
+			return
+		}
+		response.ServerError(c, err.Error())
+		return
+	}
+	if code == "admin" {
+		response.Forbidden(c, "admin role cannot be deleted")
 		return
 	}
 

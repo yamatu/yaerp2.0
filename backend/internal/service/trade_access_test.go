@@ -1,6 +1,7 @@
 package service
 
 import (
+	"slices"
 	"testing"
 
 	"yaerp/internal/model"
@@ -36,7 +37,7 @@ func TestCanViewTradeOrderAllowsConfiguredPositionsToFollowProgress(t *testing.T
 	}
 	stages := tradeOrderScopeStages(access)
 	for _, wanted := range []string{model.TradeStageInquiry, model.TradeStagePacking, model.TradeStageCompleted, model.TradeStageCancelled} {
-		if !containsTradeLabel(stages, wanted) {
+		if !slices.Contains(stages, wanted) {
 			t.Fatalf("progress scope should include stage %q: %#v", wanted, stages)
 		}
 	}
@@ -224,66 +225,6 @@ func TestNormalizeTradePaymentRecordAccess(t *testing.T) {
 	}
 }
 
-func TestTradeOverviewColumnScopeMasksSensitiveFields(t *testing.T) {
-	matrix := emptyPermissionMatrix()
-	matrix.Sheet.CanView = true
-	matrix.DefaultPermission = "read"
-	applyTradeSheetColumnScope(matrix, "订单总览", &model.TradeOrderAccess{})
-	for _, column := range []string{
-		"customer", "currency", "destination_country", "payment_method",
-		"goods_amount", "quoted_freight", "quote_exchange_rate_cny",
-		"actual_freight", "freight_profit", "gross_profit", "profit_margin", "profit_cny", "notes",
-	} {
-		if matrix.Columns[column] != "none" {
-			t.Fatalf("column %q should be masked, got %q", column, matrix.Columns[column])
-		}
-	}
-	if _, masked := matrix.Columns["order_no"]; masked {
-		t.Fatal("business order number should remain visible")
-	}
-}
-
-func TestTradePurchaseSheetMasksSupplierCostColumns(t *testing.T) {
-	for _, sheetName := range []string{"供应商询价", "采购跟进"} {
-		matrix := emptyPermissionMatrix()
-		matrix.Sheet.CanView = true
-		matrix.DefaultPermission = "read"
-		applyTradeSheetColumnScope(matrix, sheetName, &model.TradeOrderAccess{})
-		columns := []string{"supplier"}
-		if sheetName == "供应商询价" {
-			columns = append(columns, "currency", "unit_price")
-		} else {
-			columns = append(columns, "supplier_quote", "purchase_currency", "purchase_price", "cost_exchange_rate")
-		}
-		for _, column := range columns {
-			if matrix.Columns[column] != "none" {
-				t.Fatalf("sheet %q column %q should be masked, got %q", sheetName, column, matrix.Columns[column])
-			}
-		}
-	}
-}
-
-func TestTradeProfitColumnsAreManagerOnly(t *testing.T) {
-	matrix := emptyPermissionMatrix()
-	matrix.Sheet.CanView = true
-	matrix.Sheet.CanEdit = true
-	matrix.DefaultPermission = "read"
-	access := &model.TradeOrderAccess{CanViewCustomerPricing: true, CanViewSupplierPricing: true, CanViewProfit: true}
-	applyTradeSheetWriteScope(matrix, "订单总览", true)
-	applyTradeSheetColumnScope(matrix, "订单总览", access)
-	if matrix.Columns["additional_cost"] != "write" || matrix.Columns["additional_cost_notes"] != "write" {
-		t.Fatal("manager should be able to maintain additional costs")
-	}
-	for _, column := range []string{
-		"goods_amount", "quoted_freight", "quote_exchange_rate_cny", "sales_amount",
-		"product_cost", "actual_freight", "freight_profit", "gross_profit", "profit_margin", "profit_cny",
-	} {
-		if matrix.Columns[column] == "write" || matrix.Columns[column] == "none" {
-			t.Fatalf("computed profit column %q must remain readable but not writable", column)
-		}
-	}
-}
-
 func TestRedactTradeCustomerContact(t *testing.T) {
 	accountID, channelID := int64(8), int64(9)
 	customer := &model.TradeCustomer{
@@ -297,24 +238,6 @@ func TestRedactTradeCustomerContact(t *testing.T) {
 	}
 	if customer.ContactName != "" || customer.Email != "" || customer.Phone != "" || customer.ChannelID != nil || len(customer.Tags) != 0 {
 		t.Fatal("customer contact and collaboration fields were not fully redacted")
-	}
-}
-
-func TestApplyTradeSheetWriteScopeKeepsIdentityColumnsReadOnly(t *testing.T) {
-	matrix := emptyPermissionMatrix()
-	matrix.Sheet.CanView = true
-	matrix.Sheet.CanEdit = true
-	matrix.DefaultPermission = "read"
-	applyTradeSheetWriteScope(matrix, "仓库到货", true)
-	for _, column := range []string{"received_qty", "warehouse_location", "received_date", "receipt_status"} {
-		if matrix.Columns[column] != "write" {
-			t.Fatalf("column %q should be writable, got %q", column, matrix.Columns[column])
-		}
-	}
-	for _, column := range []string{"line_no", "sku", "product_name", "expected_qty"} {
-		if matrix.Columns[column] == "write" {
-			t.Fatalf("identity column %q must remain read-only", column)
-		}
 	}
 }
 

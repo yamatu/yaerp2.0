@@ -21,6 +21,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { useHistoryLayer } from "@/hooks/useMobileGestures";
 
 export type FilePreviewKind = "image" | "pdf" | "other";
 
@@ -102,6 +103,11 @@ export function FilePreviewModal({
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
   // A pan gesture ends with a click event; that click must not close the viewer.
   const dragMovedRef = useRef(false);
+  const pointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const pinchRef = useRef<{ startDistance: number; startZoom: number } | null>(null);
+  const swipeRef = useRef<{ startX: number; startY: number; axis: "x" | "y" | null } | null>(null);
+  const lastTapRef = useRef({ time: 0, x: 0, y: 0 });
+  const [swipe, setSwipe] = useState({ x: 0, y: 0 });
   const stageRef = useRef<HTMLDivElement>(null);
   // Held in a ref as well so repeated arrow presses (key repeat, or two keys in
   // the same frame) never navigate from a stale index.
@@ -184,6 +190,9 @@ export function FilePreviewModal({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [go, onClose, resetView]);
 
+  // The phone back button closes the viewer instead of leaving the page.
+  useHistoryLayer(true, onClose);
+
   // Keep the page behind the viewer from scrolling while it is open.
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -212,30 +221,147 @@ export function FilePreviewModal({
     if (zoom <= MIN_ZOOM) setPan({ x: 0, y: 0 });
   }, [zoom]);
 
-  const startDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (kind !== "image" || zoom <= MIN_ZOOM) return;
-    dragMovedRef.current = false;
-    dragRef.current = { startX: event.clientX, startY: event.clientY, originX: pan.x, originY: pan.y };
-    setDragging(true);
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
-  const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current;
-    if (!drag) return;
-    const dx = event.clientX - drag.startX;
-    const dy = event.clientY - drag.startY;
-    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragMovedRef.current = true;
-    setPan({ x: drag.originX + dx, y: drag.originY + dy });
-  };
-
-  const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current) return;
-    dragRef.current = null;
-    setDragging(false);
+  // Touch gestures: one finger swipes between files (or pans when zoomed),
+  // two fingers pinch-zoom, a double tap toggles zoom and pulling the image
+  // down closes the viewer. Mouse users keep drag-to-pan while zoomed.
+  const releasePointer = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+  };
+
+  const pointerDistance = () => {
+    const [first, second] = [...pointersRef.current.values()];
+    if (!first || !second) return 0;
+    return Math.hypot(first.x - second.x, first.y - second.y);
+  };
+
+  const startDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (kind !== "image") return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic pointers (tests, some pens) cannot always be captured.
+    }
+    if (pointersRef.current.size === 2) {
+      // A second finger turns any swipe or pan into a pinch.
+      dragRef.current = null;
+      setSwipe({ x: 0, y: 0 });
+      pinchRef.current = { startDistance: pointerDistance() || 1, startZoom: zoom };
+      dragMovedRef.current = true;
+      setDragging(true);
+      return;
+    }
+    if (pointersRef.current.size > 2) return;
+    dragMovedRef.current = false;
+    if (zoom > MIN_ZOOM) {
+      dragRef.current = { startX: event.clientX, startY: event.clientY, originX: pan.x, originY: pan.y };
+      setDragging(true);
+      return;
+    }
+    if (event.pointerType !== "mouse") {
+      swipeRef.current = { startX: event.clientX, startY: event.clientY, axis: null };
+    }
+  };
+
+  const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointersRef.current.has(event.pointerId)) return;
+    pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const pinch = pinchRef.current;
+    if (pinch && pointersRef.current.size >= 2) {
+      const next = (pinch.startZoom * pointerDistance()) / pinch.startDistance;
+      setZoom(Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, next)));
+      return;
+    }
+    const drag = dragRef.current;
+    if (drag) {
+      const dx = event.clientX - drag.startX;
+      const dy = event.clientY - drag.startY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragMovedRef.current = true;
+      setPan({ x: drag.originX + dx, y: drag.originY + dy });
+      return;
+    }
+    const swipe = swipeRef.current;
+    if (!swipe) return;
+    const dx = event.clientX - swipe.startX;
+    const dy = event.clientY - swipe.startY;
+    if (!swipe.axis) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      swipe.axis = Math.abs(dx) >= Math.abs(dy) ? "x" : "y";
+      dragMovedRef.current = true;
+      setDragging(true);
+    }
+    if (swipe.axis === "x") {
+      // Rubber band when there is nothing to swipe to.
+      setSwipe({ x: canNavigate ? dx : dx * 0.25, y: 0 });
+    } else {
+      setSwipe({ x: 0, y: Math.max(0, dy) });
+    }
+  };
+
+  const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const tracked = pointersRef.current.delete(event.pointerId);
+    releasePointer(event);
+    if (!tracked) return;
+
+    if (pinchRef.current) {
+      if (pointersRef.current.size >= 2) return;
+      pinchRef.current = null;
+      const remaining = [...pointersRef.current.values()][0];
+      if (remaining && zoom > MIN_ZOOM) {
+        dragRef.current = { startX: remaining.x, startY: remaining.y, originX: pan.x, originY: pan.y };
+        return;
+      }
+      setDragging(false);
+      return;
+    }
+
+    if (dragRef.current) {
+      dragRef.current = null;
+      setDragging(false);
+      return;
+    }
+
+    const swipe = swipeRef.current;
+    swipeRef.current = null;
+    setDragging(false);
+    if (!swipe) return;
+    const dx = event.clientX - swipe.startX;
+    const dy = event.clientY - swipe.startY;
+    setSwipe({ x: 0, y: 0 });
+    if (swipe.axis === "x") {
+      const threshold = Math.min(80, (stageRef.current?.clientWidth || 400) * 0.18);
+      if (canNavigate && Math.abs(dx) > threshold) go(dx < 0 ? 1 : -1);
+      return;
+    }
+    if (swipe.axis === "y") {
+      if (dy > 110) onClose();
+      return;
+    }
+    // A plain tap: two of them in quick succession toggle zoom.
+    const now = Date.now();
+    const lastTap = lastTapRef.current;
+    if (now - lastTap.time < 320 && Math.hypot(event.clientX - lastTap.x, event.clientY - lastTap.y) < 30) {
+      lastTapRef.current = { time: 0, x: 0, y: 0 };
+      dragMovedRef.current = true;
+      if (zoom > MIN_ZOOM) resetView();
+      else setZoom(2.5);
+      return;
+    }
+    lastTapRef.current = { time: now, x: event.clientX, y: event.clientY };
+  };
+
+  const cancelDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    pointersRef.current.delete(event.pointerId);
+    releasePointer(event);
+    if (pointersRef.current.size > 0) return;
+    pinchRef.current = null;
+    dragRef.current = null;
+    swipeRef.current = null;
+    setSwipe({ x: 0, y: 0 });
+    setDragging(false);
   };
 
   // A PDF rendered in the iframe takes keyboard focus, which would swallow the
@@ -258,7 +384,7 @@ export function FilePreviewModal({
 
   return (
     <div
-      className={`fixed inset-0 flex flex-col bg-slate-950/80 backdrop-blur-sm ${zIndexClass}`}
+      className={`fixed inset-0 flex flex-col overscroll-contain bg-black sm:bg-slate-950/80 sm:backdrop-blur-sm ${zIndexClass}`}
       onClick={() => {
         if (!dragging) onClose();
       }}
@@ -269,10 +395,10 @@ export function FilePreviewModal({
       onPointerDown={reclaimFocus}
     >
       <div
-        className="flex shrink-0 flex-wrap items-center gap-2 border-b border-white/10 px-3 py-2.5 text-white sm:px-4"
+        className="flex shrink-0 items-center gap-2 border-b border-white/10 px-2 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))] text-white sm:flex-wrap sm:px-4 sm:py-2.5"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="min-w-0 flex-1 basis-40">
+        <div className="min-w-0 flex-1 pl-1 sm:basis-40 sm:pl-0">
           <div className="flex min-w-0 items-center gap-2">
             <span className="truncate text-sm font-semibold">{item.name}</span>
             {canNavigate && (
@@ -286,13 +412,13 @@ export function FilePreviewModal({
           )}
         </div>
 
-        <div className="flex w-full flex-wrap items-center justify-end gap-1 sm:w-auto">
+        <div className="flex shrink-0 items-center justify-end gap-0.5 sm:w-auto sm:flex-wrap sm:gap-1">
           {canNavigate && (
             <>
               <button
                 type="button"
                 onClick={() => go(-1)}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
+                className="hidden h-9 w-9 sm:inline-flex items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
                 title="上一个（←）"
                 aria-label="上一个文件"
               >
@@ -301,7 +427,7 @@ export function FilePreviewModal({
               <button
                 type="button"
                 onClick={() => go(1)}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
+                className="hidden h-9 w-9 sm:inline-flex items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
                 title="下一个（→）"
                 aria-label="下一个文件"
               >
@@ -315,7 +441,7 @@ export function FilePreviewModal({
                 type="button"
                 onClick={() => setZoom((current) => Math.max(MIN_ZOOM, current - ZOOM_STEP))}
                 disabled={!zoomed}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
+                className="hidden h-9 w-9 sm:inline-flex items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
                 title="缩小（-）"
                 aria-label="缩小图片"
               >
@@ -328,7 +454,7 @@ export function FilePreviewModal({
                 type="button"
                 onClick={() => setZoom((current) => Math.min(MAX_ZOOM, current + ZOOM_STEP))}
                 disabled={zoom >= MAX_ZOOM}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
+                className="hidden h-9 w-9 sm:inline-flex items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
                 title="放大（+）"
                 aria-label="放大图片"
               >
@@ -338,7 +464,7 @@ export function FilePreviewModal({
                 type="button"
                 onClick={resetView}
                 disabled={!zoomed && pan.x === 0 && pan.y === 0}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
+                className={`${zoomed ? "inline-flex" : "hidden sm:inline-flex"} h-10 w-10 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-30 sm:h-9 sm:w-9`}
                 title="适应窗口（0）"
                 aria-label="适应窗口"
               >
@@ -352,7 +478,7 @@ export function FilePreviewModal({
               href={item.url}
               download={item.name}
               onClick={(event) => event.stopPropagation()}
-              className="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100"
+              className="inline-flex h-10 items-center gap-2 rounded-lg bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100 sm:h-9"
               title="下载文件"
             >
               <Download className="h-4 w-4" />
@@ -365,7 +491,7 @@ export function FilePreviewModal({
               target="_blank"
               rel="noreferrer"
               onClick={(event) => event.stopPropagation()}
-              className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
+              className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white sm:h-9 sm:w-9"
               title="在新窗口打开"
               aria-label="在新窗口打开"
             >
@@ -375,7 +501,7 @@ export function FilePreviewModal({
           <button
             type="button"
             onClick={onClose}
-            className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white sm:h-9 sm:w-9"
             title="关闭（Esc）"
             aria-label="关闭预览"
           >
@@ -386,7 +512,7 @@ export function FilePreviewModal({
 
       <div
         ref={stageRef}
-        className="relative min-h-0 flex-1 overflow-hidden"
+        className={`relative min-h-0 flex-1 overflow-hidden ${kind === "image" ? "touch-none select-none" : ""}`}
         onClick={(event) => {
           event.stopPropagation();
           if (!closeOnBackdropClick) return;
@@ -403,7 +529,7 @@ export function FilePreviewModal({
         onPointerDown={startDrag}
         onPointerMove={moveDrag}
         onPointerUp={endDrag}
-        onPointerCancel={endDrag}
+        onPointerCancel={cancelDrag}
         onDoubleClick={() => (zoomed ? resetView() : setZoom(2))}
         style={{ cursor: kind === "image" && zoomed ? (dragging ? "grabbing" : "grab") : "default" }}
       >
@@ -428,7 +554,10 @@ export function FilePreviewModal({
                 // behind the pointer.
                 dragging ? "transition-opacity duration-150" : "transition-[transform,opacity] duration-100"
               }`}
-              style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+              style={{
+                transform: `translate(${pan.x + swipe.x}px, ${pan.y + swipe.y}px) scale(${zoom * (swipe.y > 0 ? Math.max(0.75, 1 - swipe.y / 900) : 1)})`,
+                opacity: swipe.y > 0 ? Math.max(0.35, 1 - swipe.y / 400) : undefined,
+              }}
             />
             {(imageState === "loading" || dimmed) && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
@@ -464,7 +593,7 @@ export function FilePreviewModal({
 
       {footer && (
         <div
-          className="flex shrink-0 flex-wrap items-center gap-2 border-t border-white/10 px-3 py-2 text-white sm:px-4"
+          className="flex shrink-0 flex-wrap items-center gap-2 border-t border-white/10 px-3 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-2 text-white sm:px-4 sm:py-2 [&_button]:min-h-10 [&_button]:min-w-10 sm:[&_button]:min-h-0 sm:[&_button]:min-w-0 [&_select]:min-h-10 sm:[&_select]:min-h-0"
           onClick={(event) => event.stopPropagation()}
         >
           {footer}

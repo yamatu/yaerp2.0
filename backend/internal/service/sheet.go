@@ -654,11 +654,7 @@ func (s *SheetService) CreateSheetForUserWithSource(userID int64, sheet *model.S
 	if err != nil {
 		return err
 	}
-	if source != "trade_erp" {
-		if err := s.ensureCanAddSheet(userID, wb); err != nil {
-			return err
-		}
-	} else if err := applyWorkbookLifecycleState(wb); err != nil {
+	if err := s.ensureCanAddSheet(userID, wb); err != nil {
 		return err
 	}
 
@@ -1142,7 +1138,6 @@ func (s *SheetService) UpdateCellsWithSourceOptions(userID int64, changes []mode
 		return nil, err
 	}
 
-	trustedTradeMutation := source == "trade_erp"
 	accessCaches := make(map[int64]*sheetCellAccessCache)
 	histories := make(map[int64]*sheetMutationHistory)
 	loadedSheets := make(map[int64]*model.Sheet)
@@ -1167,9 +1162,6 @@ func (s *SheetService) UpdateCellsWithSourceOptions(userID int64, changes []mode
 	for _, change := range changes {
 		if _, err := ensureSheetColumns(change.SheetID); err != nil {
 			return nil, err
-		}
-		if trustedTradeMutation {
-			continue
 		}
 		accessCache, ok := accessCaches[change.SheetID]
 		if !ok {
@@ -1707,6 +1699,16 @@ func (s *SheetService) InsertRowWithSource(userID, sheetID int64, rowIndex int, 
 	if err != nil {
 		return err
 	}
+	// The editor renders the Univer snapshot, so the new row has to be opened
+	// there too (data row rowIndex+1 is worksheet row rowIndex+2) and formulas
+	// below it have to follow their rows.
+	nextConfig, err = shiftSnapshotRowsInConfig(nextConfig, sheet.Name, rowIndex+2, true)
+	if err != nil {
+		return err
+	}
+	if nextConfig, err = bumpSheetStructureRevision(nextConfig); err != nil {
+		return err
+	}
 
 	history, err := s.beginHistory(userID, sheetID, source, "row.insert", fmt.Sprintf("插入第 %d 行", rowIndex+2), false)
 	if err != nil {
@@ -1739,6 +1741,14 @@ func (s *SheetService) DeleteRowWithSource(userID, sheetID int64, rowIndex int, 
 
 	nextConfig, err := shiftProtectionRowsInConfig(sheet.Config, rowIndex, false)
 	if err != nil {
+		return err
+	}
+	// Data row rowIndex is worksheet row rowIndex+1 of the Univer snapshot.
+	nextConfig, err = shiftSnapshotRowsInConfig(nextConfig, sheet.Name, rowIndex+1, false)
+	if err != nil {
+		return err
+	}
+	if nextConfig, err = bumpSheetStructureRevision(nextConfig); err != nil {
 		return err
 	}
 
@@ -3146,7 +3156,9 @@ func shiftLegacyLockMap(items map[string]bool, anchorWorksheetRow int, insert bo
 
 func shiftProtectedRowIndex(row, anchorWorksheetRow int, insert bool) (int, bool) {
 	if insert {
-		if row > anchorWorksheetRow {
+		// The anchor is the index of the new row: the row that used to live
+		// there moves down together with its protection.
+		if row >= anchorWorksheetRow {
 			return row + 1, true
 		}
 		return row, true

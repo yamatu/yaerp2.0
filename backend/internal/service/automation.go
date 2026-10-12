@@ -779,7 +779,7 @@ func (s *AutomationService) DecideApproval(userID, requestID int64, input *model
 
 func (s *AutomationService) InterceptCellChanges(userID int64, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {
 	result := &model.CellUpdateResult{AppliedChanges: append([]model.CellUpdate(nil), changes...)}
-	if len(changes) == 0 || source == "approval" || source == "automation" || source == "import" || source == "trade_erp" {
+	if len(changes) == 0 || source == "approval" || source == "automation" || source == "import" {
 		return result, nil
 	}
 
