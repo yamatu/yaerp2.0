@@ -1,21 +1,13 @@
 'use client'
 
-import { AlertTriangle, Archive, Clock3, Database, Download, FileJson, HardDrive, RefreshCw, Upload } from 'lucide-react'
+import { AlertTriangle, Archive, Clock3, Database, Download, FileJson, FolderOpen, HardDrive, RefreshCw, RotateCcw, Upload } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AdminShell } from '@/components/admin/AdminShell'
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
-
-interface BackupCard {
-  key: string
-  icon: React.ReactNode
-  iconBg: string
-  iconColor: string
-  title: string
-  description: string
-  endpoint: string
-  filename: string
-}
+import { backupHelp } from '@/components/admin/adminHelp'
+import { errorText, formatDateTime, formatFileSize, translateApiMessage } from '@/components/admin/adminApi'
+import { useConfirm, useToast } from '@/components/admin/feedback'
+import { Button, CheckboxRow, DetailList, IconButton, LoadingState, Notice, SectionCard, StatGrid, StatusBadge } from '@/components/admin/ui'
+import api from '@/lib/api'
 
 interface AutomaticBackupStatus {
   enabled: boolean
@@ -28,143 +20,145 @@ interface AutomaticBackupStatus {
   latest_size?: number
 }
 
-function formatFileSize(size = 0) {
-  if (size < 1024) return `${size} B`
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+interface DownloadOption {
+  key: string
+  icon: typeof Database
+  tone: 'sky' | 'emerald' | 'amber'
+  title: string
+  badge: string
+  description: string
+  contains: string[]
+  endpoint: string
+  filename: string
+  restorable: boolean
 }
 
-const backupCards: BackupCard[] = [
+const downloadOptions: DownloadOption[] = [
   {
     key: 'database',
-    icon: <Database className="h-5 w-5" />,
-    iconBg: 'bg-sky-100',
-    iconColor: 'text-sky-700',
+    icon: Database,
+    tone: 'sky',
     title: '数据库备份',
-    description: '导出完整的数据库 SQL 转储文件，包含所有表结构和数据记录，可用于数据库恢复和迁移。',
+    badge: '.sql',
+    description: '完整的 PostgreSQL 导出，边生成边下载，数据量大也不会失败。日常备份首选。',
+    contains: ['全部业务数据、账号、权限、配置表'],
     endpoint: '/admin/backup/database',
     filename: 'database-backup.sql',
-  },
-  {
-    key: 'config',
-    icon: <FileJson className="h-5 w-5" />,
-    iconBg: 'bg-amber-100',
-    iconColor: 'text-amber-700',
-    title: '配置导出',
-    description: '导出系统配置信息为 JSON 格式，包含角色权限、系统参数等配置项，便于环境迁移和版本管理。',
-    endpoint: '/admin/backup/config',
-    filename: 'config-export.json',
+    restorable: true,
   },
   {
     key: 'combined',
-    icon: <Archive className="h-5 w-5" />,
-    iconBg: 'bg-emerald-100',
-    iconColor: 'text-emerald-700',
+    icon: Archive,
+    tone: 'emerald',
     title: '完整备份',
-    description: '打包下载数据库、配置、备份清单以及对象存储文件的完整备份压缩包（tar.gz），适用于当前新版系统的整体恢复和迁移。',
+    badge: '.tar.gz',
+    description: '数据库 + 运行配置 + 对象存储中的附件和图片，用于整机迁移。在服务器内存中打包，体积超过上限会失败。',
+    contains: ['数据库', '附件 / 图片文件', '运行配置与清单'],
     endpoint: '/admin/backup/combined',
     filename: 'full-backup.tar.gz',
+    restorable: true,
+  },
+  {
+    key: 'config',
+    icon: FileJson,
+    tone: 'amber',
+    title: '配置导出',
+    badge: '.json',
+    description: '只包含数据库、Redis、MinIO 地址等运行参数，不含密码和业务数据。用于核对部署环境，不能用于还原。',
+    contains: ['运行参数（无密码）'],
+    endpoint: '/admin/backup/config',
+    filename: 'config-export.json',
+    restorable: false,
   },
 ]
 
+const toneTiles = { sky: 'bg-sky-50 text-sky-700', emerald: 'bg-emerald-50 text-emerald-700', amber: 'bg-amber-50 text-amber-700' }
+
+function filenameFromDisposition(disposition: string, fallback: string) {
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1])
+    } catch {
+      return utf8Match[1]
+    }
+  }
+  return disposition.match(/filename="?([^";]+)"?/i)?.[1] || fallback
+}
+
+async function readError(res: Response, fallback: string) {
+  try {
+    const payload = (await res.json()) as { message?: string }
+    return translateApiMessage(payload.message, `${fallback}（HTTP ${res.status}）`)
+  } catch {
+    return `${fallback}（HTTP ${res.status}）`
+  }
+}
+
 export default function BackupPage() {
+  const toast = useToast()
+  const confirm = useConfirm()
   const [loadingKey, setLoadingKey] = useState<string | null>(null)
+  const [status, setStatus] = useState<AutomaticBackupStatus | null>(null)
+  const [statusError, setStatusError] = useState('')
+  const [loadingStatus, setLoadingStatus] = useState(true)
+  const [runningBackup, setRunningBackup] = useState(false)
   const [restoreFile, setRestoreFile] = useState<File | null>(null)
-  const [restoreConfirmed, setRestoreConfirmed] = useState(false)
+  const [restoreAcknowledged, setRestoreAcknowledged] = useState(false)
   const [restoring, setRestoring] = useState(false)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState('')
-  const [automaticStatus, setAutomaticStatus] = useState<AutomaticBackupStatus | null>(null)
-  const [loadingAutomaticStatus, setLoadingAutomaticStatus] = useState(true)
-  const [runningAutomaticBackup, setRunningAutomaticBackup] = useState(false)
+  const [restoreError, setRestoreError] = useState('')
+  const [restoreDone, setRestoreDone] = useState(false)
   const restoreInputRef = useRef<HTMLInputElement>(null)
 
-  const getToken = () => (typeof window !== 'undefined' ? localStorage.getItem('access_token') : null)
-
-  const loadAutomaticStatus = useCallback(async () => {
-    setLoadingAutomaticStatus(true)
+  const loadStatus = useCallback(async () => {
+    setLoadingStatus(true)
+    setStatusError('')
     try {
-      const token = getToken()
-      const response = await fetch(`${API_BASE}/admin/backup/automatic`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      })
-      const payload = await response.json() as { code?: number; message?: string; data?: AutomaticBackupStatus }
-      if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || '读取自动备份状态失败')
-      setAutomaticStatus(payload.data)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '读取自动备份状态失败')
+      const response = await api.get<AutomaticBackupStatus>('/admin/backup/automatic')
+      if (response.code !== 0 || !response.data) throw new Error(translateApiMessage(response.message, '读取自动备份状态失败'))
+      setStatus(response.data)
+    } catch (error) {
+      setStatusError(errorText(error, '读取自动备份状态失败'))
     } finally {
-      setLoadingAutomaticStatus(false)
+      setLoadingStatus(false)
     }
   }, [])
 
   useEffect(() => {
-    void loadAutomaticStatus()
-  }, [loadAutomaticStatus])
+    void loadStatus()
+  }, [loadStatus])
 
-  const runAutomaticBackup = async () => {
-    setRunningAutomaticBackup(true)
-    setError('')
-    setSuccess('')
+  const runBackup = async () => {
+    setRunningBackup(true)
     try {
-      const token = getToken()
-      const response = await fetch(`${API_BASE}/admin/backup/automatic/run`, {
-        method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      })
-      const payload = await response.json() as { code?: number; message?: string; data?: AutomaticBackupStatus }
-      if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || '自动备份执行失败')
-      setAutomaticStatus(payload.data)
-      setSuccess('数据库备份已写入宿主机备份目录。')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '自动备份执行失败')
+      const response = await api.post<AutomaticBackupStatus>('/admin/backup/automatic/run')
+      if (response.code !== 0 || !response.data) throw new Error(translateApiMessage(response.message, '备份执行失败'))
+      setStatus(response.data)
+      toast.success(`已生成 ${response.data.latest_file || '数据库备份'}（${formatFileSize(response.data.latest_size)}）`)
+    } catch (error) {
+      toast.error(errorText(error, '备份执行失败'))
     } finally {
-      setRunningAutomaticBackup(false)
+      setRunningBackup(false)
     }
   }
 
-  const handleDownload = async (card: BackupCard) => {
-    setLoadingKey(card.key)
-    setError('')
-    setSuccess('')
-
+  const handleDownload = async (option: DownloadOption) => {
+    setLoadingKey(option.key)
     try {
-      const token = getToken()
-
-      const res = await fetch(`${API_BASE}${card.endpoint}`, {
-        method: 'GET',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      })
-
-      if (!res.ok) {
-        throw new Error(`下载失败，服务器返回状态码 ${res.status}`)
-      }
-
+      const res = await api.download(option.endpoint)
+      if (!res.ok) throw new Error(await readError(res, `${option.title}下载失败`))
       const blob = await res.blob()
       const url = window.URL.createObjectURL(blob)
       const link = document.createElement('a')
-      const disposition = res.headers.get('Content-Disposition') || ''
-      const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
-      const fallbackMatch = disposition.match(/filename="?([^";]+)"?/i)
-      let serverFilename = fallbackMatch?.[1] || card.filename
-      if (utf8Match?.[1]) {
-        try {
-          serverFilename = decodeURIComponent(utf8Match[1])
-        } catch {
-          serverFilename = utf8Match[1]
-        }
-      }
       link.href = url
-      link.download = serverFilename
+      link.download = filenameFromDisposition(res.headers.get('Content-Disposition') || '', option.filename)
       document.body.appendChild(link)
       link.click()
       document.body.removeChild(link)
       window.URL.revokeObjectURL(url)
-
-      setSuccess(`${card.title}下载成功`)
-    } catch (err) {
-      console.error(`Failed to download ${card.key}:`, err)
-      setError(err instanceof Error ? err.message : `${card.title}下载失败，请稍后重试`)
+      toast.success(`${option.title}已开始下载（${formatFileSize(blob.size)}）`)
+    } catch (error) {
+      toast.error(errorText(error, `${option.title}下载失败`))
     } finally {
       setLoadingKey(null)
     }
@@ -172,217 +166,191 @@ export default function BackupPage() {
 
   const handleRestore = async () => {
     if (!restoreFile) {
-      setError('请先选择一个数据库备份文件')
+      setRestoreError('请先选择备份文件')
       return
     }
-
-    if (!restoreConfirmed) {
-      setError('请先确认你知道还原会覆盖当前数据库')
+    if (!/\.(sql|sql\.gz|gz|tar\.gz|tgz)$/i.test(restoreFile.name)) {
+      setRestoreError('只支持 .sql、.sql.gz 或本系统生成的 .tar.gz 完整备份')
       return
     }
-
-    if (!window.confirm('数据库还原会覆盖当前全部数据，确定继续吗？')) {
-      return
-    }
-
+    const ok = await confirm({
+      title: '确认还原数据库？',
+      message: (
+        <>
+          将使用 <strong className="break-all text-slate-900">{restoreFile.name}</strong>（{formatFileSize(restoreFile.size)}）覆盖当前数据库。
+        </>
+      ),
+      consequences: [
+        '当前数据库的全部数据会先被删除，再导入备份内容',
+        '备份时间点之后产生的所有数据将永久丢失，无法撤销',
+        '所有账号和密码回到备份时的状态，你可能需要重新登录',
+        '附件、图片等对象存储文件不会被还原或删除',
+      ],
+      confirmText: '开始还原',
+      requireText: '确认还原',
+    })
+    if (!ok) return
     setRestoring(true)
-    setError('')
-    setSuccess('')
-
+    setRestoreError('')
+    setRestoreDone(false)
     try {
-      const token = getToken()
       const formData = new FormData()
       formData.append('file', restoreFile)
-
-      const res = await fetch(`${API_BASE}/admin/backup/restore`, {
-        method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        body: formData,
-      })
-
-      const data = await res.json() as { code?: number; message?: string }
-      if (!res.ok || data.code !== 0) {
-        throw new Error(data.message || `还原失败，服务器返回状态码 ${res.status}`)
-      }
-
-      setSuccess('数据库还原成功，建议重新登录并检查关键数据。')
+      const res = await api.download('/admin/backup/restore', { method: 'POST', body: formData })
+      const payload = (await res.json().catch(() => ({}))) as { code?: number; message?: string }
+      if (!res.ok || payload.code !== 0) throw new Error(translateApiMessage(payload.message, `还原失败（HTTP ${res.status}）`))
+      setRestoreDone(true)
       setRestoreFile(null)
-      setRestoreConfirmed(false)
-      if (restoreInputRef.current) {
-        restoreInputRef.current.value = ''
-      }
-    } catch (err) {
-      console.error('Failed to restore database:', err)
-      setError(err instanceof Error ? err.message : '数据库还原失败，请稍后重试')
+      setRestoreAcknowledged(false)
+      if (restoreInputRef.current) restoreInputRef.current.value = ''
+      toast.success('数据库还原完成')
+    } catch (error) {
+      setRestoreError(errorText(error, '数据库还原失败'))
     } finally {
       setRestoring(false)
     }
   }
 
   return (
-    <AdminShell title="数据备份与还原" description="下载数据库、配置和完整备份，并执行受控还原">
+    <AdminShell title="数据备份" description="下载备份、自动备份状态与数据库还原" help={backupHelp}>
+      <StatGrid
+        items={[
+          { label: '服务器自动备份', value: status ? (status.enabled ? '已启用' : '未启用') : '—', icon: Clock3, tone: status?.enabled ? 'emerald' : 'amber' },
+          { label: '最近一次自动备份', value: status?.latest_at ? formatDateTime(status.latest_at) : '尚未生成', icon: HardDrive, tone: status?.latest_at ? 'sky' : 'slate' },
+          { label: '备份周期', value: status ? `每 ${status.interval_hours} 小时` : '—', icon: RefreshCw },
+          { label: '保留天数', value: status ? `${status.retention_days} 天` : '—', icon: FolderOpen },
+        ]}
+      />
 
-          {error && (
-            <div className="rounded-[28px] border border-rose-200 bg-rose-50/90 px-5 py-4 text-sm font-medium text-rose-700 backdrop-blur">
-              {error}
-            </div>
-          )}
-
-          {success && (
-            <div className="rounded-[28px] border border-emerald-200 bg-emerald-50/90 px-5 py-4 text-sm font-medium text-emerald-700 backdrop-blur">
-              {success}
-            </div>
-          )}
-
-          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex min-w-0 items-start gap-3">
-                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-700"><HardDrive className="h-5 w-5" /></div>
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="text-base font-semibold text-slate-950">宿主机自动数据库备份</h2>
-                    <span className={`rounded-lg px-2 py-1 text-xs font-medium ${automaticStatus?.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{automaticStatus?.enabled ? '已启用' : '未启用'}</span>
-                  </div>
-                  {loadingAutomaticStatus ? (
-                    <div className="mt-2 flex items-center gap-2 text-sm text-slate-500"><RefreshCw className="h-4 w-4 animate-spin" />正在读取备份状态</div>
-                  ) : automaticStatus ? (
-                    <div className="mt-2 grid gap-x-6 gap-y-1 text-sm text-slate-500 sm:grid-cols-2">
-                      <span>宿主机目录：<strong className="font-medium text-slate-700">{automaticStatus.host_directory}</strong></span>
-                      <span>周期：每 {automaticStatus.interval_hours} 小时</span>
-                      <span>保留：{automaticStatus.retention_days} 天</span>
-                      <span>容器目录：{automaticStatus.directory}</span>
-                      <span className="sm:col-span-2">最近备份：{automaticStatus.latest_at ? `${new Date(automaticStatus.latest_at).toLocaleString('zh-CN')} · ${automaticStatus.latest_file} · ${formatFileSize(automaticStatus.latest_size)}` : '尚未生成'}</span>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-              <div className="flex shrink-0 gap-2">
-                <button type="button" onClick={() => void loadAutomaticStatus()} disabled={loadingAutomaticStatus || runningAutomaticBackup} className="ui-tooltip inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-50" title="刷新状态" aria-label="刷新状态" data-tooltip="刷新状态"><RefreshCw className={`h-4 w-4 ${loadingAutomaticStatus ? 'animate-spin' : ''}`} /></button>
-                <button type="button" onClick={() => void runAutomaticBackup()} disabled={runningAutomaticBackup} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-3 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"><Clock3 className="h-4 w-4" />{runningAutomaticBackup ? '备份中...' : '立即备份'}</button>
-              </div>
-            </div>
-          </section>
-
-          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-            <div className="mb-6">
-              <div className="text-sm font-semibold uppercase tracking-[0.24em] text-sky-700">
-                Download Center
-              </div>
-              <h2 className="mt-2 text-2xl font-semibold text-slate-950">选择备份类型</h2>
-              <p className="mt-2 text-sm text-slate-500">
-                根据需要选择对应的备份方式，点击下载按钮即可获取备份文件。
-              </p>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {backupCards.map((card) => {
-                const isLoading = loadingKey === card.key
-                const isDisabled = loadingKey !== null
-
-                return (
-                  <div
-                    key={card.key}
-                    className="flex flex-col rounded-[28px] border border-slate-200 bg-white/95 p-5 shadow-sm transition hover:shadow-md"
-                  >
-                    <div
-                      className={`mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl ${card.iconBg} ${card.iconColor}`}
-                    >
-                      {card.icon}
-                    </div>
-                    <h3 className="text-lg font-semibold text-slate-950">{card.title}</h3>
-                    <p className="mt-2 flex-1 text-sm leading-relaxed text-slate-500">
-                      {card.description}
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => handleDownload(card)}
-                      disabled={isDisabled}
-                      className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-full bg-slate-900 px-4 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(15,23,42,0.9)] transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <Download className="h-4 w-4" />
-                      {isLoading ? '下载中...' : '下载备份'}
-                    </button>
-                  </div>
-                )
-              })}
-            </div>
-          </section>
-
-          <section className="rounded-lg border border-rose-200 bg-white p-4 shadow-sm md:p-5">
-            <div className="mb-6">
-              <div className="inline-flex items-center gap-2 rounded-full border border-rose-100 bg-rose-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-rose-700">
-                <AlertTriangle className="h-3.5 w-3.5" />
-                Restore Database
-              </div>
-              <h2 className="mt-3 text-2xl font-semibold text-slate-950">数据库还原</h2>
-              <p className="mt-2 max-w-3xl text-sm leading-7 text-slate-600">
-                    支持上传 `.sql`、`.sql.gz` 或完整备份 `.tar.gz` 文件。完整备份中已包含数据库、配置清单和对象存储文件目录说明；执行后会覆盖当前数据库，请务必先下载一份最新完整备份。
-              </p>
-            </div>
-
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
-              <div className="rounded-[24px] border border-slate-200 bg-white/95 p-5 shadow-sm">
-                <div className="flex flex-col gap-4">
-                  <div>
-                    <div className="text-sm font-semibold text-slate-900">选择备份文件</div>
-                    <div className="mt-2 text-sm text-slate-500">
-                      当前支持 PostgreSQL SQL 导出文件，以及本系统下载的新版完整备份压缩包。
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => restoreInputRef.current?.click()}
-                      className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
-                    >
-                      <Upload className="h-4 w-4" />
-                      选择还原文件
-                    </button>
-                    <span className="text-sm text-slate-500">
-                      {restoreFile ? restoreFile.name : '未选择文件'}
+      <SectionCard
+        title="服务器自动备份"
+        description="由服务器环境变量控制（BACKUP_AUTO_ENABLED 等），页面上只能查看和立即执行。"
+        icon={HardDrive}
+        iconTone="emerald"
+        actions={
+          <>
+            <IconButton icon={RefreshCw} label="刷新状态" spin={loadingStatus} disabled={runningBackup} onClick={() => void loadStatus()} />
+            <Button variant="success" icon={Clock3} loading={runningBackup} onClick={() => void runBackup()}>
+              立即备份
+            </Button>
+          </>
+        }
+      >
+        {loadingStatus && !status ? (
+          <LoadingState compact label="正在读取备份状态…" />
+        ) : statusError ? (
+          <Notice tone="danger">{statusError}</Notice>
+        ) : status ? (
+          <div className="space-y-3">
+            {!status.enabled && (
+              <Notice tone="warning" title="自动备份未启用">
+                在服务器 .env 中设置 <code className="font-mono">BACKUP_AUTO_ENABLED=true</code> 并重启后端后生效。未启用时仍可点击“立即备份”手动生成。
+              </Notice>
+            )}
+            <DetailList
+              items={[
+                { label: '状态', value: <StatusBadge tone={status.enabled ? 'emerald' : 'slate'} dot>{status.enabled ? `已启用 · 每 ${status.interval_hours} 小时` : '未启用'}</StatusBadge> },
+                { label: '宿主机目录', value: <code className="break-all font-mono text-xs">{status.host_directory}</code> },
+                { label: '容器内目录', value: <code className="break-all font-mono text-xs">{status.directory}</code> },
+                { label: '保留策略', value: `超过 ${status.retention_days} 天的自动备份会被删除` },
+                {
+                  label: '最近备份',
+                  value: status.latest_at ? (
+                    <span className="break-all">
+                      {formatDateTime(status.latest_at)} · {status.latest_file} · {formatFileSize(status.latest_size)}
                     </span>
-                    <input
-                      ref={restoreInputRef}
-                      type="file"
-                      accept=".sql,.gz,.tar.gz,.tgz"
-                      className="hidden"
-                      onChange={(event) => setRestoreFile(event.target.files?.[0] || null)}
-                    />
+                  ) : (
+                    '尚未生成'
+                  ),
+                },
+              ]}
+            />
+          </div>
+        ) : null}
+      </SectionCard>
+
+      <SectionCard title="下载备份到本机" description="建议定期下载数据库备份，并保存在服务器以外的位置。" icon={Download} iconTone="sky">
+        <div className="grid gap-3 md:grid-cols-3">
+          {downloadOptions.map((option) => {
+            const Icon = option.icon
+            return (
+              <div key={option.key} className="flex flex-col rounded-lg border border-slate-200 p-4">
+                <div className="flex items-start gap-3">
+                  <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${toneTiles[option.tone]}`}>
+                    <Icon className="h-5 w-5" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <h3 className="text-sm font-semibold text-slate-900">{option.title}</h3>
+                      <StatusBadge>{option.badge}</StatusBadge>
+                    </div>
+                    <div className="mt-1">
+                      <StatusBadge tone={option.restorable ? 'emerald' : 'amber'}>{option.restorable ? '可用于还原' : '不能用于还原'}</StatusBadge>
+                    </div>
                   </div>
-
-                  <label className="flex items-start gap-3 rounded-2xl border border-rose-100 bg-rose-50/70 px-4 py-3 text-sm text-rose-800">
-                    <input
-                      type="checkbox"
-                      checked={restoreConfirmed}
-                      onChange={(event) => setRestoreConfirmed(event.target.checked)}
-                      className="mt-1 h-4 w-4 rounded border-rose-300 text-rose-600 focus:ring-rose-500"
-                    />
-                    <span>我已确认数据库还原会清空并重建当前数据库内容，此操作不可撤销。</span>
-                  </label>
                 </div>
+                <p className="mt-3 flex-1 text-xs leading-5 text-slate-500">{option.description}</p>
+                <p className="mt-2 text-xs text-slate-400">包含：{option.contains.join('、')}</p>
+                <Button className="mt-3" block variant={option.key === 'database' ? 'primary' : 'secondary'} icon={Download} loading={loadingKey === option.key} disabled={loadingKey !== null && loadingKey !== option.key} onClick={() => void handleDownload(option)}>
+                  {loadingKey === option.key ? '正在生成…' : '下载'}
+                </Button>
               </div>
+            )
+          })}
+        </div>
+      </SectionCard>
 
-              <div className="rounded-[24px] border border-rose-200 bg-[linear-gradient(180deg,#fff1f2_0%,#ffffff_100%)] p-5 shadow-sm">
-                <div className="mb-3 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-rose-100 text-rose-700">
-                  <AlertTriangle className="h-5 w-5" />
-                </div>
-                <h3 className="text-lg font-semibold text-slate-950">执行还原</h3>
-                <p className="mt-2 text-sm leading-relaxed text-slate-600">
-                  建议先下载一份「完整备份」，确认文件无误后再执行还原。还原完成后，页面中的数据会立即切换到备份中的状态。
-                </p>
-                <button
-                  type="button"
-                  onClick={handleRestore}
-                  disabled={restoring || !restoreFile}
-                  className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-4 py-3 text-sm font-semibold text-white shadow-[0_18px_40px_-24px_rgba(225,29,72,0.85)] transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  <Upload className="h-4 w-4" />
-                  {restoring ? '还原中...' : '开始还原数据库'}
-                </button>
-              </div>
+      <SectionCard tone="danger" title="还原数据库" description="危险操作：会用备份文件覆盖当前全部数据。请先阅读上方“使用说明”。" icon={RotateCcw}>
+        <div className="space-y-4">
+          <Notice tone="warning" title="还原前请先下载一份最新的数据库备份">
+            如果还原的文件有问题，你可以用这份备份恢复到现在的状态。
+          </Notice>
+          {restoreDone && (
+            <Notice tone="success" title="数据库还原完成" onClose={() => setRestoreDone(false)}>
+              请重新登录，并检查关键数据是否正确。
+            </Notice>
+          )}
+          {restoreError && <Notice tone="danger" onClose={() => setRestoreError('')}>{restoreError}</Notice>}
+
+          <div className="flex flex-col gap-2 rounded-lg border border-dashed border-slate-300 p-4 sm:flex-row sm:items-center">
+            <Button icon={Upload} onClick={() => restoreInputRef.current?.click()} disabled={restoring}>
+              选择备份文件
+            </Button>
+            <div className="min-w-0 flex-1 text-sm">
+              {restoreFile ? (
+                <span className="break-all text-slate-800">
+                  {restoreFile.name} <span className="text-slate-400">· {formatFileSize(restoreFile.size)}</span>
+                </span>
+              ) : (
+                <span className="text-slate-500">支持 .sql、.sql.gz 和本系统生成的 .tar.gz 完整备份</span>
+              )}
             </div>
-          </section>
+            <input
+              ref={restoreInputRef}
+              type="file"
+              accept=".sql,.gz,.tgz"
+              className="hidden"
+              onChange={(event) => {
+                setRestoreFile(event.target.files?.[0] || null)
+                setRestoreError('')
+              }}
+            />
+          </div>
+
+          <CheckboxRow
+            checked={restoreAcknowledged}
+            onChange={setRestoreAcknowledged}
+            disabled={restoring}
+            label="我已下载当前数据的备份，并了解还原会清空当前数据库且不可撤销"
+          />
+
+          <div className="flex justify-end">
+            <Button variant="danger" icon={AlertTriangle} loading={restoring} disabled={!restoreFile || !restoreAcknowledged} onClick={() => void handleRestore()}>
+              {restoring ? '正在还原，请勿关闭页面…' : '开始还原'}
+            </Button>
+          </div>
+        </div>
+      </SectionCard>
     </AdminShell>
   )
 }

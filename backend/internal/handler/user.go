@@ -157,6 +157,10 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		response.Error(c, http.StatusForbidden, "default admin user cannot be disabled")
 		return
 	}
+	if id == c.GetInt64("user_id") && req.Status != nil && *req.Status == 0 {
+		response.Error(c, http.StatusForbidden, "cannot disable the currently signed-in account")
+		return
+	}
 	if req.Status != nil && *req.Status == 0 {
 		if err := h.authService.RevokeUserSessions(id); err != nil {
 			response.ServerError(c, err.Error())
@@ -223,6 +227,31 @@ func (h *UserHandler) AssignRoles(c *gin.Context) {
 	if err != nil {
 		response.ServerError(c, err.Error())
 		return
+	}
+	if id == c.GetInt64("user_id") {
+		// Removing your own admin role would end the session's admin access
+		// mid-request; another administrator must do that.
+		roles, err := h.userRepo.GetUserRoles(id)
+		if err != nil {
+			response.ServerError(c, err.Error())
+			return
+		}
+		for _, role := range roles {
+			if role.Code != "admin" {
+				continue
+			}
+			keeps := false
+			for _, roleID := range req.Roles {
+				if roleID == role.ID {
+					keeps = true
+					break
+				}
+			}
+			if !keeps {
+				response.Error(c, http.StatusForbidden, "cannot remove your own admin role")
+				return
+			}
+		}
 	}
 	if isDefaultAdmin {
 		roles, err := h.userRepo.GetUserRoles(id)
