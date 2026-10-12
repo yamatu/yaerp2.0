@@ -302,3 +302,65 @@ body.ai-panel-open .sheet-floating-stack {
     transform: translateX(300%);
   }
 }
+
+/* Mobile app shell: reserve room for the bottom tab bar (components/nav/MobileTabBar). */
+:root {
+  --mobile-tabbar-offset: 0px;
+  /*
+   * Visible viewport, kept in sync by components/nav/ViewportMetrics. Full
+   * screen sheets use these instead of 100vh so the on-screen keyboard never
+   * covers their input (iOS shrinks only the visual viewport).
+   */
+  --vv-top: 0px;
+  --vv-height: 100dvh;
+  --keyboard-inset: 0px;
+}
+
+/*
+ * Bottom edge for floating buttons: above the tab bar, or above the home
+ * indicator. Declared on body (not :root) so it resolves against the body's own
+ * --mobile-tabbar-offset, which `has-mobile-tabbar` sets on the same element.
+ */
+body {
+  --mobile-fab-bottom: max(var(--mobile-tabbar-offset), env(safe-area-inset-bottom));
+}
+
+@media (max-width: 767px) {
+  body.has-mobile-tabbar {
+    --mobile-tabbar-offset: calc(56px + env(safe-area-inset-bottom));
+    padding-bottom: var(--mobile-tabbar-offset);
+  }
+
+  /*
+   * A pushed full-screen view (e.g. an open mail) may hide the tab bar, like a
+   * native navigation stack. The offset collapses so the view gets the space.
+   */
+  body.has-mobile-tabbar.mobile-tabbar-suppressed {
+    --mobile-tabbar-offset: 0px;
+  }
+
+  body.mobile-tabbar-suppressed .mobile-tabbar,
+  body.keyboard-open .mobile-tabbar {
+    display: none;
+  }
+}
+
+/* Momentum scrolling lists that must not trigger the browser's own pull-to-refresh. */
+.app-scroll {
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.no-touch-callout {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.pt-safe {
+  padding-top: env(safe-area-inset-top);
+}

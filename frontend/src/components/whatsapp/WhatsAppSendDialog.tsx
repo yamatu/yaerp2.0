@@ -99,21 +99,21 @@ export function WhatsAppSendDialog({ open, resource, onClose, onSent }: WhatsApp
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/40 p-3 sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <div className="flex max-h-[86vh] w-full max-w-lg flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+    <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <div className="flex max-h-[92dvh] sm:max-h-[86vh] w-full max-w-lg flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-base font-semibold text-slate-900"><MessageCircle className="h-5 w-5 text-emerald-600" />发送到 WhatsApp</div>
             <div className="mt-1 truncate text-xs text-slate-400">{resource.title || '选择会话并发送系统内容'}</div>
           </div>
-          <button type="button" onClick={onClose} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100" title="关闭"><X className="h-4 w-4" /></button>
+          <button type="button" onClick={onClose} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100" title="关闭"><X className="h-4 w-4" /></button>
         </div>
 
         <div className="border-b border-slate-100 p-3">
           <div className="flex items-center gap-2">
             <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 focus-within:border-emerald-300 focus-within:bg-white">
               <Search className="h-4 w-4 shrink-0" />
-              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索联系人或群组" className="min-w-0 flex-1 bg-transparent outline-none" />
+              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索联系人或群组" className="min-w-0 flex-1 bg-transparent text-base outline-none sm:text-sm" />
             </label>
             <button type="button" onClick={() => void loadChats()} disabled={loading} className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50" title="刷新会话"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /></button>
           </div>
@@ -137,11 +137,11 @@ export function WhatsAppSendDialog({ open, resource, onClose, onSent }: WhatsApp
         </div>
 
         <div className="border-t border-slate-200 p-4">
-          <textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="附加说明（可选）" className="min-h-20 w-full resize-none rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-emerald-300" />
+          <textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="附加说明（可选）" className="min-h-16 w-full resize-none rounded-lg border border-slate-200 px-3 py-2 text-base outline-none focus:border-emerald-300 sm:min-h-20 sm:text-sm" />
           {error && chats.length > 0 && <div className="mt-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</div>}
           <div className="mt-3 flex justify-end gap-2">
-            <button type="button" onClick={onClose} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-            <button type="button" onClick={() => void send()} disabled={sending || !selectedChatId} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40"><Send className="h-4 w-4" />{sending ? '发送中...' : '发送'}</button>
+            <button type="button" onClick={onClose} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+            <button type="button" onClick={() => void send()} disabled={sending || !selectedChatId} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40"><Send className="h-4 w-4" />{sending ? '发送中...' : '发送'}</button>
           </div>
         </div>
       </div>

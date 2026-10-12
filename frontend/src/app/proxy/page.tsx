@@ -230,11 +230,11 @@ export default function ProxyPage() {
         {/* Status ---------------------------------------------------------- */}
         <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-start gap-3">
-              <span className={`mt-0.5 inline-flex h-10 w-10 items-center justify-center rounded-lg ${status.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>
+            <div className="flex min-w-0 items-start gap-3">
+              <span className={`mt-0.5 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${status.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>
                 {status.enabled ? <CheckCircle2 className="h-5 w-5" /> : <Power className="h-5 w-5" />}
               </span>
-              <div>
+              <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="text-base font-semibold text-slate-900">{status.enabled ? '代理已连接' : '代理未连接'}</h2>
                   <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${coreOnline ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
@@ -242,7 +242,7 @@ export default function ProxyPage() {
                     {coreOnline ? `内核在线 ${status.core_version || ''}`.trim() : '内核离线'}
                   </span>
                 </div>
-                <p className="mt-1 text-sm text-slate-500">
+                <p className="mt-1 break-words text-sm leading-6 text-slate-500 [overflow-wrap:anywhere]">
                   代理入口 <span className="font-mono text-slate-700">{status.proxy_endpoint || '未配置'}</span>
                   {status.core_endpoint ? <> · 控制器 <span className="font-mono text-slate-700">{status.core_endpoint}</span></> : null}
                   {status.mixed_port ? <> · 端口 <span className="font-mono text-slate-700">{status.mixed_port}</span></> : null}
@@ -250,15 +250,15 @@ export default function ProxyPage() {
                 </p>
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <button type="button" onClick={() => void loadStatus()} disabled={loading} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40">
+            <div className="flex items-center gap-2 [&>button]:flex-1 [&>button]:justify-center sm:[&>button]:flex-none">
+              <button type="button" onClick={() => void loadStatus()} disabled={loading} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40">
                 <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />刷新状态
               </button>
               <button
                 type="button"
                 onClick={() => void toggleConnection()}
                 disabled={busy !== '' || !coreOnline || (status.source_type === 'none' && !status.enabled)}
-                className={`inline-flex h-9 items-center gap-2 rounded-lg px-4 text-sm font-semibold text-white disabled:opacity-40 ${status.enabled ? 'bg-rose-600 hover:bg-rose-700' : 'bg-slate-900 hover:bg-slate-800'}`}
+                className={`inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg px-4 text-sm font-semibold text-white disabled:opacity-40 ${status.enabled ? 'bg-rose-600 hover:bg-rose-700' : 'bg-slate-900 hover:bg-slate-800'}`}
               >
                 {busy === 'connect' || busy === 'disconnect' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plug className="h-4 w-4" />}
                 {status.enabled ? '断开代理' : '连接代理'}
@@ -266,7 +266,7 @@ export default function ProxyPage() {
             </div>
           </div>
 
-          <div className="mt-4 grid gap-3 border-t border-slate-100 pt-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <div className="mt-4 grid grid-cols-2 gap-2 border-t border-slate-100 pt-4 text-sm sm:gap-3 lg:grid-cols-4">
             <div className="rounded-lg bg-slate-50 px-3 py-2">
               <div className="text-xs text-slate-400">节点数量</div>
               <div className="mt-0.5 font-semibold text-slate-800">{status.node_count}</div>
@@ -281,14 +281,14 @@ export default function ProxyPage() {
             </div>
             <div className="rounded-lg bg-slate-50 px-3 py-2">
               <div className="text-xs text-slate-400">更新时间</div>
-              <div className="mt-0.5 font-semibold text-slate-800">{status.updated_at ? new Date(status.updated_at).toLocaleString() : '—'}</div>
+              <div className="mt-0.5 break-words font-semibold text-slate-800">{status.updated_at ? new Date(status.updated_at).toLocaleString() : '—'}</div>
             </div>
           </div>
 
           {!coreOnline && (
             <div className="mt-4 flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <div className="space-y-1">
+              <div className="min-w-0 space-y-1 [overflow-wrap:anywhere]">
                 <div>代理内核（Mihomo 容器）当前不可用。</div>
                 {status.core_error && (
                   <div className="font-mono text-xs break-all text-amber-900">{status.core_error}</div>
@@ -304,7 +304,7 @@ export default function ProxyPage() {
           {coreOnline && !status.consumer_ok && (
             <div className="mt-4 flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>
+              <span className="min-w-0 [overflow-wrap:anywhere]">
                 内核在线，但后端无法连接代理入口 <code className="rounded bg-rose-100 px-1">{status.proxy_endpoint || '未配置'}</code>：{status.consumer_error}
                 。请检查 <code className="rounded bg-rose-100 px-1">MIHOMO_MIXED_ADDR</code> 的主机名是否与后端所在环境一致（容器内为 <code className="rounded bg-rose-100 px-1">proxy</code>，宿主机为 <code className="rounded bg-rose-100 px-1">127.0.0.1</code>）；端口由上方「代理端口」控制，默认 7890。
               </span>
@@ -312,22 +312,22 @@ export default function ProxyPage() {
           )}
           {status.last_error && (
             <div className="mt-3 flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{status.last_error}</span>
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span className="min-w-0 [overflow-wrap:anywhere]">{status.last_error}</span>
             </div>
           )}
           {error && <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</div>}
           {notice && <div className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{notice}</div>}
         </section>
 
-        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
           {/* Subscription ------------------------------------------------- */}
-          <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
-            <div className="flex items-center gap-2">
+          <section className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+            <div className="flex flex-wrap items-center gap-2">
               <Link2 className="h-5 w-5 text-slate-500" />
               <h2 className="text-base font-semibold text-slate-900">订阅导入</h2>
               <div className="ml-auto flex rounded-lg border border-slate-200 p-0.5 text-xs">
-                <button type="button" onClick={() => setUseRawPayload(false)} className={`rounded-md px-2.5 py-1 ${!useRawPayload ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>订阅链接</button>
-                <button type="button" onClick={() => setUseRawPayload(true)} className={`rounded-md px-2.5 py-1 ${useRawPayload ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>粘贴内容</button>
+                <button type="button" onClick={() => setUseRawPayload(false)} className={`h-10 rounded-md px-3 sm:h-auto sm:px-2.5 sm:py-1 ${!useRawPayload ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>订阅链接</button>
+                <button type="button" onClick={() => setUseRawPayload(true)} className={`h-10 rounded-md px-3 sm:h-auto sm:px-2.5 sm:py-1 ${useRawPayload ? 'bg-slate-900 text-white' : 'text-slate-600'}`}>粘贴内容</button>
               </div>
             </div>
             <p className="mt-1 text-sm text-slate-500">支持 XTLS/Clash.Meta 订阅、base64 节点列表（vless / vmess / trojan / ss / hysteria2 / tuic）。导入后会重建规则，全部流量走所选节点。</p>
@@ -335,7 +335,7 @@ export default function ProxyPage() {
             <div className="mt-4 grid gap-3">
               <label className="block">
                 <span className="mb-1.5 block text-xs font-medium text-slate-600">订阅名称（可选）</span>
-                <input value={subscriptionName} onChange={(event) => setSubscriptionName(event.target.value)} placeholder="例如：机场 A" className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm" />
+                <input value={subscriptionName} onChange={(event) => setSubscriptionName(event.target.value)} placeholder="例如：机场 A" className="h-11 w-full rounded-lg border border-slate-200 px-3 text-base sm:h-10 sm:text-sm" />
               </label>
 
               {useRawPayload ? (
@@ -356,26 +356,29 @@ export default function ProxyPage() {
                     value={subscriptionURL}
                     onChange={(event) => setSubscriptionURL(event.target.value)}
                     placeholder="https://example.com/api/v1/client/subscribe?token=..."
-                    className="h-10 w-full rounded-lg border border-slate-200 px-3 font-mono text-sm"
+                    inputMode="url"
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    className="h-11 w-full rounded-lg border border-slate-200 px-3 font-mono text-base sm:h-10 sm:text-sm"
                   />
                 </label>
               )}
 
-              <div className="flex flex-wrap items-center gap-2">
-                <button type="button" onClick={() => void importSubscription()} disabled={busy !== ''} className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">
+              <div className="grid grid-cols-2 items-center gap-2 sm:flex sm:flex-wrap [&>button]:justify-center [&>button:first-child]:col-span-2">
+                <button type="button" onClick={() => void importSubscription()} disabled={busy !== ''} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">
                   {busy === 'import' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                   {status.source_type === 'none' ? '导入订阅' : '替换订阅'}
                 </button>
-                <button type="button" onClick={() => void refreshSubscription()} disabled={busy !== '' || !status.subscription_url} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40">
+                <button type="button" onClick={() => void refreshSubscription()} disabled={busy !== '' || !status.subscription_url} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-40">
                   {busy === 'refresh' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}刷新订阅
                 </button>
-                <button type="button" onClick={() => void deleteSubscription()} disabled={busy !== '' || status.source_type === 'none'} className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-40">
+                <button type="button" onClick={() => void deleteSubscription()} disabled={busy !== '' || status.source_type === 'none'} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-40">
                   {busy === 'delete' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}删除订阅
                 </button>
               </div>
 
               {status.subscription_url && (
-                <div className="truncate rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                <div className="min-w-0 truncate rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">
                   当前订阅：<span className="font-mono text-slate-700">{status.subscription_url}</span>
                 </div>
               )}
@@ -412,7 +415,7 @@ export default function ProxyPage() {
                       checked={item.value}
                       disabled={busy !== '' || !status.enabled}
                       onChange={(event) => void updateToggle(item.key, event.target.checked)}
-                      className="h-4 w-4 shrink-0 accent-slate-900 disabled:opacity-40"
+                      className="h-5 w-5 shrink-0 accent-slate-900 disabled:opacity-40 sm:h-4 sm:w-4"
                     />
                   </label>
                 )
@@ -439,14 +442,15 @@ export default function ProxyPage() {
                   value={portDraft !== '' ? portDraft : String(status.mixed_port || '')}
                   onChange={(event) => setPortDraft(event.target.value)}
                   placeholder="7890"
-                  className="h-10 w-full rounded-lg border border-slate-200 px-3 font-mono text-sm"
+                  inputMode="numeric"
+                  className="h-11 w-full rounded-lg border border-slate-200 px-3 font-mono text-base sm:h-10 sm:text-sm"
                 />
               </label>
               <button
                 type="button"
                 onClick={savePort}
                 disabled={busy !== '' || !coreOnline || portDraft === '' || Number(portDraft) === status.mixed_port}
-                className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
+                className="inline-flex h-11 shrink-0 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40 sm:h-10"
               >
                 {busy === 'port' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存
               </button>
@@ -489,14 +493,14 @@ export default function ProxyPage() {
               <h2 className="text-base font-semibold text-slate-900">节点列表</h2>
               <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">{nodes.length}</span>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <label className="flex h-9 min-w-48 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500">
-                <Search className="h-4 w-4" />
-                <input value={nodeSearch} onChange={(event) => setNodeSearch(event.target.value)} placeholder="搜索节点名称或协议" className="min-w-0 flex-1 outline-none" />
+            <div className="flex items-center gap-2">
+              <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500 md:h-9 md:min-w-48 md:flex-none">
+                <Search className="h-4 w-4 shrink-0" />
+                <input value={nodeSearch} onChange={(event) => setNodeSearch(event.target.value)} placeholder="搜索节点名称或协议" className="min-w-0 flex-1 text-base outline-none md:text-sm" />
               </label>
-              <button type="button" onClick={() => void testNodes()} disabled={testing || !coreOnline || nodes.length === 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white disabled:opacity-40">
+              <button type="button" onClick={() => void testNodes()} disabled={testing || !coreOnline || nodes.length === 0} className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white disabled:opacity-40 md:h-9">
                 {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
-                {testing ? '测速中...' : '测试全部延迟'}
+                {testing ? '测速中...' : <><span className="md:hidden">测速</span><span className="hidden md:inline">测试全部延迟</span></>}
               </button>
             </div>
           </div>
@@ -511,7 +515,34 @@ export default function ProxyPage() {
               {nodes.length === 0 ? '还没有节点，请先导入订阅' : '没有匹配的节点'}
             </div>
           ) : (
-            <div className="max-h-[520px] overflow-y-auto">
+            <>
+            {/* Phones: one card per node instead of a table. */}
+            <ul className="divide-y divide-slate-100 md:hidden">
+              {filteredNodes.map((node) => (
+                <li key={node.name} className={`flex items-center gap-3 px-4 py-3 ${node.selected ? 'bg-emerald-50/60' : ''}`}>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      {node.selected && <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />}
+                      <span className="truncate text-sm font-medium text-slate-800">{node.name}</span>
+                    </div>
+                    <div className="mt-1 flex items-center gap-2 text-xs">
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 uppercase text-slate-500">{node.type || '—'}</span>
+                      <span className={`font-mono ${delayClass(node)}`}>{delayLabel(node)}</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void selectNode(node)}
+                    disabled={busy !== '' || node.selected || !coreOnline}
+                    className={`inline-flex h-10 min-w-16 shrink-0 items-center justify-center rounded-lg border px-3 text-sm disabled:opacity-50 ${node.selected ? 'border-emerald-200 bg-white text-emerald-700' : 'border-slate-200 bg-white text-slate-700 active:bg-slate-50'}`}
+                  >
+                    {busy === `node:${node.name}` ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : null}
+                    {node.selected ? '使用中' : '使用'}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="hidden max-h-[520px] overflow-y-auto md:block">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-slate-50 text-left text-xs text-slate-500">
                   <tr>
@@ -537,7 +568,7 @@ export default function ProxyPage() {
                           type="button"
                           onClick={() => void selectNode(node)}
                           disabled={busy !== '' || node.selected || !coreOnline}
-                          className="inline-flex h-7 items-center rounded-lg border border-slate-200 px-2.5 text-xs text-slate-600 hover:bg-white disabled:opacity-40"
+                          className="inline-flex h-10 sm:h-7 items-center rounded-lg border border-slate-200 px-2.5 text-xs text-slate-600 hover:bg-white disabled:opacity-40"
                         >
                           {busy === `node:${node.name}` ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : null}
                           {node.selected ? '使用中' : '使用'}
@@ -548,6 +579,7 @@ export default function ProxyPage() {
                 </tbody>
               </table>
             </div>
+            </>
           )}
         </section>
       </div>

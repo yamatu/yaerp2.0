@@ -2,9 +2,10 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, CheckCheck, CheckCircle2, Inbox, Link2, LogOut, MessageCircle, RefreshCw, Save, Search, Smartphone, Users, Wifi, WifiOff } from 'lucide-react'
+import { ArrowLeft, CheckCheck, CheckCircle2, ChevronLeft, ChevronRight, Inbox, Link2, LogOut, MessageCircle, RefreshCw, Save, Search, Smartphone, UserRound, Users, Wifi, WifiOff } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
 import { WhatsAppAvatarImage } from '@/components/whatsapp/WhatsAppAvatarImage'
+import { useHistoryLayer, useMediaQuery } from '@/hooks/useMobileGestures'
 import api from '@/lib/api'
 import type { WhatsAppAccount, WhatsAppChat, WhatsAppContactSyncResult } from '@/types'
 
@@ -20,6 +21,17 @@ function accountStatusLabel(status?: string) {
     default: return '未连接'
   }
 }
+
+function formatChatTime(timestamp: number) {
+  if (!timestamp) return ''
+  const date = new Date(timestamp * 1000)
+  return date.toDateString() === new Date().toDateString()
+    ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    : date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+}
+
+// Below lg the account panel, the chat list and a chat are stacked screens.
+const COMPACT_LAYOUT_QUERY = '(max-width: 1023px)'
 
 export default function WhatsAppWorkspacePage() {
   const [account, setAccount] = useState<WhatsAppAccount | null>(null)
@@ -40,6 +52,13 @@ export default function WhatsAppWorkspacePage() {
   const chatsRequestRef = useRef(false)
   const lastChatsLoadAtRef = useRef(0)
   const accountStatusRef = useRef('')
+  const compactLayout = useMediaQuery(COMPACT_LAYOUT_QUERY)
+  const [accountScreenOpen, setAccountScreenOpen] = useState(false)
+  const [openChatId, setOpenChatId] = useState('')
+  const closeAccountScreen = useCallback(() => setAccountScreenOpen(false), [])
+  const closeChatScreen = useCallback(() => setOpenChatId(''), [])
+  useHistoryLayer(compactLayout && accountScreenOpen, closeAccountScreen)
+  useHistoryLayer(compactLayout && Boolean(openChatId), closeChatScreen)
 
   const loadAccount = useCallback(async () => {
     if (accountRequestRef.current) return null
@@ -249,33 +268,49 @@ export default function WhatsAppWorkspacePage() {
 
   const connected = account?.status === 'ready'
   const canStart = !account || ['disconnected', 'error', 'auth_failure'].includes(account.status)
+  const openChat = chats.find((chat) => chat.id === openChatId) || null
+  // Phones land on the chat list once WhatsApp is connected; until then the
+  // account screen (QR code, status) is the first screen.
+  const showAccountOnPhone = !loading && (!connected || accountScreenOpen)
 
   return (
     <AuthGuard>
-      <div className="min-h-screen bg-[#efeae2]">
-        <header className="border-b border-emerald-900/20 bg-[#075e54] text-white shadow-sm">
-          <div className="mx-auto flex h-16 max-w-[1440px] items-center justify-between px-3 sm:px-5">
-            <div className="flex min-w-0 items-center gap-3">
-              <Link href="/" className="inline-flex h-9 w-9 items-center justify-center rounded-lg hover:bg-white/10" title="返回工作台"><ArrowLeft className="h-4 w-4" /></Link>
-              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/15"><MessageCircle className="h-5 w-5" /></div>
-              <div className="min-w-0"><h1 className="truncate text-base font-semibold">我的 WhatsApp</h1><p className="truncate text-xs text-emerald-100">绑定账号并管理可用于频道的会话</p></div>
+      <div className="min-h-[calc(100dvh-var(--mobile-tabbar-offset))] bg-[#efeae2]">
+        <header className="sticky top-0 z-20 border-b border-emerald-900/20 bg-[#075e54] pt-[env(safe-area-inset-top)] text-white shadow-sm lg:static">
+          <div className="mx-auto flex h-14 max-w-[1440px] items-center justify-between gap-2 px-2 sm:h-16 sm:px-5">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              {compactLayout && connected && accountScreenOpen ? (
+                <button type="button" onClick={closeAccountScreen} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full hover:bg-white/10" title="返回会话列表" aria-label="返回会话列表"><ChevronLeft className="h-5 w-5" /></button>
+              ) : (
+                <>
+                  <Link href="/channels" className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full hover:bg-white/10 lg:hidden" title="返回频道" aria-label="返回频道"><ChevronLeft className="h-5 w-5" /></Link>
+                  <Link href="/" className="hidden h-9 w-9 items-center justify-center rounded-lg hover:bg-white/10 lg:inline-flex" title="返回工作台"><ArrowLeft className="h-4 w-4" /></Link>
+                </>
+              )}
+              <div className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/15 sm:flex"><MessageCircle className="h-5 w-5" /></div>
+              <div className="min-w-0"><h1 className="truncate text-base font-semibold">{compactLayout && connected && accountScreenOpen ? '账号与绑定' : '我的 WhatsApp'}</h1><p className="hidden truncate text-xs text-emerald-100 sm:block">绑定账号并管理可用于频道的会话</p></div>
             </div>
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
               {totalUnread > 0 && (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-[#25d366] px-3 py-1.5 text-xs font-semibold text-white" title="未读消息总数">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-[#25d366] px-2.5 py-1.5 text-xs font-semibold text-white sm:px-3" title="未读消息总数">
                   <Inbox className="h-3.5 w-3.5" />
-                  {totalUnread} 条未读
+                  {totalUnread}<span className="hidden sm:inline"> 条未读</span>
                 </span>
               )}
-              <span className="inline-flex items-center gap-2 rounded-full bg-black/15 px-3 py-1.5 text-xs font-medium">{connected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}{accountStatusLabel(account?.status)}</span>
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-black/15 px-2.5 py-1.5 text-xs font-medium sm:gap-2 sm:px-3">{connected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}{accountStatusLabel(account?.status)}</span>
+              {connected && !accountScreenOpen && (
+                <button type="button" onClick={() => setAccountScreenOpen(true)} className="inline-flex h-10 w-10 items-center justify-center overflow-hidden rounded-full bg-white/15 lg:hidden" title="账号与绑定" aria-label="账号与绑定">
+                  <WhatsAppAvatarImage src={account?.profile_pic_url} fallback={<UserRound className="h-5 w-5" />} />
+                </button>
+              )}
             </div>
           </div>
         </header>
 
-        <main className="mx-auto grid min-h-[calc(100vh-4rem)] max-w-[1440px] bg-white shadow-xl lg:grid-cols-[380px_minmax(0,1fr)]">
-          <aside className="border-r border-slate-200 bg-white">
+        <main className="mx-auto grid grid-cols-1 min-h-[calc(100dvh-3.5rem-env(safe-area-inset-top)-var(--mobile-tabbar-offset))] max-w-[1440px] bg-white shadow-xl sm:min-h-[calc(100dvh-4rem-env(safe-area-inset-top)-var(--mobile-tabbar-offset))] lg:min-h-[calc(100vh-4rem)] lg:grid-cols-[380px_minmax(0,1fr)]">
+          <aside className={`${showAccountOnPhone || loading ? 'block' : 'hidden'} border-r border-slate-200 bg-white lg:block`}>
             {loading ? <div className="flex h-64 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />加载账号...</div> : (
-              <div className="p-5">
+              <div className="p-4 sm:p-5">
                 <div className="flex items-center gap-4">
                   <div className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700">
                     <WhatsAppAvatarImage src={account?.profile_pic_url} fallback={<Smartphone className="h-8 w-8" />} />
@@ -320,24 +355,24 @@ export default function WhatsAppWorkspacePage() {
                 )}
 
                 <div className="mt-5 flex flex-wrap gap-2">
-                  {canStart && <button type="button" onClick={() => void runAction('start')} disabled={Boolean(acting)} className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-lg bg-[#008069] px-4 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-50"><Smartphone className="h-4 w-4" />绑定账号</button>}
-                  <button type="button" onClick={() => void runAction('restart')} disabled={Boolean(acting)} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"><RefreshCw className={`h-4 w-4 ${acting === 'restart' ? 'animate-spin' : ''}`} />重启</button>
-                  <button type="button" onClick={() => void runAction('logout')} disabled={Boolean(acting)} className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50" title="停止当前会话并清除本地 WhatsApp 登录状态"><LogOut className="h-4 w-4" />退出/清除</button>
+                  {canStart && <button type="button" onClick={() => void runAction('start')} disabled={Boolean(acting)} className="inline-flex h-11 flex-1 basis-full items-center justify-center gap-2 rounded-lg bg-[#008069] px-4 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-50 sm:h-9 sm:basis-auto"><Smartphone className="h-4 w-4" />绑定账号</button>}
+                  <button type="button" onClick={() => void runAction('restart')} disabled={Boolean(acting)} className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50 sm:h-9 sm:flex-none"><RefreshCw className={`h-4 w-4 ${acting === 'restart' ? 'animate-spin' : ''}`} />重启</button>
+                  <button type="button" onClick={() => void runAction('logout')} disabled={Boolean(acting)} className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50 sm:h-9 sm:flex-none" title="停止当前会话并清除本地 WhatsApp 登录状态"><LogOut className="h-4 w-4" />退出/清除</button>
                 </div>
 
                 <div className="mt-6 border-t border-slate-200 pt-5">
                   <label className="block text-xs font-semibold uppercase text-slate-500">WhatsApp 简介</label>
-                  <textarea value={about} onChange={(event) => setAbout(event.target.value)} disabled={!connected} maxLength={139} className="mt-2 min-h-24 w-full resize-none rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none focus:border-emerald-300 focus:bg-white disabled:opacity-60" placeholder="登录后可修改 WhatsApp 简介" />
-                  <div className="mt-2 flex items-center justify-between"><span className="text-xs text-slate-400">{about.length}/139</span><button type="button" onClick={() => void saveAbout()} disabled={!connected || savingAbout} className="inline-flex h-8 items-center gap-2 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white disabled:opacity-40"><Save className="h-3.5 w-3.5" />保存简介</button></div>
+                  <textarea value={about} onChange={(event) => setAbout(event.target.value)} disabled={!connected} maxLength={139} className="mt-2 min-h-24 w-full resize-none rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-base outline-none sm:text-sm focus:border-emerald-300 focus:bg-white disabled:opacity-60" placeholder="登录后可修改 WhatsApp 简介" />
+                  <div className="mt-2 flex items-center justify-between"><span className="text-xs text-slate-400">{about.length}/139</span><button type="button" onClick={() => void saveAbout()} disabled={!connected || savingAbout} className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-3 text-xs font-semibold text-white disabled:opacity-40 sm:h-8"><Save className="h-3.5 w-3.5" />保存简介</button></div>
                 </div>
                 <div className="mt-6 border-t border-slate-200 pt-5">
                   <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Link2 className="h-4 w-4 text-emerald-700" />与 ERP 联动</div>
                   <p className="mt-1 text-xs leading-5 text-slate-500">把 WhatsApp 联系人同步成 ERP 频道后，可以在频道里分配跟进、保存历史消息并再次发送。</p>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <button type="button" onClick={() => void syncContactsToChannels()} disabled={!connected || syncingContacts} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#008069] px-3 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-40">
+                    <button type="button" onClick={() => void syncContactsToChannels()} disabled={!connected || syncingContacts} className="inline-flex h-10 items-center gap-2 rounded-lg bg-[#008069] px-3 text-sm font-semibold text-white hover:bg-[#006d59] disabled:opacity-40 sm:h-9">
                       <RefreshCw className={`h-4 w-4 ${syncingContacts ? 'animate-spin' : ''}`} />同步联系人为频道
                     </button>
-                    <Link href="/channels" className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50">
+                    <Link href="/channels" className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50 sm:h-9">
                       <MessageCircle className="h-4 w-4" />打开频道
                     </Link>
                   </div>
@@ -348,10 +383,16 @@ export default function WhatsAppWorkspacePage() {
             )}
           </aside>
 
-          <section className="flex min-h-0 flex-col bg-[#f7f8fa]">
-            <div className="border-b border-slate-200 bg-white p-3 sm:p-4">
+          <section className={`${showAccountOnPhone || loading ? 'hidden' : 'flex'} min-h-0 min-w-0 flex-col bg-[#f7f8fa] lg:flex`}>
+            {(error || notice) && (
+              <div className="space-y-2 border-b border-slate-200 bg-white px-3 py-2 lg:hidden">
+                {error && <div className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</div>}
+                {notice && <div className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{notice}</div>}
+              </div>
+            )}
+            <div className="sticky top-[calc(3.5rem+env(safe-area-inset-top))] z-10 border-b border-slate-200 bg-white p-3 sm:top-[calc(4rem+env(safe-area-inset-top))] sm:p-4 lg:static">
               <div className="flex items-center gap-2">
-                <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:ring-1 focus-within:ring-emerald-300"><Search className="h-4 w-4" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索 WhatsApp 联系人、群组或最近消息" className="min-w-0 flex-1 bg-transparent outline-none" /></label>
+                <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:ring-1 focus-within:ring-emerald-300"><Search className="h-4 w-4 shrink-0" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索联系人、群组或最近消息" className="min-w-0 flex-1 bg-transparent text-base outline-none sm:text-sm" /></label>
                 <button type="button" onClick={() => void loadChats()} disabled={!connected || loadingChats} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 disabled:opacity-40" title="刷新 WhatsApp 会话"><RefreshCw className={`h-4 w-4 ${loadingChats ? 'animate-spin' : ''}`} /></button>
               </div>
               {connected && (
@@ -359,7 +400,7 @@ export default function WhatsAppWorkspacePage() {
                   <button
                     type="button"
                     onClick={() => setOnlyUnread((current) => !current)}
-                    className={`inline-flex h-8 items-center gap-1.5 rounded-full px-3 font-medium transition ${onlyUnread ? 'bg-[#008069] text-white' : 'border border-slate-200 text-slate-600 hover:bg-slate-50'}`}
+                    className={`inline-flex h-10 items-center gap-1.5 rounded-full px-3 font-medium transition sm:h-8 ${onlyUnread ? 'bg-[#008069] text-white' : 'border border-slate-200 text-slate-600 hover:bg-slate-50'}`}
                     aria-pressed={onlyUnread}
                   >
                     <Inbox className="h-3.5 w-3.5" />仅看未读{totalUnread > 0 ? `（${totalUnread}）` : ''}
@@ -368,12 +409,12 @@ export default function WhatsAppWorkspacePage() {
                     type="button"
                     onClick={() => void markAllChatsRead()}
                     disabled={totalUnread === 0 || markingAllRead}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-full border border-slate-200 px-3 font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40"
+                    className="inline-flex h-10 items-center gap-1.5 rounded-full border border-slate-200 px-3 font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40 sm:h-8"
                     title="把所有未读会话标记为已读"
                   >
                     <CheckCheck className={`h-3.5 w-3.5 ${markingAllRead ? 'animate-pulse' : ''}`} />全部已读
                   </button>
-                  <Link href="/channels" className="inline-flex h-8 items-center gap-1.5 rounded-full border border-slate-200 px-3 font-medium text-slate-600 transition hover:bg-slate-50" title="在频道页面发送消息与使用模板">
+                  <Link href="/channels" className="inline-flex h-10 items-center gap-1.5 rounded-full border border-slate-200 px-3 font-medium text-slate-600 transition hover:bg-slate-50 sm:h-8" title="在频道页面发送消息与使用模板">
                     <MessageCircle className="h-3.5 w-3.5" />去频道发送
                   </Link>
                   <span className="ml-auto text-slate-400">共 {sortedChats.length} 个会话</span>
@@ -383,14 +424,62 @@ export default function WhatsAppWorkspacePage() {
             <div className="min-h-0 flex-1 overflow-y-auto">
               {!connected ? <div className="flex h-full min-h-96 flex-col items-center justify-center text-center text-slate-400"><div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 text-emerald-700"><MessageCircle className="h-7 w-7" /></div><div className="mt-4 text-base font-semibold text-slate-700">绑定后显示 WhatsApp 会话</div><p className="mt-2 max-w-sm text-sm leading-6">员工只能管理自己的账号。系统代理由管理员统一配置，不会在这里显示。</p></div> : loadingChats && chats.length === 0 ? <div className="flex h-full min-h-72 items-center justify-center text-sm text-slate-400"><RefreshCw className="mr-2 h-4 w-4 animate-spin" />正在读取 WhatsApp 会话...</div> : sortedChats.length === 0 ? <div className="p-10 text-center text-sm text-slate-400">{onlyUnread ? '没有未读的 WhatsApp 会话' : '没有匹配的 WhatsApp 会话'}</div> : sortedChats.map((chat) => (
                 <div key={chat.id} className="flex items-center gap-3 border-b border-slate-100 bg-white px-4 py-3 transition hover:bg-slate-50">
-                  <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500"><WhatsAppAvatarImage src={chat.profilePicUrl} fallback={chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />} /></div>
-                  <div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div>{chat.timestamp > 0 && <span className="shrink-0 text-[11px] text-slate-400">{new Date(chat.timestamp * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}</span>}</div><div className="mt-1 flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</span>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div></div>
-                  {chat.unreadCount > 0 && <button type="button" onClick={() => void markChatRead(chat)} disabled={Boolean(markingReadChatId)} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[#008069] transition hover:bg-emerald-50 disabled:opacity-40" title="将这个 WhatsApp 会话标记为已读"><CheckCheck className={`h-4 w-4 ${markingReadChatId === chat.id ? 'animate-pulse' : ''}`} /></button>}
+                  <button type="button" onClick={() => { if (compactLayout) setOpenChatId(chat.id) }} className="flex min-w-0 flex-1 items-center gap-3 text-left lg:cursor-default" aria-label={`查看 ${chat.name}`}>
+                    <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500"><WhatsAppAvatarImage src={chat.profilePicUrl} fallback={chat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />} /></div>
+                    <div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div className="truncate text-sm font-semibold text-slate-900">{chat.name}</div>{chat.timestamp > 0 && <span className={`shrink-0 text-[11px] ${chat.unreadCount > 0 ? 'font-semibold text-[#25d366]' : 'text-slate-400'}`}>{formatChatTime(chat.timestamp)}</span>}</div><div className="mt-1 flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs text-slate-500">{chat.lastMessage || chat.description || chat.about || (chat.isGroup ? `${chat.participantCount} 位成员` : chat.id)}</span>{chat.unreadCount > 0 && <span className="rounded-full bg-[#25d366] px-2 py-0.5 text-[10px] font-semibold text-white">{chat.unreadCount}</span>}</div></div>
+                  </button>
+                  {chat.unreadCount > 0 && <button type="button" onClick={() => void markChatRead(chat)} disabled={Boolean(markingReadChatId)} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[#008069] transition hover:bg-emerald-50 disabled:opacity-40 sm:h-9 sm:w-9" title="将这个 WhatsApp 会话标记为已读" aria-label="标记已读"><CheckCheck className={`h-4 w-4 ${markingReadChatId === chat.id ? 'animate-pulse' : ''}`} /></button>}
+                  {chat.unreadCount === 0 && <ChevronRight className="h-4 w-4 shrink-0 text-slate-300 lg:hidden" />}
                 </div>
               ))}
             </div>
           </section>
         </main>
+
+        {compactLayout && openChat && (
+          // Phone "conversation" screen: chat details and quick actions. The
+          // messages themselves are handled in linked ERP channels.
+          <div className="fixed inset-x-0 top-0 bottom-[var(--mobile-tabbar-offset)] z-[55] flex flex-col bg-[#efeae2] lg:hidden" role="dialog" aria-label={openChat.name}>
+            <div className="flex h-[calc(3.5rem+env(safe-area-inset-top))] shrink-0 items-center gap-2 bg-[#075e54] px-2 pt-[env(safe-area-inset-top)] text-white">
+              <button type="button" onClick={closeChatScreen} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full hover:bg-white/10" title="返回会话列表" aria-label="返回会话列表"><ChevronLeft className="h-5 w-5" /></button>
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-white/15"><WhatsAppAvatarImage src={openChat.profilePicUrl} fallback={openChat.isGroup ? <Users className="h-5 w-5" /> : <MessageCircle className="h-5 w-5" />} /></div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-base font-semibold">{openChat.name}</div>
+                <div className="truncate text-xs text-emerald-100">{openChat.isGroup ? `群组 · ${openChat.participantCount} 位成员` : openChat.id.replace(/@.*$/, '')}</div>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3">
+              <div className="flex flex-col items-center rounded-2xl bg-white px-4 py-6 text-center shadow-sm">
+                <div className="flex h-24 w-24 items-center justify-center overflow-hidden rounded-full bg-slate-200 text-slate-500"><WhatsAppAvatarImage src={openChat.profilePicUrl} fallback={openChat.isGroup ? <Users className="h-9 w-9" /> : <MessageCircle className="h-9 w-9" />} /></div>
+                <div className="mt-3 max-w-full break-words text-lg font-semibold text-slate-900">{openChat.name}</div>
+                {(openChat.about || openChat.description) && <p className="mt-1 max-w-full break-words text-sm leading-6 text-slate-500">{openChat.about || openChat.description}</p>}
+              </div>
+              {openChat.lastMessage && (
+                <div className="rounded-2xl bg-white p-4 shadow-sm">
+                  <div className="flex items-center justify-between text-xs text-slate-400"><span>最近消息</span><span>{formatChatTime(openChat.timestamp)}</span></div>
+                  <div className="mt-2 max-w-full whitespace-pre-wrap break-words rounded-xl rounded-tl-sm bg-[#f0f2f5] px-3 py-2 text-sm leading-6 text-slate-800">{openChat.lastMessage}</div>
+                </div>
+              )}
+              <div className="overflow-hidden rounded-2xl bg-white shadow-sm">
+                <button type="button" onClick={() => void markChatRead(openChat)} disabled={openChat.unreadCount === 0 || Boolean(markingReadChatId)} className="flex h-14 w-full items-center gap-3 border-b border-slate-100 px-4 text-left text-sm text-slate-700 disabled:text-slate-300">
+                  <CheckCheck className={`h-5 w-5 text-[#008069] ${markingReadChatId === openChat.id ? 'animate-pulse' : ''}`} />
+                  <span className="flex-1">{openChat.unreadCount > 0 ? `标记已读（${openChat.unreadCount} 条未读）` : '没有未读消息'}</span>
+                </button>
+                <Link href="/channels" className="flex h-14 items-center gap-3 border-b border-slate-100 px-4 text-sm text-slate-700">
+                  <MessageCircle className="h-5 w-5 text-[#008069]" />
+                  <span className="flex-1">在频道中跟进与回复</span>
+                  <ChevronRight className="h-4 w-4 text-slate-300" />
+                </Link>
+                <button type="button" onClick={() => void syncContactsToChannels()} disabled={!connected || syncingContacts} className="flex h-14 w-full items-center gap-3 px-4 text-left text-sm text-slate-700 disabled:opacity-40">
+                  <RefreshCw className={`h-5 w-5 text-[#008069] ${syncingContacts ? 'animate-spin' : ''}`} />
+                  <span className="flex-1">同步联系人为 ERP 频道</span>
+                </button>
+              </div>
+              {error && <div className="rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</div>}
+              {notice && <div className="rounded-xl bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{notice}</div>}
+            </div>
+          </div>
+        )}
       </div>
     </AuthGuard>
   )

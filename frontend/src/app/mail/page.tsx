@@ -28,7 +28,6 @@ import {
   ListFilter,
   Mail,
   MailOpen,
-  Menu,
   Paperclip,
   Pencil,
   Plus,
@@ -60,7 +59,10 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import { AuthGuard } from "@/components/auth/AuthGuard";
+import MailBodyFrame, { MAIL_FRAME_ROOT_ID } from "@/components/mail/MailBodyFrame";
 import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
+import PullToRefresh from "@/components/mail/PullToRefresh";
+import SwipeableRow from "@/components/mail/SwipeableRow";
 import { FilePreviewModal, type FilePreviewItem } from "@/components/ui/FilePreviewModal";
 import api from "@/lib/api";
 import { getStoredUser, isAdmin } from "@/lib/auth";
@@ -491,10 +493,63 @@ function htmlToText(value: string) {
 }
 
 function iframeDocument(html: string) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><base target="_blank"><style>html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}table{max-width:100%;border-collapse:collapse}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body>${html}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><base target="_blank"><style>html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;-webkit-text-size-adjust:100%}html{overflow-x:hidden}#${MAIL_FRAME_ROOT_ID}{display:flow-root}td,th{overflow-wrap:anywhere}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}table{max-width:100%;border-collapse:collapse}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body><div id="${MAIL_FRAME_ROOT_ID}">${html}</div></body></html>`;
 }
 
 const mailFrameSandbox = "allow-popups allow-popups-to-escape-sandbox";
+
+type MobilePane = "folders" | "messages" | "detail";
+
+/**
+ * Phone navigation state mirrored into the URL so the browser / Android back
+ * button walks the stack (message -> list, compose -> previous screen, ...).
+ */
+interface MailHistoryState {
+  pane: MobilePane;
+  compose: boolean;
+  modal: boolean;
+}
+
+const MOBILE_MEDIA_QUERY = "(max-width: 767px)";
+
+function isMobileViewport() {
+  return (
+    typeof window !== "undefined" && window.matchMedia(MOBILE_MEDIA_QUERY).matches
+  );
+}
+
+function readMailHistory(): MailHistoryState {
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get("view");
+  return {
+    pane: view === "folders" || view === "detail" ? view : "messages",
+    compose: params.get("compose") === "1",
+    modal: params.get("sheet") === "1",
+  };
+}
+
+function writeMailHistory(next: MailHistoryState, mode: "push" | "replace") {
+  const url = new URL(window.location.href);
+  if (next.pane === "messages") url.searchParams.delete("view");
+  else url.searchParams.set("view", next.pane);
+  if (next.compose) url.searchParams.set("compose", "1");
+  else url.searchParams.delete("compose");
+  if (next.modal) url.searchParams.set("sheet", "1");
+  else url.searchParams.delete("sheet");
+  // Only our own key: Next.js copies its router internals into the entry.
+  const state = { yaerpMail: next };
+  if (mode === "push") window.history.pushState(state, "", url.toString());
+  else window.history.replaceState(state, "", url.toString());
+}
+
+function ownsHistoryEntry(key: keyof MailHistoryState) {
+  const state = window.history.state as { yaerpMail?: MailHistoryState } | null;
+  return Boolean(state?.yaerpMail?.[key]) && state?.yaerpMail?.[key] !== "messages";
+}
+
+function avatarText(value: string) {
+  return value.trim().slice(0, 1).toUpperCase() || "?";
+}
 
 export default function MailPage() {
   const router = useRouter();
@@ -592,9 +647,15 @@ export default function MailPage() {
   const [translating, setTranslating] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
-  const [mobilePane, setMobilePane] = useState<
-    "folders" | "messages" | "detail"
-  >("messages");
+  const [mobilePane, setMobilePane] = useState<MobilePane>("messages");
+  const [isMobile, setIsMobile] = useState(false);
+  const [mobileSelecting, setMobileSelecting] = useState(false);
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
+  const [swipedKey, setSwipedKey] = useState<string | null>(null);
+  const [composeCcOpen, setComposeCcOpen] = useState(false);
+  const composeRef = useRef<ComposeState | null>(null);
+  const composeSnapshotRef = useRef("");
+  composeRef.current = compose;
 
   const selectedFolderMeta = useMemo(
     () => folders.find((folder) => folder.name === selectedFolder),
@@ -1081,6 +1142,202 @@ export default function MailPage() {
       document.title = "YaERP 2.0";
     };
   }, [summary?.unread]);
+  // ---- Phone shell: stacked screens, back button and overlays -------------
+  const modalOpen =
+    settingsOpen || signaturesOpen || contactsOpen || bulkJobsOpen;
+  const composeOpen = Boolean(compose);
+  const composeDirty =
+    Boolean(compose) && JSON.stringify(compose) !== composeSnapshotRef.current;
+  const pendingBackRef = useRef<MailHistoryState | null>(null);
+  const modalOpenRef = useRef(false);
+  modalOpenRef.current = modalOpen;
+  const selectedRef = useRef<MailMessageDetail | null>(null);
+  selectedRef.current = selected;
+
+  useEffect(() => {
+    const media = window.matchMedia(MOBILE_MEDIA_QUERY);
+    const sync = () => setIsMobile(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+
+  // A reload on a deep phone URL starts again from the message list.
+  useEffect(() => {
+    const current = readMailHistory();
+    if (current.pane !== "messages" || current.compose || current.modal)
+      writeMailHistory(
+        { pane: "messages", compose: false, modal: false },
+        "replace",
+      );
+  }, []);
+
+  const closeAllModals = useCallback(() => {
+    setSettingsOpen(false);
+    setSignaturesOpen(false);
+    setContactsOpen(false);
+    setBulkJobsOpen(false);
+    setSelectedContactKeys(new Set());
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const next = readMailHistory();
+      const pending = pendingBackRef.current;
+      if (pending) {
+        // We navigated back ourselves: the app state is already right, only
+        // make sure the entry we landed on describes it.
+        pendingBackRef.current = null;
+        setMobilePane(pending.pane);
+        if (
+          next.pane !== pending.pane ||
+          next.compose !== pending.compose ||
+          next.modal !== pending.modal
+        )
+          writeMailHistory(pending, "replace");
+        return;
+      }
+      if (!next.compose && composeRef.current) {
+        const dirty =
+          JSON.stringify(composeRef.current) !== composeSnapshotRef.current;
+        if (dirty && !window.confirm("放弃这封未发送的邮件？")) {
+          writeMailHistory({ ...next, compose: true }, "push");
+          return;
+        }
+        setCompose(null);
+        setComposeFiles([]);
+      } else if (next.compose && !composeRef.current) {
+        writeMailHistory({ ...next, compose: false }, "replace");
+      }
+      if (!next.modal && modalOpenRef.current) closeAllModals();
+      const pane =
+        next.pane === "detail" && !selectedRef.current ? "messages" : next.pane;
+      setMobilePane(pane);
+      setSwipedKey(null);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [closeAllModals]);
+
+  const goMobilePane = useCallback((pane: "folders" | "detail") => {
+    setMobilePane(pane);
+    setSwipedKey(null);
+    if (!isMobileViewport()) return;
+    const current = readMailHistory();
+    if (current.pane === pane) return;
+    writeMailHistory(
+      { pane, compose: current.compose, modal: current.modal },
+      current.pane === "messages" ? "push" : "replace",
+    );
+  }, []);
+
+  const backToMessages = useCallback(() => {
+    setSwipedKey(null);
+    setMobilePane("messages");
+    if (!isMobileViewport()) return;
+    const current = readMailHistory();
+    if (current.pane === "messages") return;
+    const desired = { ...current, pane: "messages" as const };
+    if (ownsHistoryEntry("pane")) {
+      pendingBackRef.current = desired;
+      window.history.back();
+    } else {
+      writeMailHistory(desired, "replace");
+    }
+  }, []);
+
+  // Overlays (compose sheet, settings/contacts sheets) get their own history
+  // entry on phones, so the back gesture closes them first.
+  useEffect(() => {
+    if (!isMobileViewport()) return;
+    const current = readMailHistory();
+    const desired = { ...current, compose: composeOpen, modal: modalOpen };
+    if (desired.compose === current.compose && desired.modal === current.modal)
+      return;
+    const depth = (value: MailHistoryState) =>
+      Number(value.compose) + Number(value.modal);
+    if (depth(desired) > depth(current)) {
+      writeMailHistory(desired, "push");
+    } else if (
+      depth(desired) < depth(current) &&
+      (ownsHistoryEntry("compose") || ownsHistoryEntry("modal"))
+    ) {
+      pendingBackRef.current = desired;
+      window.history.back();
+    } else {
+      writeMailHistory(desired, "replace");
+    }
+  }, [composeOpen, modalOpen]);
+
+  useEffect(() => {
+    if (composeOpen) {
+      composeSnapshotRef.current = JSON.stringify(composeRef.current);
+      setComposeCcOpen(
+        Boolean(composeRef.current?.cc || composeRef.current?.bcc),
+      );
+    }
+  }, [composeOpen]);
+
+  // An opened message is a pushed screen: hide the tab bar and the floating AI
+  // launcher so the reading view and its action bar get the whole screen.
+  useEffect(() => {
+    const suppress =
+      isMobile && (mobilePane === "detail" || mobileSelecting);
+    document.body.classList.toggle("mobile-tabbar-suppressed", suppress);
+    document.body.classList.toggle("fab-hidden", suppress);
+    return () => {
+      document.body.classList.remove("mobile-tabbar-suppressed");
+      document.body.classList.remove("fab-hidden");
+    };
+  }, [isMobile, mobilePane, mobileSelecting]);
+
+  useEffect(() => {
+    if (mobileSelecting && selectedKeys.size === 0) setMobileSelecting(false);
+  }, [mobileSelecting, selectedKeys]);
+
+  useEffect(() => {
+    if (!isMobile) setMobileSelecting(false);
+  }, [isMobile]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const closeCompose = () => {
+    if (sending) return;
+    if (composeDirty && !window.confirm("放弃这封未发送的邮件？")) return;
+    setCompose(null);
+    setComposeFiles([]);
+  };
+
+  const startNewCompose = (bulk = false) => {
+    setCompose({ ...emptyCompose, bulk });
+    setComposeFiles([]);
+    setComposeView("edit");
+  };
+
+  const refreshMail = async () => {
+    await Promise.all([
+      loadFolders(),
+      loadMessages(true),
+      loadContacts(),
+      pollMailSummary(),
+    ]);
+  };
+
+  const startMobileSelection = (message: MailMessageSummary) => {
+    setSwipedKey(null);
+    setMobileSelecting(true);
+    setSelectedKeys((current) => new Set(current).add(messageKey(message)));
+  };
+
+  const exitMobileSelection = () => {
+    setMobileSelecting(false);
+    setSelectedKeys(new Set());
+  };
+
   const selectFolder = (folder: MailFolder) => {
     if (!folder.selectable) return;
     setCorrespondenceContact(null);
@@ -1088,7 +1345,8 @@ export default function MailPage() {
     setSelected(null);
     setTranslation(null);
     setPage(1);
-    setMobilePane("messages");
+    exitMobileSelection();
+    backToMessages();
   };
 
   const fetchDetail = async (message: MailMessageSummary) => {
@@ -1103,7 +1361,7 @@ export default function MailPage() {
 
   const openMessage = async (message: MailMessageSummary) => {
     setLoadingDetail(true);
-    setMobilePane("detail");
+    goMobilePane("detail");
     setTranslation(null);
     try {
       const detail = await fetchDetail(message);
@@ -1249,6 +1507,7 @@ export default function MailPage() {
     setSearchQuery("");
     setCorrespondenceContact(null);
     previousInboxUnreadRef.current = null;
+    backToMessages();
     await loadAccount();
     setNotice(`已切换到 ${res.data.email_address}`);
   };
@@ -1334,9 +1593,12 @@ export default function MailPage() {
         selected &&
         affectedKeys.has(messageKey(selected)) &&
         ["delete", "move"].includes(action)
-      )
+      ) {
         setSelected(null);
+        if (mobilePane === "detail") backToMessages();
+      }
       setSelectedKeys(new Set());
+      setSwipedKey(null);
       setNotice(`已完成 ${messages.length} 封邮件的批量操作。`);
       await Promise.all([loadMessages(), loadFolders()]);
     } catch (batchError) {
@@ -1380,7 +1642,6 @@ export default function MailPage() {
   const moveSelectedMessage = async (destination: string) => {
     if (!selected || !destination || destination === selected.folder) return;
     await performBatch([selected], "move", destination);
-    setMobilePane("messages");
   };
 
   const filesFromMessage = async (detail: MailMessageDetail) => {
@@ -1407,7 +1668,11 @@ export default function MailPage() {
     const ownAddress = account?.email_address.toLowerCase();
     const baseSubject = detail.subject.replace(/^(re|fwd):\s*/i, "");
     const sender = mailAddressLabel(detail.from);
-    const quotedText = `\n\n\n--- ${sender} 于 ${formatDate(detail.date, true)} 写道 ---\n${detail.text_body || ""}`;
+    // Phones reply in plain text: editing the quoted HTML source on a small
+    // touch keyboard is not workable. The HTML quote is kept in the state, so
+    // switching the format back to HTML still works.
+    const phone = isMobileViewport();
+    const quotedText = `\n\n\n--- ${sender} 于 ${formatDate(detail.date, true)} 写道 ---\n${detail.text_body || htmlToText(detail.html_body || "").trim()}`;
     const originalHTML = detail.html_body || textToHTML(detail.text_body || "");
     const quotedHTML = `<p><br></p><blockquote style="margin:0;padding-left:14px;border-left:3px solid #cbd5e1"><div style="color:#64748b">${escapeHTML(sender)} 于 ${escapeHTML(formatDate(detail.date, true))} 写道：</div>${originalHTML}</blockquote>`;
     if (mode === "forward") {
@@ -1462,7 +1727,7 @@ export default function MailPage() {
         subject: `Re: ${baseSubject}`,
         textBody: quotedText,
         htmlBody: quotedHTML,
-        format: detail.html_body ? "html" : "text",
+        format: detail.html_body && !phone ? "html" : "text",
         inReplyTo: detail.message_id || "",
         references: [
           ...(detail.references || []),
@@ -1471,7 +1736,13 @@ export default function MailPage() {
       });
       setComposeFiles([]);
     }
-    setComposeView("edit");
+    // Forwarding an HTML mail on a phone opens on the rendered preview rather
+    // than on the raw markup.
+    setComposeView(
+      phone && detail.html_body && (mode === "forward" || mode === "edit")
+        ? "preview"
+        : "edit",
+    );
   };
 
   const openComposeForMessage = async (
@@ -1852,7 +2123,8 @@ export default function MailPage() {
     setPage(1);
     setSearchDraft("");
     setSearchQuery("");
-    setMobilePane("messages");
+    exitMobileSelection();
+    backToMessages();
   };
 
   const writeToContact = (contact: MailContact) => {
@@ -2039,7 +2311,7 @@ export default function MailPage() {
   if (account === undefined)
     return (
       <AuthGuard>
-        <div className="flex min-h-screen items-center justify-center bg-slate-100 text-sm text-slate-500">
+        <div className="flex min-h-[calc(100dvh-var(--mobile-tabbar-offset))] items-center justify-center bg-slate-100 text-sm text-slate-500 md:min-h-screen">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           正在载入邮件客户端
         </div>
@@ -2049,13 +2321,13 @@ export default function MailPage() {
   if (!account) {
     return (
       <AuthGuard>
-        <div className="min-h-screen bg-slate-100 p-3 sm:p-6">
-          <div className="mx-auto max-w-3xl overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-            <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-4 sm:px-6">
+        <div className="min-h-[calc(100dvh-var(--mobile-tabbar-offset))] bg-white sm:min-h-screen sm:bg-slate-100 sm:p-6">
+          <div className="mx-auto max-w-3xl overflow-hidden bg-white sm:rounded-lg sm:border sm:border-slate-200 sm:shadow-sm">
+            <div className="flex items-center gap-3 border-b border-slate-200 px-4 pb-4 pt-[calc(env(safe-area-inset-top)+1rem)] sm:px-6 sm:pt-4">
               <button
                 type="button"
                 onClick={() => router.push("/")}
-                className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50"
+                className="hidden h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 md:flex"
                 title="返回首页"
               >
                 <ArrowLeft className="h-4 w-4" />
@@ -2082,12 +2354,12 @@ export default function MailPage() {
                 <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
                 邮箱密码或应用密钥使用服务器密钥加密保存，管理员无法查看你的邮件和凭据。
               </div>
-              <div className="flex gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:flex">
                 <button
                   type="button"
                   onClick={() => void testAccount()}
                   disabled={testingAccount}
-                  className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-700 disabled:opacity-50"
+                  className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-700 disabled:opacity-50 sm:h-10"
                 >
                   {testingAccount && (
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -2098,7 +2370,7 @@ export default function MailPage() {
                   type="button"
                   onClick={() => void saveAccount()}
                   disabled={savingAccount}
-                  className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50"
+                  className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50 sm:h-10"
                 >
                   <Save className="h-4 w-4" />
                   {savingAccount ? "验证中..." : "验证并保存"}
@@ -2117,10 +2389,10 @@ export default function MailPage() {
   return (
     <AuthGuard>
       <div
-        className="notranslate h-screen overflow-hidden bg-slate-100 text-slate-800"
+        className="notranslate flex h-[calc(100dvh-var(--mobile-tabbar-offset))] flex-col overflow-hidden bg-slate-100 text-slate-800 md:h-screen"
         translate="no"
       >
-        <header className="flex h-16 items-center gap-2 border-b border-slate-200 bg-white px-3 sm:px-4">
+        <header className="hidden h-16 shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 sm:px-4 md:flex">
           <button
             type="button"
             onClick={() => router.push("/")}
@@ -2171,11 +2443,7 @@ export default function MailPage() {
             </button>
             <button
               type="button"
-              onClick={() => {
-                setCompose(emptyCompose);
-                setComposeFiles([]);
-                setComposeView("edit");
-              }}
+              onClick={() => startNewCompose()}
               className="ui-tooltip inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white hover:bg-sky-700"
               title="新建邮件"
               aria-label="新建邮件"
@@ -2260,7 +2528,7 @@ export default function MailPage() {
         </header>
 
         {(error || notice) && (
-          <div className="fixed left-1/2 top-[72px] z-[80] w-[calc(100%-24px)] max-w-xl -translate-x-1/2">
+          <div className="fixed left-1/2 top-[calc(env(safe-area-inset-top)+3.75rem)] z-[80] w-[calc(100%-24px)] max-w-xl -translate-x-1/2 md:top-[72px]">
             <StatusMessage
               error={error}
               notice={notice}
@@ -2273,18 +2541,81 @@ export default function MailPage() {
           </div>
         )}
 
-        <main className="grid h-[calc(100dvh-4rem)] min-h-0 md:grid-cols-[210px_minmax(300px,390px)_minmax(0,1fr)]">
+        <main className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[210px_minmax(300px,390px)_minmax(0,1fr)]">
           <aside
-            className={`${mobilePane === "folders" ? "flex" : "hidden"} min-h-0 flex-col border-r border-slate-200 bg-slate-50 md:flex`}
+            className={`${mobilePane === "folders" ? "flex" : "hidden"} app-scroll min-h-0 flex-col overflow-y-auto border-r border-slate-200 bg-slate-50 pb-20 md:flex md:overflow-visible md:pb-0`}
           >
-            <div className="flex h-14 shrink-0 items-center justify-between px-3">
+            <div className="sticky top-0 z-10 shrink-0 border-b border-slate-200 bg-white/95 pt-[env(safe-area-inset-top)] backdrop-blur md:hidden">
+              <div className="flex h-14 items-center gap-1 px-1.5">
+                <button
+                  type="button"
+                  onClick={backToMessages}
+                  className="inline-flex h-10 shrink-0 items-center gap-0.5 rounded-lg pl-1 pr-2 text-sm font-medium text-sky-700 active:bg-sky-50"
+                >
+                  <ChevronLeft className="h-5 w-5" />
+                  邮件
+                </button>
+                <h1 className="min-w-0 flex-1 truncate text-center text-base font-semibold text-slate-950">
+                  邮箱
+                </h1>
+                <button
+                  type="button"
+                  onClick={addAccount}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-600 active:bg-slate-100"
+                  aria-label="添加另一个邮箱"
+                >
+                  <Plus className="h-5 w-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => editAccount(account)}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-600 active:bg-slate-100"
+                  aria-label="邮箱设置"
+                >
+                  <Settings className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+            <div className="shrink-0 px-3 pt-3 md:hidden">
+              <div className="px-1 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                邮箱账号
+              </div>
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                {accounts.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => void activateAccount(item.id)}
+                    disabled={!item.enabled}
+                    className="flex min-h-14 w-full items-center gap-3 border-b border-slate-100 px-3 py-2 text-left last:border-b-0 active:bg-slate-50 disabled:opacity-50"
+                  >
+                    <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${item.id === account.id ? "bg-sky-600 text-white" : "bg-slate-100 text-slate-600"}`}>
+                      {avatarText(item.display_name || item.email_address)}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-semibold text-slate-900">
+                        {item.display_name || item.email_address}
+                      </span>
+                      <span className="block truncate text-xs text-slate-400">
+                        {item.email_address} · {item.provider_label}
+                        {!item.enabled ? "（已停用）" : ""}
+                      </span>
+                    </span>
+                    {item.id === account.id && (
+                      <Check className="h-5 w-5 shrink-0 text-sky-600" />
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex h-12 shrink-0 items-center justify-between px-4 pt-2 md:h-14 md:px-3 md:pt-0">
               <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
                 邮件文件夹
               </span>
               <button
                 type="button"
                 onClick={() => void createFolder()}
-                className="ui-tooltip flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white"
+                className="ui-tooltip flex h-10 w-10 items-center justify-center rounded-lg text-slate-500 hover:bg-white md:h-8 md:w-8"
                 title="新建邮件文件夹"
                 aria-label="新建邮件文件夹"
                 data-tooltip="新建邮件文件夹"
@@ -2292,7 +2623,7 @@ export default function MailPage() {
                 <FolderPlus className="h-4 w-4" />
               </button>
             </div>
-            <div className="max-h-[46%] min-h-24 shrink-0 overflow-y-auto px-2 pb-3">
+            <div className="mx-3 shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-white px-1 py-1 md:mx-0 md:max-h-[46%] md:min-h-24 md:overflow-y-auto md:rounded-none md:border-0 md:bg-transparent md:px-2 md:pb-3 md:pt-0">
               {loadingFolders && folders.length === 0 ? (
                 <div className="p-5 text-center text-xs text-slate-400">
                   正在读取文件夹...
@@ -2308,7 +2639,7 @@ export default function MailPage() {
                       type="button"
                       onClick={() => selectFolder(folder)}
                       disabled={!folder.selectable}
-                      className={`mb-0.5 flex h-10 w-full items-center gap-3 rounded-lg px-3 text-left text-sm transition ${active ? "bg-white font-semibold text-sky-700 shadow-sm" : folder.selectable ? "text-slate-600 hover:bg-white" : "cursor-default text-slate-400"}`}
+                      className={`mb-0.5 flex h-12 w-full items-center gap-3 rounded-lg px-3 text-left text-[15px] transition md:h-10 md:text-sm ${active ? "bg-sky-50 font-semibold text-sky-700 md:bg-white md:shadow-sm" : folder.selectable ? "text-slate-600 hover:bg-white active:bg-slate-50" : "cursor-default text-slate-400"}`}
                     >
                       <Icon className="h-4 w-4 shrink-0" />
                       <span className="min-w-0 flex-1 truncate">
@@ -2326,11 +2657,11 @@ export default function MailPage() {
             </div>
             {selectedFolderMeta?.role === "folder" &&
               !correspondenceContact && (
-                <div className="flex gap-2 border-t border-slate-200 p-3">
+                <div className="flex gap-2 p-3 md:border-t md:border-slate-200">
                   <button
                     type="button"
                     onClick={() => void renameFolder()}
-                    className="flex h-8 flex-1 items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white text-xs text-slate-600"
+                    className="flex h-10 flex-1 items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white text-xs text-slate-600 md:h-8"
                   >
                     <Pencil className="h-3.5 w-3.5" />
                     重命名
@@ -2338,7 +2669,7 @@ export default function MailPage() {
                   <button
                     type="button"
                     onClick={() => void deleteFolder()}
-                    className="ui-tooltip flex h-8 w-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-600"
+                    className="ui-tooltip flex h-10 w-11 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-600 md:h-8 md:w-9"
                     title="删除文件夹"
                     aria-label="删除文件夹"
                     data-tooltip="删除文件夹"
@@ -2347,7 +2678,42 @@ export default function MailPage() {
                   </button>
                 </div>
               )}
-            <div className="flex min-h-0 flex-1 flex-col border-t border-slate-200 bg-white/60 p-2">
+            <div className="shrink-0 px-3 pt-4 md:hidden">
+              <div className="px-1 pb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                工具
+              </div>
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                <MobileMenuRow
+                  icon={Users}
+                  label="群发邮件"
+                  onClick={() => startNewCompose(true)}
+                />
+                <MobileMenuRow
+                  icon={ListChecks}
+                  label="群发任务"
+                  hint={hasActiveBulkJobs ? "发送中" : undefined}
+                  onClick={() => {
+                    setBulkJobsOpen(true);
+                    void loadBulkJobs();
+                  }}
+                />
+                <MobileMenuRow
+                  icon={FileText}
+                  label="邮件落款"
+                  hint={signatures.length ? `${signatures.length} 个` : undefined}
+                  onClick={() => {
+                    resetSignatureEditor();
+                    setSignaturesOpen(true);
+                  }}
+                />
+                <MobileMenuRow
+                  icon={Settings}
+                  label="邮箱设置"
+                  onClick={() => editAccount(account)}
+                />
+              </div>
+            </div>
+            <div className="mx-3 mt-4 flex shrink-0 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-1 md:mx-0 md:mt-0 md:min-h-0 md:flex-1 md:shrink md:rounded-none md:border-0 md:border-t md:border-slate-200 md:bg-white/60 md:p-2">
               <button
                 type="button"
                 onClick={() => {
@@ -2367,7 +2733,7 @@ export default function MailPage() {
               <div className="px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                 联系人
               </div>
-              <div className="min-h-0 flex-1 overflow-y-auto">
+              <div className="md:min-h-0 md:flex-1 md:overflow-y-auto">
                 {contacts.length === 0 ? (
                   <button
                     type="button"
@@ -2383,7 +2749,7 @@ export default function MailPage() {
                       key={contactKey(contact)}
                       type="button"
                       onClick={() => viewCorrespondence(contact)}
-                      className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left hover:bg-white"
+                      className="flex min-h-12 w-full items-center gap-2 rounded-lg px-2 py-2 text-left hover:bg-white active:bg-slate-50 md:min-h-0"
                       title={`查看与 ${contact.name || contact.email} 的往来邮件`}
                     >
                       <span
@@ -2411,26 +2777,75 @@ export default function MailPage() {
           <section
             className={`${mobilePane === "messages" ? "flex" : "hidden"} min-h-0 flex-col border-r border-slate-200 bg-white md:flex`}
           >
-            <div className="border-b border-slate-200 p-3">
-              <div className="mb-3 flex items-center gap-2">
+            <div className="shrink-0 border-b border-slate-200 px-2 pb-2 pt-[env(safe-area-inset-top)] md:p-3">
+              {mobileSelecting && (
+                <div className="flex h-14 items-center gap-1 md:hidden">
+                  <button
+                    type="button"
+                    onClick={exitMobileSelection}
+                    className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 active:bg-slate-100"
+                    aria-label="退出多选"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
+                  <span className="min-w-0 flex-1 truncate text-base font-semibold text-slate-900">
+                    已选 {selectedKeys.size} 封
+                  </span>
+                  <button
+                    type="button"
+                    onClick={toggleAllVisible}
+                    className="inline-flex h-10 items-center rounded-lg px-3 text-sm font-medium text-sky-700 active:bg-sky-50"
+                  >
+                    {allVisibleSelected ? "取消全选" : "全选"}
+                  </button>
+                </div>
+              )}
+              <div
+                className={`${mobileSelecting ? "hidden md:flex" : "flex"} h-14 items-center gap-1 md:mb-3 md:h-auto md:gap-2`}
+              >
                 <button
                   type="button"
-                  onClick={() => setMobilePane("folders")}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 md:hidden"
-                  title="邮件文件夹"
+                  onClick={() => goMobilePane("folders")}
+                  className="relative inline-flex h-10 shrink-0 items-center gap-0.5 rounded-lg pl-1 pr-2 text-sm font-medium text-sky-700 active:bg-sky-50 md:hidden"
+                  title="邮箱与文件夹"
                 >
-                  <Menu className="h-4 w-4" />
+                  <ChevronLeft className="h-5 w-5" />
+                  邮箱
                 </button>
                 <div className="min-w-0 flex-1">
-                  <h2 className="truncate text-sm font-semibold text-slate-900">
+                  <h2 className="truncate text-base font-semibold text-slate-900 md:text-sm">
                     {correspondenceContact
                       ? `与 ${correspondenceContact.name || correspondenceContact.email} 的往来`
                       : selectedFolderMeta?.display_name || selectedFolder}
                   </h2>
-                  <div className="mt-0.5 text-xs text-slate-400">
+                  <div className="mt-0.5 truncate text-xs text-slate-400">
                     {pageData.total} 封邮件
+                    {selectedFolderMeta?.unread && !correspondenceContact
+                      ? ` · ${selectedFolderMeta.unread} 封未读`
+                      : ""}
+                    <span className="md:hidden"> · {account.email_address}</span>
                   </div>
                 </div>
+                {!correspondenceContact && (
+                  <button
+                    type="button"
+                    onClick={() => setMobileSearchOpen((current) => !current)}
+                    className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg active:bg-slate-100 md:hidden ${mobileSearchOpen || searchQuery ? "text-sky-700" : "text-slate-600"}`}
+                    aria-label="搜索邮件"
+                  >
+                    <Search className="h-5 w-5" />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void refreshMail()}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-600 active:bg-slate-100 md:hidden"
+                  aria-label="刷新邮件"
+                >
+                  <RefreshCw
+                    className={`h-5 w-5 ${loadingMessages || loadingFolders ? "animate-spin" : ""}`}
+                  />
+                </button>
                 {correspondenceContact && (
                   <button
                     type="button"
@@ -2438,7 +2853,7 @@ export default function MailPage() {
                       setCorrespondenceContact(null);
                       setPage(1);
                     }}
-                    className="flex h-8 items-center gap-1 rounded-lg border border-slate-200 px-2 text-xs text-slate-500"
+                    className="flex h-10 shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-2 text-xs text-slate-500 md:h-8"
                   >
                     <X className="h-3.5 w-3.5" />
                     退出往来
@@ -2449,16 +2864,24 @@ export default function MailPage() {
                     <button
                       type="button"
                       onClick={() => setFilterMenuOpen((current) => !current)}
-                      className={`ui-tooltip inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition ${filterMode !== "all" || startDate || endDate || sortBy !== "date" || sortOrder !== "desc" ? "border-sky-200 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+                      className={`ui-tooltip inline-flex h-10 w-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition md:h-8 md:w-auto md:border md:px-2 ${filterMode !== "all" || startDate || endDate || sortBy !== "date" || sortOrder !== "desc" ? "bg-sky-50 text-sky-700 md:border-sky-200" : "text-slate-600 hover:bg-slate-50 md:border-slate-200"}`}
                       title="筛选和排序邮件"
                       aria-label="筛选和排序邮件"
                       data-tooltip="筛选和排序"
                     >
-                      <ListFilter className="h-3.5 w-3.5" />
-                      筛选
+                      <ListFilter className="h-5 w-5 md:h-3.5 md:w-3.5" />
+                      <span className="hidden md:inline">筛选</span>
                     </button>
                     {filterMenuOpen && (
-                      <div className="absolute right-0 top-10 z-40 w-[min(300px,calc(100vw-24px))] rounded-lg border border-slate-200 bg-white p-2 shadow-2xl">
+                      <div
+                        className="fixed inset-0 z-[94] bg-slate-950/40 md:hidden"
+                        onClick={() => setFilterMenuOpen(false)}
+                        aria-hidden="true"
+                      />
+                    )}
+                    {filterMenuOpen && (
+                      <div className="fixed inset-x-0 bottom-0 z-[95] rounded-t-2xl border-t border-slate-200 bg-white p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-2xl md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-10 md:z-40 md:w-[min(300px,calc(100vw-24px))] md:rounded-lg md:border md:p-2 md:pb-2">
+                        <div className="mx-auto mb-2 h-1 w-10 rounded-full bg-slate-200 md:hidden" />
                         <div className="px-2 pb-1 pt-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
                           筛选邮件
                         </div>
@@ -2474,7 +2897,7 @@ export default function MailPage() {
                             key={value}
                             type="button"
                             onClick={() => setFilterMode(value)}
-                            className="flex h-9 w-full items-center justify-between rounded-lg px-2 text-left text-sm text-slate-700 hover:bg-slate-50"
+                            className="flex h-11 w-full items-center justify-between rounded-lg px-2 text-left text-sm text-slate-700 hover:bg-slate-50 md:h-9"
                           >
                             {label}
                             {filterMode === value && (
@@ -2497,7 +2920,7 @@ export default function MailPage() {
                               onChange={(event) =>
                                 setStartDate(event.target.value)
                               }
-                              className="mt-1 h-8 w-full rounded-lg border border-slate-200 px-2 text-xs text-slate-700 outline-none focus:border-sky-400"
+                              className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-2 text-xs text-slate-700 outline-none focus:border-sky-400 md:h-8"
                             />
                           </label>
                           <label className="text-[10px] text-slate-400">
@@ -2509,7 +2932,7 @@ export default function MailPage() {
                               onChange={(event) =>
                                 setEndDate(event.target.value)
                               }
-                              className="mt-1 h-8 w-full rounded-lg border border-slate-200 px-2 text-xs text-slate-700 outline-none focus:border-sky-400"
+                              className="mt-1 h-10 w-full rounded-lg border border-slate-200 px-2 text-xs text-slate-700 outline-none focus:border-sky-400 md:h-8"
                             />
                           </label>
                         </div>
@@ -2522,14 +2945,14 @@ export default function MailPage() {
                           <button
                             type="button"
                             onClick={() => setSortBy("date")}
-                            className={`h-8 rounded-lg border text-xs ${sortBy === "date" ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600"}`}
+                            className={`h-10 rounded-lg border text-xs md:h-8 ${sortBy === "date" ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600"}`}
                           >
                             按日期
                           </button>
                           <button
                             type="button"
                             onClick={() => setSortBy("size")}
-                            className={`h-8 rounded-lg border text-xs ${sortBy === "size" ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600"}`}
+                            className={`h-10 rounded-lg border text-xs md:h-8 ${sortBy === "size" ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600"}`}
                           >
                             按大小
                           </button>
@@ -2537,7 +2960,7 @@ export default function MailPage() {
                             type="button"
                             onClick={() => setSortOrder("desc")}
                             title="日期由新到旧，或大小由大到小"
-                            className={`h-8 rounded-lg border text-xs ${sortOrder === "desc" ? "border-slate-400 bg-slate-100 text-slate-800" : "border-slate-200 text-slate-600"}`}
+                            className={`h-10 rounded-lg border text-xs md:h-8 ${sortOrder === "desc" ? "border-slate-400 bg-slate-100 text-slate-800" : "border-slate-200 text-slate-600"}`}
                           >
                             降序
                           </button>
@@ -2545,7 +2968,7 @@ export default function MailPage() {
                             type="button"
                             onClick={() => setSortOrder("asc")}
                             title="日期由旧到新，或大小由小到大"
-                            className={`h-8 rounded-lg border text-xs ${sortOrder === "asc" ? "border-slate-400 bg-slate-100 text-slate-800" : "border-slate-200 text-slate-600"}`}
+                            className={`h-10 rounded-lg border text-xs md:h-8 ${sortOrder === "asc" ? "border-slate-400 bg-slate-100 text-slate-800" : "border-slate-200 text-slate-600"}`}
                           >
                             升序
                           </button>
@@ -2560,14 +2983,14 @@ export default function MailPage() {
                               setSortBy("date");
                               setSortOrder("desc");
                             }}
-                            className="h-8 px-2 text-xs text-slate-500 hover:text-slate-800"
+                            className="h-10 px-2 text-xs text-slate-500 hover:text-slate-800 md:h-8"
                           >
                             重置
                           </button>
                           <button
                             type="button"
                             onClick={() => setFilterMenuOpen(false)}
-                            className="h-8 rounded-lg bg-slate-900 px-3 text-xs font-medium text-white"
+                            className="h-10 rounded-lg bg-slate-900 px-4 text-xs font-medium text-white md:h-8 md:px-3"
                           >
                             完成
                           </button>
@@ -2578,14 +3001,24 @@ export default function MailPage() {
                 )}
               </div>
               {!correspondenceContact && (
-                <form onSubmit={submitSearch} className="flex gap-2">
-                  <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3">
+                <form
+                  onSubmit={(event) => {
+                    submitSearch(event);
+                    if (isMobile)
+                      (document.activeElement as HTMLElement | null)?.blur();
+                  }}
+                  className={`${mobileSearchOpen || searchQuery ? "flex" : "hidden"} gap-2 px-1 pb-1 md:flex md:px-0 md:pb-0`}
+                >
+                  <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 md:h-9">
                     <Search className="h-4 w-4 shrink-0 text-slate-400" />
                     <input
+                      type="search"
+                      enterKeyHint="search"
+                      autoFocus={isMobile && mobileSearchOpen && !searchQuery}
                       value={searchDraft}
                       onChange={(event) => setSearchDraft(event.target.value)}
                       placeholder="搜索发件人、主题或正文"
-                      className="min-w-0 flex-1 bg-transparent text-sm outline-none"
+                      className="min-w-0 flex-1 bg-transparent text-sm outline-none [&::-webkit-search-cancel-button]:hidden"
                     />
                     {searchDraft && (
                       <button
@@ -2595,6 +3028,7 @@ export default function MailPage() {
                           setSearchQuery("");
                           setPage(1);
                         }}
+                        className="-mr-2 flex h-9 w-9 items-center justify-center md:mr-0 md:h-auto md:w-auto"
                         title="清除搜索"
                       >
                         <X className="h-3.5 w-3.5 text-slate-400" />
@@ -2603,17 +3037,19 @@ export default function MailPage() {
                   </label>
                   <button
                     type="submit"
-                    className="h-9 rounded-lg bg-slate-900 px-3 text-xs font-medium text-white"
+                    className="h-10 shrink-0 rounded-lg bg-slate-900 px-3 text-xs font-medium text-white md:h-9"
                   >
                     搜索
                   </button>
                 </form>
               )}
-              <div className="mt-2 flex items-center gap-2">
+              <div
+                className={`${!correspondenceContact && (filterMode !== "all" || startDate || endDate) ? "flex" : "hidden"} mt-1 items-center gap-2 px-1 md:mt-2 md:flex md:px-0`}
+              >
                 <button
                   type="button"
                   onClick={toggleAllVisible}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 px-2 text-xs text-slate-600"
+                  className="hidden h-8 items-center gap-1.5 rounded-lg border border-slate-200 px-2 text-xs text-slate-600 md:inline-flex"
                 >
                   <CheckSquare className="h-3.5 w-3.5" />
                   {allVisibleSelected ? "取消全选" : "全选本页"}
@@ -2636,7 +3072,7 @@ export default function MailPage() {
               </div>
             </div>
             {selectedKeys.size > 0 && (
-              <div className="flex min-h-12 shrink-0 items-center gap-1 overflow-x-auto border-b border-sky-100 bg-sky-50 px-3">
+              <div className="hidden min-h-12 shrink-0 items-center gap-1 overflow-x-auto border-b border-sky-100 bg-sky-50 px-3 md:flex">
                 <span className="mr-2 shrink-0 text-xs font-semibold text-sky-800">
                   已选 {selectedKeys.size} 封
                 </span>
@@ -2690,49 +3126,131 @@ export default function MailPage() {
                 </button>
               </div>
             )}
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <PullToRefresh
+              onRefresh={refreshMail}
+              enabled={isMobile && !mobileSelecting}
+              className="pb-28 md:pb-0"
+            >
               {loadingMessages ? (
                 <div className="flex h-40 items-center justify-center text-sm text-slate-400">
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                   正在读取邮件
                 </div>
               ) : pageData.messages.length === 0 ? (
-                <div className="flex h-52 flex-col items-center justify-center text-sm text-slate-400">
-                  <MailOpen className="mb-3 h-9 w-9 text-slate-300" />
-                  没有匹配的邮件
+                <div className="flex h-60 flex-col items-center justify-center px-6 text-center text-sm text-slate-400 md:h-52">
+                  <MailOpen className="mb-3 h-10 w-10 text-slate-300 md:h-9 md:w-9" />
+                  {searchQuery || filterMode !== "all" || startDate || endDate
+                    ? "没有匹配的邮件"
+                    : correspondenceContact
+                      ? "还没有往来邮件"
+                      : "这个文件夹里还没有邮件"}
+                  <span className="mt-1 text-xs text-slate-300 md:hidden">
+                    下拉可刷新
+                  </span>
                 </div>
               ) : (
-                pageData.messages.map((message) => (
+                pageData.messages.map((message) => {
+                  const key = messageKey(message);
+                  const checked = selectedKeys.has(key);
+                  const showCheckbox = !isMobile || mobileSelecting;
+                  const counterpart =
+                    selectedFolderMeta?.role === "sent"
+                      ? mailAddressLabel(message.to, "未知收件人")
+                      : mailAddressLabel(message.from);
+                  return (
+                  <SwipeableRow
+                    key={key}
+                    enabled={isMobile}
+                    open={swipedKey === key}
+                    onOpenChange={(open) => setSwipedKey(open ? key : null)}
+                    onLongPress={() => {
+                      if (mobileSelecting) toggleMessage(message);
+                      else startMobileSelection(message);
+                    }}
+                    actions={
+                      mobileSelecting ? undefined : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void performBatch(
+                                [message],
+                                message.read ? "unread" : "read",
+                              )
+                            }
+                            className="flex flex-1 flex-col items-center justify-center gap-1 bg-sky-600 text-[11px] font-medium text-white"
+                          >
+                            {message.read ? (
+                              <Mail className="h-5 w-5" />
+                            ) : (
+                              <MailOpen className="h-5 w-5" />
+                            )}
+                            {message.read ? "未读" : "已读"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void performBatch([message], "delete")}
+                            className="flex flex-1 flex-col items-center justify-center gap-1 bg-rose-600 text-[11px] font-medium text-white"
+                          >
+                            <Trash2 className="h-5 w-5" />
+                            删除
+                          </button>
+                        </>
+                      )
+                    }
+                  >
                   <div
-                    key={messageKey(message)}
                     role="button"
                     tabIndex={0}
-                    onClick={() => void openMessage(message)}
+                    onClick={() => {
+                      if (isMobile && mobileSelecting) {
+                        toggleMessage(message);
+                        return;
+                      }
+                      void openMessage(message);
+                    }}
                     onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
                       if (event.key === "Enter") void openMessage(message);
                     }}
-                    onContextMenu={(event) => openContextMenu(event, message)}
-                    className={`flex w-full cursor-pointer gap-2 border-b border-slate-100 px-3 py-3 text-left transition hover:bg-slate-50 ${selected && messageKey(selected) === messageKey(message) ? "bg-sky-50" : "bg-white"}`}
+                    onContextMenu={(event) => {
+                      // Long-press on phones starts multi-select instead.
+                      if (isMobile) {
+                        event.preventDefault();
+                        return;
+                      }
+                      openContextMenu(event, message);
+                    }}
+                    className={`flex w-full cursor-pointer gap-2 border-b border-slate-100 px-3 py-3 text-left transition hover:bg-slate-50 ${(selected && messageKey(selected) === key && !isMobile) || (isMobile && checked) ? "bg-sky-50" : "bg-white"}`}
                   >
-                    <input
-                      type="checkbox"
-                      checked={selectedKeys.has(messageKey(message))}
-                      onClick={(event) => event.stopPropagation()}
-                      onChange={() => toggleMessage(message)}
-                      className="mt-1 h-4 w-4 shrink-0 accent-sky-600"
-                      aria-label={`选择邮件 ${message.subject}`}
-                    />
+                    {showCheckbox ? (
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={() => toggleMessage(message)}
+                        className="mt-1 h-5 w-5 shrink-0 accent-sky-600 md:h-4 md:w-4"
+                        aria-label={`选择邮件 ${message.subject}`}
+                      />
+                    ) : (
+                      <span
+                        className={`relative mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${message.read ? "bg-slate-100 text-slate-500" : "bg-sky-100 text-sky-700"}`}
+                        aria-hidden="true"
+                      >
+                        {avatarText(counterpart)}
+                        {!message.read && (
+                          <span className="absolute -left-0.5 top-0 h-2.5 w-2.5 rounded-full border-2 border-white bg-sky-500" />
+                        )}
+                      </span>
+                    )}
                     <span
-                      className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${message.read ? "bg-transparent" : "bg-sky-500"}`}
+                      className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${message.read ? "bg-transparent" : "bg-sky-500"} ${showCheckbox ? "" : "hidden"}`}
                     />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <span
                           className={`min-w-0 flex-1 truncate text-sm ${message.read ? "font-medium text-slate-700" : "font-semibold text-slate-950"}`}
                         >
-                          {selectedFolderMeta?.role === "sent"
-                            ? mailAddressLabel(message.to, "未知收件人")
-                            : mailAddressLabel(message.from)}
+                          {counterpart}
                         </span>
                         <span className="shrink-0 text-[11px] text-slate-400">
                           {formatDate(message.date)}
@@ -2760,18 +3278,23 @@ export default function MailPage() {
                       </div>
                     </div>
                   </div>
-                ))
+                  </SwipeableRow>
+                  );
+                })
               )}
-            </div>
-            <div className="flex h-12 shrink-0 items-center justify-between border-t border-slate-200 px-3 text-xs text-slate-500">
+            </PullToRefresh>
+            <div
+              className={`${page <= 1 && !pageData.has_more ? "hidden md:flex" : "flex"} h-12 shrink-0 items-center gap-3 border-t border-slate-200 px-3 pr-16 text-xs text-slate-500 md:justify-between md:pr-3`}
+            >
               <span>第 {pageData.page} 页</span>
               <div className="flex gap-1">
                 <button
                   type="button"
                   disabled={page <= 1}
                   onClick={() => setPage((current) => Math.max(1, current - 1))}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 disabled:opacity-40"
+                  className="flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 disabled:opacity-40 md:h-8 md:w-8"
                   title="上一页"
+                  aria-label="上一页"
                 >
                   <ChevronLeft className="h-4 w-4" />
                 </button>
@@ -2779,18 +3302,147 @@ export default function MailPage() {
                   type="button"
                   disabled={!pageData.has_more}
                   onClick={() => setPage((current) => current + 1)}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 disabled:opacity-40"
+                  className="flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 disabled:opacity-40 md:h-8 md:w-8"
                   title="下一页"
+                  aria-label="下一页"
                 >
                   <ChevronRight className="h-4 w-4" />
                 </button>
               </div>
             </div>
+            {!mobileSelecting && (
+              <button
+                type="button"
+                onClick={() => startNewCompose()}
+                className="fixed bottom-[calc(var(--mobile-fab-bottom)+4.25rem)] right-3 z-[55] flex h-14 items-center gap-2 rounded-2xl bg-sky-600 px-4 text-sm font-semibold text-white shadow-xl shadow-sky-900/20 transition active:scale-95 md:hidden"
+                aria-label="写邮件"
+              >
+                <Pencil className="h-5 w-5" />
+                写邮件
+              </button>
+            )}
+            {mobileSelecting && (
+              <div className="fixed inset-x-0 bottom-0 z-[60] grid grid-cols-5 border-t border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-[0_-4px_16px_rgba(15,23,42,0.06)] md:hidden">
+                <MobileActionButton
+                  icon={MailOpen}
+                  label="已读"
+                  onClick={() => void performSelectedBatch("read")}
+                />
+                <MobileActionButton
+                  icon={Mail}
+                  label="未读"
+                  onClick={() => void performSelectedBatch("unread")}
+                />
+                <MobileActionButton
+                  icon={Star}
+                  label="星标"
+                  onClick={() => void performSelectedBatch("star")}
+                />
+                <label className="relative flex h-14 flex-col items-center justify-center gap-0.5 text-[11px] font-medium text-slate-600 active:bg-slate-100">
+                  <Folder className="h-5 w-5" />
+                  移动
+                  <select
+                    value=""
+                    onChange={(event) =>
+                      void performSelectedBatch("move", event.target.value)
+                    }
+                    className="absolute inset-0 opacity-0"
+                    aria-label="移动到文件夹"
+                  >
+                    <option value="">移动到</option>
+                    {folders
+                      .filter((folder) => folder.selectable)
+                      .map((folder) => (
+                        <option key={folder.name} value={folder.name}>
+                          {folder.display_name}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <MobileActionButton
+                  icon={Trash2}
+                  label="删除"
+                  danger
+                  onClick={() => void performSelectedBatch("delete")}
+                />
+              </div>
+            )}
           </section>
 
           <section
             className={`${mobilePane === "detail" ? "flex" : "hidden"} min-h-0 flex-col bg-white md:flex`}
           >
+            <div className="shrink-0 border-b border-slate-200 bg-white pt-[env(safe-area-inset-top)] md:hidden">
+              <div className="flex h-14 items-center gap-0.5 px-1.5">
+                <button
+                  type="button"
+                  onClick={backToMessages}
+                  className="inline-flex h-10 min-w-0 max-w-[45%] items-center gap-0.5 rounded-lg pl-1 pr-2 text-sm font-medium text-sky-700 active:bg-sky-50"
+                >
+                  <ChevronLeft className="h-5 w-5 shrink-0" />
+                  <span className="truncate">
+                    {correspondenceContact
+                      ? "往来邮件"
+                      : selectedFolderMeta?.display_name || "邮件"}
+                  </span>
+                </button>
+                <div className="flex-1" />
+                {selected && !loadingDetail && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        translation
+                          ? setTranslation(null)
+                          : void translateText(
+                              selected.text_body.trim() ||
+                                htmlToText(selected.html_body),
+                            )
+                      }
+                      disabled={translating}
+                      className={`flex h-10 w-10 items-center justify-center rounded-lg active:bg-slate-100 disabled:opacity-60 ${translation ? "text-emerald-600" : "text-indigo-600"}`}
+                      aria-label={translation ? "恢复原始邮件" : "全文对照翻译"}
+                    >
+                      {translating ? (
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                      ) : (
+                        <Languages className="h-5 w-5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void composeFromDetail(selected, "edit")}
+                      className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 active:bg-slate-100"
+                      aria-label="复制并编辑为新邮件"
+                    >
+                      <Copy className="h-5 w-5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void updateFlag("starred", !selected.starred)}
+                      className={`flex h-10 w-10 items-center justify-center rounded-lg active:bg-slate-100 ${selected.starred ? "text-amber-500" : "text-slate-600"}`}
+                      aria-label={selected.starred ? "取消星标" : "添加星标"}
+                    >
+                      <Star
+                        className={`h-5 w-5 ${selected.starred ? "fill-current" : ""}`}
+                      />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void updateFlag("read", !selected.read)}
+                      className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 active:bg-slate-100"
+                      aria-label={selected.read ? "标记未读" : "标记已读"}
+                    >
+                      {selected.read ? (
+                        <Mail className="h-5 w-5" />
+                      ) : (
+                        <MailOpen className="h-5 w-5" />
+                      )}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
             {loadingDetail ? (
               <div className="flex h-full items-center justify-center text-sm text-slate-400">
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -2803,7 +3455,7 @@ export default function MailPage() {
               </div>
             ) : (
               <>
-                <div className="flex min-h-14 shrink-0 items-center gap-1 overflow-x-auto border-b border-slate-200 px-2 sm:px-3 md:overflow-visible">
+                <div className="hidden min-h-14 shrink-0 items-center gap-1 overflow-x-auto border-b border-slate-200 px-2 sm:px-3 md:flex md:overflow-visible">
                   <button
                     type="button"
                     onClick={() => setMobilePane("messages")}
@@ -2947,8 +3599,8 @@ export default function MailPage() {
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
-                <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
-                  <h2 className="text-xl font-semibold leading-8 text-slate-950">
+                <div className="app-scroll min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6 md:py-5">
+                  <h2 className="break-words text-lg font-semibold leading-7 text-slate-950 md:text-xl md:leading-8">
                     {selected.subject}
                   </h2>
                   <div className="mt-4 flex items-start gap-3 border-b border-slate-100 pb-4">
@@ -3073,8 +3725,11 @@ export default function MailPage() {
                           ? `，抄送 ${mailAddressLabel(selected.cc)}`
                           : ""}
                       </div>
+                      <div className="mt-0.5 text-xs text-slate-400 sm:hidden">
+                        {formatDate(selected.date, true)}
+                      </div>
                     </div>
-                    <div className="shrink-0 text-right text-xs text-slate-400">
+                    <div className="hidden shrink-0 text-right text-xs text-slate-400 sm:block">
                       {formatDate(selected.date, true)}
                     </div>
                   </div>
@@ -3084,7 +3739,8 @@ export default function MailPage() {
                       onChange={(event) =>
                         setTargetLanguage(event.target.value)
                       }
-                      className="h-8 rounded-lg border border-slate-200 bg-white px-2"
+                      className="h-10 rounded-lg border border-slate-200 bg-white px-2 md:h-8"
+                      aria-label="翻译目标语言"
                     >
                       {translationLanguages.map(([value, label]) => (
                         <option key={value} value={value}>
@@ -3098,7 +3754,7 @@ export default function MailPage() {
                         onChange={(event) =>
                           setAssistantID(Number(event.target.value))
                         }
-                        className="h-8 max-w-52 rounded-lg border border-slate-200 bg-white px-2"
+                        className="h-10 max-w-52 rounded-lg border border-slate-200 bg-white px-2 md:h-8"
                       >
                         {assistants.map((assistant) => (
                           <option key={assistant.id} value={assistant.id}>
@@ -3142,12 +3798,12 @@ export default function MailPage() {
                         .map((attachment) => (
                           <div
                             key={attachment.part_id}
-                            className="flex max-w-full items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 pl-3 pr-1 hover:border-sky-200 hover:bg-sky-50/60"
+                            className="flex w-full max-w-full items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 pl-3 pr-1 hover:border-sky-200 hover:bg-sky-50/60 sm:w-auto"
                           >
                             <button
                               type="button"
                               onClick={() => setAttachmentPreviewKey(attachment.part_id)}
-                              className="flex min-w-0 flex-1 items-center gap-2 py-2 text-left"
+                              className="flex min-h-11 min-w-0 flex-1 items-center gap-2 py-2 text-left"
                               title={`在线预览 ${attachment.filename}`}
                             >
                               <File className="h-4 w-4 shrink-0 text-sky-600" />
@@ -3163,7 +3819,7 @@ export default function MailPage() {
                             <button
                               type="button"
                               onClick={() => void downloadAttachment(attachment)}
-                              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-sky-600"
+                              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-sky-600 md:h-8 md:w-8"
                               title={`下载 ${attachment.filename}`}
                               aria-label={`下载 ${attachment.filename}`}
                             >
@@ -3173,15 +3829,61 @@ export default function MailPage() {
                         ))}
                     </div>
                   )}
-                  <div className="py-5">
-                    <iframe
+                  <div className="py-4 md:py-5">
+                    <MailBodyFrame
                       key={messageKey(selected)}
                       title="邮件正文"
-                      sandbox={mailFrameSandbox}
                       srcDoc={iframeDocument(displayedMailHTML)}
-                      className="min-h-[55dvh] w-full border-0"
                     />
                   </div>
+                </div>
+                <div className="grid shrink-0 grid-cols-5 border-t border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] md:hidden">
+                  <MobileActionButton
+                    icon={Reply}
+                    label="回复"
+                    onClick={() => void composeFromDetail(selected, "reply")}
+                  />
+                  <MobileActionButton
+                    icon={ReplyAll}
+                    label="全部回复"
+                    onClick={() => void composeFromDetail(selected, "replyAll")}
+                  />
+                  <MobileActionButton
+                    icon={Forward}
+                    label="转发"
+                    onClick={() => void composeFromDetail(selected, "forward")}
+                  />
+                  <label className="relative flex h-14 flex-col items-center justify-center gap-0.5 text-[11px] font-medium text-slate-600 active:bg-slate-100">
+                    <Folder className="h-5 w-5" />
+                    移动
+                    <select
+                      value=""
+                      onChange={(event) =>
+                        void moveSelectedMessage(event.target.value)
+                      }
+                      className="absolute inset-0 opacity-0"
+                      aria-label="移动到文件夹"
+                    >
+                      <option value="">移动到</option>
+                      {folders
+                        .filter(
+                          (folder) =>
+                            folder.selectable &&
+                            folder.name !== selected.folder,
+                        )
+                        .map((folder) => (
+                          <option key={folder.name} value={folder.name}>
+                            {folder.display_name}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <MobileActionButton
+                    icon={Trash2}
+                    label="删除"
+                    danger
+                    onClick={() => void performBatch([selected], "delete")}
+                  />
                 </div>
               </>
             )}
@@ -3411,7 +4113,7 @@ export default function MailPage() {
               <button
                 type="button"
                 onClick={() => void removeAccount()}
-                className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-rose-200 px-3 text-sm text-rose-600 sm:h-9"
               >
                 <Trash2 className="h-4 w-4" />
                 解除绑定
@@ -3441,7 +4143,7 @@ export default function MailPage() {
                 type="button"
                 onClick={() => void testAccount()}
                 disabled={testingAccount}
-                className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-700 disabled:opacity-50"
+                className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-700 disabled:opacity-50 sm:h-9"
               >
                 {testingAccount && <Loader2 className="h-4 w-4 animate-spin" />}
                 测试
@@ -3450,7 +4152,7 @@ export default function MailPage() {
                 type="button"
                 onClick={() => void saveAccount()}
                 disabled={savingAccount}
-                className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50"
+                className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50 sm:h-9"
               >
                 <Save className="h-4 w-4" />
                 {editingAccountID ? "保存" : "验证并添加"}
@@ -3544,7 +4246,7 @@ export default function MailPage() {
                     }
                     placeholder="例如：外贸业务签名"
                     maxLength={100}
-                    className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+                    className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
                   />
                 </label>
                 <div className="flex h-10 items-center gap-4 rounded-lg border border-slate-200 px-3 text-xs text-slate-600">
@@ -3674,7 +4376,7 @@ export default function MailPage() {
           }}
           maxWidth="max-w-6xl"
         >
-          <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(320px,1fr)_auto] lg:grid-cols-[180px_minmax(0,1fr)_320px] lg:grid-rows-1">
+          <div className="app-scroll grid min-h-0 flex-1 grid-rows-[auto_minmax(320px,1fr)_auto] overflow-y-auto lg:grid-cols-[180px_minmax(0,1fr)_320px] lg:grid-rows-1 lg:overflow-visible">
             <aside className="flex gap-2 overflow-x-auto border-b border-slate-200 bg-slate-50 p-3 lg:flex-col lg:overflow-visible lg:border-b-0 lg:border-r">
               <div className="hidden px-2 pb-1 pt-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400 lg:block">
                 联系人来源
@@ -3831,7 +4533,90 @@ export default function MailPage() {
                     </div>
                   </div>
                 ) : (
-                  <div className="min-w-[680px]">
+                  <>
+                  <div className="divide-y divide-slate-100 md:hidden">
+                    {filteredContacts.map((contact) => {
+                      const checked = selectedContactKeys.has(
+                        contactKey(contact),
+                      );
+                      const editable =
+                        contactSources(contact).includes("saved") &&
+                        contact.id > 0;
+                      return (
+                        <div
+                          key={contactKey(contact)}
+                          className={`flex items-start gap-3 px-3 py-3 ${checked ? "bg-sky-50/70" : ""}`}
+                        >
+                          <label className="flex h-10 w-8 shrink-0 items-center justify-center">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleContact(contact)}
+                              className="h-5 w-5 accent-sky-600"
+                              aria-label={`选择 ${contact.name || contact.email}`}
+                            />
+                          </label>
+                          <div className="min-w-0 flex-1">
+                            <button
+                              type="button"
+                              onClick={() => viewCorrespondence(contact)}
+                              className="block w-full text-left"
+                            >
+                              <span className="block truncate text-sm font-semibold text-slate-800">
+                                {contact.name || contact.email}
+                              </span>
+                              <span className="block truncate text-xs text-sky-700">
+                                {contact.email}
+                              </span>
+                              <span className="mt-0.5 block truncate text-[11px] text-slate-400">
+                                {contact.company || "未填写公司"} ·{" "}
+                                {contactSourceLabel(contact)}
+                              </span>
+                            </button>
+                            <div className="mt-2 flex gap-1">
+                              <button
+                                type="button"
+                                onClick={() => writeToContact(contact)}
+                                className="inline-flex h-9 items-center gap-1 rounded-lg bg-sky-50 px-3 text-xs font-medium text-sky-700"
+                              >
+                                <Send className="h-3.5 w-3.5" />
+                                写信
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => viewCorrespondence(contact)}
+                                className="inline-flex h-9 items-center gap-1 rounded-lg bg-slate-100 px-3 text-xs font-medium text-slate-600"
+                              >
+                                <MailOpen className="h-3.5 w-3.5" />
+                                往来
+                              </button>
+                              {editable && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => editContact(contact)}
+                                    className="ml-auto flex h-9 w-9 items-center justify-center rounded-lg text-slate-500"
+                                    aria-label="编辑联系人"
+                                  >
+                                    <Pencil className="h-4 w-4" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void deleteContact(contact)}
+                                    className="flex h-9 w-9 items-center justify-center rounded-lg text-rose-500"
+                                    aria-label="删除联系人"
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="hidden min-w-[680px] md:block">
                     <div className="grid grid-cols-[36px_minmax(150px,1fr)_minmax(190px,1.3fr)_minmax(120px,.8fr)_146px] items-center gap-3 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] font-semibold text-slate-500">
                       <span />
                       <span>联系人</span>
@@ -3943,6 +4728,7 @@ export default function MailPage() {
                       );
                     })}
                   </div>
+                  </>
                 )}
               </div>
             </section>
@@ -3975,7 +4761,7 @@ export default function MailPage() {
                       }))
                     }
                     placeholder="客户或联系人姓名"
-                    className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400"
+                    className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
                   />
                 </label>
                 <label>
@@ -3992,7 +4778,7 @@ export default function MailPage() {
                       }))
                     }
                     placeholder="name@example.com"
-                    className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400"
+                    className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
                   />
                 </label>
                 <label>
@@ -4008,7 +4794,7 @@ export default function MailPage() {
                       }))
                     }
                     placeholder="公司名称"
-                    className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400"
+                    className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
                   />
                 </label>
                 <label>
@@ -4024,7 +4810,7 @@ export default function MailPage() {
                       }))
                     }
                     placeholder="可选"
-                    className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400"
+                    className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
                   />
                 </label>
                 <label>
@@ -4182,14 +4968,25 @@ export default function MailPage() {
 
       {compose && (
         <div
-          className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={compose.bulk ? "群发邮件" : "写邮件"}
+          className="fixed inset-x-0 top-[var(--vv-top)] z-[90] flex h-[var(--vv-height)] items-end justify-center bg-slate-950/40 p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-4"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !sending)
-              setCompose(null);
+            if (event.target === event.currentTarget) closeCompose();
           }}
         >
-          <div className="flex h-[96dvh] w-full max-w-4xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:h-auto sm:max-h-[94dvh] sm:rounded-lg">
-            <div className="flex h-14 shrink-0 items-center justify-between bg-slate-900 px-4 text-white">
+          <div className="flex h-full w-full max-w-4xl flex-col overflow-hidden bg-white shadow-2xl sm:h-auto sm:max-h-[94dvh] sm:rounded-lg">
+            <div className="flex shrink-0 items-center justify-between bg-slate-900 px-2 pb-1 pt-[calc(env(safe-area-inset-top)+0.25rem)] text-white sm:h-14 sm:px-4 sm:py-0">
+              <button
+                type="button"
+                onClick={closeCompose}
+                disabled={sending}
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:hidden"
+                aria-label="关闭写邮件"
+              >
+                <X className="h-5 w-5" />
+              </button>
               <div className="flex items-center gap-2 text-sm font-semibold">
                 {compose.bulk ? (
                   <Users className="h-4 w-4" />
@@ -4202,25 +4999,39 @@ export default function MailPage() {
                 <button
                   type="button"
                   onClick={() => setContactsOpen(true)}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10"
+                  className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:h-8 sm:w-8"
                   title="选择联系人"
+                  aria-label="选择联系人"
                 >
-                  <BookUser className="h-4 w-4" />
+                  <BookUser className="h-5 w-5 sm:h-4 sm:w-4" />
                 </button>
                 <button
                   type="button"
-                  onClick={() => setCompose(null)}
+                  onClick={() => void sendMessage()}
                   disabled={sending}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10"
+                  className="flex h-10 w-10 items-center justify-center rounded-lg text-sky-300 hover:bg-white/10 disabled:opacity-50 sm:hidden"
+                  aria-label={compose.bulk ? "开始群发" : "发送"}
+                >
+                  {sending ? (
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                  ) : (
+                    <Send className="h-5 w-5" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={closeCompose}
+                  disabled={sending}
+                  className="hidden h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:flex"
                   title="关闭写邮件"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
             </div>
-            <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
+            <div className="app-scroll min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
               {compose.context === "new" && (
-                <div className="mb-3 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+                <div className="mb-3 grid grid-cols-2 rounded-lg border border-slate-200 bg-slate-50 p-0.5 sm:inline-flex">
                   <button
                     type="button"
                     onClick={() =>
@@ -4228,7 +5039,7 @@ export default function MailPage() {
                         current ? { ...current, bulk: false } : current,
                       )
                     }
-                    className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium ${!compose.bulk ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                    className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-md px-3 text-xs font-medium sm:h-8 ${!compose.bulk ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
                   >
                     <Mail className="h-3.5 w-3.5" />
                     普通发送
@@ -4242,7 +5053,7 @@ export default function MailPage() {
                           : current,
                       )
                     }
-                    className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium ${compose.bulk ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                    className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-md px-3 text-xs font-medium sm:h-8 ${compose.bulk ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
                   >
                     <Users className="h-3.5 w-3.5" />
                     逐封群发
@@ -4264,8 +5075,17 @@ export default function MailPage() {
                 ))}
               </datalist>
               <div className="space-y-2">
+                <div className="flex items-center border-b border-slate-200 focus-within:border-sky-500">
+                <span className="w-14 shrink-0 pl-2 text-xs text-slate-400 sm:hidden">
+                  收件人
+                </span>
                 <input
                   list="mail-contact-options"
+                  type="text"
+                  inputMode="email"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  spellCheck={false}
                   value={compose.to}
                   onChange={(event) =>
                     setCompose((current) =>
@@ -4279,17 +5099,33 @@ export default function MailPage() {
                       ? "群发收件人，多人用分号分隔"
                       : "收件人，可输入客户姓名搜索；多人用分号分隔"
                   }
-                  className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
+                  className="h-11 min-w-0 flex-1 px-2 text-sm outline-none sm:h-10"
                 />
+                {!compose.bulk && !composeCcOpen && (
+                  <button
+                    type="button"
+                    onClick={() => setComposeCcOpen(true)}
+                    className="h-10 shrink-0 px-2 text-xs text-sky-700 sm:hidden"
+                  >
+                    抄送/密送
+                  </button>
+                )}
+                </div>
                 {compose.bulk ? (
                   <div className="flex h-8 items-center justify-between border-b border-slate-100 px-2 text-xs text-slate-500">
                     <span>每位收件人独立发送</span>
                     <span>{splitAddresses(compose.to).length} 位收件人</span>
                   </div>
                 ) : (
-                  <>
+                  <div
+                    className={`${composeCcOpen ? "block" : "hidden"} space-y-2 sm:block`}
+                  >
                     <input
                       list="mail-contact-options"
+                      inputMode="email"
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
                       value={compose.cc}
                       onChange={(event) =>
                         setCompose((current) =>
@@ -4299,10 +5135,14 @@ export default function MailPage() {
                         )
                       }
                       placeholder="抄送"
-                      className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
+                      className="h-11 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500 sm:h-10"
                     />
                     <input
                       list="mail-contact-options"
+                      inputMode="email"
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
                       value={compose.bcc}
                       onChange={(event) =>
                         setCompose((current) =>
@@ -4312,9 +5152,9 @@ export default function MailPage() {
                         )
                       }
                       placeholder="密送"
-                      className="h-10 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500"
+                      className="h-11 w-full border-b border-slate-200 px-2 text-sm outline-none focus:border-sky-500 sm:h-10"
                     />
-                  </>
+                  </div>
                 )}
                 <input
                   value={compose.subject}
@@ -4329,8 +5169,8 @@ export default function MailPage() {
                   className="h-11 w-full border-b border-slate-200 px-2 text-sm font-medium outline-none focus:border-sky-500"
                 />
               </div>
-              <div className="mt-3 flex flex-wrap items-center gap-2 border-b border-slate-100 pb-3">
-                <div className="inline-flex rounded-lg border border-slate-200 p-0.5">
+              <div className="-mx-3 mt-3 flex items-center gap-2 overflow-x-auto border-b border-slate-100 px-3 pb-3 sm:mx-0 sm:flex-wrap sm:overflow-visible sm:px-0">
+                <div className="inline-flex shrink-0 rounded-lg border border-slate-200 p-0.5">
                   <button
                     type="button"
                     onClick={() => {
@@ -4373,7 +5213,7 @@ export default function MailPage() {
                       current === "edit" ? "preview" : "edit",
                     )
                   }
-                  className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs ${composeView === "preview" ? "border-sky-200 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-500"}`}
+                  className={`inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs sm:h-8 ${composeView === "preview" ? "border-sky-200 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-500"}`}
                 >
                   <Eye className="h-3.5 w-3.5" />
                   {composeView === "preview" ? "返回编辑" : "预览邮件"}
@@ -4391,13 +5231,14 @@ export default function MailPage() {
                         : current,
                     )
                   }
-                  className="h-8 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600"
+                  className="h-9 shrink-0 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 sm:h-8"
+                  aria-label="邮件优先级"
                 >
                   <option value="normal">普通优先级</option>
                   <option value="high">高优先级</option>
                   <option value="low">低优先级</option>
                 </select>
-                <label className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600">
+                <label className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 sm:h-8">
                   <FileText className="h-3.5 w-3.5 text-slate-400" />
                   <select
                     value={compose.signatureID}
@@ -4420,7 +5261,7 @@ export default function MailPage() {
                     ))}
                   </select>
                 </label>
-                <label className="inline-flex h-8 items-center gap-2 text-xs text-slate-500">
+                <label className="inline-flex h-9 shrink-0 items-center gap-2 whitespace-nowrap text-xs text-slate-500 sm:h-8">
                   <input
                     type="checkbox"
                     checked={compose.requestReadReceipt}
@@ -4457,7 +5298,7 @@ export default function MailPage() {
                     )
                   }
                   placeholder="输入 HTML 邮件正文，例如 <h2>报价单</h2>"
-                  className="mt-3 min-h-[42dvh] w-full resize-y rounded-lg border border-slate-200 p-3 font-mono text-sm leading-6 outline-none focus:border-sky-400"
+                  className="mt-3 min-h-[40vh] w-full sm:min-h-[42dvh] resize-y rounded-lg border border-slate-200 p-3 font-mono text-sm leading-6 outline-none focus:border-sky-400"
                 />
               ) : (
                 <textarea
@@ -4470,7 +5311,7 @@ export default function MailPage() {
                     )
                   }
                   placeholder="邮件正文"
-                  className="mt-3 min-h-[42dvh] w-full resize-y rounded-lg border border-slate-200 p-3 text-sm leading-7 outline-none focus:border-sky-400"
+                  className="mt-3 min-h-[40vh] w-full sm:min-h-[42dvh] resize-y rounded-lg border border-slate-200 p-3 text-sm leading-7 outline-none focus:border-sky-400"
                 />
               )}
               {composeFiles.length > 0 && (
@@ -4478,11 +5319,11 @@ export default function MailPage() {
                   {composeFiles.map((file, index) => (
                     <div
                       key={`${file.name}-${index}`}
-                      className="flex max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+                      className="flex max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 py-1 pl-3 pr-1 text-xs"
                     >
-                      <Paperclip className="h-3.5 w-3.5 text-sky-600" />
-                      <span className="max-w-48 truncate">{file.name}</span>
-                      <span className="text-slate-400">
+                      <Paperclip className="h-3.5 w-3.5 shrink-0 text-sky-600" />
+                      <span className="min-w-0 max-w-48 truncate">{file.name}</span>
+                      <span className="shrink-0 text-slate-400">
                         {formatBytes(file.size)}
                       </span>
                       <button
@@ -4494,7 +5335,9 @@ export default function MailPage() {
                             ),
                           )
                         }
+                        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md hover:bg-white"
                         title="移除附件"
+                        aria-label={`移除附件 ${file.name}`}
                       >
                         <X className="h-3.5 w-3.5 text-slate-400" />
                       </button>
@@ -4508,14 +5351,18 @@ export default function MailPage() {
                 </div>
               )}
             </div>
-            <div className="flex min-h-14 shrink-0 items-center gap-2 border-t border-slate-200 px-3 sm:px-4">
+            <div className="flex min-h-14 shrink-0 items-center gap-2 border-t border-slate-200 px-3 pb-[env(safe-area-inset-bottom)] sm:px-4 sm:pb-0">
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
+                className="flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 text-slate-500 hover:bg-slate-100 sm:h-9 sm:w-9 sm:px-0"
                 title="添加附件"
+                aria-label="添加附件"
               >
-                <Paperclip className="h-4 w-4" />
+                <Paperclip className="h-5 w-5 sm:h-4 sm:w-4" />
+                <span className="text-xs sm:hidden">
+                  附件{composeFiles.length ? ` ${composeFiles.length}` : ""}
+                </span>
               </button>
               <input
                 ref={fileInputRef}
@@ -4537,7 +5384,7 @@ export default function MailPage() {
                 type="button"
                 onClick={() => void sendMessage()}
                 disabled={sending}
-                className="inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+                className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50 sm:h-9"
               >
                 {sending ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -4557,6 +5404,54 @@ export default function MailPage() {
         </div>
       )}
     </AuthGuard>
+  );
+}
+
+function MobileActionButton({
+  icon: Icon,
+  label,
+  onClick,
+  danger = false,
+}: {
+  icon: typeof Mail;
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex h-14 flex-col items-center justify-center gap-0.5 text-[11px] font-medium active:bg-slate-100 ${danger ? "text-rose-600" : "text-slate-600"}`}
+    >
+      <Icon className="h-5 w-5" />
+      {label}
+    </button>
+  );
+}
+
+function MobileMenuRow({
+  icon: Icon,
+  label,
+  hint,
+  onClick,
+}: {
+  icon: typeof Mail;
+  label: string;
+  hint?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex min-h-12 w-full items-center gap-3 border-b border-slate-100 px-3 text-left text-[15px] text-slate-700 last:border-b-0 active:bg-slate-50"
+    >
+      <Icon className="h-5 w-5 shrink-0 text-slate-500" />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {hint && <span className="shrink-0 text-xs text-slate-400">{hint}</span>}
+      <ChevronRight className="h-4 w-4 shrink-0 text-slate-300" />
+    </button>
   );
 }
 
@@ -4601,24 +5496,28 @@ function ModalShell({
 }) {
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-3"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-x-0 top-[var(--vv-top)] z-[110] flex h-[var(--vv-height)] items-end justify-center bg-slate-950/45 p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-3"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
     >
       <div
-        className={`flex max-h-[96dvh] min-h-0 w-full ${maxWidth} flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:max-h-[92dvh] sm:rounded-lg`}
+        className={`flex max-h-[calc(100%-env(safe-area-inset-top)-0.5rem)] min-h-0 w-full ${maxWidth} flex-col overflow-hidden rounded-t-2xl bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:max-h-[92dvh] sm:rounded-lg sm:pb-0`}
       >
-        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
-          <div>
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
+          <div className="min-w-0">
             <h2 className="font-semibold text-slate-950">{title}</h2>
             <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 sm:h-8 sm:w-8"
             title="关闭"
+            aria-label="关闭"
           >
             <X className="h-4 w-4" />
           </button>
@@ -4692,7 +5591,7 @@ function AccountForm({
                   : false,
             })
           }
-          className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 disabled:bg-slate-50"
+          className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 disabled:bg-slate-50 sm:h-10"
         >
           <option value="imap">Poste.io / 标准 IMAP + SMTP</option>
           <option value="alimail">阿里邮箱 OpenAPI</option>
@@ -4716,7 +5615,7 @@ function AccountForm({
             onChange({ ...value, email_address: event.target.value })
           }
           placeholder="name@example.com"
-          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+          className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
         />
       </label>
       <label>
@@ -4729,7 +5628,7 @@ function AccountForm({
             onChange({ ...value, display_name: event.target.value })
           }
           placeholder="你的姓名或部门"
-          className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+          className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
         />
       </label>
       {value.provider === "imap" ? (
@@ -4744,7 +5643,7 @@ function AccountForm({
                 onChange({ ...value, login_username: event.target.value })
               }
               placeholder="默认使用完整邮箱地址"
-              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+              className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
             />
           </label>
           <label>
@@ -4760,7 +5659,7 @@ function AccountForm({
               placeholder={
                 existing ? "留空则不修改密码" : "Poste.io 邮箱密码"
               }
-              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+              className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
             />
           </label>
         </>
@@ -4775,7 +5674,7 @@ function AccountForm({
               onChange={(event) =>
                 onChange({ ...value, api_base_url: event.target.value })
               }
-              className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400"
+              className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
             >
               <option value="https://alimail-cn.aliyuncs.com">
                 中国站企业邮箱
@@ -4798,7 +5697,7 @@ function AccountForm({
                 onChange({ ...value, client_id: event.target.value })
               }
               placeholder="阿里邮箱域管理后台创建的应用 ID"
-              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+              className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
             />
           </label>
           <label className="sm:col-span-2">
@@ -4812,7 +5711,7 @@ function AccountForm({
                 onChange({ ...value, client_secret: event.target.value })
               }
               placeholder={existing ? "留空则不修改应用密钥" : "应用 Secret"}
-              className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400"
+              className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-sky-400 sm:h-10"
             />
             <span className="mt-1 block text-xs leading-5 text-slate-400">
               应用至少需要 Mail.ReadWrite.All、Mail.Send.All；同步公共通讯录还需要 SharedContact.Read.All。

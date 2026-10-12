@@ -32,6 +32,7 @@ import {
   findModuleById,
   type AppModule,
 } from './appModules'
+import { isMobileTabBarHidden } from './MobileTabBar'
 
 const OPEN_EVENT = 'yaerp:open-command-palette'
 const CREATE_EVENT = 'yaerp:create-sheet-item'
@@ -191,6 +192,10 @@ export default function GlobalQuickNav() {
 function QuickNavWidget({ admin }: { admin: boolean }) {
   const router = useRouter()
   const pathname = usePathname()
+  // On phones the bottom tab bar already covers navigation, so the floating
+  // pill only stays for full-screen tools without a tab bar (sheet editor...).
+  // The palette itself is still reachable via the OPEN_EVENT (see /settings).
+  const hideLauncherOnPhone = !isMobileTabBarHidden(pathname || '/')
 
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -499,7 +504,9 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
         onClick={() => setOpen(true)}
         title={`快捷导航（${isMac ? '⌘' : 'Ctrl'} + K）· 可拖动`}
         aria-label="打开快捷导航"
-        className={`fixed bottom-4 left-4 z-[70] inline-flex h-9 touch-none select-none items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-xs font-semibold text-slate-600 shadow-lg backdrop-blur transition hover:border-sky-200 hover:text-sky-700 ${
+        className={`fixed bottom-[calc(var(--mobile-fab-bottom)+0.75rem)] left-3 z-[70] h-10 touch-none select-none items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-xs font-semibold text-slate-600 shadow-lg backdrop-blur transition hover:border-sky-200 hover:text-sky-700 md:bottom-4 md:left-4 md:inline-flex md:h-9 ${
+          hideLauncherOnPhone ? 'hidden' : 'inline-flex'
+        } ${
           drag.dragging
             ? 'cursor-grabbing opacity-100'
             : 'cursor-grab opacity-80 hover:opacity-100'
@@ -521,9 +528,17 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
           onKeyDown={handleKeyDown}
         >
           <div className="absolute inset-0" onClick={close} aria-hidden="true" />
-          <div className="absolute left-1/2 top-[10vh] w-[min(640px,calc(100vw-1.5rem))] -translate-x-1/2 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
-            <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-3">
-              <Search className="h-4 w-4 shrink-0 text-slate-400" />
+          <div className="absolute inset-x-0 top-[var(--vv-top)] flex h-[var(--vv-height)] flex-col overflow-hidden bg-white pt-[env(safe-area-inset-top)] md:left-1/2 md:right-auto md:top-[10vh] md:block md:h-auto md:w-[min(640px,calc(100vw-1.5rem))] md:-translate-x-1/2 md:rounded-2xl md:border md:border-slate-200 md:pt-0 md:shadow-2xl">
+            <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 px-4 py-3">
+              <button
+                type="button"
+                onClick={close}
+                className="-ml-2 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 md:hidden"
+                aria-label="关闭快捷导航"
+              >
+                <X className="h-5 w-5" />
+              </button>
+              <Search className="hidden h-4 w-4 shrink-0 text-slate-400 md:block" />
               <input
                 ref={inputRef}
                 value={query}
@@ -532,7 +547,8 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
                   setActiveIndex(0)
                 }}
                 placeholder="搜索模块或工作簿，例如「邮件」「询价」..."
-                className="min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
+                enterKeyHint="go"
+                className="h-10 min-w-0 flex-1 rounded-lg bg-slate-100 px-3 text-sm text-slate-900 outline-none placeholder:text-slate-400 md:h-auto md:rounded-none md:bg-transparent md:px-0"
               />
               {query ? (
                 <button
@@ -542,20 +558,20 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
                     setActiveIndex(0)
                     inputRef.current?.focus()
                   }}
-                  className="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100"
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 md:h-6 md:w-6"
                   title="清除"
                   aria-label="清除搜索"
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
               ) : (
-                <kbd className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+                <kbd className="hidden rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 md:inline">
                   Esc
                 </kbd>
               )}
             </div>
 
-            <div ref={listRef} className="max-h-[60vh] overflow-y-auto p-2">
+            <div ref={listRef} className="app-scroll min-h-0 flex-1 overflow-y-auto p-2 md:max-h-[60vh] md:flex-none">
               {rows.length === 0 ? (
                 <div className="px-3 py-10 text-center text-sm text-slate-400">
                   {loadingWorkbooks ? '正在加载...' : '没有找到匹配的内容'}
@@ -576,7 +592,7 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
                       data-command-index={row.index}
                       onMouseEnter={() => setActiveIndex(row.index)}
                       onClick={() => select(row.item)}
-                      className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition ${
+                      className={`flex min-h-12 w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition md:min-h-0 ${
                         row.index === activeIndex
                           ? 'bg-sky-50 text-sky-900'
                           : 'text-slate-700 hover:bg-slate-50'
@@ -615,8 +631,8 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
               )}
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-2">
-              <span className="text-[11px] font-semibold text-slate-400">
+            <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-t border-slate-100 px-4 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:flex-wrap md:overflow-visible md:pb-2">
+              <span className="shrink-0 text-[11px] font-semibold text-slate-400">
                 快捷操作
               </span>
               {quickActions.map((action) => (
@@ -624,7 +640,7 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
                   key={action.key}
                   type="button"
                   onClick={() => select(action)}
-                  className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:border-sky-200 hover:text-sky-700"
+                  className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-sky-200 hover:text-sky-700 md:h-auto md:px-2.5 md:py-1"
                 >
                   <action.icon className="h-3.5 w-3.5" />
                   {action.label}
@@ -632,7 +648,7 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
               ))}
             </div>
 
-            <div className="flex items-center justify-between border-t border-slate-200 px-4 py-2 text-[11px] text-slate-400">
+            <div className="hidden items-center justify-between border-t border-slate-200 px-4 py-2 text-[11px] text-slate-400 md:flex">
               <span className="flex items-center gap-3">
                 <span className="flex items-center gap-1">
                   <ArrowUp className="h-3 w-3" />

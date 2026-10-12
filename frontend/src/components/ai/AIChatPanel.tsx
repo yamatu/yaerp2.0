@@ -698,7 +698,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   }, [messages, scrollToBottom])
 
   useEffect(() => {
-    if (open && textareaRef.current) {
+    // On phones focusing would immediately cover half the sheet with the
+    // keyboard, so the employee taps the input when they are ready to type.
+    if (open && textareaRef.current && window.matchMedia('(min-width: 768px)').matches) {
       setTimeout(() => textareaRef.current?.focus(), 100)
     }
     if (open) {
@@ -769,6 +771,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   }, [panelSizeStorageKey])
 
   useEffect(() => () => resizeCleanupRef.current?.(), [])
+
+  // The phone layout is a full-screen sheet: keep the page underneath still.
+  useEffect(() => {
+    if (!open || isDesktopViewport) return
+    const previous = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previous
+    }
+  }, [isDesktopViewport, open])
 
   useEffect(() => {
     const el = messagesScrollRef.current
@@ -967,7 +979,11 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   return (
     <div
       ref={panelRef}
-      className={`fixed inset-x-2 bottom-2 z-50 flex h-[min(82vh,720px)] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl md:inset-x-auto md:bottom-5 md:right-[76px] md:h-[var(--ai-panel-height)] md:max-h-[calc(100vh-40px)] md:w-[var(--ai-panel-width)] ${resizing || panelDrag.dragging ? 'select-none' : ''}`}
+      role="dialog"
+      aria-label="AI 工作助手"
+      // Phones: a full-screen sheet sized to the *visible* viewport, so the
+      // on-screen keyboard pushes the composer up instead of covering it.
+      className={`fixed inset-x-0 top-[var(--vv-top)] z-[75] flex h-[var(--vv-height)] flex-col overflow-hidden bg-white md:inset-x-auto md:top-auto md:bottom-5 md:right-[76px] md:z-50 md:h-[var(--ai-panel-height)] md:max-h-[calc(100vh-40px)] md:w-[var(--ai-panel-width)] md:rounded-lg md:border md:border-slate-200 md:shadow-2xl ${resizing || panelDrag.dragging ? 'select-none' : ''}`}
       style={{
         '--ai-panel-width': `${panelSize.width}px`,
         '--ai-panel-height': `${panelSize.height}px`,
@@ -997,7 +1013,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       )}
       <div
         {...(isDesktopViewport ? panelDrag.handleProps : {})}
-        className={`flex items-center justify-between bg-slate-900 px-4 py-3 md:cursor-move ${panelDrag.dragging ? 'cursor-grabbing' : ''}`}
+        className={`flex shrink-0 items-center justify-between bg-slate-900 px-3 pb-2 pt-[calc(0.5rem+env(safe-area-inset-top))] md:cursor-move md:px-4 md:py-3 ${panelDrag.dragging ? 'cursor-grabbing' : ''}`}
       >
         <div className="flex min-w-0 items-center gap-3 md:pl-6">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/10 text-white">
@@ -1005,7 +1021,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           </div>
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-white" title="按住标题栏可拖动对话框">AI 工作助手</h2>
-            <select value={assistantId ?? ''} onChange={(event) => setAssistantId(Number(event.target.value) || null)} className="mt-0.5 max-w-[220px] bg-transparent text-[11px] text-slate-300 outline-none">
+            <select value={assistantId ?? ''} onChange={(event) => setAssistantId(Number(event.target.value) || null)} aria-label="选择 AI 助手" className="mt-0.5 max-w-[180px] bg-transparent text-[11px] text-slate-300 outline-none sm:max-w-[220px]">
               {assistants.length === 0 && <option value="">默认助手</option>}
               {assistants.map((assistant) => <option key={assistant.id} value={assistant.id} className="text-slate-900">{assistant.name} · {assistant.model}</option>)}
             </select>
@@ -1035,8 +1051,18 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           </button>
           <button
             type="button"
+            onClick={() => setAgentMode(!agentMode)}
+            aria-pressed={agentMode}
+            className={`inline-flex h-10 w-10 items-center justify-center rounded-lg transition md:hidden ${agentMode ? 'text-emerald-300' : 'text-slate-500'}`}
+            aria-label={agentMode ? '关闭智能体模式' : '开启智能体模式'}
+            title={agentMode ? '智能体模式已开启' : '智能体模式已关闭'}
+          >
+            <Workflow className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
             onClick={handleClearHistory}
-            className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800 hover:text-white md:h-auto md:w-auto md:p-2"
             aria-label="删除当前对话"
           >
             <Trash2 className="h-4 w-4" />
@@ -1044,10 +1070,11 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-300 transition hover:bg-slate-800 hover:text-white md:h-auto md:w-auto md:p-2 md:text-slate-400"
             aria-label="关闭"
           >
-            <X className="h-4 w-4" />
+            <ChevronDown className="h-5 w-5 md:hidden" />
+            <X className="hidden h-4 w-4 md:block" />
           </button>
         </div>
       </div>
@@ -1059,9 +1086,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         </select>
         <button type="button" disabled={!cloud.ready} onClick={() => { setSendError(''); setInputValue(''); void cloud.create(assistantId).catch((error) => setSendError(error.message)) }} className="h-11 shrink-0 rounded-lg bg-sky-600 px-3 text-sm text-white disabled:opacity-50">新对话</button>
       </div>
-      <div className="shrink-0 px-3 py-1 text-[11px] text-slate-500">账号历史已云端同步 · 手机/电脑可接着聊 · 关闭页面不停止后台任务</div>
+      <div className="shrink-0 truncate px-3 py-1 text-[11px] text-slate-500">账号历史已云端同步 · 手机/电脑可接着聊 · 关闭页面不停止后台任务</div>
       {(sendError || cloud.error) && <div role="alert" className="shrink-0 bg-rose-50 px-3 py-2 text-xs text-rose-700">{sendError || cloud.error}</div>}
-      <div ref={messagesScrollRef} className="relative flex-1 space-y-4 overflow-y-auto px-4 py-4">
+      <div ref={messagesScrollRef} className="app-scroll relative min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-4 md:px-4">
         {messages.length === 0 && (
           <div className="mt-6 border-y border-slate-200 bg-slate-50 px-5 py-7 text-center">
             <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-lg bg-slate-900 text-white">
@@ -1266,14 +1293,14 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="border-t border-slate-200 px-3 py-3">
-        <div className="mb-3 flex flex-wrap items-center gap-2">
+      <div className="shrink-0 border-t border-slate-200 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2.5 md:py-3">
+        <div className="-mx-3 mb-2.5 flex items-center gap-2 overflow-x-auto px-3 md:mx-0 md:mb-3 md:flex-wrap md:overflow-visible md:px-0">
           {dynamicSuggestions.map((item) => (
             <button
               key={item.label}
               type="button"
               onClick={() => setInputValue(item.prompt)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 transition hover:border-slate-300 hover:bg-white"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 transition hover:border-slate-300 hover:bg-white"
               title={item.prompt}
             >
               {ideaIcon(item.icon)}
@@ -1283,17 +1310,17 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
           <button
             type="button"
             onClick={() => setSuggestionSeed(Date.now())}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 md:h-7 md:w-7"
             aria-label="换一批 AI 建议"
             title="换一批建议"
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
-          <Link href="/ai/summaries" className="ml-auto inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium text-sky-700 hover:bg-sky-50"><BarChart3 className="h-3 w-3" />总结中心</Link>
+          <Link href="/ai/summaries" onClick={() => { if (!window.matchMedia('(min-width: 768px)').matches) onClose() }} className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium text-sky-700 hover:bg-sky-50"><BarChart3 className="h-3 w-3" />总结中心</Link>
         </div>
         <div className="relative mb-2">
           <div className="flex min-w-0 items-center gap-2">
-            <button type="button" onClick={() => setContextPickerOpen((current) => !current)} className={`inline-flex h-8 shrink-0 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${contextWorkbook ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="选择 AI 需要读取的工作簿或工作表">
+            <button type="button" onClick={() => setContextPickerOpen((current) => !current)} className={`inline-flex h-9 shrink-0 md:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${contextWorkbook ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="选择 AI 需要读取的工作簿或工作表">
               <Table2 className="h-3.5 w-3.5" />
               {contextWorkbook ? '已选择表格' : '选择表格'}
               <ChevronDown className="h-3.5 w-3.5" />
@@ -1301,12 +1328,12 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             {contextWorkbook && (
               <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5 text-xs text-slate-600">
                 <span className="min-w-0 flex-1 truncate font-medium">{contextWorkbook.name}{contextSelection ? ` · ${contextSelection.range_label}` : contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}</span>
-                <button type="button" onClick={() => { setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null); setContextPickerOpen(false) }} className="shrink-0 text-slate-400 hover:text-slate-700" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
+                <button type="button" onClick={() => { setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null); setContextPickerOpen(false) }} className="-my-1 inline-flex h-8 w-8 shrink-0 items-center justify-center text-slate-400 hover:text-slate-700 md:my-0 md:h-auto md:w-auto" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
               </div>
             )}
           </div>
           {contextPickerOpen && (
-            <div className="absolute bottom-full left-0 z-30 mb-2 flex max-h-[min(25rem,calc(100vh-180px))] w-[min(560px,calc(100vw-40px))] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+            <div className="absolute bottom-full left-0 z-30 mb-2 flex max-h-[min(25rem,calc(var(--vv-height)-180px))] w-[min(560px,calc(100vw-24px))] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
               <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 p-2">
                 <div className="flex h-9 min-w-[180px] flex-1 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-xs text-slate-500 focus-within:border-amber-300 focus-within:bg-white">
                   <Search className="h-3.5 w-3.5 shrink-0" />
@@ -1376,7 +1403,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             maxLength={MAX_CHAT_INPUT_CHARS}
             placeholder="输入消息，或拖入单元格内容..."
             rows={1}
-            className="min-h-[46px] flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2.5 text-sm leading-6 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-100"
+            enterKeyHint="send"
+            className="min-h-[46px] min-w-0 flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2.5 text-sm leading-6 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-100"
           />
           <button
             type="button"
@@ -1391,7 +1419,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
             type="button"
             onClick={loading ? handleStop : () => void handleSend()}
             disabled={!loading && !inputValue.trim()}
-            className={`rounded-lg p-3 text-white transition disabled:cursor-not-allowed ${loading ? 'bg-rose-600 hover:bg-rose-700' : 'bg-slate-900 hover:bg-slate-800 disabled:opacity-40'}`}
+            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-white transition disabled:cursor-not-allowed ${loading ? 'bg-rose-600 hover:bg-rose-700' : 'bg-slate-900 hover:bg-slate-800 disabled:opacity-40'}`}
             aria-label={loading ? '停止生成' : '发送'}
             title={loading ? '停止生成（已生成的内容会保留）' : '发送'}
           >

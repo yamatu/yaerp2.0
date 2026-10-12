@@ -9,6 +9,7 @@ import {
   Bell,
   BellOff,
   Bot,
+  Camera,
   Check,
   CheckSquare,
   CheckCheck,
@@ -72,6 +73,7 @@ import { imageThumbnailUrl, imageTransformLabel, transformRemoteImage, type Imag
 import { FilePreviewModal, type FilePreviewItem } from '@/components/ui/FilePreviewModal'
 import { matchesWhatsAppChat, matchesWhatsAppSearch, normalizeWhatsAppSearchText } from '@/lib/whatsappSearch'
 import { wsClient } from '@/lib/ws'
+import { COARSE_POINTER_QUERY, MOBILE_QUERY, matchesMedia, useBodyClass, useHistoryLayer, useKeyboardViewport, useLongPress, useMediaQuery } from '@/hooks/useMobileGestures'
 import type { AIAssistant, Channel, ChannelAIAskResult, ChannelAIMember, ChannelBackup, ChannelBackupRestore, ChannelMember, ChannelMessage, ChannelMessageSearchResult, GalleryDirectory, GalleryImage, PageData, Sheet, User, WhatsAppAccount, WhatsAppChannelLink, WhatsAppChat, WhatsAppContactSyncResult, WhatsAppHistorySyncResult, Workbook, WorkbookImportResult } from '@/types'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
@@ -93,7 +95,17 @@ interface ContextMenuState {
   y: number
   kind: 'message' | 'composer'
   message?: ChannelMessage
+  /** Phones get the menu as a bottom action sheet instead of a popover. */
+  sheet?: boolean
 }
+
+// Below lg the channel list and the conversation are stacked screens.
+const COMPACT_LAYOUT_QUERY = '(max-width: 1023px)'
+
+function prefersActionSheet() {
+  return matchesMedia(MOBILE_QUERY) || matchesMedia(COARSE_POINTER_QUERY)
+}
+
 
 type SidebarSearchMode = 'channels' | 'history'
 type HistoryMatchMode = 'contains' | 'exact' | 'regex'
@@ -425,6 +437,17 @@ export default function ChannelsPage() {
   const [savedImageIds, setSavedImageIds] = useState<number[]>([])
 
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  // Long press on a message opens the same actions as the right click menu.
+  const messageLongPress = useLongPress<ChannelMessage>((message) => {
+    setContextMenu({ x: 0, y: 0, kind: 'message', message, sheet: true })
+  })
+  const [composerSheetOpen, setComposerSheetOpen] = useState(false)
+  const cameraInputRef = useRef<HTMLInputElement | null>(null)
+  const closeContextMenu = useCallback(() => setContextMenu(null), [])
+  const closeComposerSheet = useCallback(() => setComposerSheetOpen(false), [])
+  const closeHistorySearch = useCallback(() => setHistorySearchOpen(false), [])
+  useHistoryLayer(Boolean(contextMenu?.sheet), closeContextMenu)
+  useHistoryLayer(composerSheetOpen, closeComposerSheet)
   const [draggingMessageId, setDraggingMessageId] = useState<number | null>(null)
   const [dropTargetChannelId, setDropTargetChannelId] = useState<number | null>(null)
   const [isExternalFileDragging, setIsExternalFileDragging] = useState(false)
@@ -451,6 +474,25 @@ export default function ChannelsPage() {
   const channelsInitializedRef = useRef(false)
 
   const activeChannel = channels.find((channel) => channel.id === activeChannelId) || null
+
+  // Phone layout: the channel list and the open conversation are two stacked
+  // screens. Opening a conversation pushes a history entry so the browser /
+  // Android back button returns to the list.
+  const compactLayout = useMediaQuery(COMPACT_LAYOUT_QUERY)
+  const [mobileChatOpen, setMobileChatOpen] = useState(false)
+  const conversationVisible = !compactLayout || (mobileChatOpen && Boolean(activeChannel))
+  const conversationVisibleRef = useRef(typeof window === 'undefined' || !matchesMedia(COMPACT_LAYOUT_QUERY))
+  const closeMobileChat = useCallback(() => setMobileChatOpen(false), [])
+  useHistoryLayer(compactLayout && mobileChatOpen, closeMobileChat)
+  useBodyClass('fab-hidden', compactLayout && mobileChatOpen)
+  const keyboardViewport = useKeyboardViewport(compactLayout)
+  const keyboardOpen = compactLayout && keyboardViewport.keyboardInset > 0
+  const openChannel = useCallback((channelId: number) => {
+    setActiveChannelId(channelId)
+    setMobileChatOpen(true)
+  }, [])
+  useHistoryLayer(compactLayout && historySearchOpen, closeHistorySearch)
+
   const totalUnreadCount = useMemo(() => channels.reduce((sum, channel) => sum + (channel.unread_count || 0), 0), [channels])
   const selectedAskAssistantName = useMemo(() => {
     if (!selectedAskAssistantId) return ''
@@ -732,6 +774,9 @@ export default function ChannelsPage() {
   }, [])
 
   const markChannelRead = useCallback(async (channelId: number) => {
+    // On phones the remembered channel stays selected behind the list; only
+    // mark it read once the conversation screen is actually showing.
+    if (!conversationVisibleRef.current) return
     try {
       const res = await api.post(`/channels/${channelId}/read`)
       if (res.code === 0) {
@@ -883,6 +928,43 @@ export default function ChannelsPage() {
   }, [activeChannelId, currentUserId, loadChannelAIMembers, loadChannels, loadMessages, markChannelRead])
 
   useEffect(() => {
+    conversationVisibleRef.current = conversationVisible
+  }, [conversationVisible])
+
+  // Entering the conversation screen on a phone: jump to the latest message
+  // (the hidden screen could not keep its scroll position) and mark it read.
+  useEffect(() => {
+    if (!compactLayout || !mobileChatOpen || !activeChannelId) return
+    const frame = window.requestAnimationFrame(() => {
+      const viewport = messagesViewportRef.current
+      if (viewport) viewport.scrollTop = viewport.scrollHeight
+      shouldStickToBottomRef.current = true
+      setShowScrollToLatest(false)
+    })
+    void markChannelRead(activeChannelId).then(() => loadChannels(true))
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeChannelId, compactLayout, loadChannels, markChannelRead, mobileChatOpen])
+
+  useEffect(() => {
+    if (mobileChatOpen && channels.length > 0 && !activeChannel) setMobileChatOpen(false)
+  }, [activeChannel, channels.length, mobileChatOpen])
+
+  // Keep the newest message in view while images finish loading, the composer
+  // grows or the on-screen keyboard shrinks the viewport.
+  const hasLoadedMessages = messages.length > 0
+  useEffect(() => {
+    const viewport = messagesViewportRef.current
+    const content = viewport?.firstElementChild
+    if (!viewport || !content || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      if (shouldStickToBottomRef.current) viewport.scrollTop = viewport.scrollHeight
+    })
+    observer.observe(content)
+    observer.observe(viewport)
+    return () => observer.disconnect()
+  }, [activeChannelId, conversationVisible, hasLoadedMessages, loadingMessages])
+
+  useEffect(() => {
     if (activeChannel?.channel_type !== 'ai_private' || !activeChannel.ai_assistant_id) return
     setSelectedAskAssistantId(activeChannel.ai_assistant_id)
   }, [activeChannel?.ai_assistant_id, activeChannel?.channel_type])
@@ -952,7 +1034,23 @@ export default function ChannelsPage() {
   }, [notice])
 
   useEffect(() => {
-    const closeMenu = () => setContextMenu(null)
+    const input = messageInputRef.current
+    if (!input) return
+    // Phones: grow the one-line composer with its content (up to ~5 lines).
+    if (!matchesMedia(MOBILE_QUERY)) {
+      input.style.height = ''
+      return
+    }
+    input.style.height = 'auto'
+    input.style.height = `${Math.min(input.scrollHeight, 128)}px`
+  }, [messageText, activeChannelId, compactLayout])
+
+  useEffect(() => {
+    const closeMenu = () => {
+      // Some browsers fire a click when the finger lifts after a long press.
+      if (messageLongPress.justLongPressed()) return
+      setContextMenu(null)
+    }
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') closeMenu()
     }
@@ -964,7 +1062,7 @@ export default function ChannelsPage() {
       window.removeEventListener('blur', closeMenu)
       window.removeEventListener('keydown', handleKeyDown)
     }
-  }, [])
+  }, [messageLongPress])
 
   useEffect(() => {
     if (!activeChannelId) return
@@ -1190,7 +1288,7 @@ export default function ChannelsPage() {
       setNewChannelDescription('')
       setIsCreateOpen(false)
       await loadChannels(true)
-      setActiveChannelId(res.data.id)
+      openChannel(res.data.id)
     } catch {
       setError('创建频道失败')
     } finally {
@@ -1350,6 +1448,8 @@ export default function ChannelsPage() {
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+    // On-screen keyboards use Enter for new lines; the send button sends.
+    if (matchesMedia(COARSE_POINTER_QUERY) && matchesMedia(MOBILE_QUERY)) return
     event.preventDefault()
     void sendMessage()
   }
@@ -2037,7 +2137,7 @@ export default function ChannelsPage() {
         return
       }
       await loadChannels(true)
-      setActiveChannelId(res.data.id)
+      openChannel(res.data.id)
       setSelectedAskAssistantId(assistant.id)
       setIsAssistantPickerOpen(false)
     } catch {
@@ -2129,6 +2229,7 @@ export default function ChannelsPage() {
       }
       setIsManageOpen(false)
       setActiveChannelId(null)
+      setMobileChatOpen(false)
       await loadChannels(true)
     } catch {
       setError('删除频道失败')
@@ -2251,7 +2352,8 @@ export default function ChannelsPage() {
 
   const selectHistoryResult = (result: ChannelMessageSearchResult) => {
     setHighlightMessageId(result.id)
-    setActiveChannelId(result.channel_id)
+    if (compactLayout) setHistorySearchOpen(false)
+    openChannel(result.channel_id)
   }
 
   const updateSoundEnabled = (enabled: boolean) => {
@@ -2312,6 +2414,12 @@ export default function ChannelsPage() {
   const openMessageContextMenu = (event: ReactMouseEvent, message: ChannelMessage) => {
     event.preventDefault()
     event.stopPropagation()
+    // Android turns a long press into a contextmenu event as well; phones and
+    // touch screens get the same bottom action sheet as the long press.
+    if (messageLongPress.justLongPressed() || prefersActionSheet()) {
+      setContextMenu({ x: 0, y: 0, kind: 'message', message, sheet: true })
+      return
+    }
     setContextMenu({
       x: Math.min(event.clientX, window.innerWidth - 230),
       y: Math.min(event.clientY, window.innerHeight - 430),
@@ -2321,6 +2429,8 @@ export default function ChannelsPage() {
   }
 
   const openComposerContextMenu = (event: ReactMouseEvent<HTMLTextAreaElement>) => {
+    // Touch devices keep the native text selection / paste menu.
+    if (matchesMedia(COARSE_POINTER_QUERY)) return
     event.preventDefault()
     event.stopPropagation()
     setContextMenu({
@@ -2454,22 +2564,27 @@ export default function ChannelsPage() {
 
   return (
     <AuthGuard>
-      <div className="h-[100dvh] overflow-hidden bg-[#111b21] p-0 md:p-4">
+      <div
+        className={`overflow-hidden bg-[#111b21] p-0 md:p-4 ${keyboardOpen ? 'fixed inset-x-0 z-[61]' : 'h-[calc(100dvh-var(--mobile-tabbar-offset))]'}`}
+        // While the on-screen keyboard is up, pin the page to the visible part
+        // of the viewport so the composer sits right on top of the keyboard.
+        style={keyboardOpen ? { top: keyboardViewport.offsetTop, height: keyboardViewport.height } : undefined}
+      >
         <div className="mx-auto flex h-full max-w-[1440px] flex-col overflow-hidden">
-          <header className="flex h-14 shrink-0 items-center justify-between border-b border-[#334047] bg-[#202c33] px-4 text-slate-100 md:border md:border-b-0 md:border-[#334047]">
+          <header className="hidden h-14 shrink-0 items-center justify-between border-b border-[#334047] bg-[#202c33] px-4 text-slate-100 md:border md:border-b-0 md:border-[#334047] lg:flex">
             <button type="button" onClick={() => { window.location.href = consumeReturnTarget('/') }} className="inline-flex items-center gap-2 text-sm text-slate-300 transition hover:text-white">
               <ArrowLeft className="h-4 w-4" />
               返回首页
             </button>
             <div className="flex items-center gap-1">
-              <a href="/whatsapp" className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-[#25d366]" title="管理我的 WhatsApp"><MessageCircle className="h-4 w-4" /></a>
+              <a href="/whatsapp" className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-[#25d366]" title="管理我的 WhatsApp"><MessageCircle className="h-4 w-4" /></a>
               <button type="button" onClick={() => setNotificationSettingsOpen(true)} className="relative inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-white" title="频道通知设置">
                 {soundEnabled ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
                 {totalUnreadCount > 0 && (
                   <span className="absolute -right-1 -top-1 flex min-h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-4 text-white">{totalUnreadCount > 99 ? '99+' : totalUnreadCount}</span>
                 )}
               </button>
-              <button type="button" onClick={() => void Promise.all([loadChannels(), activeChannelId ? loadMessages(activeChannelId) : Promise.resolve()])} className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-white" title="刷新">
+              <button type="button" onClick={() => void Promise.all([loadChannels(), activeChannelId ? loadMessages(activeChannelId) : Promise.resolve()])} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-full text-slate-300 transition hover:bg-white/10 hover:text-white" title="刷新">
                 <RefreshCw className="h-4 w-4" />
               </button>
             </div>
@@ -2478,7 +2593,7 @@ export default function ChannelsPage() {
           {error && (
             <div className="flex items-center justify-between border-x border-t border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
               <span>{error}</span>
-              <button type="button" onClick={() => setError('')} className="inline-flex h-7 w-7 items-center justify-center rounded-lg hover:bg-rose-100" title="关闭提示">
+              <button type="button" onClick={() => setError('')} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 items-center justify-center rounded-lg hover:bg-rose-100" title="关闭提示">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -2490,18 +2605,22 @@ export default function ChannelsPage() {
             </div>
           )}
 
-          <main className="flex min-h-0 flex-1 overflow-hidden border-x border-b border-[#334047] bg-white">
-            <aside className={`${activeChannel ? 'hidden lg:flex' : 'flex'} min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white lg:w-[360px]`}>
-              <div className="flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-[#f0f2f5] px-4">
-                <div>
+          <main className="flex min-h-0 flex-1 overflow-hidden bg-white md:border-x md:border-b md:border-[#334047]">
+            <aside className={`${mobileChatOpen && activeChannel ? 'hidden lg:flex' : 'flex'} min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white lg:w-[360px]`}>
+              <div className="flex h-[calc(4rem+env(safe-area-inset-top))] shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-[#f0f2f5] px-4 pt-[env(safe-area-inset-top)] lg:h-16 lg:pt-0">
+                <div className="min-w-0">
                   <div className="text-base font-semibold text-slate-900">频道</div>
-                  <div className="mt-0.5 text-xs text-slate-400">{channels.length} 个会话</div>
+                  <div className="mt-0.5 truncate text-xs text-slate-400">{channels.length} 个会话{totalUnreadCount > 0 ? ` · ${totalUnreadCount > 99 ? '99+' : totalUnreadCount} 条未读` : ''}</div>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <button type="button" onClick={() => { setIsAssistantPickerOpen(true); void loadAvailableAssistants() }} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-700" title="打开 AI 机器人私聊">
-                    <Bot className="h-4 w-4" />
+                <div className="flex shrink-0 items-center gap-1">
+                  <a href="/whatsapp" className="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-500 transition hover:bg-white hover:text-[#008069] lg:hidden" title="管理我的 WhatsApp" aria-label="管理我的 WhatsApp"><MessageCircle className="h-5 w-5" /></a>
+                  <button type="button" onClick={() => setNotificationSettingsOpen(true)} className="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-500 transition hover:bg-white hover:text-slate-800 lg:hidden" title="频道通知设置" aria-label="频道通知设置">
+                    {soundEnabled ? <Bell className="h-5 w-5" /> : <BellOff className="h-5 w-5" />}
                   </button>
-                  <button type="button" onClick={() => setIsCreateOpen(true)} className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-[#008069] text-white transition hover:bg-[#006d59]" title="新建频道">
+                  <button type="button" onClick={() => { setIsAssistantPickerOpen(true); void loadAvailableAssistants() }} className="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-500 transition hover:bg-white hover:text-emerald-700 lg:h-9 lg:w-9 lg:rounded-lg lg:border lg:border-slate-200 lg:hover:border-emerald-200 lg:hover:bg-emerald-50" title="打开 AI 机器人私聊" aria-label="打开 AI 机器人私聊">
+                    <Bot className="h-5 w-5 lg:h-4 lg:w-4" />
+                  </button>
+                  <button type="button" onClick={() => setIsCreateOpen(true)} className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-[#008069] text-white transition hover:bg-[#006d59] lg:h-9 lg:w-9" title="新建频道" aria-label="新建频道">
                     <Plus className="h-4 w-4" />
                   </button>
                 </div>
@@ -2509,11 +2628,11 @@ export default function ChannelsPage() {
 
               <div className="border-b border-slate-100 p-3">
                 <div className="mb-2 grid grid-cols-2 rounded-lg bg-slate-100 p-1 text-xs font-medium">
-                  <button type="button" onClick={() => setSidebarSearchMode('channels')} className={`h-7 rounded-md transition ${sidebarSearchMode === 'channels' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>频道</button>
-                  <button type="button" onClick={() => { setSidebarSearchMode('history'); setHistoryChannelId(''); setHistoryResults([]); setHistoryTotal(0); void loadShareableUsers() }} className={`h-7 rounded-md transition ${sidebarSearchMode === 'history' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>历史消息</button>
+                  <button type="button" onClick={() => setSidebarSearchMode('channels')} className={`h-10 rounded-md transition lg:h-7 ${sidebarSearchMode === 'channels' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>频道</button>
+                  <button type="button" onClick={() => { setSidebarSearchMode('history'); setHistoryChannelId(''); setHistoryResults([]); setHistoryTotal(0); void loadShareableUsers() }} className={`h-10 rounded-md transition lg:h-7 ${sidebarSearchMode === 'history' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>历史消息</button>
                 </div>
                 <div className="flex items-center gap-2">
-                  <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:bg-white focus-within:ring-1 focus-within:ring-sky-300">
+                  <label className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:bg-white focus-within:ring-1 focus-within:ring-sky-300 lg:h-9">
                     <Search className="h-4 w-4 shrink-0 text-slate-400" />
                     <input
                       value={sidebarSearchMode === 'channels' ? channelSearch : historyKeyword}
@@ -2524,7 +2643,7 @@ export default function ChannelsPage() {
                     />
                   </label>
                   {sidebarSearchMode === 'history' && (
-                    <button type="button" onClick={() => openHistorySearch()} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-sky-600" title="历史搜索筛选">
+                    <button type="button" onClick={() => openHistorySearch()} className="inline-flex h-10 w-10 lg:h-9 lg:w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-sky-600" title="历史搜索筛选">
                       <SlidersHorizontal className="h-4 w-4" />
                     </button>
                   )}
@@ -2532,7 +2651,7 @@ export default function ChannelsPage() {
                 {sidebarSearchMode === 'history' && (
                   <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
                     <span>{historyTotal ? `找到 ${historyTotal} 条消息` : '支持精确和正则匹配'}</span>
-                    <button type="button" onClick={() => void runHistorySearch('')} disabled={searchingHistory} className="font-medium text-sky-600 disabled:text-slate-300">{searchingHistory ? '搜索中...' : '搜索'}</button>
+                    <button type="button" onClick={() => void runHistorySearch('')} disabled={searchingHistory} className="-my-2 px-2 py-2 font-medium text-sky-600 disabled:text-slate-300">{searchingHistory ? '搜索中...' : '搜索'}</button>
                   </div>
                 )}
               </div>
@@ -2591,15 +2710,15 @@ export default function ChannelsPage() {
                       void handlePinnedChannelDrop(channel.id)
                     }}
                     onDragEnd={() => setDraggingPinnedChannelId(null)}
-                    className={`group/channel flex border-b border-slate-100 transition ${draggingPinnedChannelId === channel.id ? 'opacity-45' : ''} ${draggingPinnedChannelId && channel.is_pinned && draggingPinnedChannelId !== channel.id ? 'hover:bg-emerald-50' : ''} ${dropTargetChannelId === channel.id ? 'bg-emerald-50 ring-2 ring-inset ring-emerald-300' : channel.id === activeChannelId ? 'bg-[#f0f2f5]' : 'hover:bg-[#f5f6f6]'}`}
+                    className={`group/channel flex border-b border-slate-100 transition ${draggingPinnedChannelId === channel.id ? 'opacity-45' : ''} ${draggingPinnedChannelId && channel.is_pinned && draggingPinnedChannelId !== channel.id ? 'hover:bg-emerald-50' : ''} ${dropTargetChannelId === channel.id ? 'bg-emerald-50 ring-2 ring-inset ring-emerald-300' : channel.id === activeChannelId && !compactLayout ? 'bg-[#f0f2f5]' : 'hover:bg-[#f5f6f6]'}`}
                   >
                     {channel.is_pinned && !channelSearch.trim() && (
                       <div className="flex w-5 shrink-0 cursor-grab items-center justify-center text-slate-300 active:cursor-grabbing" title="拖动调整置顶顺序">
                         <GripVertical className="h-4 w-4" />
                       </div>
                     )}
-                    <button type="button" onClick={() => setActiveChannelId(channel.id)} className="flex min-w-0 flex-1 gap-3 px-4 py-3 text-left">
-                      <div className={`flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full ${channel.id === activeChannelId ? 'bg-[#008069] text-white' : 'bg-slate-200 text-slate-500'}`}>
+                    <button type="button" onClick={() => openChannel(channel.id)} className="flex min-w-0 flex-1 gap-3 px-4 py-3 text-left active:bg-slate-100 lg:active:bg-transparent">
+                      <div className={`flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full lg:h-11 lg:w-11 ${channel.id === activeChannelId && !compactLayout ? 'bg-[#008069] text-white' : 'bg-slate-200 text-slate-500'}`}>
                         <WhatsAppAvatarImage src={channel.avatar_url} alt={channel.name} fallback={channel.channel_type === 'ai_private' ? <Bot className="h-4 w-4" /> : <span className="text-xs font-semibold">{initials(channel.name)}</span>} />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -2615,7 +2734,7 @@ export default function ChannelsPage() {
                         </div>
                       </div>
                     </button>
-                    <button type="button" onClick={() => void handleTogglePin(channel)} disabled={pinningChannelId === channel.id} className="mr-2 self-center inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-100 transition hover:bg-white hover:text-sky-600 disabled:opacity-40 lg:opacity-0 lg:group-hover/channel:opacity-100" title={channel.is_pinned ? '取消置顶' : '置顶频道'}>
+                    <button type="button" onClick={() => void handleTogglePin(channel)} disabled={pinningChannelId === channel.id} className="mr-1 self-center inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-100 transition hover:bg-white hover:text-sky-600 disabled:opacity-40 lg:mr-2 lg:h-8 lg:w-8 lg:pointer-fine:opacity-0 lg:group-hover/channel:opacity-100 lg:focus-visible:opacity-100" title={channel.is_pinned ? '取消置顶' : '置顶频道'}>
                       {channel.is_pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
                     </button>
                   </div>
@@ -2628,7 +2747,7 @@ export default function ChannelsPage() {
               onDragOver={handleExternalFileDragOver}
               onDragLeave={handleExternalFileDragLeave}
               onDrop={handleExternalFileDrop}
-              className={`${activeChannel ? 'flex' : 'hidden lg:flex'} relative min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#efeae2]`}
+              className={`${mobileChatOpen && activeChannel ? 'flex' : 'hidden lg:flex'} relative min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#efeae2]`}
             >
               {isExternalFileDragging && activeChannel && (
                 <div className="pointer-events-none absolute inset-3 z-50 flex items-center justify-center rounded-lg border-2 border-dashed border-sky-400 bg-sky-50/95 shadow-xl">
@@ -2643,8 +2762,8 @@ export default function ChannelsPage() {
               )}
               {activeChannel ? (
                 <>
-                  <div className="flex h-16 shrink-0 items-center gap-3 border-b border-slate-300 bg-[#f0f2f5] px-4">
-                    <button type="button" onClick={() => setActiveChannelId(null)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 lg:hidden" title="返回频道列表">
+                  <div className="flex h-[calc(3.5rem+env(safe-area-inset-top))] shrink-0 items-center gap-2 border-b border-slate-300 bg-[#f0f2f5] px-3 pt-[env(safe-area-inset-top)] sm:gap-3 sm:px-4 lg:h-16 lg:pt-0">
+                    <button type="button" onClick={closeMobileChat} className="-ml-2 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-600 hover:bg-slate-200 lg:hidden" title="返回频道列表" aria-label="返回频道列表">
                       <ChevronLeft className="h-5 w-5" />
                     </button>
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-[#008069] text-white">
@@ -2658,17 +2777,17 @@ export default function ChannelsPage() {
                       <span>{activeChannel.channel_type === 'ai_private' ? 'AI 私聊' : `${activeChannel.member_count || 1} 位成员`}</span>
                       <span>{messages.length} 条消息</span>
                     </div>
-                    <button type="button" onClick={() => openHistorySearch(activeChannel.id)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600" title="搜索当前频道历史">
+                    <button type="button" onClick={() => openHistorySearch(activeChannel.id)} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 lg:h-8 lg:w-8 lg:rounded-lg" title="搜索当前频道历史" aria-label="搜索当前频道历史">
                       <Search className="h-4 w-4" />
                     </button>
                     {activeChannel.can_manage && activeChannel.channel_type !== 'ai_private' && (
-                      <button type="button" onClick={openManageChannel} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600" title="管理频道">
+                      <button type="button" onClick={openManageChannel} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 lg:h-8 lg:w-8 lg:rounded-lg" title="管理频道" aria-label="管理频道">
                         <Settings className="h-4 w-4" />
                       </button>
                     )}
                   </div>
 
-                  <div ref={messagesViewportRef} onScroll={handleMessagesScroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-5 [scrollbar-gutter:stable] md:px-8">
+                  <div ref={messagesViewportRef} onScroll={handleMessagesScroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-4 [scrollbar-gutter:stable] sm:px-3 sm:py-5 md:px-8">
                     {loadingMessages ? (
                       <div className="text-center text-sm text-slate-400">正在加载消息...</div>
                     ) : messages.length === 0 ? (
@@ -2697,13 +2816,13 @@ export default function ChannelsPage() {
                             )
                           }
                           return (
-                            <div data-message-id={message.id} key={message.id} onContextMenu={(event) => openMessageContextMenu(event, message)} className={`group flex items-start gap-3 rounded-lg transition ${isMine ? 'flex-row-reverse' : ''} ${highlightMessageId === message.id ? 'outline outline-2 outline-offset-4 outline-sky-300' : ''}`}>
-                              <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full text-xs font-semibold ${isMine ? 'bg-[#008069] text-white' : isAI ? 'bg-emerald-600 text-white' : isWhatsApp ? 'bg-[#25d366] text-white' : 'bg-white text-slate-600 shadow-sm'}`}>
+                            <div data-message-id={message.id} key={message.id} {...messageLongPress.bind(message)} onContextMenu={(event) => openMessageContextMenu(event, message)} className={`group flex items-start gap-2 rounded-lg transition [-webkit-touch-callout:none] pointer-coarse:select-none sm:gap-3 ${isMine ? 'flex-row-reverse' : ''} ${highlightMessageId === message.id ? 'outline outline-2 outline-offset-4 outline-sky-300' : ''} ${contextMenu?.sheet && contextMenu.message?.id === message.id ? 'bg-sky-100/60' : ''}`}>
+                              <div className={`flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full text-xs font-semibold sm:h-9 sm:w-9 ${isMine ? 'bg-[#008069] text-white' : isAI ? 'bg-emerald-600 text-white' : isWhatsApp ? 'bg-[#25d366] text-white' : 'bg-white text-slate-600 shadow-sm'}`}>
                                 {isAI ? <Bot className="h-4 w-4" /> : isWhatsApp && message.external_sender_avatar ? <img src={message.external_sender_avatar} alt="" className="h-full w-full object-cover" /> : isWhatsApp ? <MessageCircle className="h-4 w-4" /> : message.sender_avatar ? <img src={message.sender_avatar} alt="" className="h-full w-full object-cover" /> : initials(senderName)}
                               </div>
-                              <div className={`flex min-w-0 max-w-[min(88%,680px)] flex-col sm:max-w-[min(78%,680px)] ${isMine ? 'items-end' : 'items-start'}`}>
-                                <div className={`mb-1 flex items-center gap-2 text-[11px] text-slate-400 ${isMine ? 'flex-row-reverse' : ''}`}>
-                                  <span className={`font-medium ${isAI ? 'text-emerald-700' : 'text-slate-500'}`}>{senderName}</span>
+                              <div className={`flex min-w-0 max-w-[calc(100%-2.5rem)] flex-col sm:max-w-[min(78%,680px)] ${isMine ? 'items-end' : 'items-start'}`}>
+                                <div className={`mb-1 flex max-w-full flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-400 ${isMine ? 'flex-row-reverse' : ''}`}>
+                                  <span className={`max-w-[12rem] truncate font-medium ${isAI ? 'text-emerald-700' : 'text-slate-500'}`}>{senderName}</span>
                                   {isAI && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">AI</span>}
                                   {isWhatsApp && <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">WhatsApp</span>}
                                   <span>{formatTime(message.created_at)}</span>
@@ -2712,7 +2831,7 @@ export default function ChannelsPage() {
                                 {message.forwarded_from_message_id && (
                                   <div className="mb-1 text-[11px] text-sky-600">转发的消息</div>
                                 )}
-                                <div className={`flex items-center gap-2 ${isMine ? 'flex-row-reverse' : ''}`}>
+                                <div className={`flex max-w-full items-center gap-2 ${isMine ? 'flex-row-reverse' : ''}`}>
                                   <div className={`min-w-0 space-y-2 ${(message.content || message.reply_to_message_id || message.reply_external_message_id) ? `rounded-lg px-3 py-2 shadow-sm ${isMine ? 'bg-[#d9fdd3] text-slate-900' : isAI ? 'bg-[#e7fce8] text-slate-800' : 'bg-white text-slate-800'}` : ''}`}>
                                     {(message.reply_to_message_id || message.reply_external_message_id) && (
                                       <button
@@ -2727,7 +2846,7 @@ export default function ChannelsPage() {
                                         className={`block w-full min-w-0 border-l-2 pl-2 text-left text-xs ${isMine ? 'border-[#008069] text-slate-600' : 'border-[#00a884] text-slate-500'}`}
                                       >
                                         <span className={`block truncate font-semibold ${isMine ? 'text-[#006d59]' : 'text-[#008069]'}`}>{message.reply_sender_name || message.reply_snapshot_sender || 'WhatsApp 联系人'}</span>
-                                        <span className="mt-0.5 block max-w-md truncate">{message.reply_recalled_at ? '原消息已撤回' : (message.reply_content || message.reply_attachment_filename || message.reply_snapshot_content || '引用消息')}</span>
+                                        <span className="mt-0.5 block max-w-[min(28rem,70vw)] truncate">{message.reply_recalled_at ? '原消息已撤回' : (message.reply_content || message.reply_attachment_filename || message.reply_snapshot_content || '引用消息')}</span>
                                       </button>
                                     )}
                                     {message.content && (isAI
@@ -2743,10 +2862,10 @@ export default function ChannelsPage() {
                                       <div className="flex items-center gap-1.5 border-t border-slate-200/80 pt-2 text-xs text-sky-600"><RefreshCw className="h-3.5 w-3.5 animate-spin" />AI 正在翻译...</div>
                                     )}
                                   </div>
-                                  <button type="button" onClick={() => startReply(message)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-60 transition hover:bg-white hover:text-sky-600 focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100" title="回复消息">
+                                  <button type="button" onClick={() => startReply(message)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-60 transition hover:bg-white hover:text-sky-600 focus:opacity-100 pointer-coarse:hidden sm:opacity-0 sm:group-hover:opacity-100" title="回复消息">
                                     <Reply className="h-4 w-4" />
                                   </button>
-                                  <button type="button" onClick={() => openForwardDialog(message)} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-60 transition hover:bg-white hover:text-sky-600 focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100" title="转发消息">
+                                  <button type="button" onClick={() => openForwardDialog(message)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 opacity-60 transition hover:bg-white hover:text-sky-600 focus:opacity-100 pointer-coarse:hidden sm:opacity-0 sm:group-hover:opacity-100" title="转发消息">
                                     <Share2 className="h-4 w-4" />
                                   </button>
                                 </div>
@@ -2759,7 +2878,7 @@ export default function ChannelsPage() {
                                     className={`relative mt-2 block max-w-full cursor-grab touch-pan-y overflow-hidden rounded-lg border border-slate-200 bg-white p-1 text-left shadow-sm transition active:cursor-grabbing ${draggingMessageId === message.id ? 'opacity-50' : 'hover:border-sky-300'}`}
                                     title="查看图片"
                                   >
-                                    <img src={imageThumbnailUrl(message.attachment_url, 640)} alt={message.attachment_filename || '频道图片'} className="max-h-72 max-w-full object-contain" loading="lazy" decoding="async" />
+                                    <img src={imageThumbnailUrl(message.attachment_url, 640)} alt={message.attachment_filename || '频道图片'} className="max-h-72 max-w-full object-contain [-webkit-touch-callout:none]" loading="lazy" decoding="async" draggable={false} />
                                     {savedImageIds.includes(message.id) && (
                                       <span className="absolute bottom-2 right-2 rounded-lg bg-emerald-600 px-2 py-1 text-[11px] text-white">已保存</span>
                                     )}
@@ -2767,7 +2886,7 @@ export default function ChannelsPage() {
                                 )}
 
                                 {message.attachment_url && !isImageMessage(message) && (
-                                  <div className="mt-2 max-w-sm overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+                                  <div className="mt-2 w-full max-w-sm overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
                                     <a href={message.attachment_url} target="_blank" rel="noreferrer" className="flex items-center gap-3 px-3 py-2.5 text-left transition hover:bg-slate-50">
                                       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500">
                                         <FileText className="h-4 w-4" />
@@ -2779,7 +2898,7 @@ export default function ChannelsPage() {
                                       <ArrowRight className="h-4 w-4 shrink-0 text-slate-400" />
                                     </a>
                                     {isExcelWorkbookMessage(message) && !message.linked_workbook_id && (
-                                      <button type="button" onClick={() => void handleImportWorkbook(message)} disabled={importingWorkbookMessageId === message.id} className="flex h-9 w-full items-center justify-center gap-2 border-t border-slate-100 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50">
+                                      <button type="button" onClick={() => void handleImportWorkbook(message)} disabled={importingWorkbookMessageId === message.id} className="flex h-10 w-full items-center justify-center gap-2 border-t border-slate-100 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50 sm:h-9">
                                         {importingWorkbookMessageId === message.id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Table2 className="h-3.5 w-3.5" />}
                                         {importingWorkbookMessageId === message.id ? '正在导入' : '保存为系统工作簿'}
                                       </button>
@@ -2819,13 +2938,13 @@ export default function ChannelsPage() {
                   </div>
 
                   {showScrollToLatest && (
-                    <button type="button" onClick={scrollToLatestMessage} className="absolute bottom-28 right-4 z-20 inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 hover:text-[#00a884] md:right-6" title="回到最新消息">
+                    <button type="button" onClick={scrollToLatestMessage} className="absolute bottom-24 right-3 z-20 sm:bottom-28 sm:right-4 inline-flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 hover:text-[#00a884] md:right-6" title="回到最新消息">
                       <ChevronDown className="h-5 w-5" />
                     </button>
                   )}
 
-                  <div className="shrink-0 border-t border-slate-300 bg-[#f0f2f5] p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:px-5 md:py-3">
-                    <div className="mx-auto max-w-4xl overflow-hidden rounded-lg bg-white shadow-sm focus-within:ring-1 focus-within:ring-[#00a884]/30">
+                  <div className="shrink-0 border-t border-slate-300 bg-[#f0f2f5] px-2 py-2 md:px-5 md:py-3">
+                    <div className="mx-auto max-w-4xl overflow-hidden rounded-2xl bg-white shadow-sm focus-within:ring-1 focus-within:ring-[#00a884]/30 md:rounded-lg">
                       {editingMessage && (
                         <div className="flex items-center gap-3 border-b border-amber-100 bg-amber-50 px-3 py-2">
                           <Pencil className="h-4 w-4 shrink-0 text-amber-600" />
@@ -2833,7 +2952,7 @@ export default function ChannelsPage() {
                             <div className="text-xs font-semibold text-amber-800">编辑消息</div>
                             <div className="mt-0.5 truncate text-xs text-amber-700/70">发送后三分钟内可以修改文字内容</div>
                           </div>
-                          <button type="button" onClick={cancelEditMessage} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-amber-700 hover:bg-white" title="取消编辑"><X className="h-3.5 w-3.5" /></button>
+                          <button type="button" onClick={cancelEditMessage} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 shrink-0 items-center justify-center rounded-lg text-amber-700 hover:bg-white" title="取消编辑"><X className="h-3.5 w-3.5" /></button>
                         </div>
                       )}
                       {selectedAskAssistantId && (
@@ -2845,7 +2964,7 @@ export default function ChannelsPage() {
                             {askingAI && <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-emerald-100"><div className="h-full rounded-full bg-emerald-500 transition-[width] duration-700" style={{ width: `${channelAIProgress.progress}%` }} /></div>}
                           </div>
                           {activeChannel.channel_type !== 'ai_private' && (
-                            <button type="button" onClick={() => setSelectedAskAssistantId(null)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-emerald-700 hover:bg-white" title="退出机器人提问"><X className="h-3.5 w-3.5" /></button>
+                            <button type="button" onClick={() => setSelectedAskAssistantId(null)} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 shrink-0 items-center justify-center rounded-lg text-emerald-700 hover:bg-white" title="退出机器人提问"><X className="h-3.5 w-3.5" /></button>
                           )}
                         </div>
                       )}
@@ -2856,7 +2975,7 @@ export default function ChannelsPage() {
                             <div className="text-xs font-semibold text-sky-800">回复 {replyingToMessage.sender_name || `用户 #${replyingToMessage.sender_id}`}</div>
                             <div className="mt-0.5 truncate text-xs text-slate-500">{messagePreview(replyingToMessage)}</div>
                           </div>
-                          <button type="button" onClick={() => setReplyingToMessage(null)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-slate-700" title="取消回复"><X className="h-3.5 w-3.5" /></button>
+                          <button type="button" onClick={() => setReplyingToMessage(null)} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-slate-700" title="取消回复"><X className="h-3.5 w-3.5" /></button>
                         </div>
                       )}
                       {(pendingFiles.length > 0 || pendingGalleryImages.length > 0 || pendingTable) && (
@@ -2881,7 +3000,7 @@ export default function ChannelsPage() {
                                       <div className="truncate text-xs font-semibold text-slate-700">{file.name}</div>
                                       <div className="text-[11px] text-slate-400">{formatFileSize(file.size)}</div>
                                     </div>
-                                    <button type="button" onClick={() => removePendingFile(index)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title={`移除 ${file.name}`}><X className="h-3.5 w-3.5" /></button>
+                                    <button type="button" onClick={() => removePendingFile(index)} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title={`移除 ${file.name}`}><X className="h-3.5 w-3.5" /></button>
                                   </div>
                                 ))}
                               </div>
@@ -2903,7 +3022,7 @@ export default function ChannelsPage() {
                                       <div className="truncate text-xs font-semibold text-slate-700">{image.filename}</div>
                                       <div className="text-[11px] text-emerald-600">来自图库</div>
                                     </div>
-                                    <button type="button" onClick={() => removePendingGalleryImage(image.id)} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title={`移除 ${image.filename}`}><X className="h-3.5 w-3.5" /></button>
+                                    <button type="button" onClick={() => removePendingGalleryImage(image.id)} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title={`移除 ${image.filename}`}><X className="h-3.5 w-3.5" /></button>
                                   </div>
                                 ))}
                               </div>
@@ -2919,15 +3038,43 @@ export default function ChannelsPage() {
                                   {makePendingTablePublic && <span className="inline-flex shrink-0 items-center gap-1 text-emerald-600"><Globe2 className="h-3 w-3" />公共</span>}
                                 </div>
                               </div>
-                              <button type="button" onClick={() => { setPendingTable(null); setMakePendingTablePublic(false) }} className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="移除表格"><X className="h-3.5 w-3.5" /></button>
+                              <button type="button" onClick={() => { setPendingTable(null); setMakePendingTablePublic(false) }} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="移除表格"><X className="h-3.5 w-3.5" /></button>
                             </div>
                           )}
                         </div>
                       )}
 
-                      <textarea ref={messageInputRef} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={handleComposerKeyDown} onContextMenu={openComposerContextMenu} placeholder={editingMessage ? '修改消息内容...' : selectedAskAssistantId ? `向 ${selectedAskAssistantName} 提问...` : replyingToMessage ? `回复 ${replyingToMessage.sender_name || '成员'}...` : '输入消息...'} className="block min-h-20 w-full resize-none px-3 py-3 text-sm text-slate-800 outline-none placeholder:text-slate-400" />
+                      {pendingFiles.length > 0 && pendingFiles.every((file) => file.type.startsWith('image/')) && (
+                        <div className="flex min-w-0 items-center gap-2 border-b border-slate-100 px-2 py-1.5 md:hidden">
+                          <button type="button" onClick={() => { setSavePendingImage((current) => !current); if (savePendingImage) setSelectedDirectoryId('') }} className={`inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition ${savePendingImage ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500'}`}>
+                            {savePendingImage ? <Check className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                            保存到图库
+                          </button>
+                          {savePendingImage && (
+                            <select value={selectedDirectoryId} onChange={(event) => setSelectedDirectoryId(event.target.value)} className="h-10 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 text-sm text-slate-600 outline-none" aria-label="图片保存目录">
+                              <option value="">频道默认目录</option>
+                              {availableDirectories.map((directory) => <option key={directory.id} value={directory.id}>{directory.name}</option>)}
+                            </select>
+                          )}
+                        </div>
+                      )}
 
-                      <div className="flex min-h-11 items-end justify-between gap-2 border-t border-slate-100 px-2 py-1.5 sm:items-center sm:gap-3">
+                      {/* Phones: one row like a native chat app, [+] text [camera] [send]. */}
+                      <div className="flex items-end gap-0.5 p-1 md:block md:p-0">
+                        <button type="button" onClick={() => setComposerSheetOpen(true)} disabled={sending || Boolean(editingMessage)} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-500 transition active:bg-slate-100 disabled:opacity-40 md:hidden" title="添加图片、文件或表格" aria-label="添加图片、文件或表格">
+                          <Plus className="h-6 w-6" />
+                        </button>
+                        <textarea ref={messageInputRef} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={handleComposerKeyDown} onContextMenu={openComposerContextMenu} enterKeyHint={compactLayout ? 'enter' : 'send'} rows={1} placeholder={editingMessage ? '修改消息内容...' : selectedAskAssistantId ? `向 ${selectedAskAssistantName} 提问...` : replyingToMessage ? `回复 ${replyingToMessage.sender_name || '成员'}...` : '输入消息...'} className="block max-h-32 min-h-10 w-full min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-base leading-6 text-slate-800 outline-none placeholder:text-slate-400 md:max-h-none md:min-h-20 md:px-3 md:py-3 md:text-sm md:leading-normal" />
+                        <button type="button" onClick={() => cameraInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-500 transition active:bg-slate-100 disabled:opacity-40 md:hidden" title="拍照发送" aria-label="拍照发送">
+                          <Camera className="h-5 w-5" />
+                        </button>
+                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && pendingFiles.length === 0 && pendingGalleryImages.length === 0 && !pendingTable)} className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 md:hidden ${selectedAskAssistantId ? 'bg-emerald-600' : 'bg-[#00a884]'}`} title={editingMessage ? '保存修改' : '发送'} aria-label={editingMessage ? '保存修改' : '发送'}>
+                          {askingAI || sending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                        </button>
+                      </div>
+                      <input ref={cameraInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(event) => { selectPendingFiles(Array.from(event.target.files || [])); event.target.value = '' }} />
+
+                      <div className="hidden min-h-11 items-end justify-between gap-2 border-t border-slate-100 px-2 py-1.5 sm:items-center sm:gap-3 md:flex">
                         <div className="flex min-w-0 flex-wrap items-center gap-1">
                           {channelAIMembers.length > 0 && (
                             <label className={`mr-1 flex h-8 max-w-52 items-center gap-1.5 rounded-lg border px-2 text-xs ${selectedAskAssistantId ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500'}`} title="选择频道机器人">
@@ -2940,21 +3087,21 @@ export default function ChannelsPage() {
                           )}
                           <input ref={fileInputRef} type="file" className="hidden" onChange={(event) => selectPendingFiles(Array.from(event.target.files || []))} />
                           <input ref={imageInputRef} type="file" accept="image/*" multiple={!selectedAskAssistantId} className="hidden" onChange={(event) => selectPendingFiles(Array.from(event.target.files || []))} />
-                          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_files && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加机器人可读取的图片或文件' : '发送文件'}>
+                          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_files && !selectedAskAssistant?.supports_vision)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加机器人可读取的图片或文件' : '发送文件'}>
                             <Paperclip className="h-4 w-4" />
                           </button>
-                          <button type="button" onClick={() => imageInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加一张机器人可读取的图片' : '从手机相册选择多张图片'}>
+                          <button type="button" onClick={() => imageInputRef.current?.click()} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '添加一张机器人可读取的图片' : '从手机相册选择多张图片'}>
                             <ImagePlus className="h-4 w-4" />
                           </button>
-                          <button type="button" onClick={() => setIsTablePickerOpen(true)} disabled={sending || Boolean(editingMessage) || workbooks.length === 0} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '选择机器人需要读取的工作簿或工作表' : '发送工作簿或工作表'}>
+                          <button type="button" onClick={() => setIsTablePickerOpen(true)} disabled={sending || Boolean(editingMessage) || workbooks.length === 0} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-sky-600 disabled:opacity-40" title={selectedAskAssistantId ? '选择机器人需要读取的工作簿或工作表' : '发送工作簿或工作表'}>
                             <Table2 className="h-4 w-4" />
                           </button>
-                          <button type="button" onClick={() => { setGalleryPickerMode('message'); setIsGalleryPickerOpen(true) }} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '从图库选择机器人需要查看的图片' : '从图库选择图片'}>
+                          <button type="button" onClick={() => { setGalleryPickerMode('message'); setIsGalleryPickerOpen(true) }} disabled={sending || Boolean(editingMessage) || Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-emerald-600 disabled:opacity-40" title={selectedAskAssistantId ? '从图库选择机器人需要查看的图片' : '从图库选择图片'}>
                             <Images className="h-4 w-4" />
                           </button>
                           {pendingFiles.length > 0 && pendingFiles.every((file) => file.type.startsWith('image/')) && (
                             <>
-                              <button type="button" onClick={() => { setSavePendingImage((current) => !current); if (savePendingImage) setSelectedDirectoryId('') }} className={`ml-1 inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs transition ${savePendingImage ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="是否保存到图库">
+                              <button type="button" onClick={() => { setSavePendingImage((current) => !current); if (savePendingImage) setSelectedDirectoryId('') }} className={`ml-1 inline-flex h-10 sm:h-8 items-center gap-1.5 rounded-lg border px-2 text-xs transition ${savePendingImage ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="是否保存到图库">
                                 {savePendingImage ? <Check className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
                                 保存到图库
                               </button>
@@ -2967,7 +3114,7 @@ export default function ChannelsPage() {
                             </>
                           )}
                         </div>
-                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && pendingFiles.length === 0 && pendingGalleryImages.length === 0 && !pendingTable)} className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={editingMessage ? '保存修改' : askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : pendingFiles.length + pendingGalleryImages.length > 1 ? `发送 ${pendingFiles.length + pendingGalleryImages.length} 张图片` : '发送'}>
+                        <button type="button" onClick={() => void sendMessage()} disabled={sending || (!messageText.trim() && pendingFiles.length === 0 && pendingGalleryImages.length === 0 && !pendingTable)} className={`inline-flex h-10 w-10 sm:h-9 sm:w-9 shrink-0 items-center justify-center rounded-full text-white transition disabled:bg-slate-200 disabled:text-slate-400 ${selectedAskAssistantId ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-[#00a884] hover:bg-[#008f72]'}`} title={editingMessage ? '保存修改' : askingAI ? 'AI 正在回答' : selectedAskAssistantId ? `发送给 ${selectedAskAssistantName}` : pendingFiles.length + pendingGalleryImages.length > 1 ? `发送 ${pendingFiles.length + pendingGalleryImages.length} 张图片` : '发送'}>
                           {askingAI ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                         </button>
                       </div>
@@ -2985,13 +3132,13 @@ export default function ChannelsPage() {
         </div>
 
         {historySearchOpen && (
-          <section className="fixed inset-x-3 top-16 z-[55] flex max-h-[calc(100vh-5rem)] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl md:left-auto md:right-8 md:top-20 md:w-[460px]">
-            <div className="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 px-4">
+          <section className="fixed inset-0 z-[95] flex flex-col overflow-hidden bg-white pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] md:inset-auto md:right-8 md:top-20 md:z-[55] md:max-h-[calc(100vh-5rem)] md:w-[460px] md:rounded-lg md:border md:border-slate-200 md:pb-0 md:pt-0 md:shadow-2xl">
+            <div className="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-slate-200 px-4">
               <div>
                 <div className="text-sm font-semibold text-slate-900">搜索历史消息</div>
                 <div className="mt-0.5 text-[11px] text-slate-400">关键词、时间、账号和消息类型可以组合筛选</div>
               </div>
-              <button type="button" onClick={() => setHistorySearchOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭">
+              <button type="button" onClick={() => setHistorySearchOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -3054,8 +3201,8 @@ export default function ChannelsPage() {
                 </div>
 
                 <div className="flex items-center justify-between gap-3 border-b border-slate-100 pb-3">
-                  <button type="button" onClick={() => { setHistoryKeyword(''); setHistoryMatchMode('contains'); setHistorySenderId(''); setHistoryMessageType('all'); setHistoryFrom(''); setHistoryTo('') }} className="h-9 rounded-lg px-3 text-sm text-slate-500 hover:bg-slate-100">重置条件</button>
-                  <button type="button" onClick={() => void runHistorySearch()} disabled={searchingHistory} className="inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">
+                  <button type="button" onClick={() => { setHistoryKeyword(''); setHistoryMatchMode('contains'); setHistorySenderId(''); setHistoryMessageType('all'); setHistoryFrom(''); setHistoryTo('') }} className="h-10 sm:h-9 rounded-lg px-3 text-sm text-slate-500 hover:bg-slate-100">重置条件</button>
+                  <button type="button" onClick={() => void runHistorySearch()} disabled={searchingHistory} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">
                     <Search className="h-4 w-4" />
                     {searchingHistory ? '搜索中...' : '搜索'}
                   </button>
@@ -3093,14 +3240,14 @@ export default function ChannelsPage() {
         )}
 
         {notificationSettingsOpen && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setNotificationSettingsOpen(false) }}>
-            <div className="w-full max-w-md overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setNotificationSettingsOpen(false) }}>
+            <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg border border-slate-200 bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">频道通知设置</div>
                   <div className="mt-1 text-xs text-slate-400">管理未读消息和新消息提示音</div>
                 </div>
-                <button type="button" onClick={() => setNotificationSettingsOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setNotificationSettingsOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
 
               <div className="space-y-3 p-5">
@@ -3129,22 +3276,22 @@ export default function ChannelsPage() {
               </div>
 
               <div className="flex items-center justify-between gap-3 border-t border-slate-200 px-5 py-4">
-                <button type="button" onClick={() => void markAllChannelsRead()} disabled={totalUnreadCount === 0} className="h-9 rounded-lg px-3 text-sm text-sky-700 hover:bg-sky-50 disabled:text-slate-300 disabled:hover:bg-transparent">全部标记已读</button>
-                <button type="button" onClick={() => setNotificationSettingsOpen(false)} className="h-9 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700">完成</button>
+                <button type="button" onClick={() => void markAllChannelsRead()} disabled={totalUnreadCount === 0} className="h-10 sm:h-9 rounded-lg px-3 text-sm text-sky-700 hover:bg-sky-50 disabled:text-slate-300 disabled:hover:bg-transparent">全部标记已读</button>
+                <button type="button" onClick={() => setNotificationSettingsOpen(false)} className="h-10 sm:h-9 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700">完成</button>
               </div>
             </div>
           </div>
         )}
 
         {isAssistantPickerOpen && (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsAssistantPickerOpen(false) }}>
-            <div className="flex max-h-[78vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsAssistantPickerOpen(false) }}>
+            <div className="flex max-h-[92dvh] sm:max-h-[78vh] w-full max-w-lg flex-col overflow-hidden rounded-t-2xl sm:rounded-lg border border-slate-200 bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="flex items-center gap-2 text-base font-semibold text-slate-900"><Bot className="h-4 w-4 text-emerald-600" />AI 机器人</div>
                   <div className="mt-1 text-xs text-slate-400">选择一个机器人打开专属私聊</div>
                 </div>
-                <button type="button" onClick={() => setIsAssistantPickerOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setIsAssistantPickerOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto p-4">
                 {loadingAssistants ? (
@@ -3178,14 +3325,14 @@ export default function ChannelsPage() {
         )}
 
         {isCreateOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsCreateOpen(false) }}>
-            <div className="w-full max-w-md rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsCreateOpen(false) }}>
+            <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">新建频道</div>
                   <div className="mt-1 text-xs text-slate-400">频道创建后即可发送消息和表格</div>
                 </div>
-                <button type="button" onClick={() => setIsCreateOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setIsCreateOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
               <div className="space-y-4 p-5">
                 <label className="block">
@@ -3198,22 +3345,22 @@ export default function ChannelsPage() {
                 </label>
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">
-                <button type="button" onClick={() => setIsCreateOpen(false)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-                <button type="button" onClick={() => void handleCreateChannel()} disabled={creatingChannel || !newChannelName.trim()} className="h-9 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">创建</button>
+                <button type="button" onClick={() => setIsCreateOpen(false)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                <button type="button" onClick={() => void handleCreateChannel()} disabled={creatingChannel || !newChannelName.trim()} className="h-10 sm:h-9 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">创建</button>
               </div>
             </div>
           </div>
         )}
 
         {isTablePickerOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTablePickerOpen(false) }}>
-            <div className="flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTablePickerOpen(false) }}>
+            <div className="flex max-h-[92dvh] sm:max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">发送表格</div>
                   <div className="mt-1 text-xs text-slate-400">按主页文件夹浏览工作簿，也可跨目录搜索并选择工作表</div>
                 </div>
-                <button type="button" onClick={() => setIsTablePickerOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setIsTablePickerOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
               <div className="grid min-h-0 flex-1 grid-rows-[minmax(240px,42vh)_minmax(0,1fr)] md:grid-cols-[360px_minmax(0,1fr)] md:grid-rows-none">
                 <div className="flex min-h-0 flex-col border-b border-slate-200 md:border-b-0 md:border-r">
@@ -3223,7 +3370,7 @@ export default function ChannelsPage() {
                       <input value={tableSearch} onChange={(event) => setTableSearch(event.target.value)} placeholder="跨文件夹搜索工作簿" className="min-w-0 flex-1 bg-transparent outline-none" />
                     </label>
                     <div className="mt-2 flex items-center justify-between gap-2">
-                      <button type="button" onClick={toggleTablePickerOnlyMine} className={`inline-flex h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${tablePickerOnlyMine ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`} aria-pressed={tablePickerOnlyMine}>
+                      <button type="button" onClick={toggleTablePickerOnlyMine} className={`inline-flex h-10 sm:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${tablePickerOnlyMine ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`} aria-pressed={tablePickerOnlyMine}>
                         {tablePickerOnlyMine ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
                         仅看自己的表
                       </button>
@@ -3272,8 +3419,8 @@ export default function ChannelsPage() {
                     <div className="flex h-11 shrink-0 items-center justify-between border-t border-slate-200 px-3 text-xs text-slate-500">
                       <span>{tablePickerPage} / {totalTablePickerPages} 页</span>
                       <div className="flex items-center gap-1">
-                        <button type="button" onClick={() => setTablePickerPage((page) => Math.max(1, page - 1))} disabled={tablePickerPage <= 1} className="inline-flex h-7 w-7 items-center justify-center rounded-lg hover:bg-slate-100 disabled:text-slate-300" title="上一页"><ChevronLeft className="h-4 w-4" /></button>
-                        <button type="button" onClick={() => setTablePickerPage((page) => Math.min(totalTablePickerPages, page + 1))} disabled={tablePickerPage >= totalTablePickerPages} className="inline-flex h-7 w-7 items-center justify-center rounded-lg hover:bg-slate-100 disabled:text-slate-300" title="下一页"><ChevronRight className="h-4 w-4" /></button>
+                        <button type="button" onClick={() => setTablePickerPage((page) => Math.max(1, page - 1))} disabled={tablePickerPage <= 1} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 items-center justify-center rounded-lg hover:bg-slate-100 disabled:text-slate-300" title="上一页"><ChevronLeft className="h-4 w-4" /></button>
+                        <button type="button" onClick={() => setTablePickerPage((page) => Math.min(totalTablePickerPages, page + 1))} disabled={tablePickerPage >= totalTablePickerPages} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 items-center justify-center rounded-lg hover:bg-slate-100 disabled:text-slate-300" title="下一页"><ChevronRight className="h-4 w-4" /></button>
                       </div>
                     </div>
                   )}
@@ -3311,15 +3458,15 @@ export default function ChannelsPage() {
                 <div className="min-w-0">
                   <span className="block truncate text-xs text-slate-400">{selectedPickerWorkbook ? `已选择：${tablePickerSheetId ? tablePickerSheets.find((sheet) => String(sheet.id) === tablePickerSheetId)?.name || selectedPickerWorkbook.name : selectedPickerWorkbook.name}` : '尚未选择工作簿'}</span>
                   {selectedPickerWorkbook && canPublishSelectedPickerWorkbook && (
-                    <button type="button" onClick={() => setMakePendingTablePublic((current) => !current)} className={`mt-2 inline-flex h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${makePendingTablePublic ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
+                    <button type="button" onClick={() => setMakePendingTablePublic((current) => !current)} className={`mt-2 inline-flex h-10 sm:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${makePendingTablePublic ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
                       <Globe2 className="h-3.5 w-3.5" />
                       {makePendingTablePublic ? '发送时设为公共表' : '仅按现有权限发送'}
                     </button>
                   )}
                 </div>
                 <div className="flex shrink-0 gap-2">
-                  <button type="button" onClick={() => setIsTablePickerOpen(false)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-                  <button type="button" onClick={confirmTableSelection} disabled={!selectedPickerWorkbook} className="h-9 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">添加到消息</button>
+                  <button type="button" onClick={() => setIsTablePickerOpen(false)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                  <button type="button" onClick={confirmTableSelection} disabled={!selectedPickerWorkbook} className="h-10 sm:h-9 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">添加到消息</button>
                 </div>
               </div>
             </div>
@@ -3327,14 +3474,14 @@ export default function ChannelsPage() {
         )}
 
         {isGalleryPickerOpen && (
-          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/35 p-3 sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsGalleryPickerOpen(false) }}>
-            <div className="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsGalleryPickerOpen(false) }}>
+            <div className="flex max-h-[92dvh] sm:max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">{galleryPickerMode === 'channel-avatar' ? '选择频道头像' : '从图库选择图片'}</div>
                   <div className="mt-1 text-xs text-slate-400">{galleryPickerMode === 'channel-avatar' ? '仅显示你当前有权查看的图库图片' : selectedAskAssistantId ? '机器人每次只能读取一张图片' : '可多选已经保存到图库的图片并批量发送'}</div>
                 </div>
-                <button type="button" onClick={() => setIsGalleryPickerOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setIsGalleryPickerOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
 
               <div className="border-b border-slate-100 p-3">
@@ -3381,8 +3528,8 @@ export default function ChannelsPage() {
               <div className="flex items-center justify-between border-t border-slate-200 px-5 py-4">
                 <span className="text-xs text-slate-400">{selectedGalleryImageIds.length > 0 ? `已选择 ${selectedGalleryImageIds.length} 张` : `共 ${galleryImages.length} 张已保存图片`}</span>
                 <div className="flex gap-2">
-                  <button type="button" onClick={() => setIsGalleryPickerOpen(false)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-                  <button type="button" onClick={() => void confirmGallerySelection()} disabled={selectedGalleryImageIds.length === 0} className="h-9 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40">{galleryPickerMode === 'channel-avatar' ? '设为频道头像' : selectedGalleryImageIds.length > 1 ? `添加 ${selectedGalleryImageIds.length} 张` : '添加到消息'}</button>
+                  <button type="button" onClick={() => setIsGalleryPickerOpen(false)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                  <button type="button" onClick={() => void confirmGallerySelection()} disabled={selectedGalleryImageIds.length === 0} className="h-10 sm:h-9 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40">{galleryPickerMode === 'channel-avatar' ? '设为频道头像' : selectedGalleryImageIds.length > 1 ? `添加 ${selectedGalleryImageIds.length} 张` : '添加到消息'}</button>
                 </div>
               </div>
             </div>
@@ -3390,14 +3537,14 @@ export default function ChannelsPage() {
         )}
 
         {renamingGalleryImage && (
-          <div className="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/45 p-4" onMouseDown={(event) => { event.stopPropagation(); if (event.target === event.currentTarget) setRenamingGalleryImage(null) }}>
-            <div className="w-full max-w-md rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[85] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { event.stopPropagation(); if (event.target === event.currentTarget) setRenamingGalleryImage(null) }}>
+            <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">重命名图片</div>
                   <div className="mt-1 text-xs text-slate-400">修改后图库和频道消息中的名称会同步更新</div>
                 </div>
-                <button type="button" onClick={() => setRenamingGalleryImage(null)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setRenamingGalleryImage(null)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
               <div className="p-5">
                 <label className="block">
@@ -3408,22 +3555,22 @@ export default function ChannelsPage() {
                 {galleryRenameError && <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{galleryRenameError}</div>}
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">
-                <button type="button" onClick={() => setRenamingGalleryImage(null)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-                <button type="button" onClick={() => void handleGalleryImageRename()} disabled={savingGalleryRename || !galleryRenameValue.trim()} className="h-9 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingGalleryRename ? '保存中...' : '保存名称'}</button>
+                <button type="button" onClick={() => setRenamingGalleryImage(null)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                <button type="button" onClick={() => void handleGalleryImageRename()} disabled={savingGalleryRename || !galleryRenameValue.trim()} className="h-10 sm:h-9 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingGalleryRename ? '保存中...' : '保存名称'}</button>
               </div>
             </div>
           </div>
         )}
 
         {forwardingMessage && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setForwardingMessage(null) }}>
-            <div className="flex max-h-[72vh] w-full max-w-md flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setForwardingMessage(null) }}>
+            <div className="flex max-h-[92dvh] sm:max-h-[72vh] w-full max-w-md flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">转发消息</div>
                   <div className="mt-1 text-xs text-slate-400">选择接收频道</div>
                 </div>
-                <button type="button" onClick={() => setForwardingMessage(null)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setForwardingMessage(null)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
               <div className="border-b border-slate-100 p-3">
                 <label className="flex h-9 items-center gap-2 rounded-lg bg-slate-100 px-3 text-sm text-slate-500 focus-within:ring-1 focus-within:ring-sky-300">
@@ -3446,22 +3593,22 @@ export default function ChannelsPage() {
                 ))}
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-200 px-5 py-4">
-                <button type="button" onClick={() => setForwardingMessage(null)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
-                <button type="button" onClick={() => void handleForward()} disabled={!forwardTargetChannelId || forwarding} className="inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"><Share2 className="h-4 w-4" />转发</button>
+                <button type="button" onClick={() => setForwardingMessage(null)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">取消</button>
+                <button type="button" onClick={() => void handleForward()} disabled={!forwardTargetChannelId || forwarding} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"><Share2 className="h-4 w-4" />转发</button>
               </div>
             </div>
           </div>
         )}
 
         {isManageOpen && activeChannel && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsManageOpen(false) }}>
-            <div className="flex max-h-[84vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
+          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsManageOpen(false) }}>
+            <div className="flex max-h-[92dvh] sm:max-h-[84vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
                   <div className="text-base font-semibold text-slate-900">管理频道</div>
                   <div className="mt-1 text-xs text-slate-400">{activeChannel.member_count || channelMembers.length || 1} 位成员</div>
                 </div>
-                <button type="button" onClick={() => setIsManageOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => setIsManageOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="关闭"><X className="h-4 w-4" /></button>
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto">
@@ -3471,14 +3618,14 @@ export default function ChannelsPage() {
                     <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-600 text-white">
                       <WhatsAppAvatarImage src={activeChannel.avatar_url} alt={activeChannel.name} fallback={<span className="text-sm font-semibold">{initials(activeChannel.name)}</span>} />
                     </div>
-                    <div className="min-w-0 flex-1">
+                    <div className="min-w-[9rem] flex-1">
                       <div className="text-sm font-semibold text-slate-800">频道头像</div>
                       <div className="mt-1 text-xs text-slate-400">支持直接上传图片，或从当前可访问的图库中选择。</div>
                     </div>
                     <input ref={channelAvatarInputRef} type="file" accept="image/*" className="hidden" onChange={(event) => void handleChannelAvatarUpload(event.target.files?.[0] || null)} />
                     <div className="flex shrink-0 gap-2">
-                      <button type="button" onClick={() => channelAvatarInputRef.current?.click()} disabled={uploadingChannelAvatar} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"><ImageIcon className="h-4 w-4" />{uploadingChannelAvatar ? '上传中' : '上传'}</button>
-                      <button type="button" onClick={() => { setGalleryPickerMode('channel-avatar'); setIsGalleryPickerOpen(true) }} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50"><Images className="h-4 w-4" />图库选择</button>
+                      <button type="button" onClick={() => channelAvatarInputRef.current?.click()} disabled={uploadingChannelAvatar} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"><ImageIcon className="h-4 w-4" />{uploadingChannelAvatar ? '上传中' : '上传'}</button>
+                      <button type="button" onClick={() => { setGalleryPickerMode('channel-avatar'); setIsGalleryPickerOpen(true) }} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50"><Images className="h-4 w-4" />图库选择</button>
                     </div>
                   </div>
                   <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto]">
@@ -3497,7 +3644,7 @@ export default function ChannelsPage() {
                       <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><DatabaseBackup className="h-4 w-4 text-sky-600" />聊天备份与恢复</div>
                       <div className="mt-1 text-xs text-slate-500">备份包含频道消息、引用关系和附件，可下载，也可以恢复到当前频道。</div>
                     </div>
-                    <button type="button" onClick={() => void handleCreateBackup()} disabled={creatingBackup} className="inline-flex h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">
+                    <button type="button" onClick={() => void handleCreateBackup()} disabled={creatingBackup} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-sky-600 px-4 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50">
                       {creatingBackup ? <RefreshCw className="h-4 w-4 animate-spin" /> : <DatabaseBackup className="h-4 w-4" />}
                       {creatingBackup ? '备份中' : '立即备份'}
                     </button>
@@ -3524,10 +3671,10 @@ export default function ChannelsPage() {
                               </div>
                             </div>
                             <div className="flex shrink-0 items-center gap-1">
-                              <a href={backup.download_url} download={backup.filename} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="下载备份"><Download className="h-4 w-4" /></a>
-                              <button type="button" onClick={() => void handleRestoreBackup(backup)} disabled={restoringBackupId === backup.id} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-emerald-700 disabled:opacity-50" title="恢复到当前频道">{restoringBackupId === backup.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <ArchiveRestore className="h-4 w-4" />}</button>
-                              <button type="button" onClick={() => void loadBackupRestores(backup.id)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="查看恢复记录"><RotateCcw className="h-4 w-4" /></button>
-                              {currentUser && (isAdmin(currentUser) || backup.created_by === currentUser.id) && <button type="button" onClick={() => void handleDeleteBackup(backup)} disabled={deletingBackupId === backup.id} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50" title="删除备份"><Trash2 className="h-4 w-4" /></button>}
+                              <a href={backup.download_url} download={backup.filename} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="下载备份"><Download className="h-4 w-4" /></a>
+                              <button type="button" onClick={() => void handleRestoreBackup(backup)} disabled={restoringBackupId === backup.id} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-emerald-700 disabled:opacity-50" title="恢复到当前频道">{restoringBackupId === backup.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <ArchiveRestore className="h-4 w-4" />}</button>
+                              <button type="button" onClick={() => void loadBackupRestores(backup.id)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-white hover:text-sky-700" title="查看恢复记录"><RotateCcw className="h-4 w-4" /></button>
+                              {currentUser && (isAdmin(currentUser) || backup.created_by === currentUser.id) && <button type="button" onClick={() => void handleDeleteBackup(backup)} disabled={deletingBackupId === backup.id} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50" title="删除备份"><Trash2 className="h-4 w-4" /></button>}
                             </div>
                           </div>
                           {selectedBackupId === backup.id && (
@@ -3562,11 +3709,11 @@ export default function ChannelsPage() {
                   {selectedWhatsAppAccount && <div className="mb-3 flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-emerald-100 text-emerald-700"><WhatsAppAvatarImage src={selectedWhatsAppAccount.profile_pic_url} fallback={<MessageCircle className="h-4 w-4" />} /></div><div className="min-w-0 flex-1"><div className="truncate text-sm font-semibold text-slate-800">{selectedWhatsAppAccount.display_name || selectedWhatsAppAccount.username}</div><div className="mt-0.5 truncate text-xs text-slate-400">员工 {selectedWhatsAppAccount.username} · {selectedWhatsAppAccount.status === 'ready' ? '可用于频道沟通' : '需要先绑定 WhatsApp'}</div></div></div>}
                   {selectedWhatsAppAccount?.status === 'ready' && (
                     <div className="mb-3 flex flex-wrap gap-2">
-                      <button type="button" onClick={() => void handleSyncWhatsAppContacts()} disabled={syncingWhatsAppContacts} className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50" title="为尚未关联的 WhatsApp 联系人批量创建同名频道">
+                      <button type="button" onClick={() => void handleSyncWhatsAppContacts()} disabled={syncingWhatsAppContacts} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50" title="为尚未关联的 WhatsApp 联系人批量创建同名频道">
                         {syncingWhatsAppContacts ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Users className="h-4 w-4" />}
                         {syncingWhatsAppContacts ? '同步客户中' : '同步客户为频道'}
                       </button>
-                      {whatsAppLink && <button type="button" onClick={() => void handleSyncWhatsAppHistory()} disabled={syncingWhatsAppHistory} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50" title="导入当前 WhatsApp 会话最近 500 条历史消息">{syncingWhatsAppHistory ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}{syncingWhatsAppHistory ? '同步记录中' : '同步历史聊天'}</button>}
+                      {whatsAppLink && <button type="button" onClick={() => void handleSyncWhatsAppHistory()} disabled={syncingWhatsAppHistory} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50" title="导入当前 WhatsApp 会话最近 500 条历史消息">{syncingWhatsAppHistory ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}{syncingWhatsAppHistory ? '同步记录中' : '同步历史聊天'}</button>}
                     </div>
                   )}
                   {loadingWhatsApp ? (
@@ -3581,7 +3728,7 @@ export default function ChannelsPage() {
                         <Search className="h-4 w-4 shrink-0" />
                         <input type="search" value={whatsAppChatSearch} onChange={(event) => setWhatsAppChatSearch(event.target.value)} placeholder="搜索姓名、号码或最近消息" autoComplete="off" className="min-w-0 flex-1 bg-transparent outline-none" />
                         <span className="shrink-0 text-[11px] text-slate-400">{filteredWhatsAppChats.length}/{whatsAppChats.length}</span>
-                        <button type="button" onClick={() => void refreshSelectedWhatsAppChats()} disabled={refreshingWhatsAppChats} className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-white hover:text-emerald-700 disabled:opacity-50" title="重新识别 WhatsApp 联系人姓名" aria-label="刷新 WhatsApp 联系人">
+                        <button type="button" onClick={() => void refreshSelectedWhatsAppChats()} disabled={refreshingWhatsAppChats} className="inline-flex h-10 w-10 sm:h-7 sm:w-7 shrink-0 items-center justify-center rounded-md text-slate-400 hover:bg-white hover:text-emerald-700 disabled:opacity-50" title="重新识别 WhatsApp 联系人姓名" aria-label="刷新 WhatsApp 联系人">
                           <RefreshCw className={`h-3.5 w-3.5 ${refreshingWhatsAppChats ? 'animate-spin' : ''}`} />
                         </button>
                       </div>
@@ -3601,8 +3748,8 @@ export default function ChannelsPage() {
                         <label className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 p-3"><div><div className="text-sm font-medium text-slate-700">发送频道消息</div><div className="mt-0.5 text-xs text-slate-400">新消息自动同步到 WhatsApp</div></div><input type="checkbox" checked={syncWhatsAppOutbound} onChange={(event) => setSyncWhatsAppOutbound(event.target.checked)} className="h-4 w-4 accent-emerald-600" /></label>
                       </div>
                       <div className="mt-3 flex justify-end gap-2">
-                        {whatsAppLink && <button type="button" onClick={() => void handleDeleteWhatsAppLink()} disabled={savingWhatsApp} className="h-9 rounded-lg border border-rose-200 px-4 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50">取消关联</button>}
-                        <button type="button" onClick={() => void handleSaveWhatsAppLink()} disabled={!selectedWhatsAppAccountId || !selectedWhatsAppChatId || savingWhatsApp} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingWhatsApp ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存关联</button>
+                        {whatsAppLink && <button type="button" onClick={() => void handleDeleteWhatsAppLink()} disabled={savingWhatsApp} className="h-10 sm:h-9 rounded-lg border border-rose-200 px-4 text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50">取消关联</button>}
+                        <button type="button" onClick={() => void handleSaveWhatsAppLink()} disabled={!selectedWhatsAppAccountId || !selectedWhatsAppChatId || savingWhatsApp} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">{savingWhatsApp ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存关联</button>
                       </div>
                     </>
                   )}
@@ -3636,7 +3783,7 @@ export default function ChannelsPage() {
                     </div>
                   )}
                   <div className="mt-3 flex justify-end">
-                    <button type="button" onClick={() => void handleSaveAIMembers()} disabled={savingAssistants || loadingAssistants} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">
+                    <button type="button" onClick={() => void handleSaveAIMembers()} disabled={savingAssistants || loadingAssistants} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">
                       {savingAssistants ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                       保存机器人
                     </button>
@@ -3663,7 +3810,7 @@ export default function ChannelsPage() {
                             <div className="truncate text-xs text-slate-400">{member.email}</div>
                           </div>
                           {member.role !== 'owner' && (
-                            <button type="button" onClick={() => void handleRemoveMember(member)} disabled={removingMemberId === member.user_id} className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-40" title="移除成员"><X className="h-4 w-4" /></button>
+                            <button type="button" onClick={() => void handleRemoveMember(member)} disabled={removingMemberId === member.user_id} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-40" title="移除成员"><X className="h-4 w-4" /></button>
                           )}
                         </div>
                       ))}
@@ -3698,7 +3845,7 @@ export default function ChannelsPage() {
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <span className="text-xs text-slate-400">已选择 {selectedMemberIds.length} 人</span>
-                    <button type="button" onClick={() => void handleAddMembers()} disabled={addingMembers || selectedMemberIds.length === 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-40">
+                    <button type="button" onClick={() => void handleAddMembers()} disabled={addingMembers || selectedMemberIds.length === 0} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-40">
                       <UserPlus className="h-4 w-4" />
                       添加已选
                     </button>
@@ -3707,8 +3854,8 @@ export default function ChannelsPage() {
               </div>
 
               <div className="flex items-center justify-between border-t border-slate-200 px-5 py-4">
-                <button type="button" onClick={() => void handleDeleteChannel()} className="inline-flex h-9 items-center gap-2 rounded-lg px-3 text-sm text-rose-600 hover:bg-rose-50"><Trash2 className="h-4 w-4" />删除频道</button>
-                <button type="button" onClick={() => setIsManageOpen(false)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">完成</button>
+                <button type="button" onClick={() => void handleDeleteChannel()} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg px-3 text-sm text-rose-600 hover:bg-rose-50"><Trash2 className="h-4 w-4" />删除频道</button>
+                <button type="button" onClick={() => setIsManageOpen(false)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600 hover:bg-slate-50">完成</button>
               </div>
             </div>
           </div>
@@ -3725,31 +3872,96 @@ export default function ChannelsPage() {
             }}
             onClose={closeImagePreview}
             dimmed={Boolean(transformingMessageImage)}
-            zIndexClass="z-[60]"
+            zIndexClass="z-[100]"
             footer={
               <>
                 <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
-                  <button type="button" onClick={() => void handleTransformMessageImage('rotate-left')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
-                  <button type="button" onClick={() => void handleTransformMessageImage('rotate-right')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
-                  <button type="button" onClick={() => void handleTransformMessageImage('flip-horizontal')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
-                  <button type="button" onClick={() => void handleTransformMessageImage('flip-vertical')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('rotate-left')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向左旋转并保存"><RotateCcw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('rotate-right')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="向右旋转并保存"><RotateCw className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('flip-horizontal')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="水平翻转并保存"><FlipHorizontal2 className="h-4 w-4" /></button>
+                  <button type="button" onClick={() => void handleTransformMessageImage('flip-vertical')} disabled={Boolean(transformingMessageImage)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 hover:text-white disabled:opacity-40" title="垂直翻转并保存"><FlipVertical2 className="h-4 w-4" /></button>
                 </div>
                 <select value={previewDirectoryId} onChange={(event) => setPreviewDirectoryId(event.target.value)} className="h-9 max-w-56 rounded-lg border border-white/15 bg-slate-900 px-3 text-sm text-slate-200 outline-none">
                   <option value="">频道默认目录</option>
                   {availableDirectories.map((directory) => <option key={directory.id} value={directory.id}>{directory.name}</option>)}
                 </select>
-                <button type="button" onClick={() => void handleSaveImage(previewImageMessage)} disabled={savingImage || savedImageIds.includes(previewImageMessage.id)} className="inline-flex h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400">
+                <button type="button" onClick={() => void handleSaveImage(previewImageMessage)} disabled={savingImage || savedImageIds.includes(previewImageMessage.id)} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-400">
                   <Save className="h-4 w-4" />
                   {savedImageIds.includes(previewImageMessage.id) ? '已保存到图库' : savingImage ? '保存中...' : '保存到图库'}
                 </button>
-                {transformingMessageImage && <span className="inline-flex h-9 items-center gap-2 px-2 text-xs text-slate-300"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingMessageImage)}并保存中...</span>}
+                {transformingMessageImage && <span className="inline-flex h-10 sm:h-9 items-center gap-2 px-2 text-xs text-slate-300"><RefreshCw className="h-3.5 w-3.5 animate-spin" />{imageTransformLabel(transformingMessageImage)}并保存中...</span>}
               </>
             }
           />
         )}
 
+        {composerSheetOpen && activeChannel && (
+          <div className="fixed inset-0 z-[90] flex items-end bg-slate-950/40" onClick={() => setComposerSheetOpen(false)}>
+            <div className="w-full rounded-t-2xl bg-white px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2 shadow-2xl" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="添加内容">
+              <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-slate-200" />
+              <div className="grid grid-cols-4 gap-2 text-xs text-slate-600">
+                {[
+                  { key: 'camera', label: '拍照', icon: Camera, tone: 'bg-rose-50 text-rose-600', disabled: Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision), run: () => cameraInputRef.current?.click() },
+                  { key: 'album', label: '相册', icon: ImagePlus, tone: 'bg-emerald-50 text-emerald-600', disabled: Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision), run: () => imageInputRef.current?.click() },
+                  { key: 'file', label: '文件', icon: Paperclip, tone: 'bg-sky-50 text-sky-600', disabled: Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_files && !selectedAskAssistant?.supports_vision), run: () => fileInputRef.current?.click() },
+                  { key: 'gallery', label: '图库', icon: Images, tone: 'bg-violet-50 text-violet-600', disabled: Boolean(selectedAskAssistantId && !selectedAskAssistant?.supports_vision), run: () => { setGalleryPickerMode('message'); setIsGalleryPickerOpen(true) } },
+                  { key: 'table', label: '表格', icon: Table2, tone: 'bg-amber-50 text-amber-600', disabled: workbooks.length === 0, run: () => setIsTablePickerOpen(true) },
+                ].map((option) => {
+                  const Icon = option.icon
+                  return (
+                    <button key={option.key} type="button" disabled={option.disabled} onClick={() => { setComposerSheetOpen(false); option.run() }} className="flex flex-col items-center gap-1.5 rounded-xl py-2 transition active:bg-slate-100 disabled:opacity-40">
+                      <span className={`flex h-12 w-12 items-center justify-center rounded-2xl ${option.tone}`}><Icon className="h-6 w-6" /></span>
+                      {option.label}
+                    </button>
+                  )
+                })}
+              </div>
+              {channelAIMembers.length > 0 && (
+                <label className="mt-3 flex h-11 items-center gap-2 rounded-xl border border-slate-200 px-3 text-sm text-slate-600">
+                  <Bot className="h-4 w-4 shrink-0 text-emerald-600" />
+                  <span className="shrink-0">发送对象</span>
+                  <select value={selectedAskAssistantId || ''} onChange={(event) => { handleAskAssistantSelection(event.target.value); setComposerSheetOpen(false) }} disabled={sending || activeChannel.channel_type === 'ai_private'} className="min-w-0 flex-1 bg-transparent text-right text-base outline-none">
+                    {activeChannel.channel_type !== 'ai_private' && <option value="">普通消息</option>}
+                    {channelAIMembers.map((assistant) => <option key={assistant.assistant_id} value={assistant.assistant_id}>@{assistant.name}</option>)}
+                  </select>
+                </label>
+              )}
+              <button type="button" onClick={() => setComposerSheetOpen(false)} className="mt-3 h-11 w-full rounded-xl bg-slate-100 text-sm font-medium text-slate-600">取消</button>
+            </div>
+          </div>
+        )}
+
+        {contextMenu?.sheet && (
+          // Backdrop clicks reach the window listener that closes the menu.
+          <div className="fixed inset-0 z-[89] bg-slate-950/40" aria-hidden="true" />
+        )}
         {contextMenu && (
-          <div className="fixed z-[70] max-h-[70vh] w-56 overflow-y-auto rounded-lg border border-slate-200 bg-white py-1 shadow-xl" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
+          <div
+            className={contextMenu.sheet
+              ? 'fixed inset-x-0 bottom-0 z-[90] max-h-[75dvh] overflow-y-auto overscroll-contain rounded-t-2xl bg-white px-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 shadow-2xl [&_button]:h-12 [&_button]:rounded-xl [&_button]:text-[15px]'
+              : 'fixed z-[70] max-h-[70vh] w-56 overflow-y-auto rounded-lg border border-slate-200 bg-white py-1 shadow-xl'}
+            style={contextMenu.sheet ? undefined : { left: contextMenu.x, top: contextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+            onClickCapture={(event) => {
+              // The finger that long-pressed may lift over the sheet; that
+              // release must not trigger the action underneath it.
+              if (contextMenu.sheet && messageLongPress.justLongPressed()) {
+                event.preventDefault()
+                event.stopPropagation()
+              }
+            }}
+            role="menu"
+          >
+            {contextMenu.sheet && (
+              <>
+                <div className="mx-auto mb-2 h-1 w-10 rounded-full bg-slate-200" />
+                {contextMenu.message && (
+                  <div className="mx-2 mb-1 line-clamp-2 rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-500">
+                    {messagePreview(contextMenu.message)}
+                  </div>
+                )}
+              </>
+            )}
             {contextMenu.kind === 'message' && contextMenu.message ? (
               <>
                 {!contextMenu.message.recalled_at && (
@@ -3799,6 +4011,9 @@ export default function ChannelsPage() {
                   <button type="button" onClick={() => { const message = contextMenu.message; if (message) void handleRecallMessage(message) }} disabled={recallingMessageId === contextMenu.message.id} className="flex h-9 w-full items-center gap-2.5 border-t border-slate-100 px-3 text-left text-sm text-rose-600 hover:bg-rose-50 disabled:opacity-50"><Undo2 className="h-4 w-4" />撤回消息</button>
                 )}
                 {contextMenu.message.recalled_at && <div className="px-3 py-2 text-xs text-slate-400">该消息已撤回</div>}
+                {contextMenu.sheet && (
+                  <button type="button" onClick={() => setContextMenu(null)} className="mt-1 flex w-full items-center justify-center bg-slate-100 text-sm font-medium text-slate-600">取消</button>
+                )}
               </>
             ) : (
               <>

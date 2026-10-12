@@ -7,6 +7,8 @@ import {
   BarChart3,
   Bot,
   Check,
+  ChevronLeft,
+  ChevronRight,
   FileText,
   Loader2,
   Pencil,
@@ -19,6 +21,7 @@ import {
   X,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import { MOBILE_QUERY, useHistoryLayer, useMediaQuery } from '@/hooks/useMobileGestures'
 import api from '@/lib/api'
 import { getAccessToken, getStoredUser, isAdmin } from '@/lib/auth'
 import type {
@@ -60,6 +63,15 @@ export default function AISummariesPage() {
   const [saved, setSaved] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [shareChannelId, setShareChannelId] = useState('')
+  // Phones: the record list and the open summary are two stacked screens.
+  const isPhone = useMediaQuery(MOBILE_QUERY)
+  const [detailOpen, setDetailOpen] = useState(false)
+  const closeDetail = useCallback(() => setDetailOpen(false), [])
+  const closeShare = useCallback(() => setShareOpen(false), [])
+  const closeGenerator = useCallback(() => setGeneratorOpen(false), [])
+  useHistoryLayer(isPhone && detailOpen, closeDetail)
+  useHistoryLayer(isPhone && shareOpen, closeShare)
+  useHistoryLayer(isPhone && generatorOpen, closeGenerator)
 
   const selectedPage = useMemo(
     () => pages.find((page) => page.id === selectedId) || null,
@@ -91,6 +103,9 @@ export default function AISummariesPage() {
         : undefined
       const nextId = preferredId || queryId || selectedId || nextPages[0]?.id || null
       setSelectedId(nextPages.some((page) => page.id === nextId) ? nextId : nextPages[0]?.id || null)
+      // A shared link or a freshly generated page opens straight on the summary.
+      const requestedId = preferredId || queryId
+      if (requestedId && nextPages.some((page) => page.id === requestedId)) setDetailOpen(true)
     } catch {
       setError('加载 AI 汇总页面失败')
     } finally {
@@ -112,6 +127,7 @@ export default function AISummariesPage() {
 
   const selectPage = (page: AISummaryPage) => {
     setSelectedId(page.id)
+    setDetailOpen(true)
     setEditing(false)
     setSaved(false)
     setError('')
@@ -189,6 +205,7 @@ export default function AISummariesPage() {
       }
       window.history.replaceState(null, '', '/ai/summaries')
       setEditing(false)
+      setDetailOpen(false)
       await loadData()
     } catch {
       setError('删除失败')
@@ -243,39 +260,39 @@ export default function AISummariesPage() {
 
   return (
     <AuthGuard>
-      <div className="h-screen overflow-hidden bg-slate-100 p-2 md:p-4">
-        <div className="mx-auto flex h-full max-w-[1500px] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-          <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-3 py-3 md:px-5">
-            <div className="flex min-w-0 items-center gap-3">
-              <button type="button" onClick={() => router.push('/')} className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-slate-900" title="返回工作台">
+      <div className="h-[calc(100dvh-var(--mobile-tabbar-offset))] overflow-hidden bg-slate-100 md:p-4">
+        <div className="mx-auto flex h-full max-w-[1500px] flex-col overflow-hidden bg-white md:rounded-lg md:border md:border-slate-200 md:shadow-sm">
+          <header className={`${detailOpen && selectedPage ? 'hidden md:flex' : 'flex'} min-h-14 items-center justify-between gap-2 border-b border-slate-200 px-3 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))] md:min-h-16 md:flex-wrap md:gap-3 md:px-5 md:py-3`}>
+            <div className="flex min-w-0 items-center gap-2 md:gap-3">
+              <button type="button" onClick={() => router.push('/')} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-slate-900 md:h-9 md:w-9" title="返回工作台" aria-label="返回工作台">
                 <ArrowLeft className="h-4 w-4" />
               </button>
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white"><BarChart3 className="h-4 w-4" /></span>
+              <span className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-900 text-white md:flex"><BarChart3 className="h-4 w-4" /></span>
               <div className="min-w-0">
                 <h1 className="truncate text-lg font-semibold text-slate-950">AI 数据总结</h1>
-                <p className="truncate text-xs text-slate-500">跨工作簿生成经营页面，并由智能助手持续编辑</p>
+                <p className="hidden truncate text-xs text-slate-500 md:block">跨工作簿生成经营页面，并由智能助手持续编辑</p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <button type="button" onClick={() => void loadData(selectedId || undefined)} disabled={loading || working} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 disabled:opacity-40" title="刷新">
+            <div className="flex shrink-0 items-center gap-2">
+              <button type="button" onClick={() => void loadData(selectedId || undefined)} disabled={loading || working} className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 disabled:opacity-40 md:h-9 md:w-9" title="刷新" aria-label="刷新">
                 <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
               </button>
-              <button type="button" onClick={() => { setGeneratorOpen(true); setError('') }} className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white transition hover:bg-slate-800">
+              <button type="button" onClick={() => { setGeneratorOpen(true); setError('') }} className="inline-flex h-10 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white transition hover:bg-slate-800 md:h-9">
                 <Plus className="h-4 w-4" />
                 新建总结
               </button>
             </div>
           </header>
 
-          {error && <div className="flex items-center justify-between border-b border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-700"><span>{error}</span><button type="button" onClick={() => setError('')}><X className="h-4 w-4" /></button></div>}
+          {error && <div className="flex items-center justify-between gap-2 border-b border-rose-200 bg-rose-50 px-4 py-1 text-sm text-rose-700 md:py-2.5"><span className="min-w-0 break-words">{error}</span><button type="button" onClick={() => setError('')} className="-mr-2 inline-flex h-10 w-10 shrink-0 items-center justify-center md:h-auto md:w-auto md:mr-0" aria-label="关闭提示"><X className="h-4 w-4" /></button></div>}
 
           <div className="grid min-h-0 flex-1 md:grid-cols-[280px_minmax(0,1fr)]">
-            <aside className="flex min-h-0 flex-col border-b border-slate-200 bg-slate-50 md:border-b-0 md:border-r">
+            <aside className={`${detailOpen && selectedPage ? 'hidden md:flex' : 'flex'} min-h-0 flex-col bg-slate-50 md:border-r md:border-slate-200`}>
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <span className="text-sm font-semibold text-slate-800">总结记录</span>
                 <span className="text-xs text-slate-400">{pages.length}</span>
               </div>
-              <div className="max-h-44 overflow-y-auto p-2 md:max-h-none md:flex-1">
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
                 {loading ? (
                   <div className="flex justify-center py-10 text-slate-400"><Loader2 className="h-5 w-5 animate-spin" /></div>
                 ) : pages.length === 0 ? (
@@ -283,12 +300,15 @@ export default function AISummariesPage() {
                 ) : (
                   <div className="space-y-1">
                     {pages.map((page) => (
-                      <button key={page.id} type="button" onClick={() => selectPage(page)} className={`w-full rounded-lg px-3 py-3 text-left transition ${selectedId === page.id ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-white'}`}>
-                        <span className="block truncate text-sm font-semibold">{page.title}</span>
-                        <span className={`mt-1 flex items-center justify-between gap-2 text-[11px] ${selectedId === page.id ? 'text-slate-300' : 'text-slate-400'}`}>
-                          <span className="truncate">{page.assistant_name || '本地权限汇总'}</span>
-                          <span className="shrink-0">{new Date(page.updated_at).toLocaleDateString('zh-CN')}</span>
+                      <button key={page.id} type="button" onClick={() => selectPage(page)} className={`flex w-full items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-3 text-left transition active:bg-slate-100 md:border-transparent md:bg-transparent ${selectedId === page.id ? 'md:!bg-slate-900 md:text-white' : 'text-slate-700 md:hover:bg-white'}`}>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-semibold">{page.title}</span>
+                          <span className={`mt-1 flex items-center justify-between gap-2 text-[11px] text-slate-400 ${selectedId === page.id ? 'md:text-slate-300' : ''}`}>
+                            <span className="truncate">{page.assistant_name || '本地权限汇总'}</span>
+                            <span className="shrink-0">{new Date(page.updated_at).toLocaleDateString('zh-CN')}</span>
+                          </span>
                         </span>
+                        <ChevronRight className="h-4 w-4 shrink-0 text-slate-300 md:hidden" />
                       </button>
                     ))}
                   </div>
@@ -296,7 +316,7 @@ export default function AISummariesPage() {
               </div>
             </aside>
 
-            <main className="min-h-0 overflow-y-auto">
+            <main className={`${detailOpen && selectedPage ? 'block' : 'hidden md:block'} min-h-0 overflow-y-auto overscroll-contain`}>
               {!selectedPage ? (
                 <div className="flex min-h-full items-center justify-center px-6 py-20 text-center">
                   <div>
@@ -307,56 +327,59 @@ export default function AISummariesPage() {
                 </div>
               ) : (
                 <div>
-                  <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur md:px-6">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-semibold text-slate-900">{selectedPage.title}</div>
-                      <div className="mt-0.5 text-xs text-slate-400">更新于 {new Date(selectedPage.updated_at).toLocaleString('zh-CN')}</div>
+                  <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-slate-200 bg-white/95 px-2 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))] backdrop-blur md:px-6 md:py-3">
+                    <div className="flex min-w-0 flex-1 items-center gap-1 md:flex-none">
+                      <button type="button" onClick={closeDetail} className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-600 active:bg-slate-100 md:hidden" title="返回总结记录" aria-label="返回总结记录"><ChevronLeft className="h-5 w-5" /></button>
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold text-slate-900">{selectedPage.title}</div>
+                        <div className="mt-0.5 truncate text-xs text-slate-400">更新于 {new Date(selectedPage.updated_at).toLocaleString('zh-CN')}</div>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex w-full items-center justify-end gap-2 pl-2 md:w-auto md:pl-0">
                       {saved && <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600"><Check className="h-3.5 w-3.5" />已保存</span>}
                       {editing ? (
                         <>
-                          <button type="button" onClick={() => { setEditing(false); setDraftTitle(selectedPage.title); setDraftContent(structuredClone(selectedPage.content)) }} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600"><X className="h-4 w-4" />取消</button>
-                          <button type="button" onClick={() => void saveSummary()} disabled={working} className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存</button>
+                          <button type="button" onClick={() => { setEditing(false); setDraftTitle(selectedPage.title); setDraftContent(structuredClone(selectedPage.content)) }} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-600"><X className="h-4 w-4" />取消</button>
+                          <button type="button" onClick={() => void saveSummary()} disabled={working} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存</button>
                         </>
                       ) : (
                         <>
-                          <button type="button" onClick={() => { setShareOpen(true); setShareChannelId(channels[0]?.id ? String(channels[0].id) : '') }} className="inline-flex h-9 items-center gap-2 rounded-lg border border-violet-200 px-3 text-sm font-medium text-violet-700 transition hover:bg-violet-50"><Share2 className="h-4 w-4" />发送到频道</button>
-                          {canManageSelectedPage && <button type="button" onClick={() => setEditing(true)} className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50"><Pencil className="h-4 w-4" />编辑</button>}
-                          {canManageSelectedPage && <button type="button" onClick={() => void deleteSummary()} disabled={working} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-rose-200 text-rose-600 transition hover:bg-rose-50" title="删除"><Trash2 className="h-4 w-4" /></button>}
+                          <button type="button" onClick={() => { setShareOpen(true); setShareChannelId(channels[0]?.id ? String(channels[0].id) : '') }} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-violet-200 px-3 text-sm font-medium text-violet-700 transition hover:bg-violet-50"><Share2 className="h-4 w-4" />发送到频道</button>
+                          {canManageSelectedPage && <button type="button" onClick={() => setEditing(true)} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50"><Pencil className="h-4 w-4" />编辑</button>}
+                          {canManageSelectedPage && <button type="button" onClick={() => void deleteSummary()} disabled={working} className="inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg border border-rose-200 text-rose-600 transition hover:bg-rose-50" title="删除"><Trash2 className="h-4 w-4" /></button>}
                         </>
                       )}
                     </div>
                   </div>
 
-                  <article className="mx-auto max-w-6xl px-4 py-7 md:px-8 md:py-10">
+                  <article className="mx-auto max-w-6xl px-4 py-5 md:px-8 md:py-10">
                     {editing ? (
                       <div className="space-y-3">
-                        <input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm font-semibold outline-none focus:border-slate-400" />
-                        <input value={draftContent.headline} onChange={(event) => setDraftContent((current) => ({ ...current, headline: event.target.value }))} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-2xl font-semibold text-slate-950 outline-none focus:border-slate-400" />
-                        <textarea value={draftContent.overview} onChange={(event) => setDraftContent((current) => ({ ...current, overview: event.target.value }))} rows={4} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm leading-7 text-slate-600 outline-none focus:border-slate-400" />
+                        <input value={draftTitle} onChange={(event) => setDraftTitle(event.target.value)} className="h-11 w-full rounded-lg border border-slate-200 px-3 text-base font-semibold outline-none focus:border-slate-400 md:h-10 md:text-sm" />
+                        <input value={draftContent.headline} onChange={(event) => setDraftContent((current) => ({ ...current, headline: event.target.value }))} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xl font-semibold text-slate-950 outline-none focus:border-slate-400 md:text-2xl" />
+                        <textarea value={draftContent.overview} onChange={(event) => setDraftContent((current) => ({ ...current, overview: event.target.value }))} rows={4} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-base leading-7 text-slate-600 outline-none focus:border-slate-400 md:text-sm" />
                       </div>
                     ) : (
                       <div>
                         <div className="flex items-center gap-2 text-xs font-semibold uppercase text-sky-700"><Sparkles className="h-3.5 w-3.5" />AI Summary</div>
-                        <h2 className="mt-3 text-3xl font-semibold text-slate-950">{draftContent.headline || selectedPage.title}</h2>
-                        <p className="mt-4 max-w-4xl text-sm leading-7 text-slate-600">{draftContent.overview}</p>
+                        <h2 className="mt-3 break-words text-2xl font-semibold text-slate-950 md:text-3xl">{draftContent.headline || selectedPage.title}</h2>
+                        <p className="mt-4 max-w-4xl break-words text-sm leading-7 text-slate-600">{draftContent.overview}</p>
                       </div>
                     )}
 
-                    <div className="mt-8 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="mt-6 grid grid-cols-2 gap-2 sm:gap-3 md:mt-8 xl:grid-cols-4">
                       {draftContent.metrics.map((metric, index) => (
-                        <div key={`${metric.label}-${index}`} className="rounded-lg border border-slate-200 border-t-2 border-t-sky-500 bg-white p-4">
+                        <div key={`${metric.label}-${index}`} className="min-w-0 rounded-lg border border-slate-200 border-t-2 border-t-sky-500 bg-white p-3 md:p-4">
                           {editing ? (
                             <div className="space-y-2">
-                              <input value={metric.label} onChange={(event) => updateMetric(index, { label: event.target.value })} className="h-8 w-full rounded-md border border-slate-200 px-2 text-xs" />
-                              <input value={metric.value} onChange={(event) => updateMetric(index, { value: event.target.value })} className="h-9 w-full rounded-md border border-slate-200 px-2 text-lg font-semibold" />
-                              <input value={metric.hint || ''} onChange={(event) => updateMetric(index, { hint: event.target.value })} className="h-8 w-full rounded-md border border-slate-200 px-2 text-xs" />
+                              <input value={metric.label} onChange={(event) => updateMetric(index, { label: event.target.value })} className="h-10 w-full min-w-0 rounded-md border border-slate-200 px-2 text-base md:h-8 md:text-xs" />
+                              <input value={metric.value} onChange={(event) => updateMetric(index, { value: event.target.value })} className="h-10 w-full min-w-0 rounded-md border border-slate-200 px-2 text-lg font-semibold md:h-9" />
+                              <input value={metric.hint || ''} onChange={(event) => updateMetric(index, { hint: event.target.value })} className="h-10 w-full min-w-0 rounded-md border border-slate-200 px-2 text-base md:h-8 md:text-xs" />
                             </div>
                           ) : (
                             <>
                               <div className="truncate text-xs font-medium text-slate-500">{metric.label}</div>
-                              <div className="mt-2 break-words text-2xl font-semibold text-slate-950">{metric.value}</div>
+                              <div className="mt-2 break-words text-xl font-semibold text-slate-950 [overflow-wrap:anywhere] md:text-2xl">{metric.value}</div>
                               {metric.hint && <div className="mt-2 text-xs leading-5 text-slate-400">{metric.hint}</div>}
                             </>
                           )}
@@ -364,21 +387,21 @@ export default function AISummariesPage() {
                       ))}
                     </div>
 
-                    <div className="mt-10 divide-y divide-slate-200 border-y border-slate-200">
+                    <div className="mt-6 divide-y divide-slate-200 border-y border-slate-200 md:mt-10">
                       {draftContent.sections.map((section, index) => (
-                        <section key={`${section.title}-${index}`} className="py-7">
+                        <section key={`${section.title}-${index}`} className="py-5 md:py-7">
                           {editing ? (
                             <div className="space-y-3">
-                              <input value={section.title} onChange={(event) => updateSection(index, { title: event.target.value })} className="h-10 w-full rounded-lg border border-slate-200 px-3 text-base font-semibold" />
-                              <textarea value={section.body} onChange={(event) => updateSection(index, { body: event.target.value })} rows={3} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm leading-7" />
-                              <textarea value={(section.bullets || []).join('\n')} onChange={(event) => updateSection(index, { bullets: event.target.value.split('\n').filter(Boolean) })} rows={4} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm leading-7" placeholder="每行一个要点" />
+                              <input value={section.title} onChange={(event) => updateSection(index, { title: event.target.value })} className="h-11 w-full rounded-lg border border-slate-200 px-3 text-base font-semibold md:h-10" />
+                              <textarea value={section.body} onChange={(event) => updateSection(index, { body: event.target.value })} rows={3} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-base leading-7 md:text-sm" />
+                              <textarea value={(section.bullets || []).join('\n')} onChange={(event) => updateSection(index, { bullets: event.target.value.split('\n').filter(Boolean) })} rows={4} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-base leading-7 md:text-sm" placeholder="每行一个要点" />
                             </div>
                           ) : (
                             <div className="grid gap-4 md:grid-cols-[220px_minmax(0,1fr)]">
                               <h3 className="text-base font-semibold text-slate-950">{section.title}</h3>
                               <div>
-                                <p className="text-sm leading-7 text-slate-600">{section.body}</p>
-                                {section.bullets && section.bullets.length > 0 && <ul className="mt-3 space-y-2 text-sm text-slate-600">{section.bullets.map((bullet, bulletIndex) => <li key={bulletIndex} className="flex gap-2"><span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" /><span className="leading-6">{bullet}</span></li>)}</ul>}
+                                <p className="break-words text-sm leading-7 text-slate-600">{section.body}</p>
+                                {section.bullets && section.bullets.length > 0 && <ul className="mt-3 space-y-2 text-sm text-slate-600">{section.bullets.map((bullet, bulletIndex) => <li key={bulletIndex} className="flex gap-2"><span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" /><span className="min-w-0 break-words leading-6">{bullet}</span></li>)}</ul>}
                               </div>
                             </div>
                           )}
@@ -390,7 +413,7 @@ export default function AISummariesPage() {
                       <div className="text-xs font-semibold text-slate-500">数据来源</div>
                       <div className="mt-3 flex flex-wrap gap-2">
                         {draftContent.sources.map((source) => (
-                          <span key={source.workbook_id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                          <span key={source.workbook_id} className="max-w-full break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
                             <strong className="font-semibold text-slate-800">{source.workbook_name}</strong> · {source.sheet_names.length} 张工作表
                           </span>
                         ))}
@@ -404,23 +427,23 @@ export default function AISummariesPage() {
         </div>
 
         {shareOpen && selectedPage && (
-          <div className="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/35 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setShareOpen(false) }}>
-            <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white shadow-2xl">
-              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3"><div><div className="text-sm font-semibold text-slate-900">发送 AI 总结到频道</div><div className="mt-0.5 text-xs text-slate-500">频道成员可以直接打开“{selectedPage.title}”</div></div><button type="button" onClick={() => setShareOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button></div>
-              <div className="p-4"><label className="block space-y-1.5"><span className="text-sm font-medium text-slate-700">目标频道</span><select value={shareChannelId} onChange={(event) => setShareChannelId(event.target.value)} className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-violet-300"><option value="">请选择频道</option>{channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label>{channels.length === 0 && <div className="mt-3 text-xs text-amber-700">当前账号还没有可用频道。</div>}</div>
-              <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setShareOpen(false)} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void shareSummary()} disabled={working || !shareChannelId} className="inline-flex h-9 items-center gap-2 rounded-lg bg-violet-600 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Share2 className="h-4 w-4" />}发送</button></div>
+          <div className="fixed inset-0 z-[85] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setShareOpen(false) }}>
+            <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg border border-slate-200 bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3"><div><div className="text-sm font-semibold text-slate-900">发送 AI 总结到频道</div><div className="mt-0.5 text-xs text-slate-500">频道成员可以直接打开“{selectedPage.title}”</div></div><button type="button" onClick={() => setShareOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button></div>
+              <div className="p-4"><label className="block space-y-1.5"><span className="text-sm font-medium text-slate-700">目标频道</span><select value={shareChannelId} onChange={(event) => setShareChannelId(event.target.value)} className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-base outline-none focus:border-violet-300 sm:h-10 sm:text-sm"><option value="">请选择频道</option>{channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label>{channels.length === 0 && <div className="mt-3 text-xs text-amber-700">当前账号还没有可用频道。</div>}</div>
+              <div className="flex justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setShareOpen(false)} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void shareSummary()} disabled={working || !shareChannelId} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-violet-600 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Share2 className="h-4 w-4" />}发送</button></div>
             </div>
           </div>
         )}
 
         {generatorOpen && (
           <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setGeneratorOpen(false) }}>
-            <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-lg border border-slate-200 bg-white shadow-2xl sm:rounded-lg">
+            <div className="flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl border border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:rounded-lg sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div className="flex items-center gap-3"><span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-white"><Bot className="h-4 w-4" /></span><div><div className="text-sm font-semibold text-slate-900">生成跨工作簿总结</div><div className="text-xs text-slate-500">仅会读取当前账号有权查看的单元格</div></div></div>
-                <button type="button" onClick={() => !working && setGeneratorOpen(false)} className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"><X className="h-4 w-4" /></button>
+                <button type="button" onClick={() => !working && setGeneratorOpen(false)} className="inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"><X className="h-4 w-4" /></button>
               </div>
-              <div className="space-y-4 overflow-y-auto p-4">
+              <div className="space-y-4 overflow-y-auto overscroll-contain p-4 [&_input:not([type=checkbox])]:text-base [&_select]:text-base [&_textarea]:text-base sm:[&_input:not([type=checkbox])]:text-sm sm:[&_select]:text-sm sm:[&_textarea]:text-sm">
                 <div className="grid gap-4 sm:grid-cols-2">
                   <label className="space-y-1.5"><span className="text-sm font-medium text-slate-700">页面标题</span><input value={generateTitle} onChange={(event) => setGenerateTitle(event.target.value)} className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-slate-400" /></label>
                   <label className="space-y-1.5"><span className="text-sm font-medium text-slate-700">AI 助手</span><select value={generateAssistantId ?? ''} onChange={(event) => setGenerateAssistantId(Number(event.target.value) || null)} className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"><option value="">本地权限汇总</option>{assistants.map((assistant) => <option key={assistant.id} value={assistant.id}>{assistant.name} · {assistant.model}</option>)}</select></label>
@@ -429,11 +452,11 @@ export default function AISummariesPage() {
                 <div>
                   <div className="mb-2 flex items-center justify-between"><span className="text-sm font-medium text-slate-700">工作簿范围</span><span className="text-xs text-slate-400">已选 {selectedWorkbookIds.length}</span></div>
                   <div className="max-h-64 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
-                    {workbooks.map((workbook) => { const checked = selectedWorkbookIds.includes(workbook.id); return <label key={workbook.id} className={`flex cursor-pointer items-center gap-3 px-3 py-3 transition ${checked ? 'bg-sky-50' : 'hover:bg-slate-50'}`}><input type="checkbox" checked={checked} onChange={() => toggleWorkbook(workbook.id)} className="h-4 w-4 rounded border-slate-300 text-sky-600" /><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-slate-800">{workbook.name}</span><span className="block truncate text-xs text-slate-400">{workbook.owner_name || `用户 #${workbook.owner_id}`}</span></span></label> })}
+                    {workbooks.map((workbook) => { const checked = selectedWorkbookIds.includes(workbook.id); return <label key={workbook.id} className={`flex cursor-pointer items-center gap-3 px-3 py-3 transition ${checked ? 'bg-sky-50' : 'hover:bg-slate-50'}`}><input type="checkbox" checked={checked} onChange={() => toggleWorkbook(workbook.id)} className="h-5 w-5 shrink-0 rounded border-slate-300 text-sky-600 sm:h-4 sm:w-4" /><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-slate-800">{workbook.name}</span><span className="block truncate text-xs text-slate-400">{workbook.owner_name || `用户 #${workbook.owner_id}`}</span></span></label> })}
                   </div>
                 </div>
               </div>
-              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setGeneratorOpen(false)} disabled={working} className="h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void generateSummary()} disabled={working || selectedWorkbookIds.length === 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{working ? '正在分析...' : '生成页面'}</button></div>
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setGeneratorOpen(false)} disabled={working} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void generateSummary()} disabled={working || selectedWorkbookIds.length === 0} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{working ? '正在分析...' : '生成页面'}</button></div>
             </div>
           </div>
         )}
