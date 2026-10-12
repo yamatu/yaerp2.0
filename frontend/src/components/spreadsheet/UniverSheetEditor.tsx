@@ -859,6 +859,11 @@ function attachUniverTouchPanning(root: HTMLElement) {
 
   const onTouchMove = (event: TouchEvent) => {
     if (!tracking || event.touches.length !== 1) return
+    // If any ancestor has already captured this pointer (e.g. a draggable
+    // widget with touch-action:none), let the capture owner handle the move
+    // and do not call preventDefault — the browser would ignore it anyway
+    // and Chrome logs an intervention warning.
+    if (event.cancelable === false) return
     const touch = event.touches[0]
     const x = touch.clientX
     const y = touch.clientY
@@ -5222,7 +5227,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       onDrop={handleContainerDrop}
       onContextMenu={handleSheetContextMenu}
     >
-      <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }} />
+      <div ref={containerRef} data-sheet-root style={{ width: '100%', height: '100%', position: 'relative' }} />
 
       <SheetMobileControls
         sheetId={sheetId}
@@ -5440,9 +5445,22 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         <div
           ref={presenceWidgetRef}
           style={presenceDrag.style}
-          className={`absolute right-4 top-14 z-[22] w-auto max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 ${presenceDrag.dragging ? 'cursor-grabbing opacity-100 select-none' : 'cursor-grab'}`}
+          className={`absolute right-2 top-12 z-[22] w-auto sm:right-4 sm:top-14 max-w-[min(16rem,calc(100%-1rem))] sm:max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 ${presenceDrag.dragging ? 'cursor-grabbing opacity-100 select-none' : 'cursor-grab'}`}
         >
-          <button {...presenceDrag.handleProps} type="button" onClick={() => setPresenceExpanded((current) => !current)} className="touch-none select-none ml-auto flex min-h-11 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur" title={presenceExpanded ? '收起在线协作人员（可拖动）' : '查看在线协作人员（可拖动）'} aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}>
+          <button
+            {...presenceDrag.handleProps}
+            onPointerDown={(event) => {
+              // Stop the sheet pan handler from consuming this touch before
+              // pointer capture is established on the drag handle.
+              event.currentTarget.closest('[data-sheet-root]')?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
+              presenceDrag.handleProps.onPointerDown(event)
+            }}
+            type="button"
+            onClick={() => setPresenceExpanded((current) => !current)}
+            className="touch-none select-none ml-auto flex min-h-11 max-w-full items-center gap-2 rounded-lg border border-slate-200 bg-white/95 px-2.5 py-1.5 text-left shadow-lg backdrop-blur"
+            title={presenceExpanded ? '收起在线协作人员（可拖动）' : '查看在线协作人员（可拖动）'}
+            aria-label={presenceExpanded ? '收起在线协作人员' : '查看在线协作人员'}
+          >
             <UserRoundCheck className="h-4 w-4 shrink-0 text-emerald-600" />
             <div className="flex -space-x-1.5">
               {displayedCollaborators.slice(0, 4).map((entry) => {
