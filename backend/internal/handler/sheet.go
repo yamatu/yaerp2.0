@@ -525,8 +525,17 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
-	cellResult, err := h.sheetService.PrepareSheetCellChanges(userID, existing, sheet, req.CellChanges, "web")
+	cellResult, err := h.sheetService.PrepareSheetCellChangesWithOptions(userID, existing, sheet, req.CellChanges, "web", service.SheetSaveOptions{
+		StructureChanged:      req.StructureChanged,
+		BaseStructureRevision: req.BaseStructureRevision,
+	})
 	if err != nil {
+		if errors.Is(err, service.ErrSheetStructureConflict) {
+			// The rows this save addresses have moved: applying it would write
+			// values and formulas to the wrong rows. The client reloads instead.
+			response.ErrorCode(c, http.StatusConflict, "sheet_structure_conflict", "表格的行列结构已被其他协作者修改，已为你同步最新内容，请重新操作。")
+			return
+		}
 		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
 			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
 			response.Forbidden(c, err.Error())
@@ -567,10 +576,16 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	} else {
 		affectedSheetIDs = append(affectedSheetIDs, syncedSheetIDs...)
 	}
-	if len(req.CellChanges) > 0 && !sheetStructureChanged(existing, sheet) {
+	// A structural save moves rows: collaborators must resync the whole sheet
+	// instead of applying index based cell updates to their old layout.
+	layoutChanged := sheetStructureChanged(existing, sheet)
+	if len(req.CellChanges) > 0 && !layoutChanged && !req.StructureChanged {
 		h.sheetService.NotifyCellChanges(userID, req.CellChanges, "web")
 		h.broadcastSheetCellChanges(c, affectedSheetIDs, req.CellChanges)
-	} else if sheetStructureChanged(existing, sheet) {
+	} else if layoutChanged || req.StructureChanged {
+		if len(req.CellChanges) > 0 && !layoutChanged {
+			h.sheetService.NotifyCellChanges(userID, req.CellChanges, "web")
+		}
 		h.broadcastSheetReload(c, affectedSheetIDs...)
 	}
 	response.OK(c, cellResult)

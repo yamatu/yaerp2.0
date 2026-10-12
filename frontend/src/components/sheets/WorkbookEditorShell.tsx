@@ -422,6 +422,15 @@ export default function WorkbookEditorShell({
   }, [sheetSearchQuery, sheetSortBy, sheetSortOrder, sheets]);
 
   const visibleSheets = filteredSheets;
+  const activeMobileTabRef = useRef<HTMLAnchorElement | null>(null);
+  const activeSheetIdForTabs = activeSheet?.id;
+  useEffect(() => {
+    if (!isMobileLayout) return;
+    activeMobileTabRef.current?.scrollIntoView({
+      inline: "center",
+      block: "nearest",
+    });
+  }, [activeSheetIdForTabs, isMobileLayout, sheets.length]);
   const selectedSheets = useMemo(
     () => sheets.filter((sheet) => selectedSheetIds.includes(sheet.id)),
     [selectedSheetIds, sheets],
@@ -980,9 +989,11 @@ export default function WorkbookEditorShell({
             <button
               type="button"
               onClick={() => router.push(consumeReturnTarget("/"))}
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2 text-sm leading-none text-slate-500 transition hover:bg-slate-100 hover:text-slate-900 sm:px-2.5"
+              className="order-first inline-flex h-10 min-w-10 items-center justify-center gap-1.5 rounded-lg border border-slate-200 px-2 text-sm leading-none text-slate-700 transition hover:bg-slate-100 hover:text-slate-900 sm:order-none sm:h-9 sm:min-w-0 sm:border-0 sm:px-2.5 sm:text-slate-500"
+              title="返回工作台"
+              aria-label="返回工作台"
             >
-              <ArrowLeft className="h-4 w-4" />
+              <ArrowLeft className="h-5 w-5 sm:h-4 sm:w-4" />
               <span className="hidden sm:inline">返回</span>
             </button>
             <div className="hidden h-5 w-px bg-slate-200 sm:block" />
@@ -1490,7 +1501,31 @@ export default function WorkbookEditorShell({
             </div>
           </aside>
 
-          <main className="min-w-0 flex-1 overflow-hidden">
+          <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+            {isMobileLayout && sheets.length > 1 && (
+              <nav
+                aria-label="工作表"
+                data-mobile-sheet-tabs
+                className="flex shrink-0 items-center gap-1.5 overflow-x-auto overscroll-x-contain border-b border-slate-200 bg-white px-2 py-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+              >
+                {sheets.map((item) => {
+                  const current = item.id === activeSheet?.id;
+                  return (
+                    <Link
+                      key={item.id}
+                      href={`/sheets/${workbookId}/${item.id}`}
+                      prefetch={false}
+                      ref={current ? activeMobileTabRef : undefined}
+                      aria-current={current ? "page" : undefined}
+                      className={`block h-9 max-w-[11rem] shrink-0 truncate rounded-full px-3.5 text-sm leading-9 transition ${current ? "bg-sky-600 font-semibold text-white" : "bg-slate-100 text-slate-600 active:bg-slate-200"}`}
+                    >
+                      {item.name}
+                    </Link>
+                  );
+                })}
+              </nav>
+            )}
+            <div className="min-h-0 flex-1">
             {activeSheet ? (
               <UniverSheetEditor
                 key={activeSheet.id}
@@ -1544,6 +1579,7 @@ export default function WorkbookEditorShell({
                 </div>
               </div>
             )}
+            </div>
           </main>
         </div>
 

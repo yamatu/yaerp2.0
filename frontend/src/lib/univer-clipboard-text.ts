@@ -1,5 +1,15 @@
-import { ICommandService } from '@univerjs/core'
+import { CellValueType, CommandType, ICommandService } from '@univerjs/core'
 import { ISheetClipboardService, SheetPasteShortKeyCommand } from '@univerjs/sheets-ui'
+import {
+  ContextMenuGroup,
+  ContextMenuPosition,
+  IClipboardInterfaceService,
+  IMenuManagerService,
+  MenuItemType,
+  MenuManagerPosition,
+  type IMenuItem,
+} from '@univerjs/ui'
+import { renderClipboardTableImage } from './sheet-clipboard-image'
 
 /**
  * Excel and LibreOffice put tab separated text on the clipboard in the RFC 4180
@@ -172,6 +182,236 @@ export interface DisposableLike {
   dispose?: () => void
 }
 
+interface ClipboardInterfaceLike {
+  write?: (text: string, html: string) => Promise<void> | void
+}
+
+/**
+ * Copies through a hidden textarea and a one-shot `copy` listener, which is
+ * the only way to set several flavours when the async clipboard API is not
+ * available (plain http, older Firefox). Runs synchronously so it stays inside
+ * the user gesture that triggered the copy.
+ */
+function legacyCopy(text: string, html: string): boolean {
+  if (typeof document === 'undefined') return false
+  const active = document.activeElement
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '0'
+  textarea.style.left = '0'
+  textarea.style.width = '1px'
+  textarea.style.height = '1px'
+  textarea.style.opacity = '0'
+  const listener = (event: ClipboardEvent) => {
+    if (!event.clipboardData) return
+    event.clipboardData.setData('text/plain', text)
+    event.clipboardData.setData('text/html', html)
+    event.preventDefault()
+  }
+  document.body.appendChild(textarea)
+  document.addEventListener('copy', listener, true)
+  try {
+    textarea.select()
+    textarea.setSelectionRange(0, text.length)
+    return document.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    document.removeEventListener('copy', listener, true)
+    document.body.removeChild(textarea)
+    if (active instanceof HTMLElement) active.focus({ preventScroll: true })
+  }
+}
+
+/**
+ * Writes a sheet copy the way WPS / Excel do: `text/plain` is the TSV of the
+ * range (no markdown pipes, no padding), `text/html` keeps the table with its
+ * inline styles and the copy id Univer uses to paste formulas and formats back
+ * into our own sheets, and `image/png` is a picture of the range for chat apps
+ * that paste an image by default. The image is optional: when the range is too
+ * large or the browser refuses image flavours, text and HTML are written alone.
+ */
+export async function writeSheetClipboard(text: string, html: string): Promise<void> {
+  const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined
+  const ItemConstructor = typeof ClipboardItem !== 'undefined' ? ClipboardItem : undefined
+  if (!clipboard || typeof clipboard.write !== 'function' || !ItemConstructor) {
+    if (!legacyCopy(text, html)) throw new Error('Clipboard is not available')
+    return
+  }
+  const textItems = {
+    'text/plain': new Blob([text], { type: 'text/plain' }),
+    'text/html': new Blob([html], { type: 'text/html' }),
+  }
+  const supports = (ItemConstructor as unknown as { supports?: (type: string) => boolean }).supports
+  const imageSupported = typeof supports !== 'function' || supports.call(ItemConstructor, 'image/png')
+  if (imageSupported) {
+    try {
+      // Handed over as a promise so the write starts inside the user gesture
+      // while the bitmap is still being encoded.
+      const image = renderClipboardTableImage(html).then((blob) => {
+        if (!blob) throw new Error('No clipboard image for this range')
+        return blob
+      })
+      await clipboard.write([new ItemConstructor({ ...textItems, 'image/png': image })])
+      return
+    } catch {
+      // Too large, unsupported or rejected: fall back to text and HTML only.
+    }
+  }
+  await clipboard.write([new ItemConstructor(textItems)])
+}
+
+/** Turns clipboard text into cell values: numbers stay numbers, everything else is text. */
+export function plainTextCellValue(text: string): { v: string | number; t: CellValueType } {
+  const trimmed = text.trim()
+  if (/^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?$/i.test(trimmed) && !/^[-+]?0\d/.test(trimmed)) {
+    const numeric = Number(trimmed)
+    if (Number.isFinite(numeric)) return { v: numeric, t: CellValueType.NUMBER }
+  }
+  // A leading `=` stays literal text: this is a values-only paste.
+  return { v: text, t: CellValueType.STRING }
+}
+
+// Method syntax on purpose: the facade narrows the parameters, which stays
+// assignable this way.
+interface PlainPasteSheetLike {
+  getActiveRange?(): { getRow?(): number; getColumn?(): number } | null | undefined
+  getMaxRows?(): number
+  getMaxColumns?(): number
+  setRowCount?(count: number): unknown
+  setColumnCount?(count: number): unknown
+  getRange(row: number, column: number, numRows: number, numColumns: number): {
+    setValues?(values: unknown): unknown
+  }
+}
+
+/** Writes clipboard text into the sheet as plain values starting at the active cell. */
+export function pastePlainTextValues(sheet: PlainPasteSheetLike | null | undefined, text: string): number {
+  if (!sheet || !text) return 0
+  const { matrix } = parseClipboardText(text.replace(/\r?\n$/, ''))
+  if (matrix.length === 0) return 0
+  const width = matrix.reduce((max, row) => Math.max(max, row.length), 0)
+  if (width === 0) return 0
+  const range = sheet.getActiveRange?.()
+  const startRow = Math.max(0, Number(range?.getRow?.() ?? 0) || 0)
+  const startColumn = Math.max(0, Number(range?.getColumn?.() ?? 0) || 0)
+  const neededRows = startRow + matrix.length
+  const neededColumns = startColumn + width
+  if (typeof sheet.getMaxRows === 'function' && sheet.getMaxRows() < neededRows) sheet.setRowCount?.(neededRows)
+  if (typeof sheet.getMaxColumns === 'function' && sheet.getMaxColumns() < neededColumns) sheet.setColumnCount?.(neededColumns)
+  const values = matrix.map((row) => Array.from({ length: width }, (_, index) => plainTextCellValue(row[index] ?? '')))
+  sheet.getRange(startRow, startColumn, matrix.length, width).setValues?.(values)
+  return matrix.length * width
+}
+
+export const PLAIN_PASTE_COMMAND_ID = 'yaerp-paste-plain-text'
+const PLAIN_PASTE_MENU_KEY = 'yaerpPastePlainText'
+
+/**
+ * Registers `粘贴为纯文本（仅值）`: the clipboard text is written as plain
+ * values, without formulas or formatting. When the page may not read the
+ * clipboard (plain http, Firefox), the next native paste is used instead -
+ * `onNeedsKeyboardPaste` tells the user to press Ctrl+V. `Ctrl+Shift+V` arms the
+ * same plain paste for keyboard users.
+ */
+export function registerPlainTextPaste(
+  univer: unknown,
+  resolveSheet: () => PlainPasteSheetLike | null | undefined,
+  callbacks: { onPasted?: (cells: number) => void; onNeedsKeyboardPaste?: () => void; canEdit?: () => boolean } = {}
+): { dispose: () => void; pastePlain: () => Promise<void> } | null {
+  const disposables: Array<{ dispose?: () => void }> = []
+  let armedUntil = 0
+
+  const apply = (text: string) => {
+    if (callbacks.canEdit && !callbacks.canEdit()) return
+    const cells = pastePlainTextValues(resolveSheet(), text)
+    if (cells > 0) callbacks.onPasted?.(cells)
+  }
+
+  const pastePlain = async () => {
+    const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined
+    if (clipboard && typeof clipboard.readText === 'function') {
+      try {
+        apply(await clipboard.readText())
+        return
+      } catch {
+        // Permission denied: fall through to the keyboard paste.
+      }
+    }
+    armedUntil = Date.now() + 15000
+    callbacks.onNeedsKeyboardPaste?.()
+  }
+
+  const onKeyDown = (event: KeyboardEvent) => {
+    if ((event.ctrlKey || event.metaKey) && event.shiftKey && (event.key === 'v' || event.key === 'V')) {
+      armedUntil = Date.now() + 1500
+    }
+  }
+  const onPaste = (event: ClipboardEvent) => {
+    if (Date.now() > armedUntil) return
+    armedUntil = 0
+    const text = event.clipboardData?.getData('text/plain') ?? ''
+    if (!text) return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    apply(text)
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('keydown', onKeyDown, true)
+    document.addEventListener('paste', onPaste, true)
+    disposables.push({
+      dispose: () => {
+        document.removeEventListener('keydown', onKeyDown, true)
+        document.removeEventListener('paste', onPaste, true)
+      },
+    })
+  }
+
+  try {
+    const injector = getInjector(univer)
+    const commandService = injector?.get<ICommandService | undefined>(ICommandService)
+    if (commandService?.registerCommand) {
+      disposables.push(
+        commandService.registerCommand({
+          id: PLAIN_PASTE_COMMAND_ID,
+          type: CommandType.OPERATION,
+          handler: () => {
+            void pastePlain()
+            return true
+          },
+        })
+      )
+    }
+    const menuManager = injector?.get<{ mergeMenu?: (source: unknown) => unknown } | undefined>(IMenuManagerService)
+    if (menuManager?.mergeMenu) {
+      const entry = {
+        // Right after `粘贴` (order 2) and before `选择性粘贴` (order 3).
+        order: 2.5,
+        menuItemFactory: (): IMenuItem => ({
+          id: PLAIN_PASTE_MENU_KEY,
+          commandId: PLAIN_PASTE_COMMAND_ID,
+          title: '粘贴为纯文本（仅值）',
+          type: MenuItemType.BUTTON,
+        }),
+      }
+      menuManager.mergeMenu({
+        [MenuManagerPosition.CONTEXT_MENU]: {
+          [ContextMenuPosition.MAIN_AREA]: { [ContextMenuGroup.FORMAT]: { [PLAIN_PASTE_MENU_KEY]: entry } },
+        },
+      })
+    }
+  } catch (error) {
+    console.warn('Failed to register the plain text paste:', error)
+  }
+
+  return {
+    pastePlain,
+    dispose: () => disposables.forEach((disposable) => disposable?.dispose?.()),
+  }
+}
+
 /**
  * Reports every paste, whoever triggered it.
  *
@@ -290,15 +530,44 @@ export function registerQuotedClipboardFixes(
     // Copy side: quote fields that carry a line break / tab / quote so the plain
     // text flavour stays unambiguous.
     const clipboardService = injector.get<ClipboardServiceLike | null | undefined>(ISheetClipboardService)
+    // The last range copied from the sheet: `write` uses it to recognise a sheet
+    // copy (documents and other editors share the same clipboard service).
+    let lastSheetCopy: { html: string; plain: string } | null = null
     if (clipboardService && typeof clipboardService.generateCopyContent === 'function') {
       const original = clipboardService.generateCopyContent
       const patched = function patchedGenerateCopyContent(this: ClipboardServiceLike, ...args: unknown[]) {
-        return quoteCopyContent(original.apply(this, args), readDisplayValues(args, resolveSheet))
+        const content = quoteCopyContent(original.apply(this, args), readDisplayValues(args, resolveSheet))
+        if (content && typeof content.html === 'string' && typeof content.plain === 'string') {
+          lastSheetCopy = { html: content.html, plain: content.plain }
+        }
+        return content
       }
       clipboardService.generateCopyContent = patched
       disposables.push({
         dispose: () => {
           if (clipboardService.generateCopyContent === patched) clipboardService.generateCopyContent = original
+        },
+      })
+    }
+
+    // Copy side, part two: write plain TSV + HTML + a PNG of the range in one
+    // clipboard item (see `writeSheetClipboard`).
+    const clipboardInterface = injector.get<ClipboardInterfaceLike | null | undefined>(IClipboardInterfaceService)
+    if (clipboardInterface && typeof clipboardInterface.write === 'function') {
+      const originalWrite = clipboardInterface.write
+      const patchedWrite = function patchedWrite(this: ClipboardInterfaceLike, text: string, html: string) {
+        const copy = lastSheetCopy
+        lastSheetCopy = null
+        if (!copy || copy.html !== html) return originalWrite.call(this, text, html)
+        return writeSheetClipboard(text, html).catch((error) => {
+          console.warn('Failed to write the sheet clipboard, using the default copy:', error)
+          return originalWrite.call(this, text, html)
+        })
+      }
+      clipboardInterface.write = patchedWrite
+      disposables.push({
+        dispose: () => {
+          if (clipboardInterface.write === patchedWrite) clipboardInterface.write = originalWrite
         },
       })
     }

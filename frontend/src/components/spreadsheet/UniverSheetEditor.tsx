@@ -21,7 +21,7 @@ import { UniverSheetsConditionalFormattingPreset } from '@univerjs/preset-sheets
 import UniverPresetSheetsConditionalFormattingZhCN from '@univerjs/preset-sheets-conditional-formatting/locales/zh-CN'
 import UniverSheetsDrawingZhCN from '@univerjs/sheets-drawing-ui/locale/zh-CN'
 import { ScrollCommand, SetScrollRelativeCommand, SetZoomRatioCommand, SheetPasteCommand, SheetPasteShortKeyCommand } from '@univerjs/sheets-ui'
-import { BEFORE_CELL_EDIT, SheetInterceptorService } from '@univerjs/sheets'
+import { BEFORE_CELL_EDIT, ClearSelectionContentCommand, SheetInterceptorService } from '@univerjs/sheets'
 import api from '@/lib/api'
 import { usePermission, resolveCellPermission } from '@/hooks/usePermission'
 import { useFloatingDrag } from '@/hooks/useFloatingDrag'
@@ -31,7 +31,10 @@ import { imageThumbnailUrl } from '@/lib/imageTransform'
 import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetVerticalAlign, normalizeUniverNumberFormatPattern, normalizeUniverStyleMap } from '@/lib/univer-sheet'
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
 import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
-import { registerPasteNotifier, registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
+import { registerPasteNotifier, registerPlainTextPaste, registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
+import { describeFormulaError, registerFormulaErrorHint, type FormulaErrorHint } from '@/lib/univer-formula-error-hint'
+import FormulaErrorTooltip from '@/components/spreadsheet/FormulaErrorTooltip'
+import FormulaConsistencyBanner from '@/components/spreadsheet/FormulaConsistencyBanner'
 import {
   addPlainTextBadge,
   collectNonPlainTextMarkers,
@@ -654,6 +657,19 @@ function commandChangesProtectionHighlightLayout(commandId: string) {
 }
 
 const PLAIN_TEXT_PASTE_COMMANDS = new Set<string>([SheetPasteCommand.id, SheetPasteShortKeyCommand.id])
+// Commands after which fill-down formula columns are checked for cells that
+// reference another row (see FormulaConsistencyBanner).
+const FORMULA_SCAN_COMMAND_PATTERN = /insert|remove|delete|move|auto-fill|refill|paste|sort/
+// Commands/mutations that move rows, columns or cell ranges. A save that
+// carries one of them is sent as a structural save (see the persist pipeline):
+// index based merging on the server is only valid while the layout is stable.
+const STRUCTURAL_COMMAND_PATTERN = /(insert|remove)-(multi-)?(row|col)|(insert|delete)-range|move-(rows|cols|range)|reorder-range|sort-range/
+const STRUCTURE_CONFLICT_ERROR_CODE = 'sheet_structure_conflict'
+
+function readStructureRevision(config: unknown): number {
+  const revision = Number((parseSheetConfig(config) as { structureRevision?: unknown }).structureRevision)
+  return Number.isInteger(revision) && revision > 0 ? revision : 0
+}
 /** Width of the hover card, used to decide which side of the badge it opens on. */
 const PLAIN_TEXT_TOOLTIP_WIDTH = 256
 /** Grace period that lets the pointer travel from the badge into the hover card. */
@@ -938,6 +954,33 @@ function attachUniverTouchPanning(root: HTMLElement) {
     root.removeEventListener('touchend', onTouchEnd)
     root.removeEventListener('touchcancel', onTouchCancel)
   }
+}
+
+/**
+ * Brings a cell into view without jumping when it already is visible. Univer's
+ * `scrollToCell` always puts the cell in the top-left corner, which made the
+ * phone's arrow pad yank the sheet around on every step.
+ */
+function revealCell(
+  worksheet: { getVisibleRange?: () => { startRow: number; endRow: number; startColumn: number; endColumn: number }; scrollToCell: (row: number, column: number) => unknown } | null | undefined,
+  row: number,
+  column: number
+) {
+  if (!worksheet) return
+  try {
+    const visible = worksheet.getVisibleRange?.()
+    // The last visible row/column is usually cut off, so keep one cell margin.
+    if (
+      visible &&
+      row >= visible.startRow &&
+      row < visible.endRow &&
+      column >= visible.startColumn &&
+      column < visible.endColumn
+    ) return
+  } catch {
+    // Fall back to scrolling.
+  }
+  worksheet.scrollToCell(row, column)
 }
 
 function cloneJsonSnapshot<T>(value: T): T {
@@ -1660,6 +1703,26 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     top: number
     flip: boolean
   } | null>(null)
+  // Formula error explanation (replaces Univer's grid-covering popup) and the
+  // trigger for the fill-down formula consistency check.
+  const [formulaErrorHint, setFormulaErrorHint] = useState<(FormulaErrorHint & { value?: string; detail?: string }) | null>(null)
+  const [formulaScanToken, setFormulaScanToken] = useState(0)
+  const pastePlainRef = useRef<(() => Promise<void>) | null>(null)
+  const latestEditableRef = useRef(false)
+  // Row/column layout version shared with the server, and whether the unsaved
+  // local edits changed that layout.
+  const structureRevisionRef = useRef(0)
+  const structuralChangePendingRef = useRef(false)
+  // True while a structural save is on its way, and for a moment afterwards:
+  // cell updates collaborators sent against the old layout may still arrive.
+  const structuralSaveInFlightRef = useRef(false)
+  const structuralGraceUntilRef = useRef(0)
+  const resyncAfterPersistRef = useRef(false)
+  const syncSheetSilentlyRef = useRef<() => Promise<void> | void>(() => undefined)
+  const localReloadNonceRef = useRef(0)
+  const appliedReloadNonceRef = useRef(0)
+  const [localReloadNonce, setLocalReloadNonce] = useState(0)
+  const [clipboardNotice, setClipboardNotice] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showImagePicker, setShowImagePicker] = useState(false)
@@ -1755,6 +1818,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const effectiveCanExportSheet = hasPermissionSnapshot ? canExportSheet : optimisticCanEdit
   const canInitializeEditor = hasPermissionSnapshot || optimisticCanEdit || !permissionLoading
   const editLocked = !effectiveCanEditSheet
+  latestEditableRef.current = !editLocked
   const activeSheetConfig = parseSheetConfig(sheet.config)
   const importSource = activeSheetConfig.importSource
   const originalWorkbookXlsxAvailable = Boolean(importSource?.attachment_id)
@@ -3239,6 +3303,18 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
   const applyIncomingChanges = useCallback((changes: IncomingCellChange[]) => {
     if (changes.length === 0) return
+    if (structuralChangePendingRef.current || structuralSaveInFlightRef.current) {
+      // Rows moved locally and that is not saved yet: the incoming row indexes
+      // describe the old layout. Resync from the server once the save is done.
+      resyncAfterPersistRef.current = true
+      return
+    }
+    if (Date.now() < structuralGraceUntilRef.current) {
+      // Sent by a collaborator just before our structural save reached the
+      // server, so still addressed in the old layout: take the server state.
+      void syncSheetSilentlyRef.current()
+      return
+    }
     if (sheetEditorActiveRef.current || imeComposingRef.current) {
       const queuedByCell = new Map<string, IncomingCellChange>()
       deferredIncomingChangesRef.current.forEach((change) => {
@@ -3309,11 +3385,24 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           return
         }
 
+        const hadPendingSave = Boolean(saveTimerRef.current) || structuralChangePendingRef.current
         if (saveTimerRef.current) {
           clearTimeout(saveTimerRef.current)
           saveTimerRef.current = null
         }
         await persistInFlightRef.current
+        if (hadPendingSave) {
+          // Save local edits before merging the server state: once rows were
+          // inserted or deleted locally they cannot be replayed by index.
+          const reloadNonce = localReloadNonceRef.current
+          try {
+            await persistRef.current?.()
+          } catch (persistError) {
+            console.warn('Failed to save pending edits before syncing:', persistError)
+          }
+          // A structure conflict reloads the editor; nothing left to sync here.
+          if (reloadNonce !== localReloadNonceRef.current) return
+        }
 
         const result = univerApiRef.current
         const workbook = result?.univerAPI.getActiveWorkbook?.()
@@ -3426,6 +3515,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         })
 
         latestSheetRef.current = nextSheet
+        structureRevisionRef.current = readStructureRevision(nextSheet.config)
         persistedWorksheetDataRef.current = cloneJsonSnapshot(serverSnapshot)
         syncSelectionState()
         requestProtectionHighlightRefresh()
@@ -3489,6 +3579,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     })
   }, [applyIncomingChanges, syncSheetSilently])
   flushDeferredRealtimeUpdatesRef.current = flushDeferredRealtimeUpdates
+  syncSheetSilentlyRef.current = syncSheetSilently
 
   useEffect(() => {
     const root = containerRef.current
@@ -3767,8 +3858,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       try {
         // On reload (triggered by WebSocket sheet_reload), refresh sheet
         // metadata first, then prefer the latest Univer snapshot in config.
-        const isReload = reloadTokenRef.current !== reloadToken
+        const isLocalReload = appliedReloadNonceRef.current !== localReloadNonce
+        const isReload = reloadTokenRef.current !== reloadToken || isLocalReload
         reloadTokenRef.current = reloadToken
+        appliedReloadNonceRef.current = localReloadNonce
 
         // If this is a reload, re-fetch the sheet metadata first
         let currentSheet = latestSheetRef.current
@@ -3784,8 +3877,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           }
         }
 
-        setActionError('')
+        // A reload after a structure conflict keeps the explanation on screen.
+        if (!isLocalReload) setActionError('')
         const config = parseSheetConfig(currentSheet.config)
+        structureRevisionRef.current = readStructureRevision(currentSheet.config)
+        structuralChangePendingRef.current = false
+        resyncAfterPersistRef.current = false
         const localeCode = 'zh-CN' as IWorkbookData['locale']
         let workbookData: IWorkbookData
 
@@ -3890,6 +3987,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         univerApiRef.current = univerResult
 
         const workbookApi = univerAPI.createUniverSheet(workbookData)
+        if (process.env.NODE_ENV !== 'production') {
+          // Development only: lets browser automation drive the live sheet.
+          ;(window as unknown as { __yaerpSheetDebug?: unknown }).__yaerpSheetDebug = { univerAPI, workbookApi, univer: univerResult.univer }
+        }
         // The sheets plugin (which owns SheetInterceptorService) and the cell
         // editor services are only instantiated while the first unit is
         // created, so wire up the alignment fixes once the workbook exists.
@@ -3904,10 +4005,39 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           univerResult.univer,
           () => workbookApi.getActiveSheet(),
           (count) => {
-            console.info(`[sheet] realigned ${count} formula cell(s) after inserting cells`)
+            console.info(`[sheet] realigned ${count} formula cell(s) after shifting cells`)
             schedulePersistRef.current?.()
+            setFormulaScanToken((token) => token + 1)
           }
         )
+        // Formula errors are explained by a click-through tooltip instead of
+        // Univer's popup, which covered (and blocked) the cells around it.
+        const formulaErrorHintDisposable = registerFormulaErrorHint(univerResult.univer, (hint) => {
+          if (!hint) {
+            setFormulaErrorHint(null)
+            return
+          }
+          let value = ''
+          try {
+            value = String(workbookApi.getActiveSheet().getRange(hint.row, hint.column, 1, 1).getDisplayValue() ?? '')
+          } catch {
+            value = ''
+          }
+          setFormulaErrorHint({ ...hint, value, detail: describeFormulaError(hint.message, value) })
+        })
+        // `粘贴为纯文本（仅值）` in the context menu, and Ctrl+Shift+V.
+        const plainTextPaste = registerPlainTextPaste(univerResult.univer, () => workbookApi.getActiveSheet(), {
+          canEdit: () => Boolean(latestEditableRef.current),
+          onPasted: (cells) => {
+            setClipboardNotice(`已按纯文本粘贴 ${cells} 个单元格`)
+            window.setTimeout(() => setClipboardNotice(''), 2600)
+          },
+          onNeedsKeyboardPaste: () => {
+            setClipboardNotice('浏览器不允许直接读取剪贴板，请现在按 Ctrl+V（手机长按选“粘贴”）完成纯文本粘贴')
+            window.setTimeout(() => setClipboardNotice(''), 6000)
+          },
+        })
+        pastePlainRef.current = plainTextPaste?.pastePlain ?? null
         // Quoted clipboard text (Excel style) may carry line breaks inside a
         // cell; handled by Univer's own paste path, that turns one row into two.
         const quotedClipboardFix = registerQuotedClipboardFixes(univerResult.univer, () => workbookApi.getActiveSheet())
@@ -3920,6 +4050,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           // describe exactly the cells this paste added.
           pendingPlainTextNotifyRef.current = true
           window.setTimeout(() => refreshPlainTextBadgesRef.current({ scan: true, notify: true }), 250)
+          setFormulaScanToken((token) => token + 1)
         })
         // Flattening a whole row or a pasted block in one step: the context menu
         // entry works on the selection and shares the scan of the badges, so a
@@ -4076,7 +4207,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   ? cloneJsonSnapshot(currentConfig.univerSheetData as Partial<IWorksheetData>)
                   : undefined)
               const cellChanges = buildRealtimeCellChanges(snap.id, previousSheet, savedSheet, nextColumns)
-              const nextConfig = {
+              // Undo/redo of a row or column insert is not reported as a
+              // structural command, but it changes the grid size.
+              const gridResized = Boolean(previousSheet) && (
+                (typeof previousSheet?.rowCount === 'number' && typeof savedSheet.rowCount === 'number' && previousSheet.rowCount !== savedSheet.rowCount) ||
+                (typeof previousSheet?.columnCount === 'number' && typeof savedSheet.columnCount === 'number' && previousSheet.columnCount !== savedSheet.columnCount)
+              )
+              const structureChanged = structuralChangePendingRef.current || gridResized
+              structuralChangePendingRef.current = false
+              const baseStructureRevision = structureRevisionRef.current
+              const nextConfig: typeof currentConfig & { structureRevision?: number } = {
                 ...currentConfig,
                 univerSheetData: savedSheet,
                 univerStyles: mergeUniverStyleMap(
@@ -4107,18 +4247,46 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 continue
               }
 
-              const res = await api.put<CellUpdateResult>(`/sheets/${snap.id}`, {
-                name: nextSheetName,
-                sort_order: snap.sort_order,
-                columns: nextColumns,
-                frozen: nextFrozen,
-                config: nextConfig,
-                cell_changes: cellChanges,
-              })
+              let res: Awaited<ReturnType<typeof api.put<CellUpdateResult>>>
+              structuralSaveInFlightRef.current = structureChanged
+              try {
+                res = await api.put<CellUpdateResult>(`/sheets/${snap.id}`, {
+                  name: nextSheetName,
+                  sort_order: snap.sort_order,
+                  columns: nextColumns,
+                  frozen: nextFrozen,
+                  config: nextConfig,
+                  cell_changes: cellChanges,
+                  structure_changed: structureChanged,
+                  base_structure_revision: baseStructureRevision,
+                })
+              } catch (requestError) {
+                if (structureChanged) structuralChangePendingRef.current = true
+                throw requestError
+              } finally {
+                structuralSaveInFlightRef.current = false
+              }
 			  if (disposed) return
 
               if (res.code !== 0) {
+                if ((res as { error_code?: string }).error_code === STRUCTURE_CONFLICT_ERROR_CODE) {
+                  // Someone else moved rows/columns since this client loaded the
+                  // sheet: these edits address rows that no longer exist at
+                  // those indexes. Drop them and reload the current layout
+                  // instead of writing values into the wrong rows.
+                  persistQueuedRef.current = false
+                  setActionError(res.message || '表格的行列结构已被其他协作者修改，已为你同步最新内容，请重新操作。')
+                  localReloadNonceRef.current += 1
+                  setLocalReloadNonce(localReloadNonceRef.current)
+                  return
+                }
+                if (structureChanged) structuralChangePendingRef.current = true
                 throw new Error(res.message || '保存工作表失败')
+              }
+              if (structureChanged) {
+                structureRevisionRef.current = baseStructureRevision + 1
+                nextConfig.structureRevision = structureRevisionRef.current
+                structuralGraceUntilRef.current = Date.now() + 1500
               }
 
               const revertedChanges = Array.isArray(res.data?.reverted_changes) ? res.data.reverted_changes : []
@@ -4160,6 +4328,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 config: nextConfig,
               }
               persistedWorksheetDataRef.current = savedSheet
+              if (resyncAfterPersistRef.current && !structuralChangePendingRef.current) {
+                // Remote cell updates arrived while rows were moving locally.
+                resyncAfterPersistRef.current = false
+                window.setTimeout(() => { void syncSheetSilentlyRef.current() }, 0)
+              }
             }
           }
 
@@ -4173,7 +4346,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // Expose persistSnapshot for manual save
         persistRef.current = persistSnapshot
 
-        const schedulePersist = () => {
+        const schedulePersist = (delay = 900) => {
           pendingLocalPersistRef.current = true
           if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
           if (sheetEditorActiveRef.current || imeComposingRef.current) {
@@ -4188,9 +4361,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               console.error('Failed to persist Univer snapshot:', e)
               setActionError(e instanceof Error ? e.message : '保存失败，请稍后再试。')
             })
-          }, 900)
+          }, delay)
         }
-        schedulePersistRef.current = schedulePersist
+        schedulePersistRef.current = () => schedulePersist()
 
         const disposable = workbookApi.onCommandExecuted((command) => {
           const refreshProtectionLayout = commandChangesProtectionHighlightLayout(command.id)
@@ -4198,6 +4371,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           // mutate the saved snapshot, so they must not trigger the expensive
           // save/diff/persist pipeline.
           const mutatesSnapshot = command.type !== CommandType.OPERATION
+          const structural = mutatesSnapshot && STRUCTURAL_COMMAND_PATTERN.test(command.id)
+          // Remote patches are applied cell by cell and never move rows.
+          if (structural && !applyingRemotePatchRef.current) structuralChangePendingRef.current = true
           if (sheetEditorActiveRef.current || imeComposingRef.current) {
             if (mutatesSnapshot) pendingLocalPersistRef.current = true
             return
@@ -4219,7 +4395,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               notify: PLAIN_TEXT_PASTE_COMMANDS.has(command.id),
             })
           }
-          if (mutatesSnapshot) schedulePersist()
+          // A structural edit is saved right away: the shorter the window in
+          // which collaborators hold different layouts, the better.
+          if (mutatesSnapshot) schedulePersist(structural || structuralChangePendingRef.current ? 200 : 900)
+          // Structural edits and fills are what break a fill-down column.
+          if (mutatesSnapshot && FORMULA_SCAN_COMMAND_PATTERN.test(command.id)) setFormulaScanToken((token) => token + 1)
         })
 
         const sendPresenceForCell = (state: 'selected' | 'editing', row: number, column: number) => {
@@ -4335,6 +4515,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           persistSheetViewMemory()
           disposable.dispose()
           cellShiftRepair?.dispose()
+          formulaErrorHintDisposable?.dispose()
+          plainTextPaste?.dispose()
+          pastePlainRef.current = null
+          setFormulaErrorHint(null)
           quotedClipboardFix?.dispose()
           pasteNotifier?.dispose?.()
           plainTextConvertMenu?.dispose?.()
@@ -4405,7 +4589,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 	  disposeCreatedUniver()
 	}
     // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveCanEditSheet synced via separate setEditable effect
-  }, [sheetId, workbookId, reloadToken, canInitializeEditor, persistSheetViewMemory, refreshPlainTextBadges, requestProtectionHighlightRefresh, scheduleSheetViewMemoryPersist])
+  }, [sheetId, workbookId, reloadToken, localReloadNonce, canInitializeEditor, persistSheetViewMemory, refreshPlainTextBadges, requestProtectionHighlightRefresh, scheduleSheetViewMemoryPersist])
 
   useEffect(() => {
     clearPlainTextBadges()
@@ -5100,7 +5284,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           const row = Math.min(worksheet.getMaxRows() - 1, Math.max(1, (range?.getRow() ?? 1) + rowDelta))
           const column = Math.min(worksheet.getMaxColumns() - 1, Math.max(0, (range?.getColumn() ?? 0) + columnDelta))
           worksheet.getRange(row, column, 1, 1).activate()
-          worksheet.scrollToCell(row, column)
+          revealCell(worksheet, row, column)
           syncSelectionState()
         }}
         undo={async () => {
@@ -5141,7 +5325,61 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           syncSelectionState()
           await persistRef.current?.()
         }}
+        extendSelection={async (rowDelta, columnDelta) => {
+          // Touch has no shift+arrow: grow or shrink the range from its
+          // bottom-right corner, keeping the anchor cell in place.
+          containerRef.current?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
+          const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
+          const range = worksheet?.getActiveRange()
+          if (!worksheet || !range) return
+          const startRow = range.getRow()
+          const startColumn = range.getColumn()
+          const endRow = Math.min(worksheet.getMaxRows() - 1, Math.max(startRow, startRow + range.getHeight() - 1 + rowDelta))
+          const endColumn = Math.min(worksheet.getMaxColumns() - 1, Math.max(startColumn, startColumn + range.getWidth() - 1 + columnDelta))
+          worksheet.getRange(startRow, startColumn, endRow - startRow + 1, endColumn - startColumn + 1).activate()
+          revealCell(worksheet, endRow, endColumn)
+          syncSelectionState()
+        }}
+        clearSelected={async () => {
+          if (imeComposingRef.current) throw new Error('请先完成正在输入的文字')
+          commitActiveCellEditor()
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
+          const range = worksheet?.getActiveRange()
+          if (!worksheet || !range) throw new Error('请先选择要清除的单元格')
+          if (editLocked || selectedCellCannotEdit || selectedCellMasked) throw new Error('这个单元格不可编辑')
+          // Same command as the Delete key, so permissions and undo behave alike.
+          const cleared = await univerApiRef.current?.univerAPI.executeCommand(ClearSelectionContentCommand.id)
+          if (!cleared) throw new Error('清除失败，所选单元格可能受保护')
+          syncSelectionState()
+          await persistRef.current?.()
+        }}
+        pastePlain={async () => {
+          if (editLocked) throw new Error('当前表格不可编辑')
+          commitActiveCellEditor()
+          await pastePlainRef.current?.()
+        }}
       />
+
+      <FormulaErrorTooltip hint={formulaErrorHint} containerRef={containerRef} />
+      <FormulaConsistencyBanner
+        scanToken={formulaScanToken}
+        ready={!loading && !error && canViewSheet}
+        editable={!editLocked}
+        getSheet={() => univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet() ?? null}
+        focusCell={(row, column) => {
+          const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
+          worksheet?.getRange(row, column, 1, 1).activate()
+          worksheet?.scrollToCell(row, column)
+          syncSelectionState()
+        }}
+        onRepaired={() => schedulePersistRef.current?.()}
+      />
+      {clipboardNotice && (
+        <div className="pointer-events-none absolute bottom-16 left-1/2 z-[70] max-w-[min(26rem,calc(100%-1rem))] -translate-x-1/2 rounded-lg bg-slate-900/90 px-3 py-2 text-center text-xs text-white shadow-lg" role="status">
+          {clipboardNotice}
+        </div>
+      )}
 
       {/* Hover card of a non plain text badge. The badges themselves are float
           DOMs anchored by Univer; this layer only draws the card, so it stays
