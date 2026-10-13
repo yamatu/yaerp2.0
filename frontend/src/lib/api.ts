@@ -93,8 +93,17 @@ class ApiClient {
     }
   }
 
-  get<T>(endpoint: string) {
-    return this.request<T>(endpoint)
+  // Several components often ask for the same resource while a page loads;
+  // identical GETs that are in flight share one network request.
+  private inflightGets = new Map<string, Promise<Response>>()
+
+  async get<T>(endpoint: string): Promise<ApiResponse<T>> {
+    let pending = this.inflightGets.get(endpoint)
+    if (!pending) {
+      pending = this.requestRaw(endpoint).finally(() => this.inflightGets.delete(endpoint))
+      this.inflightGets.set(endpoint, pending)
+    }
+    return (await pending).clone().json()
   }
 
   post<T>(endpoint: string, body?: unknown) {

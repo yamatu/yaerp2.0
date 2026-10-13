@@ -32,6 +32,7 @@ import { buildUniverWorkbookData, deriveColumnsFromUniverSheet, ensureWorksheetV
 import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInterceptor } from '@/lib/univer-editor-alignment'
 import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
 import { registerPasteNotifier, registerPlainTextPaste, registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
+import { skipEditorTextRepaints } from '@/lib/univer-render-dirty'
 import { describeFormulaError, registerFormulaErrorHint, type FormulaErrorHint } from '@/lib/univer-formula-error-hint'
 import FormulaErrorTooltip from '@/components/spreadsheet/FormulaErrorTooltip'
 import FormulaConsistencyBanner from '@/components/spreadsheet/FormulaConsistencyBanner'
@@ -3999,6 +4000,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // The sheets plugin (which owns SheetInterceptorService) and the cell
         // editor services are only instantiated while the first unit is
         // created, so wire up the alignment fixes once the workbook exists.
+        const editorRepaintFilter = skipEditorTextRepaints(univerResult.univer, workbookApi.getId())
         registerEditorComposedStyleInterceptor(univerResult.univer)
         installCellEditorAlignmentRecalculation(univerResult.univer)
         registerSharedFormulaEditorInterceptor(univerResult.univer)
@@ -4525,6 +4527,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           pastePlainRef.current = null
           setFormulaErrorHint(null)
           quotedClipboardFix?.dispose()
+          editorRepaintFilter?.dispose()
           pasteNotifier?.dispose?.()
           plainTextConvertMenu?.dispose?.()
           selectionPresenceDisposable.dispose()

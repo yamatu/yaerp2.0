@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
+
 	"yaerp/internal/model"
 )
 
@@ -248,14 +250,42 @@ func (r *UserRepo) List(page, size int) ([]model.User, int64, error) {
 		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Avatar, &u.Status, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
-		roles, err := r.GetUserRoles(u.ID)
-		if err != nil {
-			return nil, 0, fmt.Errorf("get roles for user %d: %w", u.ID, err)
-		}
-		u.Roles = roles
+		u.Roles = make([]model.Role, 0)
 		users = append(users, u)
 	}
-	return users, total, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	rows.Close()
+
+	// One query for the roles of the whole page instead of one per user.
+	ids := make([]int64, 0, len(users))
+	position := make(map[int64]int, len(users))
+	for index, user := range users {
+		ids = append(ids, user.ID)
+		position[user.ID] = index
+	}
+	roleRows, err := r.db.Query(
+		`SELECT ur.user_id, r.id, r.name, r.code, r.description, r.created_at
+		 FROM roles r
+		 INNER JOIN user_roles ur ON ur.role_id = r.id
+		 WHERE ur.user_id = ANY($1) ORDER BY ur.user_id, r.id`, pq.Array(ids),
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get roles for users: %w", err)
+	}
+	defer roleRows.Close()
+	for roleRows.Next() {
+		var userID int64
+		var role model.Role
+		if err := roleRows.Scan(&userID, &role.ID, &role.Name, &role.Code, &role.Description, &role.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		if index, ok := position[userID]; ok {
+			users[index].Roles = append(users[index].Roles, role)
+		}
+	}
+	return users, total, roleRows.Err()
 }
 
 func (r *UserRepo) GetUserRoles(userID int64) ([]model.Role, error) {
