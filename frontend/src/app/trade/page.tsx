@@ -2241,9 +2241,9 @@ export default function TradeWorkspacePage() {
     setEditingSupplierID(null);
   };
 
-  const openNewSupplierModal = (paymentMethod = paymentOptions[0]) => {
+  const openNewSupplierModal = (paymentMethod = paymentOptions[0], prefillName = "") => {
     setEditingSupplierID(null);
-    setSupplierDraft(newSupplierDraft(paymentMethod));
+    setSupplierDraft({ ...newSupplierDraft(paymentMethod), name: prefillName, company_name: prefillName });
     setSupplierModalOpen(true);
   };
 
@@ -6037,7 +6037,7 @@ export default function TradeWorkspacePage() {
             canAddItems={Boolean(detailOrder.access?.can_add_items)}
             defaultCurrency={defaultSupplierQuoteCurrency}
             onAddItems={openAddItems}
-            onCreateSupplier={() => openNewSupplierModal(paymentOptions[0])}
+            onCreateSupplier={(name) => openNewSupplierModal(paymentOptions[0], name ?? "")}
             onClose={() => setQuoteModalOpen(false)}
             onSave={() => void saveSupplierQuote()}
           />
