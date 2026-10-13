@@ -98,7 +98,7 @@ function groupRecords(records: TradeQuoteHistoryRecord[]): ProductGroup[] {
         maxPrice: Math.max(...prices),
         sameCurrency: currencies.size === 1,
         customerCount: new Set(sorted.map((record) => record.customer_id || record.customer_name)).size,
-        acceptedCount: sorted.filter((record) => record.status === "accepted").length,
+        acceptedCount: sorted.filter((record) => record.status === "accepted" && !record.declined).length,
       };
     })
     .sort((left, right) => right.latest.quoted_at.localeCompare(left.latest.quoted_at));
@@ -154,7 +154,7 @@ export function QuoteHistoryView({ customers, onOpenOrder }: QuoteHistoryViewPro
 
   const canViewCost = Boolean(data?.can_view_cost);
   const groups = useMemo(() => {
-    const records = (data?.records || []).filter((record) => !acceptedOnly || record.status === "accepted");
+    const records = (data?.records || []).filter((record) => !acceptedOnly || (record.status === "accepted" && !record.declined));
     return groupRecords(records);
   }, [acceptedOnly, data]);
 
@@ -226,6 +226,9 @@ export function QuoteHistoryView({ customers, onOpenOrder }: QuoteHistoryViewPro
                                 <span className={`rounded px-1.5 py-0.5 ${STATUS_STYLES[record.status] || "bg-slate-100"}`}>
                                   {STATUS_LABELS[record.status] || record.status}
                                 </span>
+                                {record.declined && (
+                                  <span className="ml-1 rounded bg-slate-200 px-1.5 py-0.5 text-slate-600">客户未采购</span>
+                                )}
                               </td>
                               <td className="px-3 py-2 text-right tabular-nums">
                                 {record.quantity} {record.unit}

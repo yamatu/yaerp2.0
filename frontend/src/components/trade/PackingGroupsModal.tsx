@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import api from "@/lib/api";
+import { tradeActiveItems } from "@/lib/tradeItems";
 import type { TradeOrder, TradeOrderItem, TradePackingGroup } from "@/types";
 
 interface PackingGroupDraft {
@@ -49,7 +50,7 @@ function emptyGroup(order: TradeOrder, includeAll = false): PackingGroupDraft {
     weight_kg: "",
     copies: "1",
     items: Object.fromEntries(
-      (order.items || []).map((item) => [
+      tradeActiveItems(order.items).map((item) => [
         item.id,
         includeAll ? String(availableQuantity(item)) : "",
       ]),
@@ -271,7 +272,7 @@ export function PackingGroupsModal({
                         <span className="text-right">每箱数量</span>
                         <span className="text-right">累计装箱</span>
                       </div>
-                      {(order.items || []).map((item) => {
+                      {tradeActiveItems(order.items).map((item) => {
                         const selected = Number(group.items[item.id] || 0) > 0;
                         const quantity = Number(group.items[item.id] || 0);
                         const available = availableQuantity(item);

@@ -225,9 +225,11 @@ func renderTradePIHTML(document *tradePIDocument) string {
 	order := document.Order
 	quote := document.Quote
 	profile := document.Profile
+	// The PI lists what the customer buys, not every quoted product.
+	purchased := quote.PurchasedItems()
 	goodsAmount := quote.GoodsAmount
 	if goodsAmount <= 0 {
-		for _, item := range quote.Items {
+		for _, item := range purchased {
 			goodsAmount += item.Amount
 		}
 	}
@@ -249,7 +251,7 @@ func renderTradePIHTML(document *tradePIDocument) string {
 	}
 
 	var rows strings.Builder
-	for index, item := range quote.Items {
+	for index, item := range purchased {
 		matched := tradePIOrderItem(order.Items, item.OrderItemID)
 		rows.WriteString("<tr><td class=\"center\">")
 		rows.WriteString(strconv.Itoa(index + 1))
@@ -283,7 +285,7 @@ func renderTradePIHTML(document *tradePIDocument) string {
 		}
 		rows.WriteString("</td></tr>")
 	}
-	for index := len(quote.Items); index < 4; index++ {
+	for index := len(purchased); index < 4; index++ {
 		rows.WriteString(`<tr class="blank-row"><td class="center">` + strconv.Itoa(index+1) + `</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>`)
 	}
 	if quote.FreightMode == "quoted" && quote.FreightAmount > 0 {

@@ -1190,7 +1190,7 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		addWarning("订单没有产品明细")
 	}
 	for _, item := range items {
-		if tradeItemUnavailable(&item) {
+		if tradeItemExcluded(&item) {
 			continue
 		}
 		lineComplete := true
@@ -1768,31 +1768,39 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	if len(items) == 0 {
 		return nil, fmt.Errorf("全部产品都已标记为无法报价，没有可以对客报价的产品")
 	}
-	inputPrices := make(map[int64]float64, len(request.Items))
+	inputs := make(map[int64]model.TradeCustomerQuoteItemInput, len(request.Items))
 	for _, input := range request.Items {
 		if input.OrderItemID <= 0 || input.UnitPrice <= 0 {
 			return nil, fmt.Errorf("每项产品都必须填写大于零的对客单价")
 		}
-		if _, exists := inputPrices[input.OrderItemID]; exists {
+		if input.MarginPercent < 0 || input.MarginPercent > 1000 {
+			return nil, fmt.Errorf("单个产品的加价率需要在 0 到 1000%% 之间")
+		}
+		if input.FreightAmount < 0 || input.WeightKG < 0 {
+			return nil, fmt.Errorf("产品运费和重量不能小于零")
+		}
+		if _, exists := inputs[input.OrderItemID]; exists {
 			return nil, fmt.Errorf("同一产品不能重复报价")
 		}
-		inputPrices[input.OrderItemID] = input.UnitPrice
+		inputs[input.OrderItemID] = input
 	}
 	quoteItems := make([]model.TradeCustomerQuoteItem, 0, len(items))
-	goodsAmount := 0.0
 	for _, item := range items {
-		unitPrice, exists := inputPrices[item.ID]
+		input, exists := inputs[item.ID]
 		if !exists {
 			return nil, fmt.Errorf("产品 %s 尚未填写对客报价", firstNonEmptyTrade(item.SKU, item.ProductName))
 		}
-		amount := item.Quantity * unitPrice
-		goodsAmount += amount
+		margin := 0.0
+		if orderAccess.CanViewProfit {
+			margin = input.MarginPercent
+		}
 		quoteItems = append(quoteItems, model.TradeCustomerQuoteItem{
 			OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU, ProductName: item.ProductName,
-			Quantity: item.Quantity, Unit: item.Unit, UnitPrice: unitPrice, Amount: amount,
+			Quantity: item.Quantity, Unit: item.Unit, UnitPrice: input.UnitPrice, Amount: item.Quantity * input.UnitPrice,
+			MarginPercent: margin, FreightAmount: input.FreightAmount, WeightKG: input.WeightKG, Declined: input.Declined,
 		})
 	}
-	if len(inputPrices) != len(items) {
+	if len(inputs) != len(items) {
 		return nil, fmt.Errorf("报价中包含不属于该业务单的产品")
 	}
 	currency := strings.ToUpper(strings.TrimSpace(request.Currency))
@@ -1812,21 +1820,24 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	if freightMode != "customer_forwarder" && freightMode != "quoted" {
 		return nil, fmt.Errorf("无效的运费方式")
 	}
-	freightAmount := nonNegativeTradeValue(request.FreightAmount)
-	if freightMode == "quoted" && freightAmount <= 0 {
-		return nil, fmt.Errorf("选择我方报价运费后，请填写大于零的运费金额")
-	}
 	if freightMode == "customer_forwarder" {
-		freightAmount = 0
+		for index := range quoteItems {
+			quoteItems[index].FreightAmount = 0
+		}
 	}
-	totalAmount := goodsAmount + freightAmount
 	round := &model.TradeCustomerQuoteRound{
-		OrderID: orderID, Currency: currency, Status: status, GoodsAmount: goodsAmount,
+		OrderID: orderID, Currency: currency, Status: status,
 		ExchangeRateCNY: exchangeRateCNY, ProfitMarginPercent: profitMarginPercent,
-		FreightMode: freightMode, FreightAmount: freightAmount,
-		TotalAmount: totalAmount, TotalAmountCNY: totalAmount * exchangeRateCNY,
+		FreightMode: freightMode, FreightAmount: nonNegativeTradeValue(request.FreightAmount),
 		Items: quoteItems, CustomerFeedback: strings.TrimSpace(request.CustomerFeedback),
 		Notes: strings.TrimSpace(request.Notes), CreatedBy: userID,
+	}
+	if len(round.PurchasedItems()) == 0 {
+		return nil, fmt.Errorf("请至少保留一项客户采购的产品")
+	}
+	round.ApplyItemTotals()
+	if freightMode == "quoted" && round.FreightAmount <= 0 {
+		return nil, fmt.Errorf("选择我方报价运费后，请为产品填写运费")
 	}
 	if err := s.repo.CreateCustomerQuoteRound(round); err != nil {
 		return nil, err
@@ -1869,21 +1880,42 @@ func (s *TradeService) UpdateCustomerQuoteRoundStatus(userID, orderID, quoteID i
 	if err != nil {
 		return nil, err
 	}
-	found := false
-	for _, quote := range quotes {
-		if quote.ID == quoteID {
-			found = true
+	var target *model.TradeCustomerQuoteRound
+	for index := range quotes {
+		if quotes[index].ID == quoteID {
+			target = &quotes[index]
 			break
 		}
 	}
-	if !found {
+	if target == nil {
 		return nil, fmt.Errorf("对客报价不存在")
+	}
+	var selected []int64
+	if status == "accepted" && request.SelectedItemIDs != nil {
+		inRound := make(map[int64]bool, len(target.Items))
+		for _, item := range target.Items {
+			inRound[item.OrderItemID] = true
+		}
+		seen := make(map[int64]bool, len(request.SelectedItemIDs))
+		selected = make([]int64, 0, len(request.SelectedItemIDs))
+		for _, id := range request.SelectedItemIDs {
+			if !inRound[id] {
+				return nil, fmt.Errorf("客户采购的产品不在本轮报价中")
+			}
+			if !seen[id] {
+				seen[id] = true
+				selected = append(selected, id)
+			}
+		}
+		if len(selected) == 0 {
+			return nil, fmt.Errorf("请至少选择一项客户采购的产品")
+		}
 	}
 	if status == "accepted" && (len(quotes) == 0 || quotes[0].ID != quoteID) {
 		return nil, fmt.Errorf("只能将最新一轮报价标记为客户接受")
 	}
 	if err := s.repo.UpdateCustomerQuoteRoundStatus(
-		orderID, quoteID, status, strings.TrimSpace(request.CustomerFeedback), strings.TrimSpace(request.Notes),
+		orderID, quoteID, status, strings.TrimSpace(request.CustomerFeedback), strings.TrimSpace(request.Notes), selected,
 	); err != nil {
 		return nil, err
 	}
@@ -2725,8 +2757,8 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 		}
 		blockers = append(blockers, "AI 导入订单仍有待补字段："+strings.Join(labels, "、"))
 	}
-	if order.Stage != model.TradeStageInquiry && order.Stage != model.TradeStageCancelled && len(tradeAvailableItems(items)) == 0 {
-		blockers = append(blockers, "全部产品都已标记为无法报价，请恢复至少一项产品或取消订单")
+	if order.Stage != model.TradeStageInquiry && order.Stage != model.TradeStageCancelled && len(tradeActiveItems(items)) == 0 {
+		blockers = append(blockers, "没有需要继续处理的产品（全部无法报价或客户未采购），请恢复至少一项产品或取消订单")
 	}
 	switch order.Stage {
 	case model.TradeStageInquiry:
@@ -2840,7 +2872,7 @@ func tradeMissingItemLabels(items []model.TradeOrderItem, missing func(model.Tra
 	labels := make([]string, 0, 3)
 	total := 0
 	for _, item := range items {
-		if tradeItemUnavailable(&item) || !missing(item) {
+		if tradeItemExcluded(&item) || !missing(item) {
 			continue
 		}
 		total++
