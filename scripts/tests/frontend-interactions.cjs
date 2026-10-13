@@ -199,4 +199,38 @@ async function testDragCapture() {
   assert.equal(listeners.get('pointermove').size, 0)
   console.log('PASS: stable drag-handle capture, full movement, pointer release and trailing-click suppression')
 }
-;(async () => { await testCloudObservation(); await testMobileControls(); testTouchPanScope(); await testDragCapture() })().catch((error) => { console.error(error); process.exitCode = 1 })
+function testSupplierQuoteImport() {
+  const { parseSupplierQuoteText } = compile(source('frontend/src/lib/supplierQuoteImport.ts'))
+  const items = [
+    { id: 11, line_no: 1, sku: 'A-001', product_name: 'Cable' },
+    { id: 12, line_no: 2, sku: 'A-002', product_name: 'Plug' },
+    { id: 13, line_no: 3, sku: '', product_name: 'Adapter' },
+  ]
+  const suppliers = [{ id: 7, name: '华强电子', company_name: '深圳华强电子有限公司', default_currency: 'CNY' }]
+  const pasted = [
+    '备注\t供应商\tSKU\t单价\t交期\t有效期',
+    '含税\t华强电子\ta-001\t¥1,250.5\t5-7天\t2026/12/1',
+    '\t新厂家\tAdapter\tUSD 3\t\t',
+    '\t\tA-002\t缺货',
+    '\t华强电子\tZZZ\t9',
+    '\t\tA-001\t8',
+  ].join('\n')
+  const { rows, headerDetected } = parseSupplierQuoteText(pasted, items, suppliers)
+  assert.equal(headerDetected, true, 'a header row is recognised in any column order')
+  assert.equal(rows.length, 5)
+  assert.deepEqual([rows[0].item.id, rows[0].supplierID, rows[0].unitPrice, rows[0].currency, rows[0].leadTime, rows[0].validUntil, rows[0].notes, rows[0].error],
+    [11, 7, '1250.5', 'CNY', '7', '2026-12-01', '含税', undefined], 'SKU match is case-insensitive, prices and dates are normalised')
+  assert.deepEqual([rows[1].item.id, rows[1].supplierID, rows[1].supplierName, rows[1].supplierIsNew, rows[1].currency], [13, 0, '新厂家', true, 'USD'], 'unknown suppliers are kept by name; product names match too')
+  assert.deepEqual([rows[2].item.id, rows[2].unavailable, rows[2].reason, rows[2].error], [12, true, '缺货', undefined], 'an out-of-stock price marks the item unavailable')
+  assert.match(rows[3].error, /找不到产品/)
+  assert.match(rows[4].error, /缺少供应商/)
+  const plain = parseSupplierQuoteText('A-002, 深圳华强电子有限公司, 4.2, CNY, 500, 10', items, suppliers)
+  assert.deepEqual([plain.headerDetected, plain.rows[0].item.id, plain.rows[0].supplierID, plain.rows[0].moq, plain.rows[0].leadTime], [false, 12, 7, '500', '10'], 'comma text uses the default column order and matches company names')
+
+  const icons = new Proxy({}, { get: (_, name) => (props) => React.createElement('icon', { ...props, name }) })
+  const { groupProfitWarnings } = compile(source('frontend/src/components/trade/ProfitWarnings.tsx'), { 'lucide-react': icons })
+  const grouped = groupProfitWarnings(['缺少 USD 兑人民币的报价汇率', '第 1 行尚未录入对客报价', '第 2 行尚未录入对客报价', '第 3 行尚未录入对客报价', '第 5 行尚未录入对客报价', '第 4 行尚未录入采购价'])
+  assert.deepEqual(grouped, ['缺少 USD 兑人民币的报价汇率', '尚未录入对客报价：第 1–3、5 行（共 4 行）', '尚未录入采购价：第 4 行（共 1 行）'])
+  console.log('PASS: supplier quote paste import (header detection, SKU/name/line matching, new suppliers, unavailable items), grouped profit warnings')
+}
+;(async () => { await testCloudObservation(); await testMobileControls(); testTouchPanScope(); await testDragCapture(); testSupplierQuoteImport() })().catch((error) => { console.error(error); process.exitCode = 1 })

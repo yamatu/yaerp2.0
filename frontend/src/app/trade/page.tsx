@@ -75,10 +75,15 @@ import { PaymentProofPanel } from "@/components/trade/PaymentProofPanel";
 import { PhotoCaptureSheet } from "@/components/trade/PhotoCaptureSheet";
 import { QuoteHistoryView } from "@/components/trade/QuoteHistoryView";
 import { StageFlowActions } from "@/components/trade/StageFlowActions";
+import { ProfitWarnings } from "@/components/trade/ProfitWarnings";
 import {
   SupplierQuoteBatchModal,
   isFilledSupplierQuote,
+  supplierQuoteDraftForItem,
+  tradeItemUnavailable,
+  tradeItemUnavailableReason,
   type SupplierQuoteDraft,
+  type TradeItemAvailabilityChange,
 } from "@/components/trade/SupplierQuoteBatchModal";
 import { WhatsAppAvatarImage } from "@/components/whatsapp/WhatsAppAvatarImage";
 import api from "@/lib/api";
@@ -515,21 +520,6 @@ function defaultSupplierQuoteCurrency(supplier?: TradeSupplier) {
   return supplier.default_currency?.trim().toUpperCase() || "CNY";
 }
 
-function supplierQuoteDraftForItem(itemID: number): SupplierQuoteDraft {
-  const validUntil = new Date();
-  validUntil.setDate(validUntil.getDate() + 30);
-  return {
-    order_item_id: itemID,
-    supplier_id: 0,
-    currency: "CNY",
-    unit_price: "",
-    moq: "",
-    lead_time_days: "3",
-    valid_until: formatTradeInputDate(validUntil),
-    notes: "",
-  };
-}
-
 function customerQuoteCostRateCNY(
   item: TradeOrderItem,
   quoteCurrency: string,
@@ -622,7 +612,7 @@ function newCustomerQuoteDraft(
     status: "sent",
     customer_feedback: source?.customer_feedback || "",
     notes: "",
-    items: (order.items || []).map((item) => {
+    items: (order.items || []).filter((item) => !tradeItemUnavailable(item)).map((item) => {
       const sourceItem = source?.items.find(
         (candidate) => candidate.order_item_id === item.id,
       );
@@ -2241,9 +2231,9 @@ export default function TradeWorkspacePage() {
     setEditingSupplierID(null);
   };
 
-  const openNewSupplierModal = (paymentMethod = paymentOptions[0], prefillName = "") => {
+  const openNewSupplierModal = (paymentMethod = paymentOptions[0]) => {
     setEditingSupplierID(null);
-    setSupplierDraft({ ...newSupplierDraft(paymentMethod), name: prefillName, company_name: prefillName });
+    setSupplierDraft(newSupplierDraft(paymentMethod));
     setSupplierModalOpen(true);
   };
 
@@ -2728,39 +2718,76 @@ export default function TradeWorkspacePage() {
     }
   };
 
-  const saveSupplierQuote = async () => {
+  const saveSupplierQuote = async (
+    availability: TradeItemAvailabilityChange[] = [],
+  ) => {
     if (!detailOrder) return;
-    const filledDrafts = quoteDrafts.filter(isFilledSupplierQuote);
-    if (filledDrafts.length === 0)
-      return setError("请至少为一个产品选择供应商并填写单价。");
+    const unavailableIDs = new Set(
+      (detailOrder.items || [])
+        .filter((item) => {
+          const change = availability.find(
+            (candidate) => candidate.order_item_id === item.id,
+          );
+          return change ? change.unavailable : tradeItemUnavailable(item);
+        })
+        .map((item) => item.id),
+    );
+    const filledDrafts = quoteDrafts.filter(
+      (draft) =>
+        isFilledSupplierQuote(draft) && !unavailableIDs.has(draft.order_item_id),
+    );
+    if (filledDrafts.length === 0 && availability.length === 0)
+      return setError("请至少为一个产品填写供应商和单价，或标记无法报价。");
+    if (editingSupplierQuoteID && !filledDrafts[0]?.supplier_id)
+      return setError("修改报价时请从列表中选择已有供应商。");
     setSavingQuote(true);
     setError("");
     try {
       const quotes = filledDrafts.map((draft) => ({
-          ...draft,
-          unit_price: Number(draft.unit_price || 0),
-          moq: Number(draft.moq || 0),
-          lead_time_days: Number(draft.lead_time_days || 0),
+        ...draft,
+        supplier_name: draft.supplier_id ? "" : draft.supplier_name.trim(),
+        unit_price: Number(draft.unit_price || 0),
+        moq: Number(draft.moq || 0),
+        lead_time_days: Number(draft.lead_time_days || 0),
       }));
-      const response = editingSupplierQuoteID
-        ? await api.put<TradeOrder>(
-            `/trade/orders/${detailOrder.id}/supplier-quotes/${editingSupplierQuoteID}`,
-            quotes[0],
-          )
-        : await api.post<TradeOrder>(
-            `/trade/orders/${detailOrder.id}/supplier-quotes/batch`,
-            { quotes },
-          );
-      if (response.code !== 0 || !response.data)
-        throw new Error(response.message || "保存供应商报价失败");
-      setDetailOrder(response.data);
+      let message = "供应商报价已更新。";
+      if (editingSupplierQuoteID) {
+        const response = await api.put<TradeOrder>(
+          `/trade/orders/${detailOrder.id}/supplier-quotes/${editingSupplierQuoteID}`,
+          quotes[0],
+        );
+        if (response.code !== 0 || !response.data)
+          throw new Error(response.message || "保存供应商报价失败");
+        setDetailOrder(response.data);
+      } else {
+        const response = await api.post<{
+          order: TradeOrder;
+          saved_quotes: number;
+          created_suppliers: TradeSupplier[];
+          unavailable_items: number;
+        }>(`/trade/orders/${detailOrder.id}/supplier-quotes/entry`, {
+          quotes,
+          availability,
+        });
+        if (response.code !== 0 || !response.data)
+          throw new Error(response.message || "保存供应商报价失败");
+        setDetailOrder(response.data.order);
+        const created = response.data.created_suppliers || [];
+        message =
+          [
+            response.data.saved_quotes > 0 &&
+              `已保存 ${response.data.saved_quotes} 条供应商报价`,
+            created.length > 0 &&
+              `自动新增供应商 ${created.map((supplier) => supplier.name).join("、")}`,
+            availability.length > 0 &&
+              `当前共 ${response.data.unavailable_items} 项产品无法报价`,
+          ]
+            .filter(Boolean)
+            .join("；") + "。";
+      }
       setQuoteModalOpen(false);
       setEditingSupplierQuoteID(null);
-      setNotice(
-        editingSupplierQuoteID
-          ? "供应商报价已更新。"
-          : `已保存 ${quotes.length} 条供应商报价。`,
-      );
+      setNotice(message);
       await loadData(true);
     } catch (quoteError) {
       setError(
@@ -6037,9 +6064,9 @@ export default function TradeWorkspacePage() {
             canAddItems={Boolean(detailOrder.access?.can_add_items)}
             defaultCurrency={defaultSupplierQuoteCurrency}
             onAddItems={openAddItems}
-            onCreateSupplier={(name) => openNewSupplierModal(paymentOptions[0], name ?? "")}
+            onCreateSupplier={() => openNewSupplierModal(paymentOptions[0])}
             onClose={() => setQuoteModalOpen(false)}
-            onSave={() => void saveSupplierQuote()}
+            onSave={(availability) => void saveSupplierQuote(availability)}
           />
         )}
 
@@ -7562,16 +7589,11 @@ export default function TradeWorkspacePage() {
                               detailOrder.profit_summary
                                 .additional_cost_notes) && (
                               <div className="space-y-1.5 border-t border-slate-200 px-4 py-3 text-xs">
-                                {detailOrder.profit_summary.warnings.map(
-                                  (warning) => (
-                                    <div
-                                      key={warning}
-                                      className="text-amber-700"
-                                    >
-                                      {warning}
-                                    </div>
-                                  ),
-                                )}
+                                <ProfitWarnings
+                                  warnings={
+                                    detailOrder.profit_summary.warnings
+                                  }
+                                />
                                 {detailOrder.profit_summary
                                   .additional_cost_notes && (
                                   <div className="text-slate-500">
@@ -7671,6 +7693,14 @@ export default function TradeWorkspacePage() {
                                 <div className="flex items-center justify-between gap-2">
                                   <span className="truncate font-semibold text-slate-900">
                                     {item.line_no}. {itemSKU(item)}
+                                    {tradeItemUnavailable(item) && (
+                                    <span
+                                      className="ml-1.5 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800"
+                                      title={tradeItemUnavailableReason(item) || "无法报价"}
+                                    >
+                                      无法报价
+                                    </span>
+                                  )}
                                   </span>
                                   <span className="shrink-0 text-xs tabular-nums text-slate-600">
                                     {item.quantity} {item.unit}
@@ -7815,6 +7845,14 @@ export default function TradeWorkspacePage() {
                                 <td className="px-3 py-2">
                                   <div className="font-medium">
                                     {itemSKU(item)}
+                                    {tradeItemUnavailable(item) && (
+                                    <span
+                                      className="ml-1.5 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800"
+                                      title={tradeItemUnavailableReason(item) || "无法报价"}
+                                    >
+                                      无法报价
+                                    </span>
+                                  )}
                                   </div>
                                   {itemExtraName(item) && (
                                     <div className="text-xs text-slate-400">
@@ -8365,6 +8403,23 @@ export default function TradeWorkspacePage() {
                                 </button>
                               )}
                           </div>
+                          {(detailOrder.items || []).some(tradeItemUnavailable) && (
+                            <div
+                              className="mt-2 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-800"
+                              data-unavailable-items
+                            >
+                              <span className="font-semibold">
+                                无法报价（不参与对客报价、利润和后续流程）：
+                              </span>
+                              {(detailOrder.items || [])
+                                .filter(tradeItemUnavailable)
+                                .map((item) => {
+                                  const reason = tradeItemUnavailableReason(item);
+                                  return `${item.sku || item.product_name}${reason ? `（${reason}）` : ""}`;
+                                })
+                                .join("、")}
+                            </div>
+                          )}
                           <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
                             <table className="w-full min-w-[850px] text-sm">
                               <thead className="bg-slate-50 text-left text-xs text-slate-500">
@@ -8468,6 +8523,7 @@ export default function TradeWorkspacePage() {
                                                         quote.order_item_id,
                                                       supplier_id:
                                                         quote.supplier_id || 0,
+                                                      supplier_name: "",
                                                       currency: quote.currency,
                                                       unit_price: String(
                                                         quote.unit_price,

@@ -1190,6 +1190,9 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		addWarning("订单没有产品明细")
 	}
 	for _, item := range items {
+		if tradeItemUnavailable(&item) {
+			continue
+		}
 		lineComplete := true
 		quantity := nonNegativeTradeValue(item.Quantity)
 		revenue := quantity * nonNegativeTradeValue(item.QuotedPrice)
@@ -1760,6 +1763,10 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	items, err := s.repo.ListOrderItems(orderID)
 	if err != nil {
 		return nil, err
+	}
+	items = tradeAvailableItems(items)
+	if len(items) == 0 {
+		return nil, fmt.Errorf("全部产品都已标记为无法报价，没有可以对客报价的产品")
 	}
 	inputPrices := make(map[int64]float64, len(request.Items))
 	for _, input := range request.Items {
@@ -2718,6 +2725,9 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 		}
 		blockers = append(blockers, "AI 导入订单仍有待补字段："+strings.Join(labels, "、"))
 	}
+	if order.Stage != model.TradeStageInquiry && order.Stage != model.TradeStageCancelled && len(tradeAvailableItems(items)) == 0 {
+		blockers = append(blockers, "全部产品都已标记为无法报价，请恢复至少一项产品或取消订单")
+	}
 	switch order.Stage {
 	case model.TradeStageInquiry:
 		if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
@@ -2830,7 +2840,7 @@ func tradeMissingItemLabels(items []model.TradeOrderItem, missing func(model.Tra
 	labels := make([]string, 0, 3)
 	total := 0
 	for _, item := range items {
-		if !missing(item) {
+		if tradeItemUnavailable(&item) || !missing(item) {
 			continue
 		}
 		total++

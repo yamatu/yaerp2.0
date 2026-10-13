@@ -380,6 +380,7 @@ func main() {
 		api.POST("/trade/orders/:id/advance", tradeHandler.AdvanceOrder)
 		api.POST("/trade/orders/:id/supplier-quotes", tradeHandler.CreateSupplierQuote)
 		api.POST("/trade/orders/:id/supplier-quotes/batch", tradeHandler.BatchCreateSupplierQuotes)
+		api.POST("/trade/orders/:id/supplier-quotes/entry", tradeHandler.SaveSupplierQuotes)
 		api.PUT("/trade/orders/:id/supplier-quotes/:quoteId", tradeHandler.UpdateSupplierQuote)
 		api.DELETE("/trade/orders/:id/supplier-quotes/:quoteId", tradeHandler.DeleteSupplierQuote)
 		api.POST("/trade/orders/:id/supplier-quotes/:quoteId/select", tradeHandler.SelectSupplierQuote)
