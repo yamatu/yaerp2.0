@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { Copy, Loader2, Plus, Trash2, Wand2, X } from "lucide-react";
-import { SupplierCombobox } from "@/components/trade/SupplierCombobox";
+import { SupplierCombobox, SupplierInlineSelect } from "@/components/trade/SupplierCombobox";
 import type { TradeOrder, TradeSupplier } from "@/types";
 
 export interface SupplierQuoteDraft {
@@ -40,7 +40,7 @@ interface SupplierQuoteBatchModalProps {
   canAddItems: boolean;
   defaultCurrency: (supplier?: TradeSupplier) => string;
   onAddItems: () => void;
-  onCreateSupplier: () => void;
+  onCreateSupplier: (prefillName?: string) => void;
   onClose: () => void;
   onSave: () => void;
 }
@@ -126,7 +126,7 @@ export function SupplierQuoteBatchModal({
                   </div>
                   <button
                     type="button"
-                    onClick={onCreateSupplier}
+                    onClick={() => onCreateSupplier()}
                     className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white"
                     title="新增供应商"
                   >
@@ -254,24 +254,17 @@ export function SupplierQuoteBatchModal({
                       )}
                     </td>
                     <td className="px-2 py-1.5">
-                      <select
+                      <SupplierInlineSelect
+                        suppliers={suppliers}
                         value={draft.supplier_id}
-                        onChange={(event) => {
-                          const supplier = suppliers.find((candidate) => candidate.id === Number(event.target.value));
+                        onChange={(supplierID, supplier) => {
                           update(index, {
-                            supplier_id: Number(event.target.value),
+                            supplier_id: supplierID,
                             currency: supplier ? defaultCurrency(supplier) : draft.currency,
                           });
                         }}
-                        className="h-8 w-full rounded-md border border-slate-200 bg-white px-2"
-                      >
-                        <option value={0}>选择供应商</option>
-                        {suppliers.map((supplier) => (
-                          <option key={supplier.id} value={supplier.id}>
-                            {supplier.name}
-                          </option>
-                        ))}
-                      </select>
+                        onCreateSupplier={(name) => onCreateSupplier(name)}
+                      />
                     </td>
                     <td className="px-2 py-1.5">
                       <input
