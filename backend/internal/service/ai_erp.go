@@ -320,13 +320,9 @@ func (s *AIService) prepareERPCreateCustomer(userID int64, raw map[string]any) (
 	if request.CustomerLevel != "A" && request.CustomerLevel != "B" && request.CustomerLevel != "C" {
 		return nil, nil, fmt.Errorf("客户等级仅支持 A、B、C")
 	}
-	if request.CreateChannel == nil {
-		createChannel := true
-		request.CreateChannel = &createChannel
-	}
 	preview := ERPActionPreview{
 		Kind: "create_customer", Title: "创建客户档案",
-		Description: "确认后才会写入客户资料；如启用客户频道，也会在确认后创建。",
+		Description: "确认后才会写入客户资料。",
 		TargetLabel: request.Name,
 		Details: compactERPDetails([]string{
 			"公司：" + firstNonEmptyTrade(request.CompanyName, request.Name),
@@ -336,7 +332,6 @@ func (s *AIService) prepareERPCreateCustomer(userID int64, raw map[string]any) (
 			"国家/地区：" + emptyERPLabel(strings.TrimSpace(request.Country+" "+request.Region)),
 			"来源：" + request.Source,
 			"客户等级：" + strings.ToUpper(request.CustomerLevel),
-			"创建客户频道：" + yesNoERP(request.CreateChannel != nil && *request.CreateChannel),
 		}),
 	}
 	return newStoredERPAction("create_customer", preview, request)
@@ -1352,13 +1347,6 @@ func erpTradeItemLabel(item model.CreateTradeOrderItemRequest) string {
 	return item.SKU + " · " + item.ProductName
 }
 
-func yesNoERP(value bool) string {
-	if value {
-		return "是"
-	}
-	return "否"
-}
-
 func printableERPValue(value any) string {
 	if value == nil {
 		return "清空"
@@ -1413,8 +1401,7 @@ func erpActionToolSchema() map[string]any {
 				"contact_name": map[string]any{"type": "string"}, "email": map[string]any{"type": "string"},
 				"phone": map[string]any{"type": "string"}, "source": map[string]any{"type": "string"},
 				"customer_level": map[string]any{"type": "string"}, "tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"notes":          map[string]any{"type": "string"},
-				"create_channel": map[string]any{"type": "boolean"},
+				"notes": map[string]any{"type": "string"},
 			},
 		},
 		"changes": map[string]any{"type": "object", "description": "Only changed customer fields for update_customer; empty strings intentionally clear a field."},

@@ -200,21 +200,6 @@ func (r *TradeRepo) UpdateCustomer(customer *model.TradeCustomer) error {
 	return nil
 }
 
-func (r *TradeRepo) SetCustomerChannel(customerID, ownerID, channelID int64) error {
-	result, err := r.db.Exec(
-		`UPDATE trade_customers SET channel_id = $3, updated_at = NOW() WHERE id = $1 AND owner_id = $2`,
-		customerID, ownerID, channelID,
-	)
-	if err != nil {
-		return fmt.Errorf("link customer channel: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 func (r *TradeRepo) GetCustomerByWhatsApp(ownerID int64, chatID string) (*model.TradeCustomer, error) {
 	query := tradeCustomerSelect + ` WHERE c.owner_id = $1 AND c.whatsapp_chat_id = $2 AND c.deleted_at IS NULL ` + tradeCustomerGroupBy
 	customer, err := scanTradeCustomer(r.db.QueryRow(query, ownerID, strings.TrimSpace(chatID)))

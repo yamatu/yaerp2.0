@@ -349,12 +349,10 @@ func (s *AIService) ApplyAITradeOrder(userID int64, request *AITradeOrderApplyRe
 		if !profile.CanCreateCustomers {
 			return nil, fmt.Errorf("未匹配到已有客户，当前岗位也没有自动建立客户档案的权限")
 		}
-		createChannel := false
 		customer, err = s.tradeService.CreateCustomer(userID, &model.CreateTradeCustomerRequest{
 			Name: name, CompanyName: name, Country: draft.Country,
 			Source: "other", CustomerLevel: "B",
-			Notes:         fmt.Sprintf("AI 自动建立的待核验客户档案。导入编号：%s", draft.ImportID),
-			CreateChannel: &createChannel,
+			Notes: fmt.Sprintf("AI 自动建立的待核验客户档案。导入编号：%s", draft.ImportID),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("自动建立客户档案失败: %w", err)

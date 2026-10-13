@@ -46,7 +46,11 @@ func main() {
 		log.Fatalf("Failed to apply migrations: %v", err)
 	}
 	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
+	// A page fires a burst of parallel requests; keep those connections warm
+	// instead of reconnecting for everything beyond a handful.
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxLifetime(30 * time.Minute)
 	log.Println("Database connected and migrations applied")
 
 	// Redis
