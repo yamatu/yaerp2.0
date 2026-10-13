@@ -813,6 +813,38 @@ type BatchTradeSupplierQuoteRequest struct {
 	Quotes []UpsertTradeSupplierQuoteRequest `json:"quotes" binding:"required,min=1,dive"`
 }
 
+// TradeSupplierQuoteEntry names its supplier either by ID or by name; a name
+// that matches no supplier creates one.
+type TradeSupplierQuoteEntry struct {
+	OrderItemID  int64   `json:"order_item_id"`
+	SupplierID   int64   `json:"supplier_id"`
+	SupplierName string  `json:"supplier_name"`
+	Currency     string  `json:"currency"`
+	UnitPrice    float64 `json:"unit_price"`
+	MOQ          float64 `json:"moq"`
+	LeadTimeDays int     `json:"lead_time_days"`
+	ValidUntil   string  `json:"valid_until"`
+	Notes        string  `json:"notes"`
+}
+
+type TradeItemAvailabilityInput struct {
+	OrderItemID int64  `json:"order_item_id"`
+	Unavailable bool   `json:"unavailable"`
+	Reason      string `json:"reason"`
+}
+
+type SaveTradeSupplierQuotesRequest struct {
+	Quotes       []TradeSupplierQuoteEntry    `json:"quotes"`
+	Availability []TradeItemAvailabilityInput `json:"availability"`
+}
+
+type SaveTradeSupplierQuotesResult struct {
+	Order            *TradeOrder     `json:"order"`
+	SavedQuotes      int             `json:"saved_quotes"`
+	CreatedSuppliers []TradeSupplier `json:"created_suppliers"`
+	UnavailableItems int             `json:"unavailable_items"`
+}
+
 type TradeCustomerQuoteItemInput struct {
 	OrderItemID int64   `json:"order_item_id" binding:"required"`
 	UnitPrice   float64 `json:"unit_price" binding:"gt=0"`

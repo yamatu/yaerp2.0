@@ -511,6 +511,25 @@ func (h *TradeHandler) BatchCreateSupplierQuotes(c *gin.Context) {
 	response.OK(c, order)
 }
 
+func (h *TradeHandler) SaveSupplierQuotes(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.SaveTradeSupplierQuotesRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	result, err := h.service.SaveSupplierQuotes(c.GetInt64("user_id"), orderID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *TradeHandler) UpdateSupplierQuote(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {

@@ -1171,6 +1171,28 @@ func (r *TradeRepo) ListSuppliers(search string) ([]model.TradeSupplier, error) 
 	return result, rows.Err()
 }
 
+// FindSupplierByName matches a supplier name case-insensitively, preferring
+// the short name over the company name. sql.ErrNoRows means no match.
+func (r *TradeRepo) FindSupplierByName(name string) (*model.TradeSupplier, error) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return nil, sql.ErrNoRows
+	}
+	var supplierID int64
+	err := r.db.QueryRow(
+		`SELECT id FROM trade_suppliers WHERE LOWER(TRIM(name))=$1 ORDER BY updated_at DESC,id DESC LIMIT 1`, key,
+	).Scan(&supplierID)
+	if err == sql.ErrNoRows {
+		err = r.db.QueryRow(
+			`SELECT id FROM trade_suppliers WHERE LOWER(TRIM(company_name))=$1 ORDER BY updated_at DESC,id DESC LIMIT 1`, key,
+		).Scan(&supplierID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.GetSupplier(supplierID)
+}
+
 func (r *TradeRepo) GetSupplier(supplierID int64) (*model.TradeSupplier, error) {
 	var supplier model.TradeSupplier
 	err := r.db.QueryRow(
