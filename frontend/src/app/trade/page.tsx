@@ -60,6 +60,10 @@ import { AuthGuard } from "@/components/auth/AuthGuard";
 import { CurrencySearchEnhancer } from "@/components/trade/CurrencyCombobox";
 import { CustomerCombobox } from "@/components/trade/CustomerCombobox";
 import {
+  CustomerFormModal,
+  type CustomerDraft,
+} from "@/components/trade/CustomerFormModal";
+import {
   OrderItemsEditor,
   isFilledOrderItem,
   newOrderItem,
@@ -80,7 +84,6 @@ import { WhatsAppAvatarImage } from "@/components/whatsapp/WhatsAppAvatarImage";
 import api from "@/lib/api";
 import { getStoredUser, isAdmin } from "@/lib/auth";
 import { setReturnTarget } from "@/lib/returnNavigation";
-import { matchesWhatsAppChat } from "@/lib/whatsappSearch";
 import { wsClient } from "@/lib/ws";
 import {
   imageTransformLabel,
@@ -122,26 +125,6 @@ interface StageDefinition {
   icon: LucideIcon;
   color: string;
   background: string;
-}
-
-interface CustomerDraft {
-  name: string;
-  company_name: string;
-  country: string;
-  region: string;
-  contact_name: string;
-  email: string;
-  phone: string;
-  source: TradeCustomer["source"];
-  status: TradeCustomer["status"];
-  customer_level: TradeCustomer["customer_level"];
-  tags: string;
-  notes: string;
-  create_channel: boolean;
-  whatsapp_account_id?: number;
-  whatsapp_chat_id: string;
-  whatsapp_chat_name: string;
-  avatar_url: string;
 }
 
 interface OrderDraft {
@@ -468,27 +451,6 @@ const CUSTOMER_STATUS_LABELS: Record<TradeCustomer["status"], string> = {
   inactive: "暂停合作",
   blocked: "停止合作",
 };
-
-function newCustomerDraft(): CustomerDraft {
-  return {
-    name: "",
-    company_name: "",
-    country: "",
-    region: "",
-    contact_name: "",
-    email: "",
-    phone: "",
-    source: "manual",
-    status: "lead",
-    customer_level: "B",
-    tags: "",
-    notes: "",
-    create_channel: true,
-    whatsapp_chat_id: "",
-    whatsapp_chat_name: "",
-    avatar_url: "",
-  };
-}
 
 function newAIImportItem(): AITradeOrderImportItem {
   return {
@@ -1008,8 +970,6 @@ export default function TradeWorkspacePage() {
   const [customerMode, setCustomerMode] = useState<"manual" | "whatsapp">(
     "manual",
   );
-  const [customerDraft, setCustomerDraft] =
-    useState<CustomerDraft>(newCustomerDraft);
   const [savingCustomer, setSavingCustomer] = useState(false);
   const [customerDeleteTarget, setCustomerDeleteTarget] =
     useState<TradeCustomer | null>(null);
@@ -1024,7 +984,6 @@ export default function TradeWorkspacePage() {
     useState<WhatsAppAccount | null>(null);
   const [whatsAppChats, setWhatsAppChats] = useState<WhatsAppChat[]>([]);
   const [whatsAppLoading, setWhatsAppLoading] = useState(false);
-  const [whatsAppSearch, setWhatsAppSearch] = useState("");
 
   const [orderModalOpen, setOrderModalOpen] = useState(false);
   const [orderDraft, setOrderDraft] = useState<OrderDraft>(() =>
@@ -1502,15 +1461,6 @@ export default function TradeWorkspacePage() {
     }
   }, []);
 
-  useEffect(() => {
-    if (
-      customerModalOpen &&
-      customerMode === "whatsapp" &&
-      whatsAppChats.length === 0
-    )
-      void loadWhatsApp();
-  }, [customerModalOpen, customerMode, loadWhatsApp, whatsAppChats.length]);
-
   const filteredOrders = useMemo(() => {
     const keyword = search.trim().toLowerCase();
     return orders.filter((order) => {
@@ -1600,11 +1550,6 @@ export default function TradeWorkspacePage() {
     });
   }, [profile?.id, search, showOnlyMine, suppliers]);
 
-  const filteredWhatsAppChats = useMemo(
-    () =>
-      whatsAppChats.filter((chat) => matchesWhatsAppChat(chat, whatsAppSearch)),
-    [whatsAppChats, whatsAppSearch],
-  );
   const filteredPositionUsers = useMemo(() => {
     const keyword = positionUserSearch.trim().toLowerCase();
     if (!keyword) return users;
@@ -1698,58 +1643,18 @@ export default function TradeWorkspacePage() {
 
   const openCustomerModal = (mode: "manual" | "whatsapp" = "manual") => {
     setEditingCustomer(null);
-    setCustomerDraft(newCustomerDraft());
     setCustomerMode(mode);
-    setWhatsAppSearch("");
     setCustomerModalOpen(true);
     setError("");
   };
 
   const openEditCustomer = (customer: TradeCustomer) => {
     setEditingCustomer(customer);
-    setCustomerMode("manual");
-    setWhatsAppSearch("");
-    setCustomerDraft({
-      name: customer.name,
-      company_name: customer.company_name,
-      country: customer.country,
-      region: customer.region,
-      contact_name: customer.contact_name,
-      email: customer.email,
-      phone: customer.phone,
-      source: customer.source,
-      status: customer.status,
-      customer_level: customer.customer_level,
-      tags: (customer.tags || []).join(", "),
-      notes: customer.notes,
-      create_channel: false,
-      whatsapp_account_id: customer.whatsapp_account_id,
-      whatsapp_chat_id: customer.whatsapp_chat_id,
-      whatsapp_chat_name: customer.whatsapp_chat_name,
-      avatar_url: customer.avatar_url,
-    });
     setCustomerModalOpen(true);
     setError("");
   };
 
-  const chooseWhatsAppChat = (chat: WhatsAppChat) => {
-    const phone = chat.id.split("@")[0].replace(/\D/g, "");
-    setCustomerDraft((current) => ({
-      ...current,
-      name: chat.name || phone,
-      company_name: chat.name || "",
-      contact_name: chat.name || "",
-      phone,
-      source: "whatsapp",
-      whatsapp_account_id: whatsAppAccount?.id,
-      whatsapp_chat_id: chat.id,
-      whatsapp_chat_name: chat.name,
-      avatar_url: chat.profilePicUrl,
-      notes: chat.about || chat.description || "",
-    }));
-  };
-
-  const saveCustomer = async () => {
+  const saveCustomer = async (customerDraft: CustomerDraft) => {
     if (!customerDraft.name.trim()) return setError("请输入客户名称。");
     setSavingCustomer(true);
     setError("");
@@ -1778,7 +1683,7 @@ export default function TradeWorkspacePage() {
         editingCustomer
           ? `客户「${response.data.name}」资料已更新。`
           : response.data.integration_warning ||
-              `客户「${response.data.name}」已建档。内部建档提示不会发送给 WhatsApp 客户。`,
+              `客户「${response.data.name}」已建档。`,
       );
       if (!editingCustomer) {
         setOrderDraft((current) => ({
@@ -1786,8 +1691,14 @@ export default function TradeWorkspacePage() {
           customer_id: response.data!.id,
         }));
       }
+      const saved = response.data;
+      setCustomers((current) =>
+        editingCustomer
+          ? current.map((item) => (item.id === saved.id ? saved : item))
+          : [saved, ...current.filter((item) => item.id !== saved.id)],
+      );
       setEditingCustomer(null);
-      await loadData(true);
+      void loadData(true);
     } catch (saveError) {
       setError(
         saveError instanceof Error
@@ -4962,358 +4873,23 @@ export default function TradeWorkspacePage() {
         </main>
 
         {customerModalOpen && (
-          <div
-            className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
-            onMouseDown={(event) => {
-              if (event.target === event.currentTarget && !savingCustomer) {
-                setCustomerModalOpen(false);
-                setEditingCustomer(null);
-              }
+          <CustomerFormModal
+            key={editingCustomer?.id ?? "new"}
+            editingCustomer={editingCustomer}
+            initialMode={customerMode}
+            saving={savingCustomer}
+            sourceLabels={SOURCE_LABELS}
+            statusLabels={CUSTOMER_STATUS_LABELS}
+            whatsAppAccount={whatsAppAccount}
+            whatsAppChats={whatsAppChats}
+            whatsAppLoading={whatsAppLoading}
+            onLoadWhatsApp={loadWhatsApp}
+            onClose={() => {
+              setCustomerModalOpen(false);
+              setEditingCustomer(null);
             }}
-          >
-            <div className="flex max-h-[94vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
-              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                <div>
-                  <h2 className="font-semibold">
-                    {editingCustomer ? "编辑客户资料" : "录入客户"}
-                  </h2>
-                  <p className="mt-0.5 text-xs text-slate-500">
-                    {editingCustomer
-                      ? `${editingCustomer.customer_code} · 姓名、联系人和备注都可以修改或清空。`
-                      : "客户建档提示仅供内部员工查看，不会转发给 WhatsApp 客户。"}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCustomerModalOpen(false);
-                    setEditingCustomer(null);
-                  }}
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-              <div className="min-h-0 flex-1 overflow-y-auto p-4">
-                {!editingCustomer && (
-                  <div className="mb-4 flex border-b border-slate-200">
-                    <button
-                      type="button"
-                      onClick={() => setCustomerMode("manual")}
-                      className={`border-b-2 px-3 py-2 text-sm font-medium ${customerMode === "manual" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
-                    >
-                      手工录入
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setCustomerMode("whatsapp")}
-                      className={`border-b-2 px-3 py-2 text-sm font-medium ${customerMode === "whatsapp" ? "border-emerald-600 text-emerald-700" : "border-transparent text-slate-400"}`}
-                    >
-                      从 WhatsApp 录入
-                    </button>
-                  </div>
-                )}
-                {!editingCustomer && customerMode === "whatsapp" && (
-                  <div className="mb-4 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
-                    {whatsAppLoading ? (
-                      <div className="flex h-32 items-center justify-center text-sm text-emerald-700">
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        正在读取会话...
-                      </div>
-                    ) : whatsAppAccount?.status !== "ready" ? (
-                      <div className="py-5 text-center">
-                        <MessageCircle className="mx-auto h-7 w-7 text-emerald-600" />
-                        <div className="mt-2 text-sm font-semibold">
-                          WhatsApp 尚未连接
-                        </div>
-                        <Link
-                          href="/whatsapp"
-                          className="mt-3 inline-flex h-8 items-center rounded-lg bg-emerald-700 px-3 text-xs font-semibold text-white"
-                        >
-                          前往绑定
-                        </Link>
-                      </div>
-                    ) : (
-                      <>
-                        <label className="flex h-9 items-center gap-2 rounded-lg border border-emerald-200 bg-white px-3 text-sm text-slate-500">
-                          <Search className="h-4 w-4" />
-                          <input
-                            type="search"
-                            value={whatsAppSearch}
-                            onChange={(event) =>
-                              setWhatsAppSearch(event.target.value)
-                            }
-                            placeholder="搜索客户姓名、号码或最近消息"
-                            className="min-w-0 flex-1 outline-none"
-                          />
-                          <span className="text-[11px] text-slate-400">
-                            {filteredWhatsAppChats.length}/
-                            {whatsAppChats.length}
-                          </span>
-                        </label>
-                        <div className="mt-2 max-h-56 overflow-y-auto rounded-lg border border-emerald-100 bg-white">
-                          {filteredWhatsAppChats.map((chat) => {
-                            const selected =
-                              customerDraft.whatsapp_chat_id === chat.id;
-                            return (
-                              <button
-                                key={chat.id}
-                                type="button"
-                                onClick={() => chooseWhatsAppChat(chat)}
-                                className={`flex w-full items-center gap-3 border-b border-slate-100 px-3 py-2.5 text-left last:border-b-0 ${selected ? "bg-emerald-50" : "hover:bg-slate-50"}`}
-                              >
-                                <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-slate-100">
-                                  <WhatsAppAvatarImage
-                                    src={chat.profilePicUrl}
-                                    fallback={
-                                      <MessageCircle className="h-4 w-4 text-slate-400" />
-                                    }
-                                  />
-                                </div>
-                                <div className="min-w-0 flex-1">
-                                  <div className="truncate text-sm font-semibold">
-                                    {chat.name}
-                                  </div>
-                                  <div className="mt-0.5 truncate text-xs text-slate-400">
-                                    {chat.lastMessage || chat.about || chat.id}
-                                  </div>
-                                </div>
-                                {selected && (
-                                  <Check className="h-4 w-4 text-emerald-600" />
-                                )}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )}
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <label className="text-sm font-medium text-slate-700">
-                    客户简称<span className="text-rose-500"> *</span>
-                    <input
-                      value={customerDraft.name}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          name: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    公司全称
-                    <input
-                      value={customerDraft.company_name}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          company_name: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    联系人
-                    <input
-                      value={customerDraft.contact_name}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          contact_name: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    电话 / WhatsApp
-                    <input
-                      value={customerDraft.phone}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          phone: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    邮箱
-                    <input
-                      value={customerDraft.email}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          email: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    国家/地区
-                    <input
-                      value={customerDraft.country}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          country: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    州/省/地区
-                    <input
-                      value={customerDraft.region}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          region: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    客户来源
-                    <select
-                      value={customerDraft.source}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          source: event.target.value as TradeCustomer["source"],
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 outline-none"
-                    >
-                      {Object.entries(SOURCE_LABELS).map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    客户等级
-                    <select
-                      value={customerDraft.customer_level}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          customer_level: event.target
-                            .value as TradeCustomer["customer_level"],
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 outline-none"
-                    >
-                      <option value="A">A · 重点客户</option>
-                      <option value="B">B · 普通客户</option>
-                      <option value="C">C · 潜在客户</option>
-                    </select>
-                  </label>
-                  <label className="text-sm font-medium text-slate-700">
-                    客户状态
-                    <select
-                      value={customerDraft.status}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          status: event.target.value as TradeCustomer["status"],
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 outline-none"
-                    >
-                      {Object.entries(CUSTOMER_STATUS_LABELS).map(
-                        ([value, label]) => (
-                          <option key={value} value={value}>
-                            {label}
-                          </option>
-                        ),
-                      )}
-                    </select>
-                  </label>
-                  <label className="text-sm font-medium text-slate-700 sm:col-span-2">
-                    标签
-                    <input
-                      value={customerDraft.tags}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          tags: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 h-10 w-full rounded-lg border border-slate-200 px-3 outline-none"
-                      placeholder="批发商, 欧洲, 重点跟进"
-                    />
-                  </label>
-                  <label className="text-sm font-medium text-slate-700 sm:col-span-2">
-                    备注
-                    <textarea
-                      value={customerDraft.notes}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          notes: event.target.value,
-                        }))
-                      }
-                      className="mt-1.5 min-h-20 w-full resize-y rounded-lg border border-slate-200 px-3 py-2 outline-none"
-                    />
-                  </label>
-                </div>
-                {!editingCustomer && (
-                  <label className="mt-4 flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-3 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={customerDraft.create_channel}
-                      onChange={(event) =>
-                        setCustomerDraft((current) => ({
-                          ...current,
-                          create_channel: event.target.checked,
-                        }))
-                      }
-                      className="h-4 w-4 accent-slate-900"
-                    />
-                    <span>
-                      <span className="font-medium">自动建立客户频道</span>
-                      <span className="ml-2 text-xs text-slate-400">
-                        用于沟通、文件和业务协作
-                      </span>
-                    </span>
-                  </label>
-                )}
-              </div>
-              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCustomerModalOpen(false);
-                    setEditingCustomer(null);
-                  }}
-                  className="h-9 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-600"
-                >
-                  取消
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void saveCustomer()}
-                  disabled={savingCustomer || !customerDraft.name.trim()}
-                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-40"
-                >
-                  {savingCustomer && (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  )}
-                  {editingCustomer ? "保存修改" : "保存客户"}
-                </button>
-              </div>
-            </div>
-          </div>
+            onSubmit={(draft) => void saveCustomer(draft)}
+          />
         )}
 
         {customerDeleteApprovalsOpen && tradeAccess?.is_admin && (

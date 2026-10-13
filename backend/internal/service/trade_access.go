@@ -12,6 +12,8 @@ type tradeUserAccess struct {
 	profile       model.TradeAccessProfile
 	positionCodes map[string]bool
 	stageAccess   map[string]bool
+	// Set while a list of orders is resolved; nil means look up per call.
+	stageLookup *tradeStageLookup
 }
 
 func (s *TradeService) AccessProfile(userID int64) (*model.TradeAccessProfile, error) {
@@ -212,7 +214,11 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	canOperate := full
 	if !full {
 		var err error
-		canOperate, _, err = s.canOperateStage(userID, order)
+		lookup := access.stageLookup
+		if lookup == nil {
+			lookup = newTradeStageLookup(s)
+		}
+		canOperate, _, err = lookup.canOperateStage(userID, order, order.Stage)
 		if err != nil {
 			return nil, err
 		}

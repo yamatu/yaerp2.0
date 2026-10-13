@@ -654,7 +654,6 @@ type CreateTradeCustomerRequest struct {
 	AvatarURL         string   `json:"avatar_url"`
 	Tags              []string `json:"tags"`
 	Notes             string   `json:"notes"`
-	CreateChannel     *bool    `json:"create_channel"`
 }
 
 type UpdateTradeCustomerRequest struct {

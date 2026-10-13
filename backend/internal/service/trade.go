@@ -355,38 +355,7 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 		customer.OwnerName = user.Username
 	}
 
-	createChannel := request.CreateChannel == nil || *request.CreateChannel
-	if createChannel {
-		description := fmt.Sprintf("外贸客户 %s · %s", customer.CustomerCode, firstNonEmptyTrade(customer.CompanyName, customer.Name))
-		channel, err := s.channelSvc.CreateChannel(userID, &model.ChannelCreateRequest{Name: customer.Name, Description: &description})
-		if err != nil {
-			customer.IntegrationWarning = "客户已创建，但客户频道创建失败：" + err.Error()
-		} else {
-			customer.ChannelID = &channel.ID
-			if err := s.repo.SetCustomerChannel(customer.ID, userID, channel.ID); err != nil {
-				customer.IntegrationWarning = "客户已创建，但频道关联保存失败：" + err.Error()
-			}
-			if customer.WhatsAppAccountID != nil && customer.WhatsAppChatID != "" {
-				inbound, outbound := true, true
-				_, linkErr := s.whatsAppSvc.UpdateChannelLink(userID, channel.ID, &model.WhatsAppChannelLinkRequest{
-					WhatsAppAccountID: *customer.WhatsAppAccountID,
-					WhatsAppChatID:    customer.WhatsAppChatID,
-					SyncInbound:       &inbound, SyncOutbound: &outbound,
-				})
-				if linkErr != nil {
-					customer.IntegrationWarning = "客户与频道已创建，但 WhatsApp 会话关联失败：" + linkErr.Error()
-				}
-			}
-			_, _ = s.channelSvc.CreateMessage(userID, channel.ID, ChannelMessageInput{
-				Content:      fmt.Sprintf("已建立客户档案：%s（%s）。询价、报价、采购和发货资料会集中在此频道。", customer.Name, customer.CustomerCode),
-				InternalOnly: true,
-			})
-		}
-	}
-
-	loaded, err := s.getCustomer(userID, customer.ID)
-	if err == nil {
-		loaded.IntegrationWarning = customer.IntegrationWarning
+	if loaded, err := s.getCustomer(userID, customer.ID); err == nil {
 		return loaded, nil
 	}
 	return customer, nil
@@ -628,8 +597,11 @@ func (s *TradeService) ListOrders(userID int64, filter model.TradeOrderFilter) (
 	if err != nil {
 		return nil, err
 	}
+	// One lookup for the whole page: the permission queries do not depend on
+	// the row, only on the user and the stage.
+	access.stageLookup = newTradeStageLookup(s)
 	for index := range orders {
-		s.enrichOrderPermissions(userID, &orders[index])
+		s.enrichOrderPermissionsWith(access.stageLookup, userID, &orders[index])
 		if err := s.redactTradeOrder(userID, &orders[index], access); err != nil {
 			return nil, err
 		}
@@ -2638,10 +2610,14 @@ func setTradeWorkflowValue(item *model.TradeOrderItem, key string, value any) {
 }
 
 func (s *TradeService) enrichOrderPermissions(userID int64, order *model.TradeOrder) {
+	s.enrichOrderPermissionsWith(newTradeStageLookup(s), userID, order)
+}
+
+func (s *TradeService) enrichOrderPermissionsWith(lookup *tradeStageLookup, userID int64, order *model.TradeOrder) {
 	if order == nil {
 		return
 	}
-	allowed, position, err := s.canOperateStage(userID, order)
+	allowed, position, err := lookup.canOperateStage(userID, order, order.Stage)
 	if err == nil {
 		order.CanOperateStage = allowed
 		if position != nil {
@@ -2882,20 +2858,96 @@ func (s *TradeService) canOperateStage(userID int64, order *model.TradeOrder) (b
 }
 
 func (s *TradeService) canOperateStageForStage(userID int64, order *model.TradeOrder, stage string) (bool, *model.TradePosition, error) {
-	admin, err := s.isAdmin(userID)
+	return newTradeStageLookup(s).canOperateStage(userID, order, stage)
+}
+
+// tradeStageLookup remembers the permission lookups of one request, so a list
+// of orders resolves them once instead of once per row.
+type tradeStageLookup struct {
+	svc         *TradeService
+	admins      map[int64]tradeLookupBool
+	positions   map[string]tradeLookupPosition
+	memberships map[[2]int64]tradeLookupBool
+	members     map[int64]tradeLookupUserIDs
+}
+
+type tradeLookupBool struct {
+	value bool
+	err   error
+}
+
+type tradeLookupPosition struct {
+	position *model.TradePosition
+	err      error
+}
+
+type tradeLookupUserIDs struct {
+	userIDs []int64
+	err     error
+}
+
+func newTradeStageLookup(svc *TradeService) *tradeStageLookup {
+	return &tradeStageLookup{
+		svc:         svc,
+		admins:      map[int64]tradeLookupBool{},
+		positions:   map[string]tradeLookupPosition{},
+		memberships: map[[2]int64]tradeLookupBool{},
+		members:     map[int64]tradeLookupUserIDs{},
+	}
+}
+
+func (l *tradeStageLookup) isAdmin(userID int64) (bool, error) {
+	cached, ok := l.admins[userID]
+	if !ok {
+		cached.value, cached.err = l.svc.isAdmin(userID)
+		l.admins[userID] = cached
+	}
+	return cached.value, cached.err
+}
+
+func (l *tradeStageLookup) positionForStage(stage string) (*model.TradePosition, error) {
+	cached, ok := l.positions[stage]
+	if !ok {
+		cached.position, cached.err = l.svc.repo.PositionForStage(stage)
+		l.positions[stage] = cached
+	}
+	return cached.position, cached.err
+}
+
+func (l *tradeStageLookup) userHasPosition(userID, positionID int64) (bool, error) {
+	key := [2]int64{userID, positionID}
+	cached, ok := l.memberships[key]
+	if !ok {
+		cached.value, cached.err = l.svc.repo.UserHasPosition(userID, positionID)
+		l.memberships[key] = cached
+	}
+	return cached.value, cached.err
+}
+
+func (l *tradeStageLookup) positionUserIDs(positionID int64) ([]int64, error) {
+	cached, ok := l.members[positionID]
+	if !ok {
+		cached.userIDs, cached.err = l.svc.repo.PositionUserIDs(positionID)
+		l.members[positionID] = cached
+	}
+	return cached.userIDs, cached.err
+}
+
+func (l *tradeStageLookup) canOperateStage(userID int64, order *model.TradeOrder, stage string) (bool, *model.TradePosition, error) {
+	admin, err := l.isAdmin(userID)
 	if err != nil {
 		return false, nil, err
 	}
-	position, positionErr := s.repo.PositionForStage(stage)
+	position, positionErr := l.positionForStage(stage)
 	if admin {
 		if positionErr != nil && !errors.Is(positionErr, sql.ErrNoRows) {
 			return false, nil, positionErr
 		}
 		return true, position, nil
 	}
-	managerPosition, managerErr := s.repo.PositionForStage(model.TradeStageCompleted)
+	managerPosition, managerErr := l.positionForStage(model.TradeStageCompleted)
 	if managerErr == nil {
-		isManager, checkErr := s.repo.UserHasPosition(userID, managerPosition.ID)
+		isManager, checkErr := l.userHasPosition(userID, managerPosition.ID)
 		if checkErr != nil {
 			return false, position, checkErr
 		}
@@ -2914,14 +2966,14 @@ func (s *TradeService) canOperateStageForStage(userID int64, order *model.TradeO
 	if stage == model.TradeStageInquiry {
 		return order.OwnerID == userID, position, nil
 	}
-	userIDs, err := s.repo.PositionUserIDs(position.ID)
+	userIDs, err := l.positionUserIDs(position.ID)
 	if err != nil {
 		return false, position, err
 	}
 	if len(userIDs) == 0 {
 		return order.OwnerID == userID, position, nil
 	}
-	hasPosition, err := s.repo.UserHasPosition(userID, position.ID)
+	hasPosition, err := l.userHasPosition(userID, position.ID)
 	return hasPosition, position, err
 }
 
