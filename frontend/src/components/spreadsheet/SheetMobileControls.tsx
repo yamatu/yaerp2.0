@@ -40,6 +40,37 @@ interface Props {
   pastePlain?: () => Promise<void>
 }
 
+interface SearchMemory { open: boolean; query: string; row?: number; column?: number }
+
+const SEARCH_MEMORY_PREFIX = 'yaerp:sheet-search:'
+const LAST_QUERY_KEY = 'yaerp:sheet-search:last-query'
+
+/**
+ * The editor is remounted whenever another sheet is opened, so the search box
+ * is remembered per sheet for the browser session: coming back to a sheet
+ * restores the query and the result the user was on.
+ */
+function readSearchMemory(sheetId: number): SearchMemory | null {
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(SEARCH_MEMORY_PREFIX + sheetId) || 'null')
+    return parsed && typeof parsed.query === 'string' ? parsed : null
+  } catch { return null }
+}
+
+function writeSearchMemory(sheetId: number, memory: SearchMemory) {
+  try {
+    window.sessionStorage.setItem(SEARCH_MEMORY_PREFIX + sheetId, JSON.stringify(memory))
+    if (memory.query.trim()) window.sessionStorage.setItem(LAST_QUERY_KEY, memory.query)
+  } catch { /* storage unavailable: the search simply is not remembered */ }
+}
+
+function readLastQuery(): string {
+  try { return window.sessionStorage.getItem(LAST_QUERY_KEY) || '' } catch { return '' }
+}
+
+const sameCell = (a: { row: number; column: number } | null | undefined, b: { row: number; column: number } | null | undefined) =>
+  Boolean(a && b && a.row === b.row && a.column === b.column)
+
 /**
  * Height of the on-screen keyboard. Phones keep the layout viewport at full
  * height while the keyboard is open, so anything docked to the bottom would
@@ -63,8 +94,9 @@ function useKeyboardInset(active: boolean) {
 }
 
 export default function SheetMobileControls(props: Props) {
-  const [searchOpen, setSearchOpen] = useState(false)
-  const [query, setQuery] = useState('')
+  const [remembered] = useState(() => readSearchMemory(props.sheetId))
+  const [searchOpen, setSearchOpen] = useState(Boolean(remembered?.open))
+  const [query, setQuery] = useState(remembered?.query ?? '')
   const [cells, setCells] = useState<SheetSearchCell[]>([])
   const [hits, setHits] = useState<SheetSearchCell[]>([])
   const [index, setIndex] = useState(-1)
@@ -79,20 +111,40 @@ export default function SheetMobileControls(props: Props) {
   const [error, setError] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
   const wasSearchOpen = useRef(false)
+  // The result the user is on. It survives data refreshes and remounts.
+  const anchorRef = useRef<{ row: number; column: number } | null>(
+    typeof remembered?.row === 'number' && typeof remembered?.column === 'number' ? { row: remembered.row, column: remembered.column } : null
+  )
+  // Only a query the user just typed may move the sheet selection.
+  const jumpToFirstRef = useRef(false)
+  // Whether the current result has been selected in the sheet already.
+  const visitedRef = useRef(false)
+  const memorySheetRef = useRef(props.sheetId)
   const latest = useRef(props)
   latest.current = props
   const keyboardInset = useKeyboardInset(editing)
 
   useEffect(() => {
-    setQuery(''); setHits([]); setIndex(-1); setEditing(false); setSearchOpen(false); setExtending(false)
+    if (memorySheetRef.current === props.sheetId) return
+    memorySheetRef.current = props.sheetId
+    const memory = readSearchMemory(props.sheetId)
+    anchorRef.current = typeof memory?.row === 'number' && typeof memory?.column === 'number' ? { row: memory.row, column: memory.column } : null
+    jumpToFirstRef.current = false; visitedRef.current = false
+    setQuery(memory?.query ?? ''); setSearchOpen(Boolean(memory?.open))
+    setCells([]); setHits([]); setIndex(-1); setEditing(false); setExtending(false)
   }, [props.sheetId])
+
+  const remember = (open: boolean, text: string) => {
+    writeSearchMemory(memorySheetRef.current, { open, query: text, row: anchorRef.current?.row, column: anchorRef.current?.column })
+  }
 
   useEffect(() => {
     if (!searchOpen || !props.ready) { wasSearchOpen.current = false; return }
     let cancelled = false
     const commitEditor = !wasSearchOpen.current
     wasSearchOpen.current = true
-    setCells([]); setHits([]); setIndex(-1); setSearching(true)
+    // Earlier results stay in place while the data is read again.
+    setSearching(true)
     latest.current.readCells(commitEditor).then((result) => { if (!cancelled) setCells(result) })
       .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : '读取表格失败') })
       .finally(() => { if (!cancelled) setSearching(false) })
@@ -104,17 +156,46 @@ export default function SheetMobileControls(props: Props) {
     const timer = window.setTimeout(() => {
       const needle = query.trim().toLocaleLowerCase()
       const result = needle ? cells.filter((cell) => cell.text.toLocaleLowerCase().includes(needle)) : []
-      setHits(result); setIndex(result.length ? 0 : -1)
-      if (result[0]) latest.current.focusCell(result[0].row, result[0].column)
+      const jump = jumpToFirstRef.current
+      if (cells.length) jumpToFirstRef.current = false
+      const anchor = anchorRef.current
+      let next = result.length ? 0 : -1
+      if (jump) {
+        if (result[0]) latest.current.focusCell(result[0].row, result[0].column)
+        if (cells.length) anchorRef.current = result[0] ? { row: result[0].row, column: result[0].column } : null
+        visitedRef.current = Boolean(result[0])
+      } else if (anchor && result.length) {
+        // A refresh (save, collaborator edit, reopening the sheet) keeps the
+        // position and leaves the selection where the user put it.
+        const kept = result.findIndex((cell) => cell.row > anchor.row || (cell.row === anchor.row && cell.column >= anchor.column))
+        next = kept >= 0 ? kept : 0
+        visitedRef.current = visitedRef.current && sameCell(result[next], anchor)
+      } else {
+        visitedRef.current = false
+      }
+      setHits(result); setIndex(next)
+      if (jump && cells.length) writeSearchMemory(memorySheetRef.current, { open: true, query, row: anchorRef.current?.row, column: anchorRef.current?.column })
     }, 180)
     return () => window.clearTimeout(timer)
   }, [query, cells, searchOpen])
 
   const navigate = (delta: number) => {
     if (!hits.length) return
-    const next = (index + delta + hits.length) % hits.length
+    // A restored result is selected first instead of being skipped.
+    const next = visitedRef.current ? (index + delta + hits.length) % hits.length : Math.max(0, index)
     setIndex(next)
+    anchorRef.current = { row: hits[next].row, column: hits[next].column }
+    visitedRef.current = true
+    remember(true, query)
     props.focusCell(hits[next].row, hits[next].column)
+  }
+  const closeSearch = () => { setSearchOpen(false); remember(false, query) }
+  const toggleSearch = () => {
+    if (searchOpen) { closeSearch(); return }
+    const text = query || readLastQuery()
+    if (text !== query) setQuery(text)
+    setSearchOpen(true); remember(true, text)
+    window.setTimeout(() => { inputRef.current?.focus(); inputRef.current?.select() }, 50)
   }
   const run = async (operation: () => Promise<void>) => {
     if (busyRef.current) return
@@ -150,7 +231,7 @@ export default function SheetMobileControls(props: Props) {
   return <>
     <div className="pointer-events-auto absolute left-2 z-[60] max-w-[calc(100%-1rem)] rounded-xl border border-slate-200 bg-white/95 p-1 shadow-lg" style={{ bottom: barBottom }} data-sheet-mobile-controls onPointerDown={(event) => { if (editing) event.preventDefault() }}>
       <div className="flex items-center gap-1">
-        <button type="button" className={buttonClass} disabled={!props.ready} title="搜索当前表内容" aria-label="搜索当前表内容" onClick={() => { setSearchOpen((open) => !open); window.setTimeout(() => inputRef.current?.focus(), 50) }}><Search className="h-5 w-5" /></button>
+        <button type="button" className={buttonClass} disabled={!props.ready} title="搜索当前表内容" aria-label="搜索当前表内容" onClick={toggleSearch}><Search className="h-5 w-5" /></button>
         <button type="button" className={`${buttonClass} md:hidden`} disabled={!props.ready || !props.editable || busy} title="撤销上一步" aria-label="撤销上一步" onClick={() => void run(props.undo)}><Undo2 className="h-5 w-5" /></button>
         <button type="button" className={`${buttonClass} md:hidden`} disabled={!props.ready || !props.editable || busy} title="重做" aria-label="重做" onClick={() => void run(props.redo)}><Redo2 className="h-5 w-5" /></button>
         {!editing && <button type="button" className={`${buttonClass} md:hidden`} disabled={!canEditSelection} title="编辑选中单元格" aria-label="编辑选中单元格" onClick={startEditing}><Pencil className="h-5 w-5" /></button>}
@@ -174,8 +255,8 @@ export default function SheetMobileControls(props: Props) {
     {searchOpen && <div className="absolute left-2 right-2 top-2 z-[65] rounded-xl border border-sky-200 bg-white/95 p-2 shadow-xl md:left-4 md:right-auto md:w-96" role="search" aria-label="当前表内容搜索">
       <div className="flex items-center gap-1">
         <Search className="h-5 w-5 shrink-0 text-sky-600" />
-        <input ref={inputRef} type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前表中的数据" className="h-11 min-w-0 flex-1 rounded-lg bg-slate-50 px-2 text-base outline-none focus:ring-2 focus:ring-sky-300" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } if (event.key === 'Escape') setSearchOpen(false) }} />
-        <button type="button" className={buttonClass} aria-label="关闭搜索" onClick={() => setSearchOpen(false)}><X className="h-4 w-4" /></button>
+        <input ref={inputRef} type="search" value={query} onChange={(event) => { jumpToFirstRef.current = true; setQuery(event.target.value); remember(true, event.target.value) }} placeholder="搜索当前表中的数据" className="h-11 min-w-0 flex-1 rounded-lg bg-slate-50 px-2 text-base outline-none focus:ring-2 focus:ring-sky-300" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } if (event.key === 'Escape') closeSearch() }} />
+        <button type="button" className={buttonClass} aria-label="关闭搜索" onClick={closeSearch}><X className="h-4 w-4" /></button>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2">
         <span className="min-w-0 truncate text-xs text-slate-600" aria-live="polite">{searching ? '正在读取最新数据…' : !query.trim() ? '支持文字、编号、数字；仅搜索你可见的数据' : hits.length ? `${index + 1} / ${hits.length} · ${columnIndexToLetter(hits[index]?.column ?? 0)}${(hits[index]?.row ?? 0) + 1} · ${hits[index]?.text.split('\n')[0]}` : '没有找到匹配内容'}</span>

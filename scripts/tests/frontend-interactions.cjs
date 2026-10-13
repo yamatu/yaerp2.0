@@ -22,7 +22,9 @@ const clock = {
   clearInterval(id) { timers.delete(id) },
 }
 const listeners = new Map()
-const windowStub = { ...clock, innerWidth: 600, innerHeight: 400,
+const sessionStore = new Map()
+const sessionStorage = { getItem: (key) => sessionStore.get(key) ?? null, setItem: (key, value) => sessionStore.set(key, String(value)) }
+const windowStub = { ...clock, sessionStorage, innerWidth: 600, innerHeight: 400,
   addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn) },
   removeEventListener(name, fn) { listeners.get(name)?.delete(fn) } }
 const documentStub = { visibilityState: 'visible', addEventListener() {}, removeEventListener() {} }
@@ -134,13 +136,24 @@ async function testMobileControls() {
   assert.deepEqual(focused.at(-1), [9, 1])
   await act(async () => { renderer.update(React.createElement(Mobile, { ...props, changeToken: 'saved' })) })
   assert.deepEqual(reads, [true, false], 'automatic refresh must not commit an unfinished cell editor')
+  await tick(180)
+  assert.equal(focused.length, 2, 'a background refresh must not move the selection back to the first result')
+  assert.match(renderer.root.findByProps({ 'aria-live': 'polite' }).children.join(''), /^2 \/ 2/, 'a background refresh keeps the current result')
+  let reopened
+  await act(async () => { reopened = create(React.createElement(Mobile, props)) })
+  await tick(180)
+  assert.equal(reopened.root.findByProps({ type: 'search' }).props.value, 'latest', 'reopening a sheet restores its search box and query')
+  assert.equal(focused.length, 2, 'restoring the search must not move the selection')
+  await act(async () => { reopened.root.findByProps({ 'aria-label': '下一个搜索结果' }).props.onClick() })
+  assert.deepEqual(focused.at(-1), [9, 1], 'the remembered result is selected first after reopening')
+  await act(async () => { reopened.unmount() })
   await act(async () => { button('关闭搜索').props.onClick(); button('虚拟方向键').props.onClick() })
   await act(async () => { button('编辑选中单元格').props.onClick() })
   await act(async () => { renderer.root.findByType('input').props.onChange({ target: { value: 'new value' } }) })
   await act(async () => { button('右一个单元格').props.onClick() })
   assert.deepEqual(writes[0], ['new value', 1, 0], 'editing must be saved to the old cell before navigation')
   assert.deepEqual(moves[0], [0, 1]); assert.equal(renderer.root.findByType('input').props.value, 'next')
-  assert.match(renderer.root.findByProps({ 'data-sheet-mobile-controls': true }).props.className, /bottom-28/, 'editing controls must not be hidden behind the edit form')
+  assert.equal(renderer.root.findByProps({ 'data-sheet-mobile-controls': true }).props.style.bottom, 112, 'editing controls must not be hidden behind the edit form')
   await act(async () => { renderer.unmount() })
   console.log('PASS: current-sheet content search/navigation, safe index refresh, save-before-arrow continuous editing, compact controls, numeric/percentage/checkbox input types')
 }
