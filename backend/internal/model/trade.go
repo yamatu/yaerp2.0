@@ -154,6 +154,9 @@ type TradeQuoteHistoryRecord struct {
 	PurchasePrice       float64          `json:"purchase_price,omitempty"`
 	ExchangeRateCNY     float64          `json:"exchange_rate_cny,omitempty"`
 	ProfitMarginPercent float64          `json:"profit_margin_percent,omitempty"`
+	FreightAmount       float64          `json:"freight_amount,omitempty"`
+	WeightKG            float64          `json:"weight_kg,omitempty"`
+	Declined            bool             `json:"declined,omitempty"`
 	UnitCostCNY         float64          `json:"unit_cost_cny,omitempty"`
 	UnitPriceCNY        float64          `json:"unit_price_cny,omitempty"`
 	UnitProfitCNY       float64          `json:"unit_profit_cny,omitempty"`
@@ -217,6 +220,15 @@ type TradeCustomerQuoteItem struct {
 	Unit        string  `json:"unit"`
 	UnitPrice   float64 `json:"unit_price"`
 	Amount      float64 `json:"amount"`
+	// Cost markup used to price this line; zero for users who may not see cost.
+	MarginPercent float64 `json:"margin_percent,omitempty"`
+	// Freight quoted for this line, in the quote currency.
+	FreightAmount float64 `json:"freight_amount,omitempty"`
+	// Optional weight of one unit, in kilograms.
+	WeightKG float64 `json:"weight_kg,omitempty"`
+	// The line stays quoted (and in the quote library) but the customer does
+	// not buy it.
+	Declined bool `json:"declined,omitempty"`
 }
 
 type TradeCustomerQuoteRound struct {
@@ -247,6 +259,43 @@ type TradeCustomerQuoteRound struct {
 	SentAt                         *time.Time               `json:"sent_at,omitempty"`
 	CreatedAt                      time.Time                `json:"created_at"`
 	UpdatedAt                      time.Time                `json:"updated_at"`
+}
+
+// ApplyItemTotals derives the round totals from the lines the customer buys.
+// Line freights replace the round freight when any line carries one; older
+// rounds with a single freight keep it.
+func (q *TradeCustomerQuoteRound) ApplyItemTotals() {
+	goods, lineFreight, hasLineFreight := 0.0, 0.0, false
+	for _, item := range q.Items {
+		if item.FreightAmount > 0 {
+			hasLineFreight = true
+		}
+		if item.Declined {
+			continue
+		}
+		goods += item.Amount
+		lineFreight += item.FreightAmount
+	}
+	q.GoodsAmount = goods
+	switch {
+	case q.FreightMode != "quoted":
+		q.FreightAmount = 0
+	case hasLineFreight:
+		q.FreightAmount = lineFreight
+	}
+	q.TotalAmount = q.GoodsAmount + q.FreightAmount
+	q.TotalAmountCNY = q.TotalAmount * q.ExchangeRateCNY
+}
+
+// PurchasedItems are the quoted lines the customer buys.
+func (q *TradeCustomerQuoteRound) PurchasedItems() []TradeCustomerQuoteItem {
+	items := make([]TradeCustomerQuoteItem, 0, len(q.Items))
+	for _, item := range q.Items {
+		if !item.Declined {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 type TradeShipment struct {
@@ -846,8 +895,12 @@ type SaveTradeSupplierQuotesResult struct {
 }
 
 type TradeCustomerQuoteItemInput struct {
-	OrderItemID int64   `json:"order_item_id" binding:"required"`
-	UnitPrice   float64 `json:"unit_price" binding:"gt=0"`
+	OrderItemID   int64   `json:"order_item_id" binding:"required"`
+	UnitPrice     float64 `json:"unit_price" binding:"gt=0"`
+	MarginPercent float64 `json:"margin_percent" binding:"gte=0"`
+	FreightAmount float64 `json:"freight_amount" binding:"gte=0"`
+	WeightKG      float64 `json:"weight_kg" binding:"gte=0"`
+	Declined      bool    `json:"declined"`
 }
 
 type CreateTradeCustomerQuoteRequest struct {
@@ -866,6 +919,9 @@ type UpdateTradeCustomerQuoteStatusRequest struct {
 	Status           string `json:"status" binding:"required"`
 	CustomerFeedback string `json:"customer_feedback"`
 	Notes            string `json:"notes"`
+	// Products the customer buys when the round is accepted; nil keeps the
+	// selection saved with the round.
+	SelectedItemIDs []int64 `json:"selected_item_ids"`
 }
 
 type UpdateTradeCustomerPaymentRequest struct {

@@ -143,7 +143,8 @@ func (r *TradeRepo) ListQuoteHistory(filter model.TradeQuoteHistoryFilter) ([]mo
 				OrderItemID: item.OrderItemID, SKU: item.SKU, ProductName: item.ProductName,
 				Quantity: item.Quantity, Unit: item.Unit, Currency: currency,
 				UnitPrice: item.UnitPrice, Amount: item.Amount, QuotedAt: quotedAt,
-				ExchangeRateCNY: rate, ProfitMarginPercent: margin,
+				ExchangeRateCNY: rate, ProfitMarginPercent: firstPositiveTrade(item.MarginPercent, margin),
+				FreightAmount: item.FreightAmount, WeightKG: item.WeightKG, Declined: item.Declined,
 			})
 		}
 	}
@@ -155,4 +156,13 @@ func (r *TradeRepo) AttachmentUploader(attachmentID int64) (int64, string, error
 	var mimeType string
 	err := r.db.QueryRow(`SELECT uploader_id,mime_type FROM attachments WHERE id=$1`, attachmentID).Scan(&uploader, &mimeType)
 	return uploader.Int64, mimeType, err
+}
+
+func firstPositiveTrade(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }

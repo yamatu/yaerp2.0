@@ -1353,6 +1353,10 @@ export interface TradeItemImage {
 
 export interface TradeQuoteHistoryRecord {
   quote_id: number;
+  /** The product was quoted but not bought in that round. */
+  declined?: boolean;
+  freight_amount?: number;
+  weight_kg?: number;
   round_no: number;
   status: string;
   order_id: number;
@@ -1438,6 +1442,12 @@ export interface TradeCustomerQuoteItem {
   unit: string;
   unit_price: number;
   amount: number;
+  margin_percent?: number;
+  freight_amount?: number;
+  /** Weight of one unit in kg. */
+  weight_kg?: number;
+  /** Quoted but not bought by the customer. */
+  declined?: boolean;
 }
 
 export interface TradeCustomerQuoteRound {

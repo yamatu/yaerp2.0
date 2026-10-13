@@ -9,7 +9,8 @@ import {
   parseSupplierQuoteText,
   type ParsedQuoteRow,
 } from "@/lib/supplierQuoteImport";
-import type { TradeOrder, TradeOrderItem, TradeSupplier } from "@/types";
+import { tradeItemUnavailable, tradeItemUnavailableReason } from "@/lib/tradeItems";
+import type { TradeOrder, TradeSupplier } from "@/types";
 
 export interface SupplierQuoteDraft {
   order_item_id: number;
@@ -71,15 +72,6 @@ export function isFilledSupplierQuote(draft: SupplierQuoteDraft) {
 
 function isBlankDraft(draft: SupplierQuoteDraft) {
   return !hasDraftSupplier(draft) && !draft.unit_price.trim();
-}
-
-export function tradeItemUnavailable(item?: Pick<TradeOrderItem, "workflow_data"> | null) {
-  return item?.workflow_data?.supplier_unavailable === true;
-}
-
-export function tradeItemUnavailableReason(item?: Pick<TradeOrderItem, "workflow_data"> | null) {
-  const reason = item?.workflow_data?.supplier_unavailable_reason;
-  return typeof reason === "string" ? reason : "";
 }
 
 type Availability = Record<number, { unavailable: boolean; reason: string }>;

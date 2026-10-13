@@ -27,6 +27,34 @@ func tradeItemUnavailable(item *model.TradeOrderItem) bool {
 	return value
 }
 
+const tradeItemDeclinedKey = "customer_declined"
+
+// tradeItemDeclined reports an item that was quoted but which the customer
+// chose not to buy when accepting the quote.
+func tradeItemDeclined(item *model.TradeOrderItem) bool {
+	if item == nil || item.WorkflowData == nil {
+		return false
+	}
+	value, _ := item.WorkflowData[tradeItemDeclinedKey].(bool)
+	return value
+}
+
+// tradeItemExcluded items take no further part in purchasing, receiving,
+// inspection, packing, shipment and profit.
+func tradeItemExcluded(item *model.TradeOrderItem) bool {
+	return tradeItemUnavailable(item) || tradeItemDeclined(item)
+}
+
+func tradeActiveItems(items []model.TradeOrderItem) []model.TradeOrderItem {
+	active := make([]model.TradeOrderItem, 0, len(items))
+	for index := range items {
+		if !tradeItemExcluded(&items[index]) {
+			active = append(active, items[index])
+		}
+	}
+	return active
+}
+
 func tradeAvailableItems(items []model.TradeOrderItem) []model.TradeOrderItem {
 	available := make([]model.TradeOrderItem, 0, len(items))
 	for index := range items {

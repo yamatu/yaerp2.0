@@ -614,8 +614,8 @@ func (r *TradeRepo) DeleteOrderItem(orderID, itemID int64) error {
 	}
 	if _, err := tx.Exec(
 		`UPDATE trade_orders SET
-		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1),0),
-		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1),0)+quoted_freight_amount,
+		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0),
+		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0)+quoted_freight_amount,
 		 updated_at=NOW()
 		 WHERE id=$1 AND deleted_at IS NULL`, orderID,
 	); err != nil {
@@ -1072,11 +1072,15 @@ func (r *TradeRepo) UpdateOrderProfitSettings(orderID int64, additionalCost floa
 	return nil
 }
 
+// tradeActiveItemSQL keeps items that continue through the workflow: neither
+// impossible to source nor left out by the customer.
+const tradeActiveItemSQL = `COALESCE(workflow_data->>'supplier_unavailable','')<>'true' AND COALESCE(workflow_data->>'customer_declined','')<>'true'`
+
 func (r *TradeRepo) RecalculateOrderTotal(orderID int64) error {
 	_, err := r.db.Exec(
 		`UPDATE trade_orders SET
-		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1),0),
-		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1),0)+quoted_freight_amount,
+		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0),
+		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0)+quoted_freight_amount,
 		 updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`,
 		orderID,
 	)
@@ -1667,6 +1671,10 @@ func (r *TradeRepo) CreateCustomerQuoteRound(round *model.TradeCustomerQuoteRoun
 	if _, err := tx.Exec(`UPDATE trade_customer_quote_rounds SET status='superseded',updated_at=NOW() WHERE order_id=$1 AND status IN ('draft','sent','accepted')`, round.OrderID); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`UPDATE trade_order_items SET workflow_data=workflow_data-'customer_declined',updated_at=NOW()
+	 WHERE order_id=$1 AND workflow_data ? 'customer_declined'`, round.OrderID); err != nil {
+		return err
+	}
 	var sentAt sql.NullTime
 	if err := tx.QueryRow(
 		`INSERT INTO trade_customer_quote_rounds(order_id,round_no,currency,status,goods_amount,exchange_rate_cny,
@@ -1713,7 +1721,11 @@ func (r *TradeRepo) CreateCustomerQuoteRound(round *model.TradeCustomerQuoteRoun
 	return tx.Commit()
 }
 
-func (r *TradeRepo) UpdateCustomerQuoteRoundStatus(orderID, quoteID int64, status, customerFeedback, notes string) error {
+// UpdateCustomerQuoteRoundStatus records the customer's answer. Accepting a
+// round applies its prices to the order; selectedItemIDs (nil keeps the
+// round's own selection) decides which products the customer buys - the
+// others stay quoted but are marked customer_declined and leave the workflow.
+func (r *TradeRepo) UpdateCustomerQuoteRoundStatus(orderID, quoteID int64, status, customerFeedback, notes string, selectedItemIDs []int64) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
@@ -1727,37 +1739,69 @@ func (r *TradeRepo) UpdateCustomerQuoteRoundStatus(orderID, quoteID int64, statu
 		return fmt.Errorf("trade order is not in customer quotation stage")
 	}
 	var itemsRaw []byte
-	var currency, freightMode string
-	var goodsAmount, exchangeRateCNY, freightAmount, totalAmount float64
+	round := model.TradeCustomerQuoteRound{ID: quoteID, OrderID: orderID}
 	if err := tx.QueryRow(`SELECT item_prices,currency,goods_amount,exchange_rate_cny,freight_mode,freight_amount,total_amount
 	 FROM trade_customer_quote_rounds WHERE id=$1 AND order_id=$2 FOR UPDATE`, quoteID, orderID).Scan(
-		&itemsRaw, &currency, &goodsAmount, &exchangeRateCNY, &freightMode, &freightAmount, &totalAmount,
+		&itemsRaw, &round.Currency, &round.GoodsAmount, &round.ExchangeRateCNY, &round.FreightMode, &round.FreightAmount, &round.TotalAmount,
 	); err != nil {
 		return err
 	}
-	var items []model.TradeCustomerQuoteItem
-	if err := json.Unmarshal(itemsRaw, &items); err != nil {
+	if err := json.Unmarshal(itemsRaw, &round.Items); err != nil {
 		return err
 	}
 	if status == "accepted" {
+		if selectedItemIDs != nil {
+			selected := make(map[int64]bool, len(selectedItemIDs))
+			for _, id := range selectedItemIDs {
+				selected[id] = true
+			}
+			for index := range round.Items {
+				round.Items[index].Declined = !selected[round.Items[index].OrderItemID]
+			}
+		}
+		if len(round.PurchasedItems()) == 0 {
+			return fmt.Errorf("请至少选择一项客户采购的产品")
+		}
+		round.ApplyItemTotals()
+		itemsRaw, err = json.Marshal(round.Items)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE trade_customer_quote_rounds SET item_prices=$3,goods_amount=$4,freight_amount=$5,
+		 total_amount=$6,total_amount_cny=$7,updated_at=NOW() WHERE id=$1 AND order_id=$2`,
+			quoteID, orderID, itemsRaw, round.GoodsAmount, round.FreightAmount, round.TotalAmount, round.TotalAmountCNY); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`UPDATE trade_customer_quote_rounds SET status='superseded',updated_at=NOW() WHERE order_id=$1 AND status='accepted' AND id<>$2`, orderID, quoteID); err != nil {
 			return err
 		}
-		for _, item := range items {
-			if _, err := tx.Exec(`UPDATE trade_order_items SET quoted_price=$3,status='客户确认',updated_at=NOW() WHERE id=$1 AND order_id=$2`, item.OrderItemID, orderID, item.UnitPrice); err != nil {
+		for _, item := range round.Items {
+			query := `UPDATE trade_order_items SET quoted_price=$3,status='客户确认',workflow_data=workflow_data-'customer_declined',updated_at=NOW() WHERE id=$1 AND order_id=$2`
+			if item.Declined {
+				query = `UPDATE trade_order_items SET quoted_price=$3,status='客户未采购',workflow_data=workflow_data||'{"customer_declined":true}'::jsonb,updated_at=NOW() WHERE id=$1 AND order_id=$2`
+			}
+			if _, err := tx.Exec(query, item.OrderItemID, orderID, item.UnitPrice); err != nil {
 				return err
 			}
 		}
 		if _, err := tx.Exec(`UPDATE trade_orders SET currency=$2,total_amount=$3,quoted_goods_amount=$4,
 		 quote_exchange_rate_cny=$5,freight_mode=$6,quoted_freight_amount=$7,updated_at=NOW()
 		 WHERE id=$1 AND deleted_at IS NULL`,
-			orderID, currency, totalAmount, goodsAmount, exchangeRateCNY, freightMode, freightAmount); err != nil {
+			orderID, round.Currency, round.TotalAmount, round.GoodsAmount, round.ExchangeRateCNY, round.FreightMode, round.FreightAmount); err != nil {
 			return err
 		}
 	} else {
-		for _, item := range items {
-			if _, err := tx.Exec(`UPDATE trade_order_items SET status='已报价',updated_at=NOW() WHERE id=$1 AND order_id=$2`, item.OrderItemID, orderID); err != nil {
-				return err
+		// Another accepted round owns the item states; only reset them when
+		// none remains.
+		var otherAccepted bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM trade_customer_quote_rounds WHERE order_id=$1 AND status='accepted' AND id<>$2)`, orderID, quoteID).Scan(&otherAccepted); err != nil {
+			return err
+		}
+		if !otherAccepted {
+			for _, item := range round.Items {
+				if _, err := tx.Exec(`UPDATE trade_order_items SET status='已报价',workflow_data=workflow_data-'customer_declined',updated_at=NOW() WHERE id=$1 AND order_id=$2`, item.OrderItemID, orderID); err != nil {
+					return err
+				}
 			}
 		}
 	}

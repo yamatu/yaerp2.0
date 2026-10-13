@@ -25,6 +25,7 @@ import { AuthGuard } from "@/components/auth/AuthGuard";
 import api from "@/lib/api";
 import { encodeCode128B } from "@/lib/code128";
 import { consumeReturnTarget } from "@/lib/returnNavigation";
+import { tradeActiveItems } from "@/lib/tradeItems";
 import type { TradeOrder, TradeOrderItem, TradePackingGroup } from "@/types";
 
 type PaperPreset = "A4" | "A5" | "LETTER" | "CUSTOM";
@@ -217,7 +218,7 @@ export default function TradeLabelPrintPage() {
         setOffsetXMM(numberOr(loaded.label_offset_x_mm, loaded.label_margin_left_mm || 10));
         setOffsetYMM(numberOr(loaded.label_offset_y_mm, loaded.label_margin_top_mm || 10));
         const items = loaded.items || [];
-        setSelectedItemIDs(items.map((item) => item.id));
+        setSelectedItemIDs(tradeActiveItems(items).map((item) => item.id));
         setCopies(
           Object.fromEntries(
             items.map((item) => [item.id, Math.max(1, item.carton_count || 1)]),
