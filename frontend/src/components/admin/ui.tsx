@@ -8,7 +8,9 @@
 
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Info,
@@ -22,7 +24,9 @@ import {
   forwardRef,
   useEffect,
   useId,
+  useMemo,
   useRef,
+  useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
@@ -126,6 +130,146 @@ export function SelectInput({ className, children, ...rest }: SelectHTMLAttribut
     <select className={cx(controlClass, 'pr-8', className)} {...rest}>
       {children}
     </select>
+  )
+}
+
+export interface SearchSelectOption {
+  id: number
+  label: string
+  /** Secondary text, also searched. */
+  description?: string
+  /** Options sharing a group are listed under one heading. */
+  group?: string
+}
+
+interface SearchSelectProps {
+  value: number | null
+  onChange: (id: number) => void
+  options: SearchSelectOption[]
+  placeholder?: string
+  searchPlaceholder?: string
+  emptyText?: string
+  disabled?: boolean
+  className?: string
+  'aria-label'?: string
+}
+
+const SEARCH_SELECT_LIMIT = 200
+
+/** Select with a search box, for lists too long for a native select. */
+export function SearchSelect({ value, onChange, options, placeholder = '请选择', searchPlaceholder = '搜索', emptyText = '没有匹配的选项', disabled, className, 'aria-label': ariaLabel }: SearchSelectProps) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [activeIndex, setActiveIndex] = useState(0)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const listId = useId()
+  const selected = options.find((option) => option.id === value) || null
+
+  const { filtered, hiddenCount } = useMemo(() => {
+    const keyword = query.trim().toLocaleLowerCase('zh-CN')
+    const matches = keyword
+      ? options.filter((option) => `${option.label} ${option.description || ''} ${option.group || ''}`.toLocaleLowerCase('zh-CN').includes(keyword))
+      : options
+    return { filtered: matches.slice(0, SEARCH_SELECT_LIMIT), hiddenCount: Math.max(0, matches.length - SEARCH_SELECT_LIMIT) }
+  }, [options, query])
+
+  useEffect(() => {
+    if (!open) return
+    const close = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', close)
+    return () => document.removeEventListener('pointerdown', close)
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    setQuery('')
+    const index = options.findIndex((option) => option.id === value)
+    setActiveIndex(index >= 0 && index < SEARCH_SELECT_LIMIT ? index : 0)
+  }, [open, options, value])
+
+  useEffect(() => {
+    if (!open) return
+    listRef.current?.querySelector<HTMLElement>(`[data-index="${activeIndex}"]`)?.scrollIntoView({ block: 'nearest' })
+  }, [activeIndex, open])
+
+  const choose = (option: SearchSelectOption | undefined) => {
+    if (!option) return
+    onChange(option.id)
+    setOpen(false)
+  }
+
+  return (
+    <div ref={rootRef} className={cx('relative min-w-0', className)}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        className={cx(controlClass, 'flex items-center gap-2 pr-2 text-left')}
+      >
+        <span className={cx('min-w-0 flex-1 truncate', !selected && 'text-slate-400')}>
+          {selected ? (selected.group ? `${selected.group} / ${selected.label}` : selected.label) : placeholder}
+        </span>
+        <ChevronDown className={cx('h-4 w-4 shrink-0 text-slate-400 transition-transform', open && 'rotate-180')} />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 top-full z-40 mt-1 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+          <div className="border-b border-slate-100 p-2">
+            <input
+              autoFocus
+              type="text"
+              inputMode="search"
+              value={query}
+              onChange={(event) => { setQuery(event.target.value); setActiveIndex(0) }}
+              onKeyDown={(event) => {
+                if (event.key === 'ArrowDown') { event.preventDefault(); setActiveIndex((index) => Math.min(index + 1, filtered.length - 1)) }
+                else if (event.key === 'ArrowUp') { event.preventDefault(); setActiveIndex((index) => Math.max(index - 1, 0)) }
+                else if (event.key === 'Enter') { event.preventDefault(); choose(filtered[activeIndex]) }
+                else if (event.key === 'Escape') { event.preventDefault(); setOpen(false) }
+              }}
+              placeholder={searchPlaceholder}
+              aria-controls={listId}
+              className={cx(controlClass, 'h-9!')}
+            />
+          </div>
+          <div ref={listRef} id={listId} role="listbox" className="max-h-72 overflow-y-auto py-1">
+            {filtered.length === 0 ? (
+              <div className="px-3 py-6 text-center text-xs text-slate-400">{emptyText}</div>
+            ) : (
+              filtered.map((option, index) => {
+                const showGroup = option.group && option.group !== filtered[index - 1]?.group
+                return (
+                  <div key={option.id}>
+                    {showGroup && <div className="px-3 pb-1 pt-2 text-[11px] font-semibold text-slate-400">{option.group}</div>}
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={option.id === value}
+                      data-index={index}
+                      onMouseEnter={() => setActiveIndex(index)}
+                      onClick={() => choose(option)}
+                      className={cx('flex w-full items-center gap-2 px-3 py-2 text-left text-sm', index === activeIndex ? 'bg-sky-50 text-sky-900' : 'text-slate-700')}
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate">{option.label}</span>
+                        {option.description && <span className="block truncate text-xs text-slate-400">{option.description}</span>}
+                      </span>
+                      {option.id === value && <Check className="h-4 w-4 shrink-0 text-sky-600" />}
+                    </button>
+                  </div>
+                )
+              })
+            )}
+            {hiddenCount > 0 && <div className="px-3 py-2 text-center text-[11px] text-slate-400">还有 {hiddenCount} 项，请输入关键词缩小范围</div>}
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 

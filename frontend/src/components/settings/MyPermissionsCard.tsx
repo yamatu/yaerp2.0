@@ -1,7 +1,7 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
-import { Check, ChevronRight, Loader2, Lock, Shield, ShieldCheck } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Check, ChevronRight, Loader2, Lock, RefreshCw, Shield, ShieldCheck } from 'lucide-react'
 import api from '@/lib/api'
 
 interface SheetPermissionEntry {
@@ -85,26 +85,30 @@ export default function MyPermissionsCard() {
   const [error, setError] = useState('')
   const [expandedWorkbookId, setExpandedWorkbookId] = useState<number | null>(null)
 
-  useEffect(() => {
-    let active = true
-    const load = async () => {
-      try {
-        const res = await api.get<PermissionSnapshot>('/me/permissions')
-        if (!active) return
-        if (res.code !== 0 || !res.data) {
-          setError(res.message || '无法加载权限信息。')
-          return
-        }
-        setSnapshot(res.data)
-      } catch {
-        if (active) setError('无法加载权限信息。')
-      } finally {
-        if (active) setLoading(false)
+  const requestRef = useRef(0)
+  const load = useCallback(async () => {
+    const requestId = ++requestRef.current
+    setLoading(true)
+    setError('')
+    try {
+      const res = await api.get<PermissionSnapshot>('/me/permissions')
+      if (requestId !== requestRef.current) return
+      if (res.code !== 0 || !res.data) {
+        setError(res.message || '无法加载权限信息。')
+        return
       }
+      setSnapshot(res.data)
+    } catch {
+      if (requestId === requestRef.current) setError('无法加载权限信息。')
+    } finally {
+      if (requestId === requestRef.current) setLoading(false)
     }
-    void load()
-    return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    void load()
+    return () => { requestRef.current += 1 }
+  }, [load])
 
   const granted = useMemo(() => {
     if (!snapshot) return []
@@ -123,15 +127,20 @@ export default function MyPermissionsCard() {
           <ShieldCheck className="h-5 w-5 text-sky-600" />
           我的权限
         </h2>
-        {snapshot && (
-          <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium ${snapshot.is_admin ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600'}`}>
-            <Shield className="h-3.5 w-3.5" />
-            {snapshot.is_admin ? '管理员账号' : '普通账号'}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {snapshot && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium ${snapshot.is_admin ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600'}`}>
+              <Shield className="h-3.5 w-3.5" />
+              {snapshot.is_admin ? '管理员账号' : '普通账号'}
+            </span>
+          )}
+          <button type="button" onClick={() => void load()} disabled={loading} aria-label="刷新权限信息" title="刷新权限信息" className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 disabled:opacity-50">
+            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
       </div>
 
-      {loading ? (
+      {loading && !snapshot ? (
         <div className="flex items-center gap-2 py-6 text-sm text-slate-500">
           <Loader2 className="h-4 w-4 animate-spin" />
           正在加载权限信息…
@@ -215,11 +224,12 @@ export default function MyPermissionsCard() {
                                 {sheet.can_edit ? '可编辑' : sheet.can_view ? '只读' : '不可见'}
                               </span>
                               {sheet.can_export && <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">可导出</span>}
+                              {sheet.can_delete && <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">可删除表</span>}
                               {(sheet.readonly_columns?.length ?? 0) > 0 && (
-                                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-700">限制列 {sheet.readonly_columns?.length}</span>
+                                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-700" title={sheet.readonly_columns?.join('、')}>只读列 {sheet.readonly_columns?.length}</span>
                               )}
                               {(sheet.hidden_columns?.length ?? 0) > 0 && (
-                                <span className="rounded-full bg-rose-100 px-2 py-0.5 text-rose-700">隐藏列 {sheet.hidden_columns?.length}</span>
+                                <span className="rounded-full bg-rose-100 px-2 py-0.5 text-rose-700" title={sheet.hidden_columns?.join('、')}>不可见列 {sheet.hidden_columns?.length}</span>
                               )}
                             </div>
                           ))}

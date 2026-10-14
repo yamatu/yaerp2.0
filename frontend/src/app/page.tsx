@@ -1670,6 +1670,18 @@ export default function HomePage() {
     workbookId: number,
     action: WorkbookStateAction,
   ) => {
+    if (
+      action === "publish" &&
+      !window.confirm(
+        "设为公共表后，所有员工都可以查看、编辑和导出该工作簿。\n数据遮罩、隐藏公式和保护区域仍然生效。确定继续吗？",
+      )
+    )
+      return;
+    if (
+      action === "unpublish" &&
+      !window.confirm("取消公共表后，只有被单独授权的成员还能访问。确定继续吗？")
+    )
+      return;
     setActionError("");
     try {
       const res = await api.put(`/workbooks/${workbookId}/state`, { action });

@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
-import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Sigma, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -56,6 +56,18 @@ import {
   type SharedFormulaResolver,
 } from '@/lib/univer-shared-formula'
 import { wsClient } from '@/lib/ws'
+import {
+  describeProtectionArea,
+  findProtectionBlockingRemoval,
+  findProtectionInRects,
+  protectionAreas,
+  rangeToRect,
+  remapProtectionSnapshot,
+  structureOpFromMutation,
+  UNBOUNDED_INDEX,
+  type StructureOp,
+  type WorksheetRect,
+} from '@/lib/univer-protection-guard'
 import { getRealtimeClientId } from '@/lib/realtimeClient'
 import { subscribeDataChanged, subscribePrepareDataMutation } from '@/lib/dataEvents'
 import { columnIndexToLetter, parseSheetConfig } from '@/lib/spreadsheet'
@@ -69,6 +81,7 @@ interface Props {
   workbookSheets?: Array<Pick<Sheet, 'id' | 'name'>>
   sheet: Sheet
   reloadToken?: string
+  permissionToken?: number
   onExternalReload?: () => Promise<void> | void
   optimisticCanEdit?: boolean
   canImportWorkbook?: boolean
@@ -486,11 +499,13 @@ function protectionVisualKey(item: Pick<ProtectionInfo, 'owner_id' | 'hidden'>) 
   return item.hidden ? 'hidden' : `owner:${item.owner_id}`
 }
 
-function formatProtectionMode(item: Pick<ProtectionInfo, 'hidden' | 'lock_editing'>) {
-  if (item.hidden && item.lock_editing) return '数据遮罩并锁定编辑'
-  if (item.hidden) return '数据遮罩'
-  if (item.lock_editing) return '锁定编辑'
-  return '访问规则'
+function formatProtectionMode(item: Pick<ProtectionInfo, 'hidden' | 'lock_editing' | 'hide_formula'>) {
+  const modes = [
+    item.hidden ? '数据遮罩' : '',
+    item.hide_formula ? '隐藏公式' : '',
+    item.lock_editing ? '锁定编辑' : '',
+  ].filter(Boolean)
+  return modes.length > 0 ? modes.join(' + ') : '访问规则'
 }
 
 function compactLinearProtectionBlocks(
@@ -1626,7 +1641,7 @@ function getVisibleUniverCellEditor(root: HTMLElement | null) {
   return editor
 }
 
-export default function UniverSheetEditor({ workbookId, workbookName, workbookSheets = [], sheet, reloadToken, onExternalReload, optimisticCanEdit = false, canImportWorkbook = false }: Props) {
+export default function UniverSheetEditor({ workbookId, workbookName, workbookSheets = [], sheet, reloadToken, permissionToken = 0, onExternalReload, optimisticCanEdit = false, canImportWorkbook = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const persistInFlightRef = useRef<Promise<void> | null>(null)
@@ -1719,6 +1734,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   // local edits changed that layout.
   const structureRevisionRef = useRef(0)
   const structuralChangePendingRef = useRef(false)
+  // Row/column operations behind the unsaved layout, sent so protections follow them.
+  const pendingStructureOpsRef = useRef<StructureOp[]>([])
+  const refreshProtectionSnapshotRef = useRef<() => Promise<void>>(async () => undefined)
   // True while a structural save is on its way, and for a moment afterwards:
   // cell updates collaborators sent against the old layout may still arrive.
   const structuralSaveInFlightRef = useRef(false)
@@ -1746,6 +1764,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   )
   const [hasFilter, setHasFilter] = useState(false)
   const [actionError, setActionError] = useState('')
+  useEffect(() => {
+    if (!actionError) return
+    const timer = window.setTimeout(() => setActionError(''), 6000)
+    return () => window.clearTimeout(timer)
+  }, [actionError])
   const [showNumberFormatPanel, setShowNumberFormatPanel] = useState(false)
   const [numberFormatScope, setNumberFormatScope] = useState<NumberFormatScope>('selection')
   const [numberFormatPreset, setNumberFormatPreset] = useState('general')
@@ -1777,6 +1800,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [showAllProtections, setShowAllProtections] = useState(false)
   const [selectionState, setSelectionState] = useState<SelectionState | null>(null)
   const [protectionSnapshot, setProtectionSnapshot] = useState<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
+  const protectionIndex = useMemo(() => ({
+    rows: new Map(protectionSnapshot.rows.map((item) => [item.row_index, item])),
+    columns: new Map(protectionSnapshot.columns.map((item) => [item.column_key || item.key, item])),
+    cells: new Map(protectionSnapshot.cells.map((item) => [`${item.row_index}:${item.column_key}`, item])),
+  }), [protectionSnapshot])
   const [protectionLoading, setProtectionLoading] = useState(false)
   const [protectionAction, setProtectionAction] = useState('')
   const [protectionUsers, setProtectionUsers] = useState<User[]>([])
@@ -1789,6 +1817,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [protectionScope, setProtectionScope] = useState<ProtectionScope>('cell')
   const [selectedProtectionLockEditing, setSelectedProtectionLockEditing] = useState(true)
   const [selectedProtectionHidden, setSelectedProtectionHidden] = useState(false)
+  const [selectedProtectionHideFormula, setSelectedProtectionHideFormula] = useState(false)
+  const [protectionPanelTab, setProtectionPanelTab] = useState<'settings' | 'records'>('settings')
+  const [protectionWhitelistFilter, setProtectionWhitelistFilter] = useState<'all' | 'department' | 'user'>('all')
+  const [protectionRecordFilter, setProtectionRecordFilter] = useState<'all' | 'hidden' | 'formula' | 'lock'>('all')
   const [selectedProtectionReadonlyUserIds, setSelectedProtectionReadonlyUserIds] = useState<number[]>([])
   const [selectedProtectionReadonlyDepartmentIds, setSelectedProtectionReadonlyDepartmentIds] = useState<number[]>([])
   const [selectedProtectionEditableUserIds, setSelectedProtectionEditableUserIds] = useState<number[]>([])
@@ -1814,6 +1846,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const adminMode = isAdmin(profile)
   const sheetId = sheet.id
   const { permissions, loading: permissionLoading, canEditCell, refreshPermissions } = usePermission(sheetId)
+  useEffect(() => {
+    if (permissionToken > 0) refreshPermissions()
+  }, [permissionToken, refreshPermissions])
   const searchAccessToken = useMemo(() => JSON.stringify([permissions, protectionSnapshot]), [permissions, protectionSnapshot])
   const canViewSheet = permissions?.sheet.canView ?? false
   const canEditSheet = permissions?.sheet.canEdit ?? false
@@ -2017,6 +2052,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       setProtectionLoading(false)
     }
   }, [sheetId])
+
+  refreshProtectionSnapshotRef.current = refreshProtectionSnapshot
 
   const refreshApprovalStates = useCallback(async () => {
     if (!sheetId) return
@@ -2614,6 +2651,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setProtectionScope('cell')
     setSelectedProtectionLockEditing(true)
     setSelectedProtectionHidden(false)
+    setSelectedProtectionHideFormula(false)
     setSelectedProtectionReadonlyUserIds([])
     setSelectedProtectionReadonlyDepartmentIds([])
     setSelectedProtectionEditableUserIds([])
@@ -2775,6 +2813,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const openCustomProtectionPanel = useCallback((options?: { showAll?: boolean }) => {
     syncSelectionState()
     setShowAllProtections(Boolean(options?.showAll))
+    setProtectionPanelTab(options?.showAll ? 'records' : 'settings')
     setShowProtectionPanel(true)
   }, [syncSelectionState])
 
@@ -3020,6 +3059,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           ...(action === 'lock' ? { view_hidden_department_ids: selectedProtectionViewHiddenDepartmentIds } : {}),
           ...(action === 'lock' ? { lock_editing: selectedProtectionLockEditing } : {}),
           ...(action === 'lock' && typeof hidden === 'boolean' ? { hidden } : {}),
+          ...(action === 'lock' ? { hide_formula: selectedProtectionHideFormula } : {}),
         })),
       })
       if (res.code !== 0) {
@@ -3040,7 +3080,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     } finally {
       setProtectionAction('')
     }
-  }, [editLocked, refreshPermissions, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionLockEditing, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
+  }, [editLocked, refreshPermissions, refreshProtectionSnapshot, selectedProtectionEditableDepartmentIds, selectedProtectionEditableUserIds, selectedProtectionHideFormula, selectedProtectionLockEditing, selectedProtectionReadonlyDepartmentIds, selectedProtectionReadonlyUserIds, selectedProtectionViewHiddenDepartmentIds, selectedProtectionViewHiddenUserIds, sheetId, syncSelectionState])
 
   const selectedColumnKeys = useCallback((selection: SelectionState) => {
     const columns = latestSheetRef.current.columns || []
@@ -3888,6 +3928,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         const config = parseSheetConfig(currentSheet.config)
         structureRevisionRef.current = readStructureRevision(currentSheet.config)
         structuralChangePendingRef.current = false
+        pendingStructureOpsRef.current = []
         resyncAfterPersistRef.current = false
         const localeCode = 'zh-CN' as IWorkbookData['locale']
         let workbookData: IWorkbookData
@@ -4220,7 +4261,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 (typeof previousSheet?.rowCount === 'number' && typeof savedSheet.rowCount === 'number' && previousSheet.rowCount !== savedSheet.rowCount) ||
                 (typeof previousSheet?.columnCount === 'number' && typeof savedSheet.columnCount === 'number' && previousSheet.columnCount !== savedSheet.columnCount)
               )
-              const structureChanged = structuralChangePendingRef.current || gridResized
+              const structureChanged = structuralChangePendingRef.current || gridResized || pendingStructureOpsRef.current.length > 0
               structuralChangePendingRef.current = false
               const baseStructureRevision = structureRevisionRef.current
               const nextConfig: typeof currentConfig & { structureRevision?: number } = {
@@ -4256,6 +4297,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
               let res: Awaited<ReturnType<typeof api.put<CellUpdateResult>>>
               structuralSaveInFlightRef.current = structureChanged
+              const sentStructureOps = pendingStructureOpsRef.current.splice(0)
+              const restoreStructureOps = () => {
+                if (sentStructureOps.length > 0) pendingStructureOpsRef.current = [...sentStructureOps, ...pendingStructureOpsRef.current]
+              }
               try {
                 res = await api.put<CellUpdateResult>(`/sheets/${snap.id}`, {
                   name: nextSheetName,
@@ -4266,9 +4311,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   cell_changes: cellChanges,
                   structure_changed: structureChanged,
                   base_structure_revision: baseStructureRevision,
+                  ...(sentStructureOps.length > 0 ? { structure_ops: sentStructureOps } : {}),
                 })
               } catch (requestError) {
                 if (structureChanged) structuralChangePendingRef.current = true
+                restoreStructureOps()
                 throw requestError
               } finally {
                 structuralSaveInFlightRef.current = false
@@ -4287,8 +4334,22 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   setLocalReloadNonce(localReloadNonceRef.current)
                   return
                 }
+                if (structureChanged && res.code === 403) {
+                  // The server refused the new layout (protected rows): go back
+                  // to the saved one instead of keeping a sheet that cannot save.
+                  persistQueuedRef.current = false
+                  setActionError(res.message || '本次行列调整涉及受保护区域，已恢复为保存前的内容。')
+                  localReloadNonceRef.current += 1
+                  setLocalReloadNonce(localReloadNonceRef.current)
+                  return
+                }
                 if (structureChanged) structuralChangePendingRef.current = true
+                restoreStructureOps()
                 throw new Error(res.message || '保存工作表失败')
+              }
+              if (sentStructureOps.length > 0) {
+                const rules = protectionSnapshotRef.current
+                if (rules.rows.length + rules.columns.length + rules.cells.length > 0) void refreshProtectionSnapshotRef.current()
               }
               if (structureChanged) {
                 structureRevisionRef.current = baseStructureRevision + 1
@@ -4320,6 +4381,23 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   setApprovalNotice(`已提交 ${pendingStates.length} 个单元格审批，正式数据保持原值。`)
                   window.setTimeout(() => setApprovalNotice(''), 4200)
                 }
+                if (remotePatchResetTimerRef.current) clearTimeout(remotePatchResetTimerRef.current)
+                remotePatchResetTimerRef.current = setTimeout(() => {
+                  applyingRemotePatchRef.current = false
+                  remotePatchResetTimerRef.current = null
+                }, 200)
+              }
+
+              const computedChanges = Array.isArray(res.data?.computed_changes) ? res.data.computed_changes : []
+              if (computedChanges.length > 0) {
+                applyingRemotePatchRef.current = true
+                computedChanges.forEach((change) => {
+                  const columnIndex = nextColumns.findIndex((column) => column.key === change.col)
+                  if (columnIndex < 0 || change.row < 0) return
+                  workbookApi.getActiveSheet().getRange(change.row + 1, columnIndex, 1, 1).setValue((change.value ?? '') as string | number | boolean)
+                })
+                savedSheet = applyRealtimeCellChangesToWorksheetSnapshot(savedSheet, computedChanges, nextColumns)
+                nextConfig.univerSheetData = savedSheet
                 if (remotePatchResetTimerRef.current) clearTimeout(remotePatchResetTimerRef.current)
                 remotePatchResetTimerRef.current = setTimeout(() => {
                   applyingRemotePatchRef.current = false
@@ -4373,6 +4451,18 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         schedulePersistRef.current = () => schedulePersist()
 
         const disposable = workbookApi.onCommandExecuted((command) => {
+          if (command.type === CommandType.MUTATION) {
+            const structureOp = structureOpFromMutation(command.id, command.params)
+            if (structureOp) {
+              pendingStructureOpsRef.current.push(structureOp)
+              const rules = protectionSnapshotRef.current
+              if (rules.rows.length + rules.columns.length + rules.cells.length > 0) {
+                const remapped = remapProtectionSnapshot(rules, [structureOp], latestSheetRef.current.columns || [])
+                protectionSnapshotRef.current = remapped
+                setProtectionSnapshot(remapped)
+              }
+            }
+          }
           const refreshProtectionLayout = commandChangesProtectionHighlightLayout(command.id)
           // OPERATION commands (selection, scroll, zoom, sidebar toggles, ...) never
           // mutate the saved snapshot, so they must not trigger the expensive
@@ -4471,10 +4561,96 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           scheduleSheetViewMemoryPersist()
         })
 
+        const selectionRects = (): WorksheetRect[] => {
+          try {
+            const ranges = workbookApi.getActiveSheet().getSelection()?.getActiveRangeList?.() || []
+            return ranges.map((range) => rangeToRect(range.getRange())).filter((rect): rect is WorksheetRect => Boolean(rect))
+          } catch {
+            return []
+          }
+        }
+        const guardProtectedCommand = (id: string, params: unknown): string => {
+          const rules = protectionSnapshotRef.current
+          if (rules.rows.length + rules.columns.length + rules.cells.length === 0) return ''
+          const columns = latestSheetRef.current.columns || []
+          const areas = protectionAreas(rules, columns)
+          const value = (params || {}) as { range?: Parameters<typeof rangeToRect>[0]; fromRange?: Parameters<typeof rangeToRect>[0]; toRange?: Parameters<typeof rangeToRect>[0] }
+          const user = getStoredUser()
+          const canRestructure = isAdmin(user) || areas.every((area) => area.item.owner_id === user?.id)
+          const restructureDenied = '此表包含其他人设置的保护或遮罩区域，只有管理员或保护创建者可以插入、删除或移动行列。'
+          const describe = (area: (typeof areas)[number]) => describeProtectionArea(area, columns)
+          switch (id) {
+            case 'sheet.command.insert-row':
+            case 'sheet.command.insert-col':
+            case 'sheet.command.move-rows':
+            case 'sheet.command.move-cols':
+              return canRestructure ? '' : restructureDenied
+            case 'sheet.command.remove-row-by-range':
+            case 'sheet.command.remove-col-by-range': {
+              if (!canRestructure) return restructureDenied
+              const rect = rangeToRect(value.range)
+              if (!rect) return ''
+              const area = id.includes('-row-')
+                ? findProtectionBlockingRemoval(areas, 'row', rect.startRow, rect.endRow)
+                : findProtectionBlockingRemoval(areas, 'column', rect.startColumn, rect.endColumn)
+              return area ? `${describe(area)}所在的${id.includes('-row-') ? '行' : '列'}不能删除，请先在「保护设置」中解除保护。` : ''
+            }
+            case 'sheet.command.delete-range-move-up':
+            case 'sheet.command.insert-range-move-down':
+            case 'sheet.command.delete-range-move-left':
+            case 'sheet.command.insert-range-move-right': {
+              const rect = rangeToRect(value.range) || selectionRects().slice(-1)[0]
+              if (!rect) return ''
+              const vertical = id.endsWith('-up') || id.endsWith('-down')
+              const area = findProtectionInRects(areas, [vertical ? { ...rect, endRow: UNBOUNDED_INDEX } : { ...rect, endColumn: UNBOUNDED_INDEX }])
+              return area ? `这次操作会让${describe(area)}错位，已阻止。请先解除保护。` : ''
+            }
+            case 'sheet.command.move-range': {
+              const rects = [rangeToRect(value.fromRange), rangeToRect(value.toRange)].filter((rect): rect is WorksheetRect => Boolean(rect))
+              const area = findProtectionInRects(areas, rects)
+              return area ? `${describe(area)}不能被移动或覆盖。` : ''
+            }
+            case 'sheet.command.sort-range': {
+              const rect = rangeToRect(value.range)
+              const area = rect ? findProtectionInRects(areas, [rect]) : undefined
+              return area ? `排序会打乱${describe(area)}，已阻止。请缩小排序范围或先解除保护。` : ''
+            }
+            case 'sheet.command.clear-selection-content':
+            case 'sheet.command.clear-selection-all': {
+              const area = findProtectionInRects(areas, selectionRects(), (item) => Boolean(item.hidden || item.hide_formula || !item.can_edit))
+              return area ? `${describe(area)}不能被清除。` : ''
+            }
+            default:
+              return ''
+          }
+        }
+        const protectionGuardDisposable = univerAPI.addEvent(univerAPI.Event.BeforeCommandExecute, (event) => {
+          const message = guardProtectedCommand(event.id, event.params)
+          if (!message) return
+          event.cancel = true
+          setActionError(message)
+        })
+
         const beforeEditPresenceDisposable = univerAPI.addEvent(univerAPI.Event.BeforeSheetEditStart, (params) => {
           const columnKey = latestSheetRef.current.columns?.[params.column]?.key
           const dataRow = params.row - 1
           if (!columnKey || dataRow < 0) return
+          const rules = protectionSnapshotRef.current
+          const cellRules = [
+            ...rules.rows.filter((rule) => rule.row_index === dataRow),
+            ...rules.columns.filter((rule) => (rule.column_key || rule.key) === columnKey),
+            ...rules.cells.filter((rule) => rule.row_index === dataRow && rule.column_key === columnKey),
+          ]
+          const blockedRule = cellRules.find((rule) => rule.masked_for_current_user || rule.formula_hidden_for_current_user || !rule.can_edit)
+          if (blockedRule) {
+            params.cancel = true
+            setActionError(blockedRule.masked_for_current_user
+              ? '该单元格内容已遮罩，不能编辑。'
+              : blockedRule.formula_hidden_for_current_user
+                ? '该单元格的公式已隐藏，只能查看计算结果。'
+                : `该单元格已由 ${blockedRule.owner_name} 保护，不能编辑。`)
+            return
+          }
           const currentClientId = getRealtimeClientId()
           const ownUserId = getStoredUser()?.id
           // Your own other tabs/accounts must not lock you out of your own cell.
@@ -4534,6 +4710,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           searchableOptionClickDisposable.dispose()
           scrollPositionDisposable.dispose()
           beforeEditPresenceDisposable.dispose()
+          protectionGuardDisposable.dispose()
           editStartedPresenceDisposable.dispose()
           editEndedPresenceDisposable.dispose()
           persistRef.current = null
@@ -5014,6 +5191,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     if (!selectionState) {
       setSelectedProtectionLockEditing(true)
       setSelectedProtectionHidden(false)
+      setSelectedProtectionHideFormula(false)
       setSelectedProtectionReadonlyUserIds([])
       setSelectedProtectionReadonlyDepartmentIds([])
       setSelectedProtectionEditableUserIds([])
@@ -5023,23 +5201,22 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       return
     }
 
-    const currentCell = protectionSnapshot.cells.find(
-      (item) => item.row_index === selectionState.rowIndex && item.column_key === selectionState.columnKey
-    )
-    const currentRow = protectionSnapshot.rows.find((item) => item.row_index === selectionState.rowIndex)
-    const currentColumn = protectionSnapshot.columns.find((item) => item.column_key === selectionState.columnKey)
+    const currentCell = protectionIndex.cells.get(`${selectionState.rowIndex}:${selectionState.columnKey}`)
+    const currentRow = protectionIndex.rows.get(selectionState.rowIndex)
+    const currentColumn = protectionIndex.columns.get(selectionState.columnKey)
     const activeProtection = currentCell || currentRow || currentColumn
 
     if (activeProtection) setProtectionScope(activeProtection.scope)
     setSelectedProtectionLockEditing(activeProtection?.lock_editing ?? true)
     setSelectedProtectionHidden(Boolean(activeProtection?.hidden))
+    setSelectedProtectionHideFormula(Boolean(activeProtection?.hide_formula))
     setSelectedProtectionReadonlyUserIds(activeProtection?.readonly_user_ids || [])
     setSelectedProtectionReadonlyDepartmentIds(activeProtection?.readonly_department_ids || [])
     setSelectedProtectionEditableUserIds(activeProtection?.editable_user_ids || [])
     setSelectedProtectionEditableDepartmentIds(activeProtection?.editable_department_ids || [])
     setSelectedProtectionViewHiddenUserIds(activeProtection?.view_hidden_user_ids || [])
     setSelectedProtectionViewHiddenDepartmentIds(activeProtection?.view_hidden_department_ids || [])
-  }, [protectionSnapshot.cells, protectionSnapshot.columns, protectionSnapshot.rows, selectionState])
+  }, [protectionIndex, selectionState])
 
   if (error) {
     return (
@@ -5052,17 +5229,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     )
   }
 
-  const showFabs = !showImagePicker && !univerHasOverlay && !showNumberFormatPanel && !showApprovalPanel && !showFieldControlPanel && !optionPickerTarget
-  const currentRowProtection = selectionState
-    ? protectionSnapshot.rows.find((item) => item.row_index === selectionState.rowIndex) || null
-    : null
-  const currentColumnProtection = selectionState
-    ? protectionSnapshot.columns.find((item) => item.column_key === selectionState.columnKey) || null
-    : null
+  const showFabs = !showImagePicker && !univerHasOverlay && !showNumberFormatPanel && !showApprovalPanel && !showFieldControlPanel && !showProtectionPanel && !optionPickerTarget
+  const currentRowProtection = selectionState ? protectionIndex.rows.get(selectionState.rowIndex) || null : null
+  const currentColumnProtection = selectionState ? protectionIndex.columns.get(selectionState.columnKey) || null : null
   const currentCellProtection = selectionState
-    ? protectionSnapshot.cells.find(
-        (item) => item.row_index === selectionState.rowIndex && item.column_key === selectionState.columnKey
-      ) || null
+    ? protectionIndex.cells.get(`${selectionState.rowIndex}:${selectionState.columnKey}`) || null
     : null
   const columnLabelMap = new Map((latestSheetRef.current.columns || []).map((column) => [column.key, column.name || column.key]))
   const getProtectionColumnLabel = (columnKey?: string | null) => {
@@ -5153,6 +5324,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setProtectionScope(scope)
     setSelectedProtectionLockEditing(item?.lock_editing ?? true)
     setSelectedProtectionHidden(Boolean(item?.hidden))
+    setSelectedProtectionHideFormula(Boolean(item?.hide_formula))
     setSelectedProtectionReadonlyUserIds(item?.readonly_user_ids || [])
     setSelectedProtectionReadonlyDepartmentIds(item?.readonly_department_ids || [])
     setSelectedProtectionEditableUserIds(item?.editable_user_ids || [])
@@ -5160,6 +5332,56 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     setSelectedProtectionViewHiddenUserIds(item?.view_hidden_user_ids || [])
     setSelectedProtectionViewHiddenDepartmentIds(item?.view_hidden_department_ids || [])
   }
+  const protectionSelectionSize = (() => {
+    if (!selectionState) return { rows: 0, columns: 0 }
+    const sheetColumns = latestSheetRef.current.columns || []
+    const startColumn = sheetColumns.findIndex((column) => column.key === selectionState.columnKey)
+    const endColumn = sheetColumns.findIndex((column) => column.key === selectionState.endColumnKey)
+    return {
+      rows: Math.max(0, selectionState.endRowIndex - selectionState.rowIndex + 1),
+      columns: startColumn < 0 || endColumn < 0 ? 0 : Math.abs(endColumn - startColumn) + 1,
+    }
+  })()
+  const effectiveProtectionScope: ProtectionScope = selectionState?.isEntireColumnSelection
+    ? 'column'
+    : selectionState?.isEntireRowSelection
+      ? 'row'
+      : protectionScope
+  const protectionTargetCount = effectiveProtectionScope === 'row'
+    ? protectionSelectionSize.rows
+    : effectiveProtectionScope === 'column'
+      ? protectionSelectionSize.columns
+      : protectionSelectionSize.rows * protectionSelectionSize.columns
+  const protectionTargetLabel = `${protectionTargetCount.toLocaleString('zh-CN')} ${effectiveProtectionScope === 'row' ? '行' : effectiveProtectionScope === 'column' ? '列' : '个单元格'}`
+  const protectionBatchTooLarge = protectionTargetCount > 5000
+  const protectionBatchLarge = effectiveProtectionScope === 'cell' && protectionTargetCount > 300
+  const protectionModeMissing = !selectedProtectionLockEditing && !selectedProtectionHidden && !selectedProtectionHideFormula
+  const protectionApplyBlockedReason = !selectionState
+    ? '请先在表格中框选要保护的范围'
+    : editLocked
+      ? '当前账号只有查看权限'
+      : protectionModeMissing
+        ? '请至少选择一种保护方式'
+        : protectionBatchTooLarge
+          ? '所选单元格超过 5000 个，请改用整列或整行'
+          : activeProtection && !canUpdateProtectionEditors(activeProtection)
+            ? `该范围由 ${activeProtection.owner_name} 设置，只有创建者或管理员可以修改`
+            : ''
+  const protectionReleaseBlocked = !selectionState || editLocked || !activeProtection || !canReleaseProtection(activeProtection)
+  const normalizedWhitelistSearch = protectionUserSearch.trim().toLocaleLowerCase('zh-CN')
+  const whitelistDepartments = protectionWhitelistFilter === 'user'
+    ? []
+    : protectionDepartments.filter((department) => !normalizedWhitelistSearch || department.name.toLocaleLowerCase('zh-CN').includes(normalizedWhitelistSearch))
+  const whitelistUsers = protectionWhitelistFilter === 'department' ? [] : filteredProtectionUsers
+  const buildFilteredProtectionRecordGroups = () => protectionOwnerGroups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => protectionRecordFilter === 'all'
+        || (protectionRecordFilter === 'hidden' && item.hidden)
+        || (protectionRecordFilter === 'formula' && item.hide_formula)
+        || (protectionRecordFilter === 'lock' && item.lock_editing)),
+    }))
+    .filter((group) => group.items.length > 0)
   const currentProtectionItems = [currentRowProtection, currentColumnProtection, currentCellProtection]
     .filter((item): item is ProtectionInfo => Boolean(item))
   const selectedCellCannotEdit = Boolean(
@@ -5169,7 +5391,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     )
   )
   const selectedCellMasked = currentProtectionItems.some((item) => item.masked_for_current_user)
-  const showSelectionRestriction = selectedCellMasked || (currentProtectionItems.length > 0 && selectedCellCannotEdit)
+  const selectedCellFormulaHidden = currentProtectionItems.some((item) => item.formula_hidden_for_current_user)
+  const showSelectionRestriction = selectedCellMasked || selectedCellFormulaHidden || (currentProtectionItems.length > 0 && selectedCellCannotEdit)
   const protectionOwnerGroups = Array.from(allProtectionItems.reduce((groups, item) => {
     const current = groups.get(item.owner_id) || { ownerId: item.owner_id, ownerName: item.owner_name, items: [] as ProtectionInfo[] }
     current.items.push(item)
@@ -5236,7 +5459,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         sheetId={sheetId}
         ready={!loading && !error && canViewSheet}
         editable={!editLocked}
-        selectionEditable={Boolean(selectionState && selectionState.rowIndex >= 0 && !editLocked && !selectedCellCannotEdit && !selectedCellMasked)}
+        selectionEditable={Boolean(selectionState && selectionState.rowIndex >= 0 && !editLocked && !selectedCellCannotEdit && !selectedCellMasked && !selectedCellFormulaHidden)}
         selectionLabel={selectionState?.rangeLabel || ''}
         changeToken={`${saveStatus}:${reloadToken || ''}:${searchAccessToken}`}
         readCells={async (commitEditor) => {
@@ -5576,11 +5799,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               <FloatingToolHint label="保护设置">
                 <button
                   type="button"
-                  onClick={() => {
-                    syncSelectionState()
-                    setShowAllProtections(false)
-                    setShowProtectionPanel((current) => !current)
-                  }}
+                  onClick={() => openCustomProtectionPanel()}
                   className={`flex h-10 w-10 items-center justify-center rounded-full border shadow-lg transition ${
                     showProtectionPanel
                       ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
@@ -5662,7 +5881,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                 <button
                   type="button"
                   onClick={openPdfExportPanel}
-                  disabled={!effectiveCanViewSheet || exportAction !== ''}
+                  disabled={!effectiveCanExportSheet || exportAction !== ''}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                   title="PDF 导出与预览"
                   aria-label="PDF 导出与预览"
@@ -6138,232 +6357,235 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         </div>
       )}
 
-      {showProtectionPanel && (
-        <div className="absolute inset-x-3 bottom-3 z-30 max-h-[min(820px,calc(100vh-5rem))] overflow-y-auto rounded-lg border border-slate-200 bg-white p-4 shadow-2xl sm:inset-x-auto sm:bottom-20 sm:right-20 sm:w-[560px]">
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold text-slate-900">选区保护与数据白名单</div>
-              <div className="mt-1 text-xs leading-5 text-slate-500">
-                当前选择：{selectionState ? selectionState.rangeLabel : '未选中单元格'}
+      {showProtectionPanel && (() => {
+        const recordGroups = buildFilteredProtectionRecordGroups()
+        const accessOptions = (
+          <>
+            <option value="">不加入</option>
+            <option value="readonly">只读</option>
+            <option value="edit">可修改</option>
+            <option value="view_hidden">可看原文/公式</option>
+          </>
+        )
+        const modeCards: Array<{ key: string; checked: boolean; onChange: (value: boolean) => void; icon: typeof Lock; title: string; detail: string; tone: string }> = [
+          { key: 'lock', checked: selectedProtectionLockEditing, onChange: setSelectedProtectionLockEditing, icon: Lock, title: '锁定编辑', detail: '没有“可修改”权限的人不能改动内容', tone: 'border-sky-300 bg-sky-50 text-sky-800' },
+          { key: 'hidden', checked: selectedProtectionHidden, onChange: setSelectedProtectionHidden, icon: EyeOff, title: '数据遮罩', detail: '其他人只看到 ••••，行列也不能被删除', tone: 'border-slate-400 bg-slate-100 text-slate-800' },
+          { key: 'formula', checked: selectedProtectionHideFormula, onChange: setSelectedProtectionHideFormula, icon: Sigma, title: '隐藏公式', detail: '其他人只看到计算结果，结果随数据实时更新', tone: 'border-violet-300 bg-violet-50 text-violet-800' },
+        ]
+        return (
+          <div className="absolute inset-x-2 bottom-2 top-14 z-30 flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl sm:inset-x-auto sm:right-3 sm:w-[440px]">
+            <div className="shrink-0 border-b border-slate-200 px-4 pb-0 pt-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><Shield className="h-4 w-4 text-sky-600" />保护与遮罩</div>
+                  <div className="mt-1 truncate text-xs text-slate-500" title={selectionState?.rangeLabel}>
+                    {selectionState ? `当前选择：${selectionState.rangeLabel}` : '先在表格中框选单元格、整行或整列'}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button type="button" onClick={() => setShowProtectionHighlights((current) => !current)} className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition ${showProtectionHighlights ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title={showProtectionHighlights ? '隐藏表格中的保护颜色' : '在表格中标出保护区域'}>
+                    {showProtectionHighlights ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+                    标记
+                  </button>
+                  <button type="button" onClick={() => setShowProtectionPanel(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600" aria-label="关闭保护设置">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 flex gap-4 text-xs font-semibold" role="tablist">
+                {([
+                  { value: 'settings', label: '设置保护' },
+                  { value: 'records', label: `保护记录 ${allProtectionItems.length}` },
+                ] as const).map((tab) => (
+                  <button key={tab.value} type="button" role="tab" aria-selected={protectionPanelTab === tab.value} onClick={() => setProtectionPanelTab(tab.value)} className={`-mb-px border-b-2 pb-2 transition ${protectionPanelTab === tab.value ? 'border-sky-600 text-sky-700' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>
+                    {tab.label}
+                  </button>
+                ))}
               </div>
             </div>
-            <div className="flex shrink-0 items-center gap-1">
-              <button type="button" onClick={() => setShowProtectionHighlights((current) => !current)} className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition ${showProtectionHighlights ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title={showProtectionHighlights ? '隐藏保护区域颜色' : '显示保护区域颜色'}>
-                {showProtectionHighlights ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                {showProtectionHighlights ? '隐藏标记' : '显示标记'}
-              </button>
-              <button type="button" onClick={() => setShowProtectionPanel(false)} className="ui-tooltip inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600" title="关闭保护设置" aria-label="关闭保护设置" data-tooltip="关闭" data-tooltip-side="left">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
 
-          <div className="space-y-3">
-            {editLocked && (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
-                当前账号只有查看权限，可以查看保护状态，但不能加锁、解锁或保存表格。
-              </div>
-            )}
-            {protectionFocusNotice && (
-              <div className="flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-medium text-sky-800">
-                <LocateFixed className="h-4 w-4 shrink-0" />
-                <span className="min-w-0 flex-1">{protectionFocusNotice}</span>
-              </div>
-            )}
-            {protectionOwnerGroups.length > 0 && (
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="mb-2 text-xs font-semibold text-slate-700">保护颜色图例</div>
-                <div className="flex flex-wrap gap-2">
-                  {protectionOwnerGroups.map((group) => {
-                    const visual = visualForUser(group.ownerId)
-                    return <span key={group.ownerId} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600"><span className="h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: visual.fill, border: `2px solid ${visual.stroke}` }} />{group.ownerName}<span className="text-slate-400">{group.items.length}</span></span>
-                  })}
-                  {allProtectionItems.some((item) => item.hidden) && <span className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600"><EyeOff className="h-3 w-3 text-slate-600" />对其他人隐藏</span>}
-                </div>
-              </div>
-            )}
-            <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-              <div className="border-b border-slate-200 bg-slate-50 px-3 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-slate-800">1. 选择保护范围</div>
-                  <span className="rounded-md bg-white px-2 py-1 text-[11px] font-medium text-slate-500">拖动框选后直接应用</span>
-                </div>
-                <div className="mt-3 grid grid-cols-3 gap-1 rounded-lg bg-slate-200/70 p-1">
-                  {([
-                    { value: 'cell', label: '精确选区', icon: Square },
-                    { value: 'row', label: '所选整行', icon: Rows3 },
-                    { value: 'column', label: '所选整列', icon: Columns3 },
-                  ] as Array<{ value: ProtectionScope; label: string; icon: typeof Square }>).map(({ value, label, icon: Icon }) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => selectProtectionScope(value)}
-                      className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-md text-xs font-semibold transition ${protectionScope === value ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
-                    >
-                      <Icon className="h-3.5 w-3.5" />
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                {(selectionState?.includesHeaderRow || selectionState?.isEntireColumnSelection || selectionState?.isEntireRowSelection) && (
-                  <div className="mt-2 text-[11px] leading-5 text-sky-700">
-                    {selectionState.isEntireColumnSelection
-                      ? '已通过列标题选择整列，将按所选列处理。'
-                      : selectionState.isEntireRowSelection
-                        ? '已通过行标题选择整行，将按所选行处理。'
-                        : '已选择表头单元格区域，将按当前范围处理，不会扩展为整列。'}
-                  </div>
-                )}
-                <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                  <label className={`flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition ${selectedProtectionLockEditing ? 'border-sky-300 bg-sky-50' : 'border-slate-200 bg-white'}`}>
-                    <input type="checkbox" checked={selectedProtectionLockEditing} onChange={(event) => setSelectedProtectionLockEditing(event.target.checked)} disabled={editLocked} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600" />
-                    <span className="min-w-0 flex-1">
-                      <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><Lock className="h-3.5 w-3.5" />锁定单元格编辑</span>
-                      <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">未获得“修改”权限的成员不能更改内容。</span>
-                    </span>
-                  </label>
-                  <label className={`flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition ${selectedProtectionHidden ? 'border-slate-400 bg-slate-100' : 'border-slate-200 bg-white'}`}>
-                    <input type="checkbox" checked={selectedProtectionHidden} onChange={(event) => setSelectedProtectionHidden(event.target.checked)} disabled={editLocked} className="mt-0.5 h-4 w-4 rounded border-slate-300 text-slate-700" />
-                    <span className="min-w-0 flex-1">
-                      <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-700"><EyeOff className="h-3.5 w-3.5" />对未授权人员遮罩数据</span>
-                      <span className="mt-0.5 block text-[11px] leading-5 text-slate-500">未获得原文权限的成员只会看到 ••••。</span>
-                    </span>
-                  </label>
-                </div>
-                {!selectedProtectionLockEditing && !selectedProtectionHidden && <div className="mt-2 text-[11px] font-medium text-amber-700">请至少开启“锁定编辑”或“数据遮罩”中的一项。</div>}
-              </div>
+            {protectionPanelTab === 'settings' ? (
+              <>
+                <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
+                  {editLocked && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">当前账号只有查看权限，只能查看保护状态。</div>
+                  )}
+                  {protectionFocusNotice && (
+                    <div className="flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-medium text-sky-800"><LocateFixed className="h-4 w-4 shrink-0" /><span className="min-w-0 flex-1">{protectionFocusNotice}</span></div>
+                  )}
+                  {activeProtection && (
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs leading-5 text-slate-600">
+                      <div className="font-semibold text-slate-800">该位置已有保护 · {formatProtectionMode(activeProtection)}</div>
+                      <div>设置人：{activeProtection.owner_name}　例外名单：{formatProtectionWhitelist(activeProtection)}</div>
+                      <div className="text-slate-400">下面已载入现有设置，修改后点击“应用”即可更新。</div>
+                    </div>
+                  )}
 
-              <div className="px-3 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-800"><Users className="h-4 w-4 text-sky-600" />2. 配置白名单</div>
-                    <div className="mt-1 text-[11px] leading-5 text-slate-500">修改可编辑并看原文；查看遮罩内容只能看原文；只读不能修改。</div>
-                  </div>
-                  <button type="button" onClick={clearProtectionWhitelist} disabled={editLocked || selectedProtectionPrincipalCount === 0} className="h-8 shrink-0 rounded-lg border border-slate-200 px-2.5 text-xs font-medium text-slate-500 transition hover:bg-slate-50 disabled:opacity-40">清空 {selectedProtectionPrincipalCount || ''}</button>
-                </div>
+                  <section>
+                    <div className="mb-2 flex items-baseline justify-between gap-2">
+                      <h3 className="text-xs font-semibold text-slate-800">1. 保护范围</h3>
+                      {selectionState && <span className="text-[11px] text-slate-500">将应用到 <b className="text-slate-700">{protectionTargetLabel}</b></span>}
+                    </div>
+                    <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
+                      {([
+                        { value: 'cell', label: '所选单元格', icon: Square },
+                        { value: 'row', label: '整行', icon: Rows3 },
+                        { value: 'column', label: '整列', icon: Columns3 },
+                      ] as Array<{ value: ProtectionScope; label: string; icon: typeof Square }>).map(({ value, label, icon: Icon }) => {
+                        const forced = (selectionState?.isEntireColumnSelection && value !== 'column') || (selectionState?.isEntireRowSelection && value !== 'row')
+                        return (
+                          <button key={value} type="button" onClick={() => selectProtectionScope(value)} disabled={Boolean(forced)} className={`inline-flex h-8 items-center justify-center gap-1.5 rounded-md text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 ${effectiveProtectionScope === value ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                            <Icon className="h-3.5 w-3.5" />{label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    {(selectionState?.isEntireColumnSelection || selectionState?.isEntireRowSelection) && (
+                      <p className="mt-1.5 text-[11px] text-sky-700">已通过{selectionState.isEntireColumnSelection ? '列' : '行'}标题选择，按整{selectionState.isEntireColumnSelection ? '列' : '行'}保护，新增的{selectionState.isEntireColumnSelection ? '行' : '列'}也会自动受保护。</p>
+                    )}
+                    {protectionBatchLarge && (
+                      <p className={`mt-1.5 rounded-md px-2 py-1.5 text-[11px] leading-5 ${protectionBatchTooLarge ? 'bg-rose-50 text-rose-700' : 'bg-amber-50 text-amber-800'}`}>
+                        {protectionBatchTooLarge ? '所选单元格超过 5000 个，无法逐个保护。' : '所选单元格较多，'}建议改用「整列」或「整行」：设置更快，表格打开也更流畅。
+                      </p>
+                    )}
+                  </section>
 
-                {protectionDepartments.length > 0 && (
-                  <div className="mt-3">
-                    <div className="mb-1.5 text-xs font-semibold text-slate-600">部门</div>
-                    <div className="max-h-40 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
-                      {protectionDepartments.map((department) => (
-                        <div key={department.id} className="flex items-center gap-3 px-3 py-2">
-                          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-sky-50 text-sky-700"><Users className="h-3.5 w-3.5" /></div>
-                          <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-700">{department.name}</div><div className="text-[10px] text-slate-400">{department.member_count} 名成员</div></div>
-                          <select aria-label={`设置部门 ${department.name} 的选区权限`} value={getProtectionDepartmentAccess(department.id)} onChange={(event) => setProtectionDepartmentAccess(department.id, event.target.value as ProtectionWhitelistAccess | '')} disabled={editLocked} className="h-8 w-32 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 outline-none focus:border-sky-300">
-                            <option value="">不加入</option><option value="readonly">只读</option><option value="edit">修改</option><option value="view_hidden">查看遮罩内容</option>
-                          </select>
-                        </div>
+                  <section>
+                    <h3 className="mb-2 text-xs font-semibold text-slate-800">2. 保护方式 <span className="font-normal text-slate-400">可多选</span></h3>
+                    <div className="space-y-1.5">
+                      {modeCards.map(({ key, checked, onChange, icon: Icon, title, detail, tone }) => (
+                        <label key={key} className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 transition ${checked ? tone : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'} ${editLocked ? 'cursor-not-allowed opacity-60' : ''}`}>
+                          <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} disabled={editLocked} className="h-4 w-4 shrink-0 rounded border-slate-300" />
+                          <Icon className="h-4 w-4 shrink-0" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-xs font-semibold">{title}</span>
+                            <span className="block text-[11px] leading-4 opacity-75">{detail}</span>
+                          </span>
+                        </label>
                       ))}
                     </div>
-                  </div>
-                )}
+                    <p className="mt-1.5 text-[11px] leading-4 text-slate-400">管理员和设置人始终能看到原文与公式。受保护的行列不能被删除、排序或移位。</p>
+                  </section>
 
-                <div className="mt-3">
-                  <div className="mb-1.5 flex items-center justify-between gap-3"><span className="text-xs font-semibold text-slate-600">员工</span><span className="text-[10px] text-slate-400">个人设置优先于部门</span></div>
-                  {protectionUsersLoading ? (
-                    <div className="rounded-lg border border-slate-200 px-3 py-4 text-center text-xs text-slate-400">正在加载员工...</div>
-                  ) : protectionUsersError ? (
-                    <div className="flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"><span>{protectionUsersError}</span><button type="button" onClick={() => { setProtectionDirectoryLoaded(false); setProtectionUsersLoadToken((current) => current + 1) }} className="shrink-0 font-semibold text-rose-800 hover:underline">重试</button></div>
-                  ) : protectionUsers.length === 0 ? (
-                    <div className="rounded-lg bg-slate-50 px-3 py-3 text-xs text-slate-400">暂无可选择员工，请先创建并启用员工账号。</div>
-                  ) : (
-                    <>
-                      <label className="relative block">
+                  <section>
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <h3 className="text-xs font-semibold text-slate-800">3. 例外名单 <span className="font-normal text-slate-400">{selectedProtectionPrincipalCount > 0 ? `已选 ${selectedProtectionPrincipalCount}` : '默认仅设置人和管理员'}</span></h3>
+                      {selectedProtectionPrincipalCount > 0 && (
+                        <button type="button" onClick={clearProtectionWhitelist} disabled={editLocked} className="text-[11px] font-medium text-slate-500 hover:text-slate-700 disabled:opacity-40">清空</button>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="relative min-w-0 flex-1">
                         <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                        <input type="search" value={protectionUserSearch} onChange={(event) => setProtectionUserSearch(event.target.value)} placeholder="搜索姓名或邮箱" className="h-9 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-2 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100" />
+                        <input type="search" value={protectionUserSearch} onChange={(event) => setProtectionUserSearch(event.target.value)} placeholder="搜索部门、姓名或邮箱" className="h-8 w-full rounded-lg border border-slate-200 bg-slate-50 pl-8 pr-2 text-xs text-slate-700 outline-none transition focus:border-sky-300 focus:bg-white focus:ring-2 focus:ring-sky-100" />
                       </label>
-                      <div className="mt-2 max-h-52 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
-                        {filteredProtectionUsers.length === 0 ? (
-                          <div className="px-2 py-5 text-center text-xs text-slate-400">没有匹配的员工</div>
-                        ) : filteredProtectionUsers.map((user) => (
-                          <div key={user.id} className="flex items-center gap-3 px-3 py-2">
-                            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 text-[10px] font-semibold text-slate-600">{user.username.slice(0, 2).toUpperCase()}</div>
-                            <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-700">{user.username}</div><div className="truncate text-[10px] text-slate-400">{user.email}</div></div>
-                            <select aria-label={`设置员工 ${user.username} 的选区权限`} value={getProtectionUserAccess(user.id)} onChange={(event) => setProtectionUserAccess(user.id, event.target.value as ProtectionWhitelistAccess | '')} disabled={editLocked} className="h-8 w-32 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 outline-none focus:border-sky-300">
-                              <option value="">不加入</option><option value="readonly">只读</option><option value="edit">修改</option><option value="view_hidden">查看遮罩内容</option>
-                            </select>
-                          </div>
+                      <div className="flex shrink-0 rounded-lg bg-slate-100 p-0.5 text-[11px] font-medium">
+                        {([['all', '全部'], ['department', '部门'], ['user', '员工']] as const).map(([value, label]) => (
+                          <button key={value} type="button" onClick={() => setProtectionWhitelistFilter(value)} className={`rounded-md px-2 py-1 transition ${protectionWhitelistFilter === value ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>{label}</button>
                         ))}
                       </div>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              <div className="border-t border-slate-200 bg-slate-50 px-3 py-3">
-                {activeProtection && <div className="mb-2 text-[11px] leading-5 text-slate-500">当前{protectionScope === 'row' ? '行' : protectionScope === 'column' ? '列' : '单元格'}已由 {activeProtection.owner_name} 设置“{formatProtectionMode(activeProtection)}”：{formatProtectionWhitelist(activeProtection)}</div>}
-                <div className="grid grid-cols-[1fr_auto] gap-2">
-                  <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'lock', selectedProtectionHidden)} disabled={!selectionState || editLocked || (!selectedProtectionLockEditing && !selectedProtectionHidden) || protectionAction === `${protectionScope}:bulk:lock` || Boolean(activeProtection && !canUpdateProtectionEditors(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"><Shield className="h-4 w-4" />保存并应用到选区</button>
-                  <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'unlock')} disabled={!selectionState || editLocked || protectionAction === `${protectionScope}:bulk:unlock` || Boolean(activeProtection && !canReleaseProtection(activeProtection))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"><Unlock className="h-4 w-4" />解除</button>
-                </div>
-                <div className="mt-2 text-[10px] leading-5 text-slate-400">白名单会并入最终权限矩阵；工作簿或工作表的锁定、归档状态仍然优先。</div>
-              </div>
-            </div>
-            <div className="rounded-xl border border-slate-200 bg-white p-3">
-              <button
-                type="button"
-                onClick={() => setShowAllProtections((value) => !value)}
-                disabled={protectionLoading || allProtectionItems.length === 0}
-                className="flex w-full items-center justify-between gap-3 text-left disabled:cursor-default"
-              >
-                <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
-                  <Shield className="h-4 w-4 text-amber-600" />
-                  全部保护记录
-                </span>
-                <span className="flex items-center gap-2 text-xs text-slate-500">
-                  共 {allProtectionItems.length} 项
-                  {allProtectionItems.length > 0 && (
-                    <ChevronUp className={`h-4 w-4 transition-transform ${showAllProtections ? '' : 'rotate-180'}`} />
-                  )}
-                </span>
-              </button>
-              {protectionLoading ? (
-                <div className="mt-3 text-xs text-slate-400">正在加载...</div>
-              ) : allProtectionItems.length === 0 ? (
-                <div className="mt-3 text-xs text-slate-400">当前工作表还没有保护记录。</div>
-              ) : showAllProtections ? (
-                <div className="mt-3 max-h-80 space-y-3 overflow-y-auto pr-1 text-xs">
-                  {protectionOwnerGroups.map((group) => {
-                    const visual = visualForUser(group.ownerId)
-                    return (
-                      <section key={group.ownerId} className="overflow-hidden rounded-lg border border-slate-200">
-                        <div className="flex items-center justify-between px-3 py-2" style={{ backgroundColor: visual.soft }}>
-                          <span className="flex min-w-0 items-center gap-2 font-semibold" style={{ color: visual.stroke }}><span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: visual.stroke }} />{group.ownerName}</span>
-                          <span className="shrink-0 text-[10px]" style={{ color: visual.stroke }}>{group.items.length} 个区域</span>
-                        </div>
-                        <div className="divide-y divide-slate-100 bg-white">
-                          {group.items.map((item, index) => (
-                            <button key={`${item.scope}-${item.key}-${index}`} type="button" onClick={() => focusProtection(item)} className="block w-full px-3 py-2.5 text-left transition hover:bg-slate-50">
-                              <div className="flex items-start justify-between gap-3">
-                                <div className="flex min-w-0 items-center gap-2 font-semibold text-slate-700">
-                                  {item.scope === 'row' ? <Rows3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : item.scope === 'column' ? <Columns3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : <Square className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} />}
-                                  <span className="truncate">{formatProtectionTarget(item)}</span>
-                                  {item.hidden && <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600"><EyeOff className="h-3 w-3" />已遮盖</span>}
-                                  {item.lock_editing && <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700"><Lock className="h-3 w-3" />已锁定</span>}
-                                </div>
-                                <LocateFixed className="h-3.5 w-3.5 shrink-0 text-slate-300" />
-                              </div>
-                              <div className="mt-1 leading-5 text-slate-500">{new Date(item.protected_at).toLocaleString('zh-CN')}</div>
-                              <div className="mt-1 truncate leading-5 text-slate-500">白名单：{formatProtectionWhitelist(item)}</div>
-                            </button>
+                    </div>
+                    <div className="mt-2 max-h-64 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
+                      {protectionUsersLoading ? (
+                        <div className="px-3 py-5 text-center text-xs text-slate-400">正在加载成员...</div>
+                      ) : protectionUsersError ? (
+                        <div className="flex items-center justify-between gap-3 bg-rose-50 px-3 py-2 text-xs text-rose-700"><span>{protectionUsersError}</span><button type="button" onClick={() => { setProtectionDirectoryLoaded(false); setProtectionUsersLoadToken((current) => current + 1) }} className="shrink-0 font-semibold hover:underline">重试</button></div>
+                      ) : whitelistDepartments.length === 0 && whitelistUsers.length === 0 ? (
+                        <div className="px-3 py-5 text-center text-xs text-slate-400">{protectionUsers.length === 0 && protectionDepartments.length === 0 ? '暂无可选成员，请先创建员工账号。' : '没有匹配的部门或员工'}</div>
+                      ) : (
+                        <>
+                          {whitelistDepartments.map((department) => (
+                            <div key={`department-${department.id}`} className="flex items-center gap-2.5 px-3 py-1.5">
+                              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-sky-50 text-sky-700"><Building2 className="h-3.5 w-3.5" /></div>
+                              <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-700">{department.name}</div><div className="text-[10px] text-slate-400">部门 · {department.member_count} 人</div></div>
+                              <select aria-label={`设置部门 ${department.name} 的例外权限`} value={getProtectionDepartmentAccess(department.id)} onChange={(event) => setProtectionDepartmentAccess(department.id, event.target.value as ProtectionWhitelistAccess | '')} disabled={editLocked} className={`h-7 w-[7.5rem] rounded-md border px-1.5 text-[11px] outline-none focus:border-sky-300 ${getProtectionDepartmentAccess(department.id) ? 'border-sky-300 bg-sky-50 text-sky-800' : 'border-slate-200 bg-white text-slate-500'}`}>{accessOptions}</select>
+                            </div>
                           ))}
-                        </div>
-                      </section>
-                    )
-                  })}
+                          {whitelistUsers.map((user) => (
+                            <div key={`user-${user.id}`} className="flex items-center gap-2.5 px-3 py-1.5">
+                              <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-100 text-[10px] font-semibold text-slate-600">{user.username.slice(0, 2).toUpperCase()}</div>
+                              <div className="min-w-0 flex-1"><div className="truncate text-xs font-medium text-slate-700">{user.username}</div><div className="truncate text-[10px] text-slate-400">{user.email}</div></div>
+                              <select aria-label={`设置员工 ${user.username} 的例外权限`} value={getProtectionUserAccess(user.id)} onChange={(event) => setProtectionUserAccess(user.id, event.target.value as ProtectionWhitelistAccess | '')} disabled={editLocked} className={`h-7 w-[7.5rem] rounded-md border px-1.5 text-[11px] outline-none focus:border-sky-300 ${getProtectionUserAccess(user.id) ? 'border-sky-300 bg-sky-50 text-sky-800' : 'border-slate-200 bg-white text-slate-500'}`}>{accessOptions}</select>
+                            </div>
+                          ))}
+                        </>
+                      )}
+                    </div>
+                    <p className="mt-1.5 text-[11px] leading-4 text-slate-400">可修改：能编辑并看原文；可看原文/公式：只看不改；只读：不能修改。个人设置优先于部门。</p>
+                  </section>
                 </div>
-              ) : (
-                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-500">
-                  <span className="rounded-full bg-slate-100 px-2 py-1">行 {protectionSnapshot.rows.length}</span>
-                  <span className="rounded-full bg-slate-100 px-2 py-1">列 {protectionSnapshot.columns.length}</span>
-                  <span className="rounded-full bg-slate-100 px-2 py-1">单元格 {protectionSnapshot.cells.length}</span>
+
+                <div className="shrink-0 border-t border-slate-200 bg-slate-50 px-4 py-3">
+                  {protectionApplyBlockedReason && selectionState && (
+                    <div className="mb-2 text-[11px] font-medium text-amber-700">{protectionApplyBlockedReason}</div>
+                  )}
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'lock', selectedProtectionHidden)} disabled={Boolean(protectionApplyBlockedReason) || protectionAction === `${protectionScope}:bulk:lock`} title={protectionApplyBlockedReason || undefined} className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-lg bg-sky-600 px-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50">
+                      <Shield className="h-4 w-4" />{protectionAction === `${protectionScope}:bulk:lock` ? '正在应用...' : activeProtection ? '更新保护' : '应用保护'}
+                    </button>
+                    <button type="button" onClick={() => void handleProtectionRangeChange(protectionScope, 'unlock')} disabled={protectionReleaseBlocked || protectionAction === `${protectionScope}:bulk:unlock`} title={protectionReleaseBlocked ? (activeProtection ? '只有设置人或管理员可以解除' : '所选位置没有保护') : '解除所选范围的保护'} className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50">
+                      <Unlock className="h-4 w-4" />解除
+                    </button>
+                  </div>
                 </div>
-              )}
-            </div>
+              </>
+            ) : (
+              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+                <div className="mb-3 flex flex-wrap items-center gap-1.5 text-[11px] font-medium">
+                  {([
+                    ['all', `全部 ${allProtectionItems.length}`],
+                    ['hidden', `遮罩 ${allProtectionItems.filter((item) => item.hidden).length}`],
+                    ['formula', `隐藏公式 ${allProtectionItems.filter((item) => item.hide_formula).length}`],
+                    ['lock', `锁定 ${allProtectionItems.filter((item) => item.lock_editing).length}`],
+                  ] as const).map(([value, label]) => (
+                    <button key={value} type="button" onClick={() => setProtectionRecordFilter(value)} className={`rounded-full border px-2.5 py-1 transition ${protectionRecordFilter === value ? 'border-sky-300 bg-sky-50 text-sky-700' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`}>{label}</button>
+                  ))}
+                </div>
+                {protectionLoading ? (
+                  <div className="py-8 text-center text-xs text-slate-400">正在加载...</div>
+                ) : recordGroups.length === 0 ? (
+                  <div className="py-8 text-center text-xs text-slate-400">{allProtectionItems.length === 0 ? '当前工作表还没有保护。' : '没有符合筛选条件的保护。'}</div>
+                ) : (
+                  <div className="space-y-3 text-xs">
+                    {recordGroups.map((group) => {
+                      const visual = visualForUser(group.ownerId)
+                      return (
+                        <section key={group.ownerId} className="overflow-hidden rounded-lg border border-slate-200">
+                          <div className="flex items-center justify-between px-3 py-2" style={{ backgroundColor: visual.soft }}>
+                            <span className="flex min-w-0 items-center gap-2 font-semibold" style={{ color: visual.stroke }}><span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: visual.stroke }} />{group.ownerName}</span>
+                            <span className="shrink-0 text-[10px]" style={{ color: visual.stroke }}>{group.items.length} 处</span>
+                          </div>
+                          <div className="divide-y divide-slate-100 bg-white">
+                            {(showAllProtections ? group.items : group.items.slice(0, 50)).map((item, index) => (
+                              <button key={`${item.scope}-${item.key}-${index}`} type="button" onClick={() => focusProtection(item)} className="block w-full px-3 py-2 text-left transition hover:bg-slate-50" title="点击在表格中定位">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="flex min-w-0 items-center gap-1.5 font-semibold text-slate-700">
+                                    {item.scope === 'row' ? <Rows3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : item.scope === 'column' ? <Columns3 className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} /> : <Square className="h-3.5 w-3.5 shrink-0" style={{ color: visual.stroke }} />}
+                                    <span className="truncate">{formatProtectionTarget(item)}</span>
+                                  </div>
+                                  <div className="flex shrink-0 items-center gap-1">
+                                    {item.hidden && <span className="inline-flex items-center gap-0.5 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600"><EyeOff className="h-3 w-3" />遮罩</span>}
+                                    {item.hide_formula && <span className="inline-flex items-center gap-0.5 rounded bg-violet-50 px-1.5 py-0.5 text-[10px] text-violet-700"><Sigma className="h-3 w-3" />公式</span>}
+                                    {item.lock_editing && <span className="inline-flex items-center gap-0.5 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700"><Lock className="h-3 w-3" />锁定</span>}
+                                  </div>
+                                </div>
+                                <div className="mt-0.5 truncate text-[11px] text-slate-500">例外：{formatProtectionWhitelist(item)} · {new Date(item.protected_at).toLocaleDateString('zh-CN')}</div>
+                              </button>
+                            ))}
+                            {!showAllProtections && group.items.length > 50 && (
+                              <button type="button" onClick={() => setShowAllProtections(true)} className="block w-full px-3 py-2 text-center text-[11px] font-medium text-sky-700 hover:bg-sky-50">显示全部 {group.items.length} 处</button>
+                            )}
+                          </div>
+                        </section>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Save status toast */}
       {saveStatus === 'saved' && (
@@ -6418,8 +6640,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {actionError && (
-        <div className="absolute left-1/2 top-14 z-20 -translate-x-1/2 rounded-full bg-rose-500 px-4 py-1.5 text-xs font-semibold text-white shadow-lg">
-          {actionError}
+        <div role="alert" className="absolute left-1/2 top-14 z-30 flex max-w-[min(92vw,36rem)] -translate-x-1/2 items-start gap-2 rounded-xl bg-rose-600 py-2 pl-4 pr-2 text-xs font-semibold leading-5 text-white shadow-lg">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">{actionError}</span>
+          <button type="button" onClick={() => setActionError('')} aria-label="关闭提示" className="shrink-0 rounded-md p-0.5 text-white/80 hover:bg-white/15 hover:text-white">
+            <X className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
 
@@ -6440,14 +6666,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               <span className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white/95 px-2.5 py-1 text-[11px] font-semibold text-slate-700 shadow-sm" title={selectedCellMasked && selectedCellCannotEdit ? '当前单元格内容已遮罩，且当前账号没有修改权限' : selectedCellMasked ? '当前单元格内容已遮罩' : '当前账号不能修改此单元格'}>
                 {selectedCellMasked && <EyeOff className="h-3 w-3" />}
                 {selectedCellMasked && <span>内容已遮罩</span>}
-                {selectedCellMasked && selectedCellCannotEdit && <span className="text-slate-300">·</span>}
+                {selectedCellFormulaHidden && !selectedCellMasked && <Sigma className="h-3 w-3" />}
+                {selectedCellFormulaHidden && !selectedCellMasked && <span>公式已隐藏</span>}
+                {(selectedCellMasked || selectedCellFormulaHidden) && selectedCellCannotEdit && <span className="text-slate-300">·</span>}
                 {selectedCellCannotEdit && <Lock className="h-3 w-3" />}
                 {selectedCellCannotEdit && <span>不可修改</span>}
               </span>
             )}
             {currentProtectionItems.map((item) => {
                 const visual = item.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(item.owner_id)
-                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title={`点击定位：${formatProtectionMode(item)}`}>{item.hidden ? <EyeOff className="h-3 w-3" /> : <Lock className="h-3 w-3" />}{formatProtectionBadge(item)}</button>
+                return <button type="button" key={`${item.scope}-${item.key}`} onClick={() => focusProtection(item)} className="inline-flex items-center gap-1.5 rounded-lg border bg-white/95 px-2.5 py-1 text-[11px] font-semibold shadow-sm" style={{ borderColor: visual.stroke, color: visual.stroke }} title={`点击定位：${formatProtectionMode(item)}`}>{item.hidden ? <EyeOff className="h-3 w-3" /> : item.hide_formula ? <Sigma className="h-3 w-3" /> : <Lock className="h-3 w-3" />}{formatProtectionBadge(item)}</button>
               })}
           </div>
       )}

@@ -103,7 +103,7 @@ func ParsePDFExportOptions(paperSize, orientation, fitToWidth string) (PDFExport
 }
 
 func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string, options PDFExportOptions) (*sheetExportFile, error) {
-	ctx, err := s.loadSheetExportContext(userID, sheetID, false)
+	ctx, err := s.loadSheetExportContext(userID, sheetID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func (s *SheetService) BuildSheetPDFFile(userID, sheetID int64, filename string,
 }
 
 func (s *SheetService) BuildWorkbookPDFFile(userID, workbookID int64, sheetIDs []int64, filename string, options PDFExportOptions) (*sheetExportFile, error) {
-	workbook, contexts, err := s.loadWorkbookExportContexts(userID, workbookID, sheetIDs, false)
+	workbook, contexts, err := s.loadWorkbookExportContexts(userID, workbookID, sheetIDs, true)
 	if err != nil {
 		return nil, err
 	}

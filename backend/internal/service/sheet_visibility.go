@@ -35,6 +35,9 @@ func protectionPreventsCellEdit(protections protectionMaps, rowIndex int, column
 		protections.Columns[columnKey],
 	}
 	for _, info := range checks {
+		if protectionInfoHidesFormula(info, userID, departmentIDs) {
+			return true
+		}
 		if !protectionLocksEditing(info) || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs) {
 			continue
 		}
@@ -111,11 +114,11 @@ func (s *SheetService) maskSheetForUserScoped(sheet *model.Sheet, userID int64, 
 }
 
 func applySheetVisibilityMask(sheet *model.Sheet, userID int64, matrix *model.PermissionMatrix, departmentIDs []int64) (*model.Sheet, error) {
-	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
+	protections, _, err := readSheetProtections(sheet.Config)
 	if err != nil {
 		return nil, err
 	}
-	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
+	if !needsVisibilityMask(protections, matrix) {
 		return sheet, nil
 	}
 	columnKeys, err := parseColumnKeys(sheet.Columns)
@@ -148,13 +151,14 @@ func (s *SheetService) maskRowsForUser(sheet *model.Sheet, rows []model.Row, use
 		return nil, err
 	}
 	departmentSet := int64Set(departmentIDs)
-	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
+	protections, _, err := readSheetProtections(sheet.Config)
 	if err != nil {
 		return nil, err
 	}
-	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
+	if !needsVisibilityMask(protections, matrix) {
 		return rows, nil
 	}
+	formulaResults := hiddenFormulaRowValues(sheet, protections, userID, departmentSet)
 	masked := make([]model.Row, len(rows))
 	copy(masked, rows)
 	for index := range masked {
@@ -170,6 +174,11 @@ func (s *SheetService) maskRowsForUser(sheet *model.Sheet, rows []model.Row, use
 				!permissionMatrixAllowsCell(matrix, columnKey, masked[index].RowIndex, "read") {
 				data[columnKey] = json.RawMessage(strconv.Quote(hiddenCellPlaceholder))
 				changed = true
+				continue
+			}
+			if formulaResults != nil && protectionHidesFormula(protections, masked[index].RowIndex, columnKey, userID, false, departmentSet) {
+				data[columnKey] = formulaResults(masked[index].RowIndex, columnKey)
+				changed = true
 			}
 		}
 		if changed {
@@ -184,7 +193,7 @@ func (s *SheetService) maskRowsForUser(sheet *model.Sheet, rows []model.Row, use
 }
 
 func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protections protectionMaps, matrix *model.PermissionMatrix, userID int64, isAdmin bool, departmentIDs map[int64]struct{}) (json.RawMessage, error) {
-	if isAdmin || (!hasHiddenProtection(protections) && !hasRestrictedPermission(matrix)) || len(config) == 0 {
+	if isAdmin || !needsVisibilityMask(protections, matrix) || len(config) == 0 {
 		return config, nil
 	}
 	var payload map[string]interface{}
@@ -198,6 +207,10 @@ func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protecti
 	cellData, ok := sheetData["cellData"].(map[string]interface{})
 	if !ok {
 		return config, nil
+	}
+	hidesFormulas := hidesFormulaFromUser(protections, userID, departmentIDs)
+	if hidesFormulas {
+		expandSharedFormulaMembers(cellData)
 	}
 	for worksheetRowKey, rowValue := range cellData {
 		worksheetRow, err := strconv.Atoi(worksheetRowKey)
@@ -216,6 +229,11 @@ func maskUniverSheetConfig(config json.RawMessage, columnKeys []string, protecti
 			}
 			if !protectionHidesCell(protections, dataRowIndex, columnKeys[columnIndex], userID, false, departmentIDs) &&
 				permissionMatrixAllowsCell(matrix, columnKeys[columnIndex], dataRowIndex, "read") {
+				if hidesFormulas && protectionHidesFormula(protections, dataRowIndex, columnKeys[columnIndex], userID, false, departmentIDs) {
+					if original, ok := cellValue.(map[string]interface{}); ok {
+						stripCellFormula(original)
+					}
+				}
 				continue
 			}
 			maskedCell := map[string]interface{}{"v": hiddenCellPlaceholder, "t": 1}
@@ -244,15 +262,11 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 	}
 	// Only decode protection state when the config actually carries any, which
 	// lets the common unprotected sheet skip a full snapshot decode.
-	var protections protectionMaps
-	if configHasProtectionFields(existingConfig) {
-		if _, parsed, _, err := parseSheetConfigProtection(existingConfig); err != nil {
-			return nil, err
-		} else {
-			protections = parsed
-		}
+	protections, _, err := readSheetProtections(existingConfig)
+	if err != nil {
+		return nil, err
 	}
-	if !hasHiddenProtection(protections) && !hasRestrictedPermission(matrix) {
+	if !needsVisibilityMask(protections, matrix) {
 		return nextConfig, nil
 	}
 	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
@@ -295,7 +309,7 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 		for columnIndexKey, original := range existingRow {
 			columnIndex, err := strconv.Atoi(columnIndexKey)
 			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) ||
-				!cellIsMasked(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
+				!cellIsRestored(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
 				continue
 			}
 			nextValue, nextExists := nextRow[columnIndexKey]
@@ -319,7 +333,7 @@ func (s *SheetService) restoreHiddenCellsForUser(sheetID, userID int64, existing
 		for columnIndexKey := range nextRow {
 			columnIndex, err := strconv.Atoi(columnIndexKey)
 			if err != nil || columnIndex < 0 || columnIndex >= len(columnKeys) ||
-				!cellIsMasked(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
+				!cellIsRestored(protections, matrix, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) {
 				continue
 			}
 			if !protectionPreventsCellEdit(protections, dataRowIndex, columnKeys[columnIndex], userID, departmentSet) &&
@@ -372,45 +386,52 @@ func hasRestrictedPermission(matrix *model.PermissionMatrix) bool {
 	return false
 }
 
+// needsVisibilityMask reports whether a user without admin rights may receive
+// a different view of the sheet than what is stored.
+func needsVisibilityMask(protections protectionMaps, matrix *model.PermissionMatrix) bool {
+	return hasHiddenProtection(protections) || hasHiddenFormulaProtection(protections) || hasRestrictedPermission(matrix)
+}
+
+// cellIsRestored reports whether the server, not the user's snapshot, owns the
+// content of a cell: masked cells and cells whose formula is hidden.
+func cellIsRestored(protections protectionMaps, matrix *model.PermissionMatrix, rowIndex int, columnKey string, userID int64, departmentIDs map[int64]struct{}) bool {
+	return cellIsMasked(protections, matrix, rowIndex, columnKey, userID, departmentIDs) ||
+		protectionHidesFormula(protections, rowIndex, columnKey, userID, false, departmentIDs)
+}
+
+// hiddenFormulaRowValues returns a lookup of the cached results of formulas
+// hidden from the user, for the legacy row payload. Nil when there are none.
+func hiddenFormulaRowValues(sheet *model.Sheet, protections protectionMaps, userID int64, departmentIDs map[int64]struct{}) func(rowIndex int, columnKey string) json.RawMessage {
+	if !hidesFormulaFromUser(protections, userID, departmentIDs) {
+		return nil
+	}
+	columnKeys, _ := parseColumnKeys(sheet.Columns)
+	columnIndexes := make(map[string]int, len(columnKeys))
+	for index, key := range columnKeys {
+		columnIndexes[key] = index
+	}
+	cells, _ := decodeRawCellData(sheet.Config)
+	empty := json.RawMessage(strconv.Quote(""))
+	return func(rowIndex int, columnKey string) json.RawMessage {
+		column, ok := columnIndexes[columnKey]
+		if !ok {
+			return empty
+		}
+		fields, ok := decodeCellValueFields(cells[strconv.Itoa(rowIndex+1)][strconv.Itoa(column)])
+		if !ok || len(fields.V) == 0 || string(fields.V) == "null" {
+			return empty
+		}
+		return fields.V
+	}
+}
+
 func cellIsMasked(protections protectionMaps, matrix *model.PermissionMatrix, rowIndex int, columnKey string, userID int64, departmentIDs map[int64]struct{}) bool {
 	return protectionHidesCell(protections, rowIndex, columnKey, userID, false, departmentIDs) ||
 		!permissionMatrixAllowsCell(matrix, columnKey, rowIndex, "read")
 }
 
 func (s *SheetService) RealtimeCellChangesForUser(sheetID, userID int64, changes []model.CellUpdate) ([]model.CellUpdate, error) {
-	if len(changes) == 0 {
-		return nil, nil
-	}
-
-	sheet, err := s.sheetRepo.GetSheet(sheetID)
-	if err != nil {
-		return nil, err
-	}
-	isAdmin, err := s.permService.IsAdmin(userID)
-	if err != nil {
-		return nil, err
-	}
-	if isAdmin {
-		return filterRealtimeCellChanges(sheetID, userID, changes, true, protectionMaps{}, nil, nil), nil
-	}
-
-	matrix, err := s.permService.GetPermissionMatrix(sheetID, userID)
-	if err != nil {
-		return nil, err
-	}
-	if matrix == nil || !matrix.Sheet.CanView {
-		return nil, nil
-	}
-	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
-	if err != nil {
-		return nil, err
-	}
-	_, protections, _, err := parseSheetConfigProtection(sheet.Config)
-	if err != nil {
-		return nil, err
-	}
-
-	return filterRealtimeCellChanges(sheetID, userID, changes, false, protections, matrix, int64Set(departmentIDs)), nil
+	return s.RealtimeCellFilter(sheetID, changes)(userID)
 }
 
 func filterRealtimeCellChanges(

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -13,10 +14,28 @@ import (
 
 type PermissionHandler struct {
 	permService *service.PermissionService
+	broadcaster sheetBroadcaster
 }
 
-func NewPermissionHandler(permService *service.PermissionService) *PermissionHandler {
-	return &PermissionHandler{permService: permService}
+func NewPermissionHandler(permService *service.PermissionService, broadcaster ...sheetBroadcaster) *PermissionHandler {
+	h := &PermissionHandler{permService: permService}
+	if len(broadcaster) > 0 {
+		h.broadcaster = broadcaster[0]
+	}
+	return h
+}
+
+// notifySheetReload makes open editors of the sheet reload, so a narrowed
+// permission takes effect without waiting for the employee to refresh.
+func (h *PermissionHandler) notifySheetReload(c *gin.Context, sheetID int64) {
+	if h.broadcaster == nil || sheetID <= 0 {
+		return
+	}
+	payload, err := json.Marshal(gin.H{"type": "sheet_reload", "sheetId": sheetID, "userId": c.GetInt64("user_id")})
+	if err != nil {
+		return
+	}
+	h.broadcaster.BroadcastToSheetExceptClientID(sheetID, payload, "")
 }
 
 func (h *PermissionHandler) SetSheetPermission(c *gin.Context) {
@@ -31,6 +50,7 @@ func (h *PermissionHandler) SetSheetPermission(c *gin.Context) {
 		return
 	}
 
+	h.notifySheetReload(c, req.SheetID)
 	response.OKMsg(c, "sheet permission set")
 }
 
@@ -46,6 +66,7 @@ func (h *PermissionHandler) SetUserSheetPermission(c *gin.Context) {
 		return
 	}
 
+	h.notifySheetReload(c, req.SheetID)
 	response.OKMsg(c, "user sheet permission set")
 }
 
@@ -61,6 +82,7 @@ func (h *PermissionHandler) SetCellPermission(c *gin.Context) {
 		return
 	}
 
+	h.notifySheetReload(c, req.SheetID)
 	response.OKMsg(c, "cell permission set")
 }
 
@@ -74,6 +96,7 @@ func (h *PermissionHandler) SetPrincipalSheetPermission(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	h.notifySheetReload(c, req.SheetID)
 	response.OKMsg(c, "principal sheet permission set")
 }
 
@@ -87,6 +110,7 @@ func (h *PermissionHandler) SetPrincipalCellPermission(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	h.notifySheetReload(c, req.SheetID)
 	response.OKMsg(c, "principal range permission set")
 }
 
@@ -106,6 +130,7 @@ func (h *PermissionHandler) DeletePrincipalSheetPermission(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	h.notifySheetReload(c, sheetID)
 	response.OKMsg(c, "principal sheet permission reset")
 }
 
@@ -135,10 +160,12 @@ func (h *PermissionHandler) DeletePrincipalCellPermission(c *gin.Context) {
 		response.BadRequest(c, "invalid range permission id")
 		return
 	}
-	if err := h.permService.DeletePrincipalCellPermission(id); err != nil {
+	sheetID, err := h.permService.DeletePrincipalCellPermission(id)
+	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	h.notifySheetReload(c, sheetID)
 	response.OKMsg(c, "range permission deleted")
 }
 
@@ -221,12 +248,64 @@ func (h *PermissionHandler) GetEffectivePermissionMatrixForUser(c *gin.Context) 
 		return
 	}
 
-	matrix, err := h.permService.GetPermissionMatrix(sheetID, userID)
+	explanation, err := h.permService.ExplainPermissionMatrix(sheetID, userID)
 	if err != nil {
 		response.ServerError(c, err.Error())
 		return
 	}
-	response.OK(c, matrix)
+	response.OK(c, explanation)
+}
+
+func (h *PermissionHandler) ListPermissionSheets(c *gin.Context) {
+	sheets, err := h.permService.ListPermissionSheets()
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, sheets)
+}
+
+func (h *PermissionHandler) GetSheetPermissionOverview(c *gin.Context) {
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+	overview, err := h.permService.GetSheetPermissionOverview(sheetID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, overview)
+}
+
+// DeleteLegacySheetPermissions removes legacy rules of a sheet. The optional
+// kind (role|user) and principalId narrow it to one role or one employee.
+func (h *PermissionHandler) DeleteLegacySheetPermissions(c *gin.Context) {
+	sheetID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid sheet id")
+		return
+	}
+	kind := strings.TrimSpace(c.Param("kind"))
+	var principalID int64
+	if kind != "" {
+		if kind != "role" && kind != "user" {
+			response.BadRequest(c, "invalid legacy permission kind")
+			return
+		}
+		if principalID, err = strconv.ParseInt(c.Param("principalId"), 10, 64); err != nil {
+			response.BadRequest(c, "invalid principal id")
+			return
+		}
+	}
+	removed, err := h.permService.DeleteLegacySheetPermissions(sheetID, kind, principalID)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	h.notifySheetReload(c, sheetID)
+	response.OK(c, gin.H{"removed": removed})
 }
 
 func (h *PermissionHandler) ListUserSheetPermissions(c *gin.Context) {

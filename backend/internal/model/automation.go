@@ -144,6 +144,9 @@ type CellUpdateResult struct {
 	AppliedChanges  []CellUpdate        `json:"applied_changes"`
 	PendingStates   []CellApprovalState `json:"pending_states"`
 	RevertedChanges []CellUpdate        `json:"reverted_changes"`
+	// ComputedChanges carries server recalculated results of formulas hidden
+	// from the saving user, whose client cannot compute them itself.
+	ComputedChanges []CellUpdate `json:"computed_changes,omitempty"`
 }
 
 type AutomationRun struct {

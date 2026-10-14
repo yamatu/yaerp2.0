@@ -108,7 +108,7 @@ export function usePermission(sheetId: number) {
   }
 
   const isColumnReadOnly = (col: string): boolean => {
-    if (!permissions) return true
+    if (!permissions || !permissions.sheet.canEdit) return true
     return resolveCellPermission(permissions, col) !== 'write'
   }
 

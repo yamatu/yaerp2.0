@@ -111,11 +111,48 @@ func (s *PermissionService) SetPrincipalCellPermission(req *model.SetPrincipalCe
 	return s.permRepo.SetPrincipalCellPermission(permission)
 }
 
-func (s *PermissionService) DeletePrincipalCellPermission(id int64) error {
+func (s *PermissionService) DeletePrincipalCellPermission(id int64) (int64, error) {
 	if id <= 0 {
-		return fmt.Errorf("invalid range permission id")
+		return 0, fmt.Errorf("invalid range permission id")
 	}
 	return s.permRepo.DeletePrincipalCellPermission(id)
+}
+
+// ExplainPermissionMatrix returns a user's effective matrix together with the
+// sources of the whole-sheet flags, for administrators.
+func (s *PermissionService) ExplainPermissionMatrix(sheetID, userID int64) (*model.EffectivePermissionExplanation, error) {
+	matrix, err := s.GetPermissionMatrix(sheetID, userID)
+	if err != nil {
+		return nil, err
+	}
+	grants := matrix.Grants
+	if grants == nil {
+		grants = []model.PermissionGrant{}
+	}
+	return &model.EffectivePermissionExplanation{PermissionMatrix: matrix, Grants: grants}, nil
+}
+
+func (s *PermissionService) ListPermissionSheets() ([]model.PermissionSheetOption, error) {
+	return s.permRepo.ListPermissionSheets()
+}
+
+func (s *PermissionService) GetSheetPermissionOverview(sheetID int64) (*model.SheetPermissionOverview, error) {
+	principals, err := s.permRepo.GetSheetPermissionOverview(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	legacy, err := s.permRepo.GetLegacySheetPermissions(sheetID)
+	if err != nil {
+		return nil, err
+	}
+	return &model.SheetPermissionOverview{Principals: principals, Legacy: *legacy}, nil
+}
+
+func (s *PermissionService) DeleteLegacySheetPermissions(sheetID int64, kind string, principalID int64) (int64, error) {
+	if sheetID <= 0 || (kind != "" && principalID <= 0) {
+		return 0, fmt.Errorf("invalid legacy permission target")
+	}
+	return s.permRepo.DeleteLegacySheetPermissions(sheetID, kind, principalID)
 }
 
 func (s *PermissionService) GetPrincipalPermissionConfig(sheetID int64, principalType string, principalID int64) (*model.PrincipalPermissionConfig, error) {
@@ -372,17 +409,34 @@ func mergePrincipalCellPermissions(layer *model.ScopedPermissionLayer, permissio
 	}
 }
 
-func mergeProtectionWhitelistPermissions(matrix *model.PermissionMatrix, protections protectionMaps, userID int64, departmentIDs map[int64]struct{}) bool {
+// mergeProtectionWhitelistPermissions folds protection whitelists into the
+// matrix. ownerIsAdmin may be nil; when it reports a non-admin owner, the
+// whitelist can only narrow access: an employee who protects a range must not
+// be able to lift the rules an administrator configured for it.
+func mergeProtectionWhitelistPermissions(matrix *model.PermissionMatrix, protections protectionMaps, userID int64, departmentIDs map[int64]struct{}, ownerIsAdmin ...func(ownerID int64) bool) bool {
 	if matrix == nil {
 		return false
 	}
 	ensurePermissionMatrixLayers(matrix)
+	var isAdminOwner func(int64) bool
+	if len(ownerIsAdmin) > 0 {
+		isAdminOwner = ownerIsAdmin[0]
+	}
+	// Floors are computed from the rules before any whitelist is merged.
+	adminLayers := cloneScopedPermissionLayers(matrix)
+	defaultPermission := matrix.DefaultPermission
+	if defaultPermission == "" {
+		defaultPermission = defaultCellPermission(matrix.Sheet)
+	}
 	merged := false
 	apply := func(scope string, items map[string]protectionOwner) {
 		for key, info := range items {
 			permission, directUser, allowed := protectionWhitelistPermission(info, userID, departmentIDs)
 			if !allowed {
 				continue
+			}
+			if isAdminOwner != nil && !isAdminOwner(info.OwnerID) {
+				permission = restrictivePermissionValue(permission, scopedAreaPermissionFloor(adminLayers, defaultPermission, scope, key))
 			}
 			layer := &matrix.DepartmentOverrides
 			if directUser {
@@ -403,6 +457,60 @@ func mergeProtectionWhitelistPermissions(matrix *model.PermissionMatrix, protect
 	apply("column", protections.Columns)
 	apply("cell", protections.Cells)
 	return merged
+}
+
+func cloneScopedPermissionLayers(matrix *model.PermissionMatrix) []model.ScopedPermissionLayer {
+	layers := permissionMatrixScopedLayers(matrix)
+	cloned := make([]model.ScopedPermissionLayer, 0, len(layers))
+	copyMap := func(source map[string]string) map[string]string {
+		target := make(map[string]string, len(source))
+		for key, value := range source {
+			target[key] = value
+		}
+		return target
+	}
+	for _, layer := range layers {
+		cloned = append(cloned, model.ScopedPermissionLayer{Rows: copyMap(layer.Rows), Columns: copyMap(layer.Columns), Cells: copyMap(layer.Cells)})
+	}
+	return cloned
+}
+
+// scopedAreaPermissionFloor returns the most restrictive permission any rule
+// assigns inside a protected row, column or cell.
+func scopedAreaPermissionFloor(layers []model.ScopedPermissionLayer, defaultPermission, scope, key string) string {
+	floor := defaultPermission
+	rowKey, columnKey := "", ""
+	switch scope {
+	case "row":
+		rowKey = key
+	case "column":
+		columnKey = key
+	case "cell":
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			return "none"
+		}
+		rowKey, columnKey = parts[0], parts[1]
+	}
+	for _, layer := range layers {
+		for row, permission := range layer.Rows {
+			if rowKey == "" || row == rowKey {
+				floor = restrictivePermissionValue(floor, permission)
+			}
+		}
+		for column, permission := range layer.Columns {
+			if columnKey == "" || column == columnKey {
+				floor = restrictivePermissionValue(floor, permission)
+			}
+		}
+		for cell, permission := range layer.Cells {
+			parts := strings.SplitN(cell, ":", 2)
+			if len(parts) == 2 && (rowKey == "" || parts[0] == rowKey) && (columnKey == "" || parts[1] == columnKey) {
+				floor = restrictivePermissionValue(floor, permission)
+			}
+		}
+	}
+	return floor
 }
 
 func protectionWhitelistHasAccess(protections protectionMaps, userID int64, departmentIDs map[int64]struct{}) bool {
