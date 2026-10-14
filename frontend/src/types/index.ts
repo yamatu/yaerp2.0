@@ -140,8 +140,10 @@ export interface ProtectionInfo {
   view_hidden_department_ids?: number[];
   lock_editing: boolean;
   hidden?: boolean;
+  hide_formula?: boolean;
   can_edit: boolean;
   masked_for_current_user: boolean;
+  formula_hidden_for_current_user?: boolean;
   protected_at: string;
 }
 
@@ -1119,6 +1121,7 @@ export interface CellUpdateResult {
   applied_changes: CellUpdate[];
   pending_states: CellApprovalState[];
   reverted_changes: CellUpdate[];
+  computed_changes?: CellUpdate[];
 }
 
 export interface AutomationRun {

@@ -251,7 +251,7 @@ func main() {
 	importHandler := handler.NewImportHandler(importService)
 	userHandler := handler.NewUserHandler(userRepo, authService, uploadService)
 	roleHandler := handler.NewRoleHandler(db)
-	permHandler := handler.NewPermissionHandler(permService)
+	permHandler := handler.NewPermissionHandler(permService, hub)
 	departmentHandler := handler.NewDepartmentHandler(departmentService)
 	folderHandler := handler.NewFolderHandler(folderService)
 	recycleBinHandler := handler.NewRecycleBinHandler(recycleBinService)
@@ -607,6 +607,10 @@ func main() {
 			admin.GET("/permissions/sheets/:id/users", permHandler.ListUserSheetPermissions)
 			admin.GET("/permissions/sheets/:id/users/:userId", permHandler.GetPermissionMatrixForUser)
 			admin.GET("/permissions/sheets/:id/users/:userId/effective", permHandler.GetEffectivePermissionMatrixForUser)
+			admin.GET("/permissions/sheets", permHandler.ListPermissionSheets)
+			admin.GET("/permissions/sheets/:id/overview", permHandler.GetSheetPermissionOverview)
+			admin.DELETE("/permissions/sheets/:id/legacy", permHandler.DeleteLegacySheetPermissions)
+			admin.DELETE("/permissions/sheets/:id/legacy/:kind/:principalId", permHandler.DeleteLegacySheetPermissions)
 			admin.POST("/workbooks/:id/assign", sheetHandler.AssignWorkbook)
 
 			// Departments

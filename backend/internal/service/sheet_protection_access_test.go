@@ -179,3 +179,36 @@ func TestApplyProtectionRequestRequiresMaskOrLock(t *testing.T) {
 		t.Fatalf("invalid rule must not be persisted: %#v", protections.Columns)
 	}
 }
+
+func TestEmployeeWhitelistCannotLiftAdminRules(t *testing.T) {
+	matrix := emptyPermissionMatrix()
+	matrix.Sheet.CanView = true
+	matrix.Sheet.CanEdit = true
+	matrix.DefaultPermission = "write"
+	ensurePermissionMatrixLayers(matrix)
+	matrix.DepartmentOverrides.Columns["cost"] = "none"
+	protections := protectionMaps{
+		Rows:    map[string]protectionOwner{"5": {OwnerID: 9, EditableDepartmentIDs: []int64{8}}},
+		Columns: map[string]protectionOwner{"cost": {OwnerID: 9, EditableDepartmentIDs: []int64{8}}},
+		Cells:   map[string]protectionOwner{},
+	}
+	isAdmin := func(ownerID int64) bool { return ownerID == 1 }
+
+	mergeProtectionWhitelistPermissions(matrix, protections, 5, map[int64]struct{}{8: {}}, isAdmin)
+	if permissionMatrixAllowsCell(matrix, "cost", 5, "read") || permissionMatrixAllowsCell(matrix, "cost", 0, "read") {
+		t.Fatal("an employee's whitelist must not reveal a column the administrator hid")
+	}
+	if !permissionMatrixAllowsCell(matrix, "name", 0, "write") {
+		t.Fatal("unrelated cells keep their permission")
+	}
+
+	adminMatrix := emptyPermissionMatrix()
+	adminMatrix.Sheet.CanView = true
+	adminMatrix.DefaultPermission = "read"
+	ensurePermissionMatrixLayers(adminMatrix)
+	adminProtections := protectionMaps{Columns: map[string]protectionOwner{"cost": {OwnerID: 1, EditableDepartmentIDs: []int64{8}}}}
+	mergeProtectionWhitelistPermissions(adminMatrix, adminProtections, 5, map[int64]struct{}{8: {}}, isAdmin)
+	if !permissionMatrixAllowsCell(adminMatrix, "cost", 0, "write") {
+		t.Fatal("an administrator's whitelist may still grant edit access")
+	}
+}

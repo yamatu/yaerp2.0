@@ -38,7 +38,7 @@ func newSheetCellAccessCache(permService *PermissionService, userID, sheetID int
 	cache.departmentIDs = int64Set(departmentIDs)
 
 	if includeProtection {
-		_, protections, legacyLocks, err := parseSheetConfigProtection(config)
+		protections, legacyLocks, err := readSheetProtections(config)
 		if err != nil {
 			return nil, err
 		}

@@ -1,5 +1,7 @@
 package model
 
+import "encoding/json"
+
 type SheetPermission struct {
 	ID        int64 `json:"id" db:"id"`
 	SheetID   int64 `json:"sheet_id" db:"sheet_id"`
@@ -38,6 +40,76 @@ type PermissionMatrix struct {
 	DepartmentOverrides   ScopedPermissionLayer `json:"departmentOverrides"`
 	UserOverrides         ScopedPermissionLayer `json:"userOverrides"`
 	ExplicitUserSheetRule bool                  `json:"explicitUserSheetRule,omitempty"`
+	// Grants explains where the whole-sheet flags came from. It is only sent
+	// to administrators (see EffectivePermissionExplanation).
+	Grants []PermissionGrant `json:"-"`
+}
+
+// PermissionGrant is one source of a user's whole-sheet access, in the order
+// it was applied. Source is one of: admin, owner, legacy_role,
+// legacy_role_ranges, department, public, folder, legacy_user, user, scoped,
+// state, hidden, folder_denied.
+type PermissionGrant struct {
+	Source      string `json:"source"`
+	PrincipalID int64  `json:"principal_id,omitempty"`
+	CanView     bool   `json:"can_view"`
+	CanEdit     bool   `json:"can_edit"`
+	CanDelete   bool   `json:"can_delete"`
+	CanExport   bool   `json:"can_export"`
+	// Replaces marks a source that overrides every source before it.
+	Replaces bool   `json:"replaces,omitempty"`
+	Note     string `json:"note,omitempty"`
+}
+
+type EffectivePermissionExplanation struct {
+	*PermissionMatrix
+	Grants []PermissionGrant `json:"grants"`
+}
+
+type LegacyRoleSheetPermission struct {
+	RoleID    int64  `json:"role_id"`
+	RoleName  string `json:"role_name"`
+	RoleCode  string `json:"role_code"`
+	CanView   bool   `json:"can_view"`
+	CanEdit   bool   `json:"can_edit"`
+	CanDelete bool   `json:"can_delete"`
+	CanExport bool   `json:"can_export"`
+	// RangeRules counts the role's legacy row/column/cell rules on the sheet.
+	RangeRules int `json:"range_rules"`
+}
+
+type LegacyUserSheetPermission struct {
+	UserID    int64  `json:"user_id"`
+	Username  string `json:"username"`
+	CanView   bool   `json:"can_view"`
+	CanEdit   bool   `json:"can_edit"`
+	CanDelete bool   `json:"can_delete"`
+	CanExport bool   `json:"can_export"`
+}
+
+type LegacySheetPermissions struct {
+	Roles []LegacyRoleSheetPermission `json:"roles"`
+	Users []LegacyUserSheetPermission `json:"users"`
+}
+
+type SheetPermissionOverviewEntry struct {
+	PrincipalType string                    `json:"principal_type"`
+	PrincipalID   int64                     `json:"principal_id"`
+	Sheet         *PrincipalSheetPermission `json:"sheet,omitempty"`
+	RuleCounts    map[string]int            `json:"rule_counts"`
+}
+
+type SheetPermissionOverview struct {
+	Principals []SheetPermissionOverviewEntry `json:"principals"`
+	Legacy     LegacySheetPermissions         `json:"legacy"`
+}
+
+type PermissionSheetOption struct {
+	ID           int64           `json:"id"`
+	Name         string          `json:"name"`
+	WorkbookID   int64           `json:"workbook_id"`
+	WorkbookName string          `json:"workbook_name"`
+	Columns      json.RawMessage `json:"columns"`
 }
 
 type ScopedPermissionLayer struct {

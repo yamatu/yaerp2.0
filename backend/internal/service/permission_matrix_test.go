@@ -84,3 +84,20 @@ func TestDepartmentConflictUsesMostRestrictiveSameScopeRule(t *testing.T) {
 		t.Fatal("an explicit department deny must win conflicting same-scope department grants")
 	}
 }
+
+func TestRecordStateGrantExplainsLockedSheet(t *testing.T) {
+	matrix := fullAccessMatrix()
+	recordStateGrant(matrix, &model.Workbook{}, &model.Sheet{IsLocked: true})
+	if matrix.Sheet.CanEdit {
+		t.Fatal("a locked sheet must not be editable")
+	}
+	if len(matrix.Grants) != 1 || matrix.Grants[0].Source != "state" || matrix.Grants[0].Note != "工作表已锁定" || !matrix.Grants[0].Replaces {
+		t.Fatalf("expected a state grant explaining the lock, got %#v", matrix.Grants)
+	}
+
+	untouched := fullAccessMatrix()
+	recordStateGrant(untouched, &model.Workbook{}, &model.Sheet{})
+	if len(untouched.Grants) != 0 {
+		t.Fatalf("no state grant expected when nothing changed, got %#v", untouched.Grants)
+	}
+}

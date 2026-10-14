@@ -162,8 +162,9 @@ func (h *SheetHandler) broadcastSheetCellChanges(c *gin.Context, sheetIDs []int6
 		if len(targetChanges) == 0 {
 			continue
 		}
+		filterForUser := h.sheetService.RealtimeCellFilter(sheetID, targetChanges)
 		h.broadcaster.BroadcastToSheetByUser(sheetID, excludeClientID, func(recipientUserID int64) []byte {
-			filteredChanges, err := h.sheetService.RealtimeCellChangesForUser(sheetID, recipientUserID, targetChanges)
+			filteredChanges, err := filterForUser(recipientUserID)
 			if err != nil {
 				log.Printf("failed to build realtime sheet changes for sheet %d user %d: %v", sheetID, recipientUserID, err)
 				return nil
@@ -548,12 +549,18 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
-	req.CellChanges = cellResult.AppliedChanges
+	req.CellChanges, err = h.sheetService.DropHiddenFormulaChanges(userID, existing, cellResult.AppliedChanges)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	cellResult.AppliedChanges = req.CellChanges
 	if !sheetChanged(existing, sheet) {
 		response.OK(c, cellResult)
 		return
 	}
-	if err := h.sheetService.UpdateSheetForUser(userID, existing, sheet); err != nil {
+	outcome, err := h.sheetService.UpdateSheetForUserWithOps(userID, existing, sheet, req.StructureOps)
+	if err != nil {
 		if errors.Is(err, service.ErrProtectionDenied) {
 			response.Forbidden(c, err.Error())
 			return
@@ -587,6 +594,12 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 			h.sheetService.NotifyCellChanges(userID, req.CellChanges, "web")
 		}
 		h.broadcastSheetReload(c, affectedSheetIDs...)
+	}
+	if outcome != nil && len(outcome.ComputedValues) > 0 {
+		cellResult.ComputedChanges = outcome.ComputedValues
+		if !layoutChanged && !req.StructureChanged {
+			h.broadcastSheetCellChanges(c, []int64{id}, outcome.ComputedFormulas)
+		}
 	}
 	response.OK(c, cellResult)
 }

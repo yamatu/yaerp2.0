@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 
 	"yaerp/internal/model"
 )
@@ -56,7 +57,9 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 
 	for _, role := range roles {
 		if role.Code == "admin" {
-			return fullAccessMatrix(), nil
+			matrix := fullAccessMatrix()
+			matrix.Grants = []model.PermissionGrant{grantFromSheetPerm("admin", 0, matrix.Sheet, false, "管理员不受表格权限限制")}
+			return matrix, nil
 		}
 	}
 	if s.sheetOverride != nil {
@@ -90,13 +93,15 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 		return nil, err
 	}
 	if workbook.IsHidden {
-		return emptyPermissionMatrix(), nil
+		matrix := emptyPermissionMatrix()
+		matrix.Grants = []model.PermissionGrant{{Source: "hidden", Replaces: true, Note: "工作簿已隐藏，只有管理员可见"}}
+		return matrix, nil
 	}
 
 	if workbook.OwnerID == userID {
 		matrix := fullAccessMatrix()
-		applyWorkbookStateToPermissionMatrix(workbook, matrix)
-		applySheetStateToPermissionMatrix(sheet, matrix)
+		matrix.Grants = []model.PermissionGrant{grantFromSheetPerm("owner", 0, matrix.Sheet, false, "工作簿创建者拥有全部权限")}
+		recordStateGrant(matrix, workbook, sheet)
 		return matrix, nil
 	}
 
@@ -105,6 +110,12 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 		return nil, err
 	}
 	ensurePermissionMatrixLayers(matrix)
+	if sheetPermGrantsAnything(matrix.Sheet) {
+		matrix.Grants = append(matrix.Grants, grantFromSheetPerm("legacy_role", 0, matrix.Sheet, false, "旧版按角色设置的整表权限"))
+	}
+	if legacyRanges := len(matrix.Rows) + len(matrix.Columns) + len(matrix.Cells); legacyRanges > 0 {
+		matrix.Grants = append(matrix.Grants, model.PermissionGrant{Source: "legacy_role_ranges", Note: fmt.Sprintf("%d 条旧版角色区域规则", legacyRanges)})
+	}
 	departmentIDs, err := s.departmentIDsCached(userID, cache)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load user departments: %w", err)
@@ -121,6 +132,10 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 	}
 	for _, permission := range departmentSheetPerms {
 		mergeSheetPermission(&matrix.Sheet, permission)
+		matrix.Grants = append(matrix.Grants, model.PermissionGrant{
+			Source: "department", PrincipalID: permission.PrincipalID,
+			CanView: permission.CanView, CanEdit: permission.CanEdit, CanDelete: permission.CanDelete, CanExport: permission.CanExport,
+		})
 	}
 	employeeCellPerms, departmentCellPerms, err := s.permRepo.GetPrincipalCellPermissionsForAccess(sheetID, userID, departmentIDs)
 	if err != nil {
@@ -132,6 +147,7 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 		matrix.Sheet.CanView = true
 		matrix.Sheet.CanEdit = true
 		matrix.Sheet.CanExport = true
+		matrix.Grants = append(matrix.Grants, model.PermissionGrant{Source: "public", CanView: true, CanEdit: true, CanExport: true, Note: "公共工作簿"})
 	}
 
 	userPerm, err := s.permRepo.GetUserSheetPermission(sheetID, userID)
@@ -148,10 +164,13 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 			!hasPrincipalAccess(departmentSheetPerms, departmentCellPerms) &&
 			!hasPrincipalAccess(userPrincipalSheetPerms, userPrincipalCellPerms) &&
 			!hasVisualWhitelistAccess {
-			return emptyPermissionMatrix(), nil
+			denied := emptyPermissionMatrix()
+			denied.Grants = []model.PermissionGrant{{Source: "folder_denied", Replaces: true, Note: "工作簿所在文件夹未共享给该员工，且没有任何单独授权"}}
+			return denied, nil
 		}
 		if access.CanView {
 			matrix.Sheet.CanView = true
+			matrix.Grants = append(matrix.Grants, model.PermissionGrant{Source: "folder", CanView: true, Note: "所在文件夹已共享"})
 		}
 	}
 
@@ -160,6 +179,12 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 		matrix.Sheet.CanEdit = matrix.Sheet.CanEdit || userPerm.CanEdit
 		matrix.Sheet.CanDelete = matrix.Sheet.CanDelete || userPerm.CanDelete
 		matrix.Sheet.CanExport = matrix.Sheet.CanExport || userPerm.CanExport
+		if hasAnyDirectUserSheetPermission(userPerm) {
+			matrix.Grants = append(matrix.Grants, model.PermissionGrant{
+				Source: "legacy_user", CanView: userPerm.CanView, CanEdit: userPerm.CanEdit, CanDelete: userPerm.CanDelete, CanExport: userPerm.CanExport,
+				Note: "旧版单独授予该员工的整表权限",
+			})
+		}
 	}
 	if len(userPrincipalSheetPerms) > 0 {
 		permission := userPrincipalSheetPerms[0]
@@ -168,18 +193,34 @@ func (s *PermissionService) loadPermissionMatrixScoped(sheetID int64, userID int
 			CanDelete: permission.CanDelete, CanExport: permission.CanExport,
 		}
 		matrix.ExplicitUserSheetRule = true
+		matrix.Grants = append(matrix.Grants, grantFromSheetPerm("user", permission.PrincipalID, matrix.Sheet, true, "个人整表规则会覆盖上面所有来源（含公共表和文件夹共享）"))
 	}
 
 	matrix.DefaultPermission = defaultCellPermission(matrix.Sheet)
 	mergePrincipalCellPermissions(&matrix.DepartmentOverrides, departmentCellPerms, false)
 	mergePrincipalCellPermissions(&matrix.UserOverrides, userPrincipalCellPerms, true)
-	mergeProtectionWhitelistPermissions(matrix, protections, userID, departmentSet)
+	ownerIsAdmin := func(ownerID int64) bool {
+		roles, _, err := s.getUserRolesCached(ownerID, cache)
+		if err != nil {
+			return false
+		}
+		for _, role := range roles {
+			if role.Code == "admin" {
+				return true
+			}
+		}
+		return false
+	}
+	mergeProtectionWhitelistPermissions(matrix, protections, userID, departmentSet, ownerIsAdmin)
 	if !matrix.ExplicitUserSheetRule {
+		beforeScoped := matrix.Sheet
 		elevateMatrixForScopedPermissions(matrix)
+		if matrix.Sheet != beforeScoped {
+			matrix.Grants = append(matrix.Grants, grantFromSheetPerm("scoped", 0, matrix.Sheet, false, "区域规则或保护例外名单开放了部分单元格"))
+		}
 	}
 
-	applyWorkbookStateToPermissionMatrix(workbook, matrix)
-	applySheetStateToPermissionMatrix(sheet, matrix)
+	recordStateGrant(matrix, workbook, sheet)
 
 	return matrix, nil
 }
@@ -663,4 +704,41 @@ func (s *PermissionService) shareAccessLevelCached(folderID, userID int64, cache
 	}
 
 	return level, nil
+}
+
+func grantFromSheetPerm(source string, principalID int64, perm model.SheetPerm, replaces bool, note string) model.PermissionGrant {
+	return model.PermissionGrant{
+		Source: source, PrincipalID: principalID,
+		CanView: perm.CanView, CanEdit: perm.CanEdit, CanDelete: perm.CanDelete, CanExport: perm.CanExport,
+		Replaces: replaces, Note: note,
+	}
+}
+
+func sheetPermGrantsAnything(perm model.SheetPerm) bool {
+	return perm.CanView || perm.CanEdit || perm.CanDelete || perm.CanExport
+}
+
+// recordStateGrant applies the workbook and sheet lifecycle states and notes
+// when they took rights away.
+func recordStateGrant(matrix *model.PermissionMatrix, workbook *model.Workbook, sheet *model.Sheet) {
+	before := matrix.Sheet
+	applyWorkbookStateToPermissionMatrix(workbook, matrix)
+	applySheetStateToPermissionMatrix(sheet, matrix)
+	if matrix.Sheet == before {
+		return
+	}
+	reasons := make([]string, 0, 3)
+	if workbook != nil && workbook.IsLocked {
+		reasons = append(reasons, "工作簿已锁定")
+	}
+	if sheet != nil && sheet.IsHidden {
+		reasons = append(reasons, "工作表已隐藏")
+	}
+	if sheet != nil && sheet.IsLocked {
+		reasons = append(reasons, "工作表已锁定")
+	}
+	if sheet != nil && sheet.IsArchived {
+		reasons = append(reasons, "工作表已归档")
+	}
+	matrix.Grants = append(matrix.Grants, grantFromSheetPerm("state", 0, matrix.Sheet, true, strings.Join(reasons, "、")))
 }

@@ -107,6 +107,7 @@ type UpdateProtectionRequest struct {
 	ViewHiddenDepartmentIDs []int64 `json:"view_hidden_department_ids,omitempty"`
 	LockEditing             *bool   `json:"lock_editing,omitempty"`
 	Hidden                  *bool   `json:"hidden,omitempty"`
+	HideFormula             *bool   `json:"hide_formula,omitempty"`
 }
 
 type BatchUpdateProtectionRequest struct {
@@ -132,8 +133,10 @@ type ProtectionInfo struct {
 	ViewHiddenDepartmentIDs []int64   `json:"view_hidden_department_ids,omitempty"`
 	LockEditing             bool      `json:"lock_editing"`
 	Hidden                  bool      `json:"hidden,omitempty"`
+	HideFormula             bool      `json:"hide_formula,omitempty"`
 	CanEdit                 bool      `json:"can_edit"`
 	MaskedForCurrentUser    bool      `json:"masked_for_current_user"`
+	FormulaHiddenForCurrent bool      `json:"formula_hidden_for_current_user,omitempty"`
 	ProtectedAt             time.Time `json:"protected_at"`
 }
 
@@ -161,6 +164,20 @@ type UpdateSheetRequest struct {
 	// service.PrepareSheetCellChangesWithOptions.
 	StructureChanged      bool   `json:"structure_changed"`
 	BaseStructureRevision *int64 `json:"base_structure_revision"`
+	// StructureOps lists, in order, the rows/columns the client inserted,
+	// removed or moved since its last save, so protections can follow them.
+	StructureOps []SheetStructureOp `json:"structure_ops,omitempty"`
+}
+
+// SheetStructureOp uses worksheet indexes (row 0 is the header row). For a
+// move, Target is the index the block is dropped before, counted in the layout
+// prior to the move (Univer's semantics).
+type SheetStructureOp struct {
+	Kind   string `json:"kind"`
+	Axis   string `json:"axis"`
+	Start  int    `json:"start"`
+	Count  int    `json:"count"`
+	Target int    `json:"target,omitempty"`
 }
 
 type CellUpdate struct {

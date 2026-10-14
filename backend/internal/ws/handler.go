@@ -212,8 +212,9 @@ func (h *WSHandler) broadcastCellMutation(client *Client, msg *Message) {
 		}
 	}
 
+	filterForUser := h.SheetService.RealtimeCellFilter(sheetID, changes)
 	h.Hub.BroadcastToSheetByUser(sheetID, client.ClientID, func(recipientUserID int64) []byte {
-		filteredChanges, err := h.SheetService.RealtimeCellChangesForUser(sheetID, recipientUserID, changes)
+		filteredChanges, err := filterForUser(recipientUserID)
 		if err != nil {
 			log.Printf("failed to build websocket cell changes for sheet %d user %d: %v", sheetID, recipientUserID, err)
 			return nil

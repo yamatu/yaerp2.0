@@ -211,16 +211,14 @@ func (r *PermissionRepo) SetPrincipalCellPermission(perm *model.PrincipalCellPer
 	return tx.Commit()
 }
 
-func (r *PermissionRepo) DeletePrincipalCellPermission(id int64) error {
-	result, err := r.db.Exec(`DELETE FROM principal_cell_permissions WHERE id = $1`, id)
-	if err != nil {
-		return err
+// DeletePrincipalCellPermission deletes a range rule and returns its sheet.
+func (r *PermissionRepo) DeletePrincipalCellPermission(id int64) (int64, error) {
+	var sheetID int64
+	err := r.db.QueryRow(`DELETE FROM principal_cell_permissions WHERE id = $1 RETURNING sheet_id`, id).Scan(&sheetID)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("range permission %d not found", id)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("range permission %d not found", id)
-	}
-	return nil
+	return sheetID, err
 }
 
 func (r *PermissionRepo) GetPrincipalPermissionConfig(sheetID int64, principalType string, principalID int64) (*model.PrincipalPermissionConfig, error) {

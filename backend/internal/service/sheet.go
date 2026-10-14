@@ -39,6 +39,7 @@ type protectionOwner struct {
 	ViewHiddenDepartmentIDs []int64 `json:"viewHiddenDepartmentIds,omitempty"`
 	LockEditing             *bool   `json:"lockEditing,omitempty"`
 	Hidden                  bool    `json:"hidden,omitempty"`
+	HideFormula             bool    `json:"hideFormula,omitempty"`
 	ProtectedAt             string  `json:"protectedAt"`
 }
 
@@ -771,48 +772,129 @@ func (s *SheetService) DuplicateSheetForUser(userID, sheetID int64) (*model.Shee
 }
 
 func (s *SheetService) UpdateSheetForUser(userID int64, existing, sheet *model.Sheet) error {
+	_, err := s.UpdateSheetForUserWithOps(userID, existing, sheet, nil)
+	return err
+}
+
+// SheetSaveOutcome reports server side follow-ups of a snapshot save.
+type SheetSaveOutcome struct {
+	// ComputedValues are recalculated results of formulas hidden from the
+	// saving user, to be applied in that user's editor.
+	ComputedValues []model.CellUpdate
+	// ComputedFormulas are the same cells with their formulas, to broadcast.
+	ComputedFormulas []model.CellUpdate
+}
+
+// UpdateSheetForUserWithOps saves an editor snapshot. ops describes the row and
+// column inserts, removals and moves behind the snapshot; protections follow
+// them.
+func (s *SheetService) UpdateSheetForUserWithOps(userID int64, existing, sheet *model.Sheet, ops []model.SheetStructureOp) (*SheetSaveOutcome, error) {
 	if err := applySheetLifecycleState(existing); err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.ensureSheetModificationAllowed(existing, userID); err != nil {
-		return err
+		return nil, err
 	}
-	if err := s.ensureProtectedStructureMutationAllowed(userID, existing, sheet); err != nil {
-		return err
+	remapped, err := s.ensureProtectedStructureMutationAllowed(userID, existing, sheet, ops)
+	if err != nil {
+		return nil, err
 	}
 	restoredConfig, err := s.restoreHiddenCellsForUser(existing.ID, userID, existing.Config, sheet.Config, existing.Columns)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sheet.Config = restoredConfig
 	if err := s.ensureCellMutationsAuthorized(userID, existing, sheet); err != nil {
-		return err
+		return nil, err
 	}
 
 	mergedConfig, err := mergeProtectionState(existing.Config, sheet.Config)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if remapped != nil {
+		payload, _, _, err := parseSheetConfigProtection(mergedConfig)
+		if err != nil {
+			return nil, err
+		}
+		finalizeProtectionPayload(payload, remapped.protections, remapped.legacyLocks)
+		if mergedConfig, err = json.Marshal(payload); err != nil {
+			return nil, fmt.Errorf("marshal remapped protection config: %w", err)
+		}
 	}
 	removedColumns, err := removedColumnKeys(existing.Columns, sheet.Columns)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(removedColumns) > 0 {
 		mergedConfig, err = removeColumnProtectionState(mergedConfig, removedColumns)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	sheet.Config = mergedConfig
+	outcome := &SheetSaveOutcome{}
+	recomputed, err := s.recomputeHiddenFormulasForSave(userID, existing, sheet)
+	if err != nil {
+		return nil, err
+	}
+	if recomputed != nil {
+		sheet.Config = recomputed.config
+		outcome.ComputedValues = recomputed.values
+		outcome.ComputedFormulas = recomputed.formulas
+	}
 	history, err := s.beginHistory(userID, sheet.ID, "web", "sheet.update", "更新工作表内容或格式", true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
-		return err
+		return nil, err
 	}
-	return s.finishHistory(history)
+	return outcome, s.finishHistory(history)
+}
+
+// recomputeHiddenFormulasForSave refreshes the results of formulas hidden from
+// the saving user: that user's editor has no formula to compute them with.
+func (s *SheetService) recomputeHiddenFormulasForSave(userID int64, existing, next *model.Sheet) (*recomputedFormulaResult, error) {
+	protections, _, err := readSheetProtections(next.Config)
+	if err != nil || !hasHiddenFormulaProtection(protections) {
+		return nil, err
+	}
+	isAdmin, err := s.permService.IsAdmin(userID)
+	if err != nil || isAdmin {
+		return nil, err
+	}
+	departmentIDs, err := s.permService.GetUserDepartmentIDs(userID)
+	if err != nil {
+		return nil, err
+	}
+	columnKeys, err := parseColumnKeys(next.Columns)
+	if err != nil {
+		return nil, err
+	}
+	var workbookSheets map[string]map[string]map[string]json.RawMessage
+	loadForeign := func(name string) map[string]map[string]json.RawMessage {
+		if workbookSheets == nil {
+			workbookSheets = map[string]map[string]map[string]json.RawMessage{}
+			siblings, err := s.sheetRepo.GetSheetsByWorkbook(existing.WorkbookID)
+			if err != nil {
+				return nil
+			}
+			for _, sibling := range siblings {
+				if sibling.ID == existing.ID {
+					continue
+				}
+				// The formula's owner chose to publish its result, so it is
+				// computed from the stored data; only the result is returned.
+				if cells, err := decodeRawCellData(sibling.Config); err == nil && cells != nil {
+					workbookSheets[sibling.Name] = cells
+				}
+			}
+		}
+		return workbookSheets[name]
+	}
+	return recomputeHiddenFormulaResults(next.Config, next.Name, columnKeys, protections, userID, int64Set(departmentIDs), loadForeign)
 }
 
 func (s *SheetService) GetSheet(id int64) (*model.Sheet, error) {
@@ -1851,7 +1933,14 @@ func (s *SheetService) UpdateProtection(sheetID, userID int64, username string, 
 	return updatedSheet, snapshot, nil
 }
 
+// Every cell protection is stored and evaluated individually; past this size a
+// row or column protection is the right tool and keeps the sheet fast.
+const maxProtectionBatchItems = 5000
+
 func (s *SheetService) UpdateProtectionBatch(sheetID, userID int64, username string, items []model.UpdateProtectionRequest) (*model.Sheet, *model.ProtectionSnapshot, error) {
+	if len(items) > maxProtectionBatchItems {
+		return nil, nil, fmt.Errorf("%w: 一次最多设置 %d 个单元格，请改用「整列」或「整行」保护", ErrProtectionDenied, maxProtectionBatchItems)
+	}
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
 		return nil, nil, err
@@ -2329,8 +2418,9 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 		}
 		lockEditing := resolveProtectionLockEditing(req.LockEditing, info.LockEditing)
 		hidden := resolveProtectionHidden(req.Hidden, info.Hidden)
-		if !*lockEditing && !hidden {
-			return fmt.Errorf("%w: 请至少开启锁定编辑或数据遮罩", ErrProtectionDenied)
+		hideFormula := resolveProtectionHidden(req.HideFormula, info.HideFormula)
+		if !*lockEditing && !hidden && !hideFormula {
+			return fmt.Errorf("%w: 请至少开启锁定编辑、数据遮罩或隐藏公式中的一项", ErrProtectionDenied)
 		}
 		ownerID := userID
 		ownerName := username
@@ -2355,6 +2445,7 @@ func applyProtectionRequest(protections *protectionMaps, payload map[string]inte
 			ViewHiddenDepartmentIDs: access.ViewHiddenDepartmentIDs,
 			LockEditing:             lockEditing,
 			Hidden:                  hidden,
+			HideFormula:             hideFormula,
 			ProtectedAt:             protectedAt,
 		}
 		return nil
@@ -2437,8 +2528,10 @@ func flattenProtectionMap(scope string, items map[string]protectionOwner, userID
 			ViewHiddenDepartmentIDs: append([]int64(nil), info.ViewHiddenDepartmentIDs...),
 			LockEditing:             protectionLocksEditing(info),
 			Hidden:                  info.Hidden,
+			HideFormula:             info.HideFormula,
 			CanEdit:                 !protectionLocksEditing(info) || isAdmin || info.OwnerID == userID || protectionAllowsUser(info, userID, departmentIDs),
 			MaskedForCurrentUser:    info.Hidden && !isAdmin && info.OwnerID != userID && !protectionAllowsViewHidden(info, userID, departmentIDs),
+			FormulaHiddenForCurrent: info.HideFormula && !isAdmin && info.OwnerID != userID && !protectionAllowsViewHidden(info, userID, departmentIDs),
 		}
 		if parsedTime, err := time.Parse(time.RFC3339, info.ProtectedAt); err == nil {
 			entry.ProtectedAt = parsedTime
@@ -2502,6 +2595,15 @@ func ensureProtectionOwnership(config json.RawMessage, userID int64, action stri
 }
 
 func (s *SheetService) ensureRowDeletionAllowed(userID int64, sheet *model.Sheet, rowIndex int) error {
+	if configHasProtectionFields(sheet.Config) {
+		_, protections, legacyLocks, err := parseSheetConfigProtection(sheet.Config)
+		if err != nil {
+			return err
+		}
+		if protectionCoversDataRows(protections, legacyLocks, rowIndex, rowIndex) {
+			return fmt.Errorf("%w: 第 %d 行包含保护或遮罩区域，不能删除。请先解除对应保护再删除", ErrProtectionDenied, rowIndex+2)
+		}
+	}
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
 		return err
@@ -2596,58 +2698,92 @@ func (s *SheetService) EnsureRowDeletionAllowed(userID, sheetID int64, rowIndex 
 	return s.ensureRowDeletionAllowed(userID, sheet, rowIndex)
 }
 
-func (s *SheetService) ensureProtectedStructureMutationAllowed(userID int64, existing, next *model.Sheet) error {
+type remappedProtectionState struct {
+	protections protectionMaps
+	legacyLocks map[string]bool
+}
+
+// ensureProtectedStructureMutationAllowed gates a snapshot save that changes
+// the row/column layout. With ops it also returns the protections moved along
+// with the rows and columns (nil when nothing has to move).
+func (s *SheetService) ensureProtectedStructureMutationAllowed(userID int64, existing, next *model.Sheet, ops []model.SheetStructureOp) (*remappedProtectionState, error) {
+	if err := validateStructureOps(ops); err != nil {
+		return nil, err
+	}
 	currentColumns, err := parseColumnKeys(existing.Columns)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	nextColumns, err := parseColumnKeys(next.Columns)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	columnLayoutChanged := columnLayoutRequiresStructureGate(currentColumns, nextColumns)
 	currentRows, currentColumnCount := univerSheetDimensions(existing.Config)
 	nextRows, nextColumnCount := univerSheetDimensions(next.Config)
 	rowCountReduced := currentRows > 0 && nextRows < currentRows
 	columnCountReduced := currentColumnCount > 0 && nextColumnCount < currentColumnCount
-	if !columnLayoutChanged && !rowCountReduced && !columnCountReduced {
-		return nil
+	if len(ops) == 0 && !columnLayoutChanged && !rowCountReduced && !columnCountReduced {
+		return nil, nil
 	}
 
 	isAdmin, err := s.permService.IsAdmin(userID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !isAdmin {
 		matrix, err := s.permService.GetPermissionMatrix(existing.ID, userID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !permissionMatrixAllowsStructureMutation(matrix) {
-			return fmt.Errorf("%w: 当前账号存在不可见或只读区域，不能删除、移动行列或调整表格结构", ErrSheetPermissionDenied)
+			return nil, fmt.Errorf("%w: 当前账号存在不可见或只读区域，不能删除、移动行列或调整表格结构", ErrSheetPermissionDenied)
 		}
 	}
 
 	_, protections, legacyLocks, err := parseSheetConfigProtection(existing.Config)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !hasAnyProtection(protections) && len(legacyLocks) == 0 {
-		return nil
+		return nil, nil
 	}
+	if !isAdmin {
+		// Cells hidden from this user come back from the server by position, so
+		// only admins and the owners of every protection may move rows around.
+		if err := ensureProtectionOwnership(existing.Config, userID, "插入、删除或移动行列"); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(ops) > 0 {
+		nextProtections, nextLegacy, err := remapProtectionsForStructureOps(protections, legacyLocks, currentColumns, nextColumns, ops)
+		if err != nil {
+			return nil, err
+		}
+		if nextRows > 0 && protectionCoversDataRows(nextProtections, nextLegacy, nextRows-1, int(^uint(0)>>1)) {
+			return nil, fmt.Errorf("%w: 本次结构变更会让保护区域超出表格范围，已阻止", ErrProtectionDenied)
+		}
+		return &remappedProtectionState{protections: nextProtections, legacyLocks: nextLegacy}, nil
+	}
+
+	// A client that does not report its operations: allow only changes that
+	// cannot have moved a protection.
 	if rowCountReduced && (len(protections.Rows) > 0 || len(protections.Cells) > 0 || len(legacyLocks) > 0) {
-		return fmt.Errorf("%w: 工作表包含行或单元格保护，请先解除对应保护再通过整表操作删除行", ErrProtectionDenied)
+		return nil, fmt.Errorf("%w: 工作表包含行或单元格保护，请先解除对应保护再删除行", ErrProtectionDenied)
 	}
 	if columnCountReduced {
 		removedColumns := removedColumnKeysFromLists(currentColumns, nextColumns)
 		if len(removedColumns) == 0 && (len(protections.Columns) > 0 || len(protections.Cells) > 0 || len(legacyLocks) > 0) {
-			return fmt.Errorf("%w: 无法确认被删除列的保护范围，已阻止本次结构变更", ErrProtectionDenied)
+			return nil, fmt.Errorf("%w: 无法确认被删除列的保护范围，已阻止本次结构变更", ErrProtectionDenied)
+		}
+		for key := range removedColumns {
+			if _, protected := protections.Columns[key]; protected {
+				return nil, fmt.Errorf("%w: 列 %s 包含保护或遮罩区域，不能删除", ErrProtectionDenied, key)
+			}
 		}
 	}
-	if isAdmin {
-		return nil
-	}
-	return ensureProtectionOwnership(existing.Config, userID, "调整工作表结构")
+	return nil, nil
 }
 
 func permissionMatrixAllowsStructureMutation(matrix *model.PermissionMatrix) bool {

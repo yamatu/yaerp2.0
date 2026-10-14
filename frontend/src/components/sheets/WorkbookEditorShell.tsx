@@ -128,7 +128,7 @@ export default function WorkbookEditorShell({
   requestedSheetId,
 }: Props) {
   const router = useRouter();
-  const { workbook, loading, error, refresh, refreshSilently } =
+  const { workbook, loading, error, refreshSilently } =
     useWorkbook(workbookId);
   const rootRef = useRef<HTMLDivElement>(null);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
@@ -163,6 +163,7 @@ export default function WorkbookEditorShell({
     number | null
   >(null);
   const [reloadToken, setReloadToken] = useState(0);
+  const [permissionToken, setPermissionToken] = useState(0);
   const [renamingSheetId, setRenamingSheetId] = useState<number | null>(null);
   const [renamingSheetName, setRenamingSheetName] = useState("");
   const [sidebarDragImportActive, setSidebarDragImportActive] = useState(false);
@@ -178,9 +179,10 @@ export default function WorkbookEditorShell({
   const addSheetPopoverRef = useRef<HTMLDivElement>(null);
 
   const handleSheetReload = useCallback(async () => {
-    await refresh();
+    await refreshSilently();
     setReloadToken((prev) => prev + 1);
-  }, [refresh]);
+    setPermissionToken((prev) => prev + 1);
+  }, [refreshSilently]);
 
   // Keep the empty fallback stable so derived dependencies do not change on
   // every render while the workbook is loading.
@@ -305,9 +307,15 @@ export default function WorkbookEditorShell({
     setHistoryPanelOpen(false);
   }, [activeSheet?.id]);
 
-  const { permissions, loading: permissionLoading } = usePermission(
-    activeSheet?.id ?? 0,
-  );
+  const {
+    permissions,
+    loading: permissionLoading,
+    refreshPermissions,
+  } = usePermission(activeSheet?.id ?? 0);
+
+  useEffect(() => {
+    if (permissionToken > 0) refreshPermissions();
+  }, [permissionToken, refreshPermissions]);
   const canDeleteActiveSheet = permissions?.sheet.canDelete ?? false;
 
   useSheetWebSocket(activeSheet?.id ?? 0, handleSheetReload);
@@ -486,7 +494,7 @@ export default function WorkbookEditorShell({
       setNewSheetName("");
       setAddingSheet(false);
       setOptimisticEditableSheetId(res.data.id);
-      await refresh();
+      await refreshSilently();
       router.replace(`/sheets/${workbookId}/${res.data.id}`);
     } catch (err) {
       console.error("Failed to add sheet:", err);
@@ -519,7 +527,7 @@ export default function WorkbookEditorShell({
         return;
       }
 
-      await refresh();
+      await refreshSilently();
       if (targetSheet.id !== activeSheet?.id) {
         return;
       }
@@ -553,7 +561,7 @@ export default function WorkbookEditorShell({
       }
       setSelectedSheetIds([]);
       setOptimisticEditableSheetId(res.data.id);
-      await refresh();
+      await refreshSilently();
       router.replace(`/sheets/${workbookId}/${res.data.id}`);
     } catch (err) {
       console.error("Failed to duplicate sheet:", err);
@@ -615,6 +623,13 @@ export default function WorkbookEditorShell({
     action: "lock" | "unlock" | "hide" | "unhide" | "publish" | "unpublish",
   ) => {
     if (!workbook) return;
+    const confirmation =
+      action === "publish"
+        ? `设为公共表后，所有员工都可以查看、编辑和导出「${workbook.name}」。\n数据遮罩、隐藏公式和保护区域仍然生效。确定继续吗？`
+        : action === "unpublish"
+          ? `取消公共表后，只有被单独授权的成员还能访问「${workbook.name}」。确定继续吗？`
+          : "";
+    if (confirmation && !window.confirm(confirmation)) return;
     setSheetActionError("");
     setSheetActionLoading(true);
 
@@ -624,7 +639,8 @@ export default function WorkbookEditorShell({
         setSheetActionError(res.message || "更新工作簿状态失败，请稍后再试。");
         return;
       }
-      await refresh();
+      await refreshSilently();
+      setPermissionToken((prev) => prev + 1);
       if (action === "hide" && !isAdminUser) {
         router.replace("/");
       }
@@ -649,7 +665,8 @@ export default function WorkbookEditorShell({
         setSheetActionError(res.message || "更新工作表状态失败，请稍后再试。");
         return;
       }
-      await refresh();
+      await refreshSilently();
+      setPermissionToken((prev) => prev + 1);
     } catch (err) {
       console.error("Failed to update sheet state:", err);
       setSheetActionError("更新工作表状态失败，请稍后再试。");
@@ -676,7 +693,8 @@ export default function WorkbookEditorShell({
           failure.message || "部分工作表状态更新失败，请稍后再试。",
         );
       }
-      await refresh();
+      await refreshSilently();
+      setPermissionToken((prev) => prev + 1);
     } catch (err) {
       console.error("Failed to batch update sheet state:", err);
       setSheetActionError("批量更新工作表状态失败，请稍后再试。");
@@ -715,7 +733,7 @@ export default function WorkbookEditorShell({
           failure.message || "部分工作表删除失败，请刷新后重试。",
         );
       }
-      await refresh();
+      await refreshSilently();
       setSelectedSheetIds([]);
       if (activeSheet && selectedIdSet.has(activeSheet.id)) {
         router.replace(
@@ -1085,7 +1103,11 @@ export default function WorkbookEditorShell({
                 title={workbook.is_public ? "取消公共访问" : "设为公共工作簿"}
               >
                 <Globe2 className="h-3.5 w-3.5" />
-                {workbook.is_public ? "公共表" : "设为公共表"}
+                {sheetActionLoading
+                  ? "处理中..."
+                  : workbook.is_public
+                    ? "公共表"
+                    : "设为公共表"}
               </button>
             )}
             {isAdminUser && activeSheet && (
@@ -1537,6 +1559,7 @@ export default function WorkbookEditorShell({
                 }))}
                 sheet={activeSheet}
                 reloadToken={String(reloadToken)}
+                permissionToken={permissionToken}
                 onExternalReload={refreshSilently}
                 optimisticCanEdit={
                   optimisticEditableSheetId === activeSheet.id ||
