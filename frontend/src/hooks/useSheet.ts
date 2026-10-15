@@ -57,7 +57,10 @@ export function useWorkbook(id: string | number) {
     if (!silent) setLoading(true)
     setError(null)
     try {
-      const res = await api.get<Workbook>(`/workbooks/${id}`)
+      // Summary: sheet structure and rules only. The editor loads the cells of
+      // the open sheet itself, so large workbooks open without shipping (and
+      // masking) every sheet.
+      const res = await api.get<Workbook>(`/workbooks/${id}?summary=1`)
       if (res.code === 0 && res.data) {
         setWorkbook(res.data)
       } else {

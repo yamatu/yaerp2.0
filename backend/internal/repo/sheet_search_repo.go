@@ -182,3 +182,26 @@ func (r *SheetRepo) SearchSheetContent(query SheetContentQuery) ([]SheetContentR
 	}
 	return result, rows.Err()
 }
+
+// GetSheetSummariesByWorkbook is GetSheetsByWorkbook without the worksheet
+// snapshot and styles: what a workbook needs to list and gate its sheets.
+func (r *SheetRepo) GetSheetSummariesByWorkbook(workbookID int64) ([]model.Sheet, error) {
+	rows, err := r.db.Query(`SELECT id, workbook_id, name, sort_order, columns, frozen,
+		COALESCE(config, '{}'::jsonb) - 'univerSheetData' - 'univerStyles', created_at, updated_at
+		FROM sheets WHERE workbook_id = $1 ORDER BY sort_order, id`, workbookID)
+	if err != nil {
+		return nil, fmt.Errorf("list sheet summaries: %w", err)
+	}
+	defer rows.Close()
+	sheets := make([]model.Sheet, 0)
+	for rows.Next() {
+		var sheet model.Sheet
+		if err := rows.Scan(&sheet.ID, &sheet.WorkbookID, &sheet.Name, &sheet.SortOrder,
+			&sheet.Columns, &sheet.Frozen, &sheet.Config, &sheet.CreatedAt, &sheet.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan sheet summary: %w", err)
+		}
+		sheet.ConfigOmitted = true
+		sheets = append(sheets, sheet)
+	}
+	return sheets, rows.Err()
+}

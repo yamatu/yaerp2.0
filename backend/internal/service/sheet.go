@@ -298,11 +298,22 @@ func (s *SheetService) GetWorkbook(id int64, userID int64) (*model.Workbook, err
 	return s.getWorkbook(id, userID, s.permService.NewAccessScope())
 }
 
+// GetWorkbookSummary is GetWorkbook without cell data: the sheets carry their
+// structure and rules only. Opening a workbook therefore neither transfers nor
+// masks the cells of every sheet; the editor loads the active sheet itself.
+func (s *SheetService) GetWorkbookSummary(id int64, userID int64) (*model.Workbook, error) {
+	return s.getWorkbookWithOptions(id, userID, s.permService.NewAccessScope(), true)
+}
+
 // getWorkbook resolves the workbook, its visible sheets and the access level of
 // each of them, sharing the permission lookups through the scope. Callers that
 // resolve several workbooks in one request pass the same scope so the role,
 // folder and workbook rows are read once.
 func (s *SheetService) getWorkbook(id int64, userID int64, scope *AccessScope) (*model.Workbook, error) {
+	return s.getWorkbookWithOptions(id, userID, scope, false)
+}
+
+func (s *SheetService) getWorkbookWithOptions(id int64, userID int64, scope *AccessScope, summary bool) (*model.Workbook, error) {
 	wb, err := scope.Workbook(id)
 	if err != nil {
 		return nil, err
@@ -313,7 +324,11 @@ func (s *SheetService) getWorkbook(id int64, userID int64, scope *AccessScope) (
 	if err := s.ensureWorkbookVisibleScoped(wb, userID, scope); err != nil {
 		return nil, err
 	}
-	sheets, err := s.sheetRepo.GetSheetsByWorkbook(id)
+	loadSheets := s.sheetRepo.GetSheetsByWorkbook
+	if summary {
+		loadSheets = s.sheetRepo.GetSheetSummariesByWorkbook
+	}
+	sheets, err := loadSheets(id)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +379,11 @@ func (s *SheetService) getWorkbook(id int64, userID int64, scope *AccessScope) (
 				sheet.AccessLevel = "write"
 			} else {
 				sheet.AccessLevel = "read"
+			}
+			if summary {
+				// No cell data was loaded, so there is nothing to mask.
+				visibleSheets = append(visibleSheets, sheet)
+				continue
 			}
 			masked, err := s.maskSheetForUserScoped(&sheet, userID, matrix, scope)
 			if err != nil {
