@@ -68,6 +68,8 @@ export interface Sheet {
   columns: ColumnDef[];
   frozen: { row: number; col: number };
   config: SheetConfig;
+  /** Listed without cells and styles (workbook summary); load the sheet itself for them. */
+  config_omitted?: boolean;
   is_locked?: boolean;
   is_archived?: boolean;
   is_hidden?: boolean;

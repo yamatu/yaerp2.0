@@ -41,6 +41,9 @@ type Sheet struct {
 	Columns        json.RawMessage `json:"columns" db:"columns"`
 	Frozen         json.RawMessage `json:"frozen" db:"frozen"`
 	Config         json.RawMessage `json:"config" db:"config"`
+	// ConfigOmitted marks a sheet listed without its worksheet snapshot and
+	// styles; fetch the sheet itself for its cells.
+	ConfigOmitted bool `json:"config_omitted,omitempty"`
 	IsLocked       bool            `json:"is_locked,omitempty"`
 	IsArchived     bool            `json:"is_archived,omitempty"`
 	IsHidden       bool            `json:"is_hidden,omitempty"`

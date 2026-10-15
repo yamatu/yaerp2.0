@@ -56,6 +56,7 @@ import {
   type SharedFormulaResolver,
 } from '@/lib/univer-shared-formula'
 import { wsClient } from '@/lib/ws'
+import { createMarkLayer, watchMarkShapeWipes, type MarkLayer, type MarkShape } from '@/lib/univer-mark-layer'
 import {
   describeProtectionArea,
   findProtectionBlockingRemoval,
@@ -651,10 +652,10 @@ function clipProtectionHighlightBlocks(
   maxColumns: number
 ) {
   if (!visibleRange) return blocks
-  const rowStart = Math.max(0, visibleRange.startRow - 12)
-  const rowEnd = Math.min(maxRows - 1, visibleRange.endRow + 12)
-  const columnStart = Math.max(0, visibleRange.startColumn - 4)
-  const columnEnd = Math.min(maxColumns - 1, visibleRange.endColumn + 4)
+  const rowStart = Math.max(0, visibleRange.startRow - 60)
+  const rowEnd = Math.min(maxRows - 1, visibleRange.endRow + 60)
+  const columnStart = Math.max(0, visibleRange.startColumn - 8)
+  const columnEnd = Math.min(maxColumns - 1, visibleRange.endColumn + 8)
   return blocks.flatMap((block) => {
     const startRow = Math.max(block.startRow, rowStart)
     const endRow = Math.min(block.endRow, rowEnd)
@@ -1673,6 +1674,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const persistedWorksheetDataRef = useRef<Partial<IWorksheetData> | null>(null)
   const protectionHighlightDisposablesRef = useRef<UniverDisposable[]>([])
   const approvalHighlightDisposablesRef = useRef<UniverDisposable[]>([])
+  // Batched highlight layers; Univer wipes all highlights on edit/copy, so they
+  // are redrawn whenever that happens (see src/lib/univer-mark-layer.ts).
+  const protectionMarkLayerRef = useRef<MarkLayer | null>(null)
+  const approvalMarkLayerRef = useRef<MarkLayer | null>(null)
+  const approvalHighlightRendererRef = useRef<() => void>(() => undefined)
+  const overlayRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [presenceRedrawToken, setPresenceRedrawToken] = useState(0)
   const presenceDisposablesRef = useRef<UniverDisposable[]>([])
   const protectionFocusDisposableRef = useRef<UniverDisposable | null>(null)
   const protectionFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -1800,6 +1808,18 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const [showAllProtections, setShowAllProtections] = useState(false)
   const [selectionState, setSelectionState] = useState<SelectionState | null>(null)
   const [protectionSnapshot, setProtectionSnapshot] = useState<ProtectionSnapshot>({ rows: [], columns: [], cells: [] })
+  // Derived once per snapshot: every selection change re-renders this component.
+  const allProtectionItems = useMemo(
+    () => [...protectionSnapshot.rows, ...protectionSnapshot.columns, ...protectionSnapshot.cells],
+    [protectionSnapshot],
+  )
+  const protectionOwnerGroups = useMemo(() => Array.from(allProtectionItems.reduce((groups, item) => {
+    const current = groups.get(item.owner_id) || { ownerId: item.owner_id, ownerName: item.owner_name, items: [] as ProtectionInfo[] }
+    current.items.push(item)
+    groups.set(item.owner_id, current)
+    return groups
+  }, new Map<number, { ownerId: number; ownerName: string; items: ProtectionInfo[] }>()).values())
+    .sort((left, right) => left.ownerName.localeCompare(right.ownerName, 'zh-CN')), [allProtectionItems])
   const protectionIndex = useMemo(() => ({
     rows: new Map(protectionSnapshot.rows.map((item) => [item.row_index, item])),
     columns: new Map(protectionSnapshot.columns.map((item) => [item.column_key || item.key, item])),
@@ -2080,6 +2100,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const clearApprovalHighlights = useCallback(() => {
     approvalHighlightDisposablesRef.current.forEach((item) => item.dispose())
     approvalHighlightDisposablesRef.current = []
+    approvalMarkLayerRef.current?.clear()
   }, [])
 
   const renderApprovalHighlights = useCallback(() => {
@@ -2094,31 +2115,36 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     } catch {
       visibleRange = null
     }
+    const columnIndexes = new Map(columns.map((column, index) => [column.key, index]))
+    const style = { stroke: '#D97706', strokeWidth: 2, strokeDash: 4, isAnimationDash: false, fill: 'rgba(251, 191, 36, 0.10)' }
+    const shapes: MarkShape[] = []
     approvalStatesRef.current
       .filter((item) => item.status === 'pending')
       .slice(0, 1000)
       .forEach((item) => {
-        const columnIndex = columns.findIndex((column) => column.key === item.col)
+        const columnIndex = columnIndexes.get(item.col) ?? -1
         const worksheetRow = item.row + 1
         if (columnIndex < 0 || worksheetRow < 1) return
         if (visibleRange && (
-          worksheetRow < visibleRange.startRow || worksheetRow > visibleRange.endRow ||
-          columnIndex < visibleRange.startColumn || columnIndex > visibleRange.endColumn
+          worksheetRow < visibleRange.startRow - 40 || worksheetRow > visibleRange.endRow + 40 ||
+          columnIndex < visibleRange.startColumn - 6 || columnIndex > visibleRange.endColumn + 6
         )) return
-        try {
-          const disposable = worksheet.getRange(worksheetRow, columnIndex, 1, 1).highlight({
-            stroke: '#D97706',
-            strokeWidth: 2,
-            strokeDash: 4,
-            isAnimationDash: false,
-            fill: 'rgba(251, 191, 36, 0.10)',
-          })
-          approvalHighlightDisposablesRef.current.push(disposable)
-        } catch {
-          // Ignore a stale coordinate while rows or columns are being rebuilt.
-        }
+        shapes.push({ range: { startRow: worksheetRow, endRow: worksheetRow, startColumn: columnIndex, endColumn: columnIndex }, style })
       })
+    const layer = approvalMarkLayerRef.current
+    if (layer) {
+      layer.replace(shapes)
+      return
+    }
+    shapes.forEach((shape) => {
+      try {
+        approvalHighlightDisposablesRef.current.push(worksheet.getRange(shape.range.startRow, shape.range.startColumn, 1, 1).highlight(shape.style))
+      } catch {
+        // Ignore a stale coordinate while rows or columns are being rebuilt.
+      }
+    })
   }, [clearApprovalHighlights])
+  approvalHighlightRendererRef.current = renderApprovalHighlights
 
   const clearProtectionHighlights = useCallback(() => {
     protectionHighlightRenderGenerationRef.current += 1
@@ -2128,6 +2154,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
     protectionHighlightDisposablesRef.current.forEach((item) => item.dispose())
     protectionHighlightDisposablesRef.current = []
+    protectionMarkLayerRef.current?.clear()
   }, [])
 
   const requestProtectionHighlightRefresh = useCallback(() => {
@@ -2451,6 +2478,28 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       visibleRange = null
     }
     const renderBlocks = clipProtectionHighlightBlocks(blocks, visibleRange, maxRows, maxColumns)
+    const shapes: MarkShape[] = renderBlocks.map((block) => {
+      const visual = block.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(block.ownerId)
+      return {
+        range: { startRow: block.startRow, endRow: block.endRow, startColumn: block.startColumn, endColumn: block.endColumn },
+        style: {
+          stroke: 'rgba(0, 0, 0, 0)',
+          strokeWidth: 0,
+          fill: visual.fill,
+          rowHeaderFill: block.scope === 'row' ? visual.fill : undefined,
+          columnHeaderFill: block.scope === 'column' ? visual.fill : undefined,
+        },
+      }
+    })
+    const layer = protectionMarkLayerRef.current
+    if (layer) {
+      try {
+        layer.replace(shapes)
+      } catch (highlightError) {
+        console.error('Failed to highlight protected ranges:', highlightError)
+      }
+      return
+    }
 
     const generation = protectionHighlightRenderGenerationRef.current
     let blockIndex = 0
@@ -2458,31 +2507,17 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       if (generation !== protectionHighlightRenderGenerationRef.current || !showProtectionHighlightsRef.current) return
       protectionHighlightRenderFrameRef.current = null
       const frameStartedAt = performance.now()
-      let renderedInFrame = 0
-      while (blockIndex < renderBlocks.length && renderedInFrame < 48 && performance.now() - frameStartedAt < 8) {
-        const block = renderBlocks[blockIndex]
+      while (blockIndex < shapes.length && performance.now() - frameStartedAt < 8) {
+        const shape = shapes[blockIndex]
         blockIndex += 1
-        renderedInFrame += 1
         try {
-          const visual = block.hidden ? HIDDEN_PROTECTION_VISUAL : visualForUser(block.ownerId)
-          const range = worksheet.getRange(
-            block.startRow,
-            block.startColumn,
-            block.endRow - block.startRow + 1,
-            block.endColumn - block.startColumn + 1
-          )
-          protectionHighlightDisposablesRef.current.push(range.highlight({
-            stroke: 'rgba(0, 0, 0, 0)',
-            strokeWidth: 0,
-            fill: visual.fill,
-            rowHeaderFill: block.scope === 'row' ? visual.fill : undefined,
-            columnHeaderFill: block.scope === 'column' ? visual.fill : undefined,
-          }))
+          const range = worksheet.getRange(shape.range.startRow, shape.range.startColumn, shape.range.endRow - shape.range.startRow + 1, shape.range.endColumn - shape.range.startColumn + 1)
+          protectionHighlightDisposablesRef.current.push(range.highlight(shape.style))
         } catch (highlightError) {
           console.error('Failed to highlight protected range:', highlightError)
         }
       }
-      if (blockIndex < renderBlocks.length) {
+      if (blockIndex < shapes.length) {
         protectionHighlightRenderFrameRef.current = window.requestAnimationFrame(renderChunk)
       }
     }
@@ -2556,7 +2591,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       }
     })
     return clearPresenceVisuals
-  }, [clearPresenceVisuals, loading, profile?.id, sheetId, sheetPresence])
+  }, [clearPresenceVisuals, loading, presenceRedrawToken, profile?.id, sheetId, sheetPresence])
 
   useEffect(() => () => {
     clearProtectionHighlights()
@@ -2601,7 +2636,26 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     return () => observer.disconnect()
   }, [])
 
-  useEffect(() => { latestSheetRef.current = sheet }, [sheet])
+  useEffect(() => {
+    const current = latestSheetRef.current
+    if (!sheet.config_omitted || current.id !== sheet.id || current.config_omitted) {
+      latestSheetRef.current = sheet
+      return
+    }
+    // A workbook summary refresh carries the sheet's rules but not its cells:
+    // keep the cells and styles this editor already holds.
+    const currentConfig = parseSheetConfig(current.config) as Record<string, unknown>
+    latestSheetRef.current = {
+      ...sheet,
+      frozen: sheet.frozen ?? current.frozen,
+      config_omitted: false,
+      config: {
+        ...parseSheetConfig(sheet.config),
+        univerSheetData: currentConfig.univerSheetData,
+        univerStyles: currentConfig.univerStyles,
+      },
+    }
+  }, [sheet])
 
   useEffect(() => {
     try {
@@ -3911,17 +3965,22 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
         // If this is a reload, re-fetch the sheet metadata first
         let currentSheet = latestSheetRef.current
-        if (isReload) {
+        if (isReload || currentSheet.config_omitted) {
           try {
             const sheetRes = await api.get<Sheet>(`/sheets/${currentSheet.id}`)
             if (sheetRes.code === 0 && sheetRes.data) {
               currentSheet = sheetRes.data
               latestSheetRef.current = currentSheet
+            } else if (currentSheet.config_omitted) {
+              throw new Error(sheetRes.message || '加载工作表数据失败')
             }
-          } catch {
-            // Fall through with existing sheet data
+          } catch (loadError) {
+            // A reload falls through with the sheet data it already has; a
+            // summary has no cells to fall back on.
+            if (currentSheet.config_omitted) throw loadError
           }
         }
+        if (disposed) return
 
         // A reload after a structure conflict keeps the explanation on screen.
         if (!isLocalReload) setActionError('')
@@ -4042,6 +4101,21 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // editor services are only instantiated while the first unit is
         // created, so wire up the alignment fixes once the workbook exists.
         const editorRepaintFilter = skipEditorTextRepaints(univerResult.univer, workbookApi.getId())
+        protectionMarkLayerRef.current = createMarkLayer(univerResult.univer)
+        approvalMarkLayerRef.current = createMarkLayer(univerResult.univer)
+        // Univer drops every highlight when a cell editor opens or closes and on
+        // copy/cut: draw ours again right after.
+        let overlayRedrawFrame: number | null = null
+        const stopWatchingMarkWipes = watchMarkShapeWipes(univerResult.univer, () => {
+          if (overlayRedrawFrame !== null) return
+          overlayRedrawFrame = window.requestAnimationFrame(() => {
+            overlayRedrawFrame = null
+            if (disposed) return
+            if (showProtectionHighlightsRef.current) protectionHighlightRendererRef.current()
+            approvalHighlightRendererRef.current()
+            setPresenceRedrawToken((token) => token + 1)
+          })
+        })
         registerEditorComposedStyleInterceptor(univerResult.univer)
         installCellEditorAlignmentRecalculation(univerResult.univer)
         registerSharedFormulaEditorInterceptor(univerResult.univer)
@@ -4559,6 +4633,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
         const scrollPositionDisposable = univerAPI.addEvent(univerAPI.Event.Scroll, () => {
           scheduleSheetViewMemoryPersist()
+          // Highlights only cover the area around the viewport.
+          if (overlayRefreshTimerRef.current) clearTimeout(overlayRefreshTimerRef.current)
+          overlayRefreshTimerRef.current = setTimeout(() => {
+            overlayRefreshTimerRef.current = null
+            if (showProtectionHighlightsRef.current) protectionHighlightRendererRef.current()
+            approvalHighlightRendererRef.current()
+          }, 150)
         })
 
         const selectionRects = (): WorksheetRect[] => {
@@ -4617,8 +4698,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             }
             case 'sheet.command.clear-selection-content':
             case 'sheet.command.clear-selection-all': {
-              const area = findProtectionInRects(areas, selectionRects(), (item) => Boolean(item.hidden || item.hide_formula || !item.can_edit))
-              return area ? `${describe(area)}不能被清除。` : ''
+              // Clearing removes cell data only; the protection itself stays. Only
+              // content this user cannot see or edit is off limits.
+              const area = findProtectionInRects(areas, selectionRects(), (item) => Boolean(item.masked_for_current_user || item.formula_hidden_for_current_user || !item.can_edit))
+              return area ? `${describe(area)}对你不可见或不可编辑，不能清除其中的数据。` : ''
             }
             default:
               return ''
@@ -4704,6 +4787,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           setFormulaErrorHint(null)
           quotedClipboardFix?.dispose()
           editorRepaintFilter?.dispose()
+          stopWatchingMarkWipes?.()
+          if (overlayRedrawFrame !== null) window.cancelAnimationFrame(overlayRedrawFrame)
+          if (overlayRefreshTimerRef.current) { clearTimeout(overlayRefreshTimerRef.current); overlayRefreshTimerRef.current = null }
+          protectionMarkLayerRef.current?.clear()
+          approvalMarkLayerRef.current?.clear()
+          protectionMarkLayerRef.current = null
+          approvalMarkLayerRef.current = null
           pasteNotifier?.dispose?.()
           plainTextConvertMenu?.dispose?.()
           selectionPresenceDisposable.dispose()
@@ -5246,11 +5336,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     return `${getProtectionColumnLabel(item.column_key || item.key)}${(item.row_index ?? 0) + 2}`
   }
   const formatProtectionBadge = (item: ProtectionInfo) => `${formatProtectionTarget(item)} · ${formatProtectionMode(item)} - ${item.owner_name}`
-  const allProtectionItems = [
-    ...protectionSnapshot.rows,
-    ...protectionSnapshot.columns,
-    ...protectionSnapshot.cells,
-  ]
   const canReleaseProtection = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
   const canUpdateProtectionEditors = (item: ProtectionInfo | null) => Boolean(item && !editLocked && (adminMode || item.owner_id === profile?.id))
   const protectionUserNameMap = new Map(protectionUsers.map((user) => [user.id, user.username]))
@@ -5393,13 +5478,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   const selectedCellMasked = currentProtectionItems.some((item) => item.masked_for_current_user)
   const selectedCellFormulaHidden = currentProtectionItems.some((item) => item.formula_hidden_for_current_user)
   const showSelectionRestriction = selectedCellMasked || selectedCellFormulaHidden || (currentProtectionItems.length > 0 && selectedCellCannotEdit)
-  const protectionOwnerGroups = Array.from(allProtectionItems.reduce((groups, item) => {
-    const current = groups.get(item.owner_id) || { ownerId: item.owner_id, ownerName: item.owner_name, items: [] as ProtectionInfo[] }
-    current.items.push(item)
-    groups.set(item.owner_id, current)
-    return groups
-  }, new Map<number, { ownerId: number; ownerName: string; items: ProtectionInfo[] }>()).values())
-    .sort((left, right) => left.ownerName.localeCompare(right.ownerName, 'zh-CN'))
   const onlineCollaborators = Array.from(sheetPresence.reduce((users, entry) => {
     const current = users.get(entry.userId)
     const priority = { viewing: 0, selected: 1, editing: 2 }

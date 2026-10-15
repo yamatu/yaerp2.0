@@ -289,7 +289,11 @@ func (h *SheetHandler) GetWorkbook(c *gin.Context) {
 		response.BadRequest(c, "invalid workbook id")
 		return
 	}
-	wb, err := h.sheetService.GetWorkbook(id, userID)
+	getWorkbook := h.sheetService.GetWorkbook
+	if c.Query("summary") == "1" {
+		getWorkbook = h.sheetService.GetWorkbookSummary
+	}
+	wb, err := getWorkbook(id, userID)
 	if err != nil {
 		if errors.Is(err, service.ErrWorkbookAccessDenied) {
 			response.Forbidden(c, "you do not have permission to access this workbook")
