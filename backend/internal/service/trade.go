@@ -1717,34 +1717,16 @@ func (s *TradeService) SelectSupplierQuote(userID, orderID, quoteID int64) (*mod
 	return s.GetOrder(userID, orderID)
 }
 
-func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *model.CreateTradeCustomerQuoteRequest) (*model.TradeOrder, error) {
-	order, err := s.repo.GetOrder(orderID, userID, true)
-	if err != nil {
-		return nil, fmt.Errorf("业务单不存在或无权访问")
-	}
-	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
-	if err != nil {
-		return nil, err
-	}
-	if !allowed {
-		return nil, fmt.Errorf("只有对客报价与议价岗位或业务负责人可以创建报价轮次")
-	}
-	if order.Stage != model.TradeStageQuotation {
-		return nil, fmt.Errorf("当前业务单不在对客报价与议价阶段")
-	}
+// buildCustomerQuoteRound validates a quote entry and turns it into the round
+// that will be stored. A draft is allowed to be partial (empty prices, empty
+// rate, no products picked) so the salesman can put the dialog aside; only a
+// round that is sent to the customer has to be complete.
+func (s *TradeService) buildCustomerQuoteRound(userID int64, order *model.TradeOrder, request *model.TradeCustomerQuoteRoundRequest, canViewProfit bool) (*model.TradeCustomerQuoteRound, error) {
 	if request == nil {
 		return nil, fmt.Errorf("请填写本轮每项产品的对客报价")
 	}
-	userAccess, err := s.loadTradeUserAccess(userID)
-	if err != nil {
-		return nil, err
-	}
-	orderAccess, err := s.orderAccessForUser(userID, order, userAccess)
-	if err != nil {
-		return nil, err
-	}
 	profitMarginPercent := 0.0
-	if orderAccess.CanViewProfit {
+	if canViewProfit {
 		profitMarginPercent = nonNegativeTradeValue(request.ProfitMarginPercent)
 		if profitMarginPercent > 1000 {
 			return nil, fmt.Errorf("成本加价率不能超过 1000%%")
@@ -1760,7 +1742,8 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	if status != "draft" && status != "sent" {
 		return nil, fmt.Errorf("新报价只能保存为草稿或标记为已发送")
 	}
-	items, err := s.repo.ListOrderItems(orderID)
+	draft := status == "draft"
+	items, err := s.repo.ListOrderItems(order.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -1770,8 +1753,11 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	}
 	inputs := make(map[int64]model.TradeCustomerQuoteItemInput, len(request.Items))
 	for _, input := range request.Items {
-		if input.OrderItemID <= 0 || input.UnitPrice <= 0 {
-			return nil, fmt.Errorf("每项产品都必须填写大于零的对客单价")
+		if input.OrderItemID <= 0 {
+			return nil, fmt.Errorf("报价中包含无效的产品")
+		}
+		if input.UnitPrice < 0 {
+			return nil, fmt.Errorf("对客单价不能小于零")
 		}
 		if input.MarginPercent < 0 || input.MarginPercent > 1000 {
 			return nil, fmt.Errorf("单个产品的加价率需要在 0 到 1000%% 之间")
@@ -1784,33 +1770,25 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 		}
 		inputs[input.OrderItemID] = input
 	}
-	quoteItems := make([]model.TradeCustomerQuoteItem, 0, len(items))
-	for _, item := range items {
-		input, exists := inputs[item.ID]
-		if !exists {
-			return nil, fmt.Errorf("产品 %s 尚未填写对客报价", firstNonEmptyTrade(item.SKU, item.ProductName))
-		}
-		margin := 0.0
-		if orderAccess.CanViewProfit {
-			margin = input.MarginPercent
-		}
-		quoteItems = append(quoteItems, model.TradeCustomerQuoteItem{
-			OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU, ProductName: item.ProductName,
-			Quantity: item.Quantity, Unit: item.Unit, UnitPrice: input.UnitPrice, Amount: item.Quantity * input.UnitPrice,
-			MarginPercent: margin, FreightAmount: input.FreightAmount, WeightKG: input.WeightKG, Declined: input.Declined,
-		})
-	}
 	if len(inputs) != len(items) {
+		for _, item := range items {
+			if _, exists := inputs[item.ID]; !exists {
+				return nil, fmt.Errorf("报价中缺少产品 %s", firstNonEmptyTrade(item.SKU, item.ProductName))
+			}
+		}
 		return nil, fmt.Errorf("报价中包含不属于该业务单的产品")
 	}
 	currency := strings.ToUpper(strings.TrimSpace(request.Currency))
 	if currency == "" {
 		currency = order.Currency
 	}
+	if currency == "" {
+		currency = "USD"
+	}
 	exchangeRateCNY := nonNegativeTradeValue(request.ExchangeRateCNY)
 	if strings.EqualFold(currency, "CNY") {
 		exchangeRateCNY = 1
-	} else if exchangeRateCNY <= 0 {
+	} else if exchangeRateCNY <= 0 && !draft {
 		return nil, fmt.Errorf("请填写 1 %s 兑人民币的报价汇率", currency)
 	}
 	freightMode := strings.ToLower(strings.TrimSpace(request.FreightMode))
@@ -1820,31 +1798,204 @@ func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *
 	if freightMode != "customer_forwarder" && freightMode != "quoted" {
 		return nil, fmt.Errorf("无效的运费方式")
 	}
-	if freightMode == "customer_forwarder" {
-		for index := range quoteItems {
-			quoteItems[index].FreightAmount = 0
+	quoteItems := make([]model.TradeCustomerQuoteItem, 0, len(items))
+	for _, item := range items {
+		input := inputs[item.ID]
+		margin := 0.0
+		if canViewProfit {
+			margin = input.MarginPercent
 		}
+		freight := input.FreightAmount
+		if freightMode != "quoted" {
+			freight = 0
+		}
+		quoteItems = append(quoteItems, model.TradeCustomerQuoteItem{
+			OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU, ProductName: item.ProductName,
+			Quantity: item.Quantity, Unit: item.Unit, UnitPrice: input.UnitPrice, Amount: item.Quantity * input.UnitPrice,
+			MarginPercent: margin, FreightAmount: freight, WeightKG: input.WeightKG, Declined: input.Declined,
+		})
 	}
 	round := &model.TradeCustomerQuoteRound{
-		OrderID: orderID, Currency: currency, Status: status,
+		OrderID: order.ID, Currency: currency, Status: status,
 		ExchangeRateCNY: exchangeRateCNY, ProfitMarginPercent: profitMarginPercent,
 		FreightMode: freightMode, FreightAmount: nonNegativeTradeValue(request.FreightAmount),
 		Items: quoteItems, CustomerFeedback: strings.TrimSpace(request.CustomerFeedback),
 		Notes: strings.TrimSpace(request.Notes), CreatedBy: userID,
 	}
-	if len(round.PurchasedItems()) == 0 {
-		return nil, fmt.Errorf("请至少保留一项客户采购的产品")
+	if !draft {
+		if unpriced := tradeUnpricedQuoteLines(round.Items); unpriced != "" {
+			return nil, fmt.Errorf("以下产品还没填对客单价：%s", unpriced)
+		}
+		if len(round.PurchasedItems()) == 0 {
+			return nil, fmt.Errorf("请至少勾选一项客户可能采购的产品")
+		}
+		if freightMode == "quoted" && !tradeQuoteLinesHaveFreight(round.Items) {
+			return nil, fmt.Errorf("选择我方报价运费后，请为产品填写运费")
+		}
 	}
 	round.ApplyItemTotals()
-	if freightMode == "quoted" && round.FreightAmount <= 0 {
-		return nil, fmt.Errorf("选择我方报价运费后，请为产品填写运费")
+	return round, nil
+}
+
+// tradeUnpricedQuoteLines lists the products a sent round still has no price
+// for, so the salesman learns which lines are missing.
+func tradeUnpricedQuoteLines(items []model.TradeCustomerQuoteItem) string {
+	labels := make([]string, 0)
+	for _, item := range items {
+		if item.UnitPrice > 0 {
+			continue
+		}
+		labels = append(labels, firstNonEmptyTrade(item.SKU, item.ProductName, fmt.Sprintf("第 %d 行", item.LineNo)))
+		if len(labels) == 6 {
+			labels = append(labels, "等")
+			break
+		}
+	}
+	return strings.Join(labels, "、")
+}
+
+// validateAcceptedQuoteSelection makes sure every product the customer buys
+// has a price, since a round saved as a draft may still have empty lines.
+// selected nil means the round's own selection.
+func validateAcceptedQuoteSelection(round *model.TradeCustomerQuoteRound, selected []int64) error {
+	chosen := make(map[int64]bool, len(selected))
+	for _, id := range selected {
+		chosen[id] = true
+	}
+	bought := make([]model.TradeCustomerQuoteItem, 0, len(round.Items))
+	for _, item := range round.Items {
+		if (selected == nil && !item.Declined) || chosen[item.OrderItemID] {
+			bought = append(bought, item)
+		}
+	}
+	if len(bought) == 0 {
+		return fmt.Errorf("请至少选择一项客户采购的产品")
+	}
+	if unpriced := tradeUnpricedQuoteLines(bought); unpriced != "" {
+		return fmt.Errorf("客户采购的产品还没有对客单价：%s，请先修改本轮报价", unpriced)
+	}
+	if !strings.EqualFold(round.Currency, "CNY") && round.ExchangeRateCNY <= 0 {
+		return fmt.Errorf("本轮报价缺少 1 %s 兑人民币的汇率，请先修改本轮报价", round.Currency)
+	}
+	return nil
+}
+
+func tradeQuoteLinesHaveFreight(items []model.TradeCustomerQuoteItem) bool {
+	for _, item := range items {
+		if item.Declined {
+			continue
+		}
+		if item.FreightAmount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *TradeService) CreateCustomerQuoteRound(userID, orderID int64, request *model.CreateTradeCustomerQuoteRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("只有对客报价与议价岗位或业务负责人可以创建报价轮次")
+	}
+	if order.Stage != model.TradeStageQuotation {
+		return nil, fmt.Errorf("当前业务单不在对客报价与议价阶段")
+	}
+	userAccess, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	orderAccess, err := s.orderAccessForUser(userID, order, userAccess)
+	if err != nil {
+		return nil, err
+	}
+	round, err := s.buildCustomerQuoteRound(userID, order, request, orderAccess.CanViewProfit)
+	if err != nil {
+		return nil, err
 	}
 	if err := s.repo.CreateCustomerQuoteRound(round); err != nil {
 		return nil, err
 	}
 	if order.ChannelID != nil {
+		verb := "已保存为草稿"
+		if round.Status == "sent" {
+			verb = fmt.Sprintf("已生成第 %d 轮对客报价，商品 %.2f、运费 %.2f，合计 %s %.2f（约 CNY %.2f）",
+				round.RoundNo, round.GoodsAmount, round.FreightAmount, round.Currency, round.TotalAmount, round.TotalAmountCNY)
+		}
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
-			Content:      fmt.Sprintf("业务单 %s 已生成第 %d 轮对客报价，商品 %.2f、运费 %.2f，合计 %s %.2f（约 CNY %.2f）。", order.OrderNo, round.RoundNo, round.GoodsAmount, round.FreightAmount, round.Currency, round.TotalAmount, round.TotalAmountCNY),
+			Content:      fmt.Sprintf("业务单 %s 的对客报价%s。", order.OrderNo, verb),
+			InternalOnly: true,
+		})
+	}
+	s.notifyOrderUpdated(orderID)
+	return s.GetOrder(userID, orderID)
+}
+
+// UpdateCustomerQuoteRound rewrites an unfinished round in place, so the
+// salesman can keep working on a draft or fill in the prices before it goes to
+// the customer instead of creating a new round for every correction.
+func (s *TradeService) UpdateCustomerQuoteRound(userID, orderID, quoteID int64, request *model.TradeCustomerQuoteRoundRequest) (*model.TradeOrder, error) {
+	order, err := s.repo.GetOrder(orderID, userID, true)
+	if err != nil {
+		return nil, fmt.Errorf("业务单不存在或无权访问")
+	}
+	allowed, _, err := s.canOperateStageForStage(userID, order, model.TradeStageQuotation)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, fmt.Errorf("只有对客报价与议价岗位或业务负责人可以修改报价轮次")
+	}
+	if order.Stage != model.TradeStageQuotation {
+		return nil, fmt.Errorf("当前业务单不在对客报价与议价阶段")
+	}
+	quotes, err := s.repo.ListCustomerQuoteRounds(orderID)
+	if err != nil {
+		return nil, err
+	}
+	var target *model.TradeCustomerQuoteRound
+	for index := range quotes {
+		if quotes[index].ID == quoteID {
+			target = &quotes[index]
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("对客报价不存在")
+	}
+	switch target.Status {
+	case "draft", "sent":
+	case "accepted":
+		return nil, fmt.Errorf("客户已接受的报价不能修改，请创建新一轮报价")
+	default:
+		return nil, fmt.Errorf("该轮报价已作废，不能修改")
+	}
+	userAccess, err := s.loadTradeUserAccess(userID)
+	if err != nil {
+		return nil, err
+	}
+	orderAccess, err := s.orderAccessForUser(userID, order, userAccess)
+	if err != nil {
+		return nil, err
+	}
+	round, err := s.buildCustomerQuoteRound(userID, order, request, orderAccess.CanViewProfit)
+	if err != nil {
+		return nil, err
+	}
+	round.ID = quoteID
+	round.RoundNo = target.RoundNo
+	if err := s.repo.UpdateCustomerQuoteRound(orderID, round); err != nil {
+		return nil, err
+	}
+	if order.ChannelID != nil {
+		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
+			Content:      fmt.Sprintf("业务单 %s 第 %d 轮对客报价已修改。", order.OrderNo, target.RoundNo),
 			InternalOnly: true,
 		})
 	}
@@ -1909,6 +2060,19 @@ func (s *TradeService) UpdateCustomerQuoteRoundStatus(userID, orderID, quoteID i
 		}
 		if len(selected) == 0 {
 			return nil, fmt.Errorf("请至少选择一项客户采购的产品")
+		}
+	}
+	if status == "accepted" {
+		if err := validateAcceptedQuoteSelection(target, selected); err != nil {
+			return nil, err
+		}
+	}
+	if status == "sent" && target.Status == "draft" {
+		if unpriced := tradeUnpricedQuoteLines(target.Items); unpriced != "" {
+			return nil, fmt.Errorf("草稿中以下产品还没填对客单价：%s，请先继续编辑报价", unpriced)
+		}
+		if !strings.EqualFold(target.Currency, "CNY") && target.ExchangeRateCNY <= 0 {
+			return nil, fmt.Errorf("草稿缺少 1 %s 兑人民币的汇率，请先继续编辑报价", target.Currency)
 		}
 	}
 	if status == "accepted" && (len(quotes) == 0 || quotes[0].ID != quoteID) {

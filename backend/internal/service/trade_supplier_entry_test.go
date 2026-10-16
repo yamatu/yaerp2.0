@@ -118,3 +118,26 @@ func TestPIListsOnlyPurchasedProducts(t *testing.T) {
 		t.Fatalf("the PI total must be the purchased goods plus their freight")
 	}
 }
+
+func TestAcceptingAQuoteNeedsPricesOnlyForBoughtProducts(t *testing.T) {
+	round := &model.TradeCustomerQuoteRound{
+		Currency: "USD", ExchangeRateCNY: 7,
+		Items: []model.TradeCustomerQuoteItem{
+			{OrderItemID: 1, SKU: "PRICED", UnitPrice: 10},
+			{OrderItemID: 2, SKU: "EMPTY"},
+		},
+	}
+	if err := validateAcceptedQuoteSelection(round, []int64{1}); err != nil {
+		t.Fatalf("a draft line the customer does not buy may stay unpriced: %v", err)
+	}
+	if err := validateAcceptedQuoteSelection(round, nil); err == nil || !strings.Contains(err.Error(), "EMPTY") {
+		t.Fatalf("buying an unpriced line must name it, got %v", err)
+	}
+	if err := validateAcceptedQuoteSelection(round, []int64{}); err == nil {
+		t.Fatalf("accepting without any bought product must fail")
+	}
+	round.ExchangeRateCNY = 0
+	if err := validateAcceptedQuoteSelection(round, []int64{1}); err == nil {
+		t.Fatalf("a foreign currency round needs its exchange rate before acceptance")
+	}
+}

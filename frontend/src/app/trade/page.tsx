@@ -909,6 +909,9 @@ export default function TradeWorkspacePage() {
   const [customerQuoteSource, setCustomerQuoteSource] = useState<
     TradeCustomerQuoteRound | undefined
   >(undefined);
+  const [customerQuoteEditing, setCustomerQuoteEditing] = useState<
+    TradeCustomerQuoteRound | undefined
+  >(undefined);
   const [savingCustomerQuote, setSavingCustomerQuote] = useState(false);
   const [customerQuoteStatusDraft, setCustomerQuoteStatusDraft] =
     useState<CustomerQuoteStatusDraft | null>(null);
@@ -2732,9 +2735,13 @@ export default function TradeWorkspacePage() {
     }
   };
 
-  const openCustomerQuoteModal = (source?: TradeCustomerQuoteRound) => {
+  const openCustomerQuoteModal = (
+    source?: TradeCustomerQuoteRound,
+    editing?: TradeCustomerQuoteRound,
+  ) => {
     if (!detailOrder) return;
     setCustomerQuoteSource(source);
+    setCustomerQuoteEditing(editing);
     setCustomerQuoteModalOpen(true);
     setError("");
   };
@@ -2744,22 +2751,26 @@ export default function TradeWorkspacePage() {
     setSavingCustomerQuote(true);
     setError("");
     try {
-      const response = await api.post<TradeOrder>(
-        `/trade/orders/${detailOrder.id}/customer-quotes`,
-        payload,
-      );
+      const response = customerQuoteEditing
+        ? await api.put<TradeOrder>(
+            `/trade/orders/${detailOrder.id}/customer-quotes/${customerQuoteEditing.id}`,
+            payload,
+          )
+        : await api.post<TradeOrder>(
+            `/trade/orders/${detailOrder.id}/customer-quotes`,
+            payload,
+          );
       if (response.code !== 0 || !response.data)
         throw new Error(response.message || "保存对客报价失败");
       setDetailOrder(response.data);
       setCustomerQuoteModalOpen(false);
-      const declined = payload.items.filter((item) => item.declined).length;
+      const unpriced = payload.items.filter(
+        (item) => !(item.unit_price > 0),
+      ).length;
       setNotice(
-        (payload.status === "sent"
-          ? "新一轮报价已记录为向客户发送，等待客户反馈。"
-          : "对客报价草稿已保存。") +
-          (declined > 0
-            ? `其中 ${declined} 项标记为客户不买，报价仍保留在报价库。`
-            : ""),
+        payload.status === "sent"
+          ? "报价已标记为向客户发送。客户确定要哪些产品后，点「客户接受」勾选客户下单的产品。"
+          : `对客报价草稿已保存${unpriced > 0 ? `，还有 ${unpriced} 项未填对客单价` : ""}，可以随时点「继续编辑」。`,
       );
       await loadData(true);
     } catch (saveError) {
@@ -2780,9 +2791,8 @@ export default function TradeWorkspacePage() {
       status,
       customer_feedback: quote.customer_feedback || "",
       notes: quote.notes || "",
-      selected_item_ids: quote.items
-        .filter((item) => !item.declined)
-        .map((item) => item.order_item_id),
+      // The salesman ticks exactly what the customer ordered.
+      selected_item_ids: [],
     });
     setError("");
   };
@@ -2822,7 +2832,10 @@ export default function TradeWorkspacePage() {
       setDetailOrder(response.data);
       setCustomerQuoteStatusDraft(null);
       setNotice(
-        `第 ${customerQuoteStatusDraft.quote.round_no} 轮报价已更新为“${customerQuoteStatusLabels[customerQuoteStatusDraft.status]}”。`,
+        `第 ${customerQuoteStatusDraft.quote.round_no} 轮报价已更新为“${customerQuoteStatusLabels[customerQuoteStatusDraft.status]}”。` +
+          (customerQuoteStatusDraft.status === "accepted"
+            ? `客户下单 ${customerQuoteStatusDraft.selected_item_ids.length} / ${customerQuoteStatusDraft.quote.items.length} 项，其余产品报价保留在报价库。`
+            : ""),
       );
       await loadData(true);
     } catch (saveError) {
@@ -5874,6 +5887,7 @@ export default function TradeWorkspacePage() {
           <CustomerQuoteRoundModal
             order={detailOrder}
             source={customerQuoteSource}
+            editing={customerQuoteEditing}
             canUsePurchasePricing={Boolean(
               detailOrder.access?.can_view_supplier_pricing,
             )}
@@ -5937,7 +5951,12 @@ export default function TradeWorkspacePage() {
                     const chosen = new Set(
                       customerQuoteStatusDraft.selected_item_ids,
                     );
-                    const allChosen = chosen.size === quote.items.length;
+                    const choosable = quote.items.filter(
+                      (item) => item.unit_price > 0,
+                    );
+                    const allChosen =
+                      choosable.length > 0 &&
+                      chosen.size === choosable.length;
                     const hasLineFreight = quote.items.some(
                       (item) => (item.freight_amount || 0) > 0,
                     );
@@ -5968,7 +5987,7 @@ export default function TradeWorkspacePage() {
                       >
                         <div className="flex items-center justify-between gap-2 border-b border-sky-100 px-3 py-2">
                           <span className="text-sm font-semibold text-slate-800">
-                            客户采购的产品
+                            勾选客户下单的产品
                             <span className="ml-1 text-xs font-normal text-slate-500">
                               已选 {chosen.size} / {quote.items.length}
                             </span>
@@ -5979,7 +5998,7 @@ export default function TradeWorkspacePage() {
                               setChosen(
                                 allChosen
                                   ? []
-                                  : quote.items.map(
+                                  : choosable.map(
                                       (item) => item.order_item_id,
                                     ),
                               )
@@ -5993,10 +6012,16 @@ export default function TradeWorkspacePage() {
                           {quote.items.map((item) => (
                             <label
                               key={item.order_item_id}
-                              className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm"
+                              className={`flex items-center gap-2 px-3 py-1.5 text-sm ${item.unit_price > 0 ? "cursor-pointer" : "cursor-not-allowed opacity-50"}`}
+                              title={
+                                item.unit_price > 0
+                                  ? undefined
+                                  : "该产品还没有对客单价，请先修改本轮报价"
+                              }
                             >
                               <input
                                 type="checkbox"
+                                disabled={!(item.unit_price > 0)}
                                 checked={chosen.has(item.order_item_id)}
                                 onChange={() =>
                                   setChosen(
@@ -6018,8 +6043,21 @@ export default function TradeWorkspacePage() {
                                   {item.quantity} {item.unit}
                                 </span>
                               </span>
-                              <span className="shrink-0 text-xs tabular-nums text-slate-600">
-                                {formatMoney(quote.currency, item.amount)}
+                              <span className="shrink-0 text-right text-xs tabular-nums text-slate-600">
+                                {item.unit_price > 0 ? (
+                                  <>
+                                    <span className="text-slate-400">
+                                      {formatMoney(
+                                        quote.currency,
+                                        item.unit_price,
+                                      )}{" "}
+                                      ×{" "}
+                                    </span>
+                                    {formatMoney(quote.currency, item.amount)}
+                                  </>
+                                ) : (
+                                  "未填单价"
+                                )}
                               </span>
                             </label>
                           ))}
@@ -6034,7 +6072,7 @@ export default function TradeWorkspacePage() {
                           </span>
                           {freight > 0 &&
                             `（含运费 ${formatFinancialMoney(quote.currency, freight)}）`}
-                          。没勾选的产品报价仍保留在报价库，但不进入采购和后续环节。
+                          。客户没要的产品报价仍保留在报价库，但不进入采购和后续环节。
                         </div>
                       </div>
                     );
@@ -7492,25 +7530,20 @@ export default function TradeWorkspacePage() {
                                               <button
                                                 type="button"
                                                 onClick={() =>
-                                                  openCustomerQuoteModal(quote)
-                                                }
-                                                className="h-7 rounded-md border border-slate-200 px-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-                                              >
-                                                调整报价
-                                              </button>
-                                            )}
-                                            {quote.status === "draft" && (
-                                              <button
-                                                type="button"
-                                                onClick={() =>
-                                                  openCustomerQuoteStatus(
+                                                  openCustomerQuoteModal(
+                                                    undefined,
                                                     quote,
-                                                    "sent",
                                                   )
                                                 }
-                                                className="h-7 rounded-md border border-sky-200 px-2 text-xs font-semibold text-sky-700 hover:bg-sky-50"
+                                                className={
+                                                  quote.status === "draft"
+                                                    ? "h-7 rounded-md bg-sky-700 px-2.5 text-xs font-semibold text-white hover:bg-sky-800"
+                                                    : "h-7 rounded-md border border-slate-200 px-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                                                }
                                               >
-                                                标记已发送
+                                                {quote.status === "draft"
+                                                  ? "继续编辑"
+                                                  : "修改报价"}
                                               </button>
                                             )}
                                             {quote.status === "sent" && (
@@ -7671,9 +7704,15 @@ export default function TradeWorkspacePage() {
                                                 {item.quantity} {item.unit}
                                               </td>
                                               <td className="px-3 py-2 text-right">
-                                                {formatMoney(
-                                                  quote.currency,
-                                                  item.unit_price,
+                                                {item.unit_price > 0 ? (
+                                                  formatMoney(
+                                                    quote.currency,
+                                                    item.unit_price,
+                                                  )
+                                                ) : (
+                                                  <span className="text-amber-600">
+                                                    未填
+                                                  </span>
                                                 )}
                                               </td>
                                               {quote.items.some(

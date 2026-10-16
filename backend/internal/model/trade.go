@@ -895,15 +895,19 @@ type SaveTradeSupplierQuotesResult struct {
 }
 
 type TradeCustomerQuoteItemInput struct {
-	OrderItemID   int64   `json:"order_item_id" binding:"required"`
-	UnitPrice     float64 `json:"unit_price" binding:"gt=0"`
+	OrderItemID int64 `json:"order_item_id" binding:"required"`
+	// A draft may leave the price empty; it is only required before a round is
+	// marked as sent to the customer.
+	UnitPrice     float64 `json:"unit_price" binding:"gte=0"`
 	MarginPercent float64 `json:"margin_percent" binding:"gte=0"`
 	FreightAmount float64 `json:"freight_amount" binding:"gte=0"`
 	WeightKG      float64 `json:"weight_kg" binding:"gte=0"`
 	Declined      bool    `json:"declined"`
 }
 
-type CreateTradeCustomerQuoteRequest struct {
+// TradeCustomerQuoteRoundRequest carries one round of customer pricing, either
+// as a new round (POST) or as a correction of an unfinished one (PUT).
+type TradeCustomerQuoteRoundRequest struct {
 	Currency            string                        `json:"currency"`
 	ExchangeRateCNY     float64                       `json:"exchange_rate_cny"`
 	ProfitMarginPercent float64                       `json:"profit_margin_percent"`
@@ -914,6 +918,8 @@ type CreateTradeCustomerQuoteRequest struct {
 	Notes               string                        `json:"notes"`
 	Items               []TradeCustomerQuoteItemInput `json:"items" binding:"required,min=1,dive"`
 }
+
+type CreateTradeCustomerQuoteRequest = TradeCustomerQuoteRoundRequest
 
 type UpdateTradeCustomerQuoteStatusRequest struct {
 	Status           string `json:"status" binding:"required"`
