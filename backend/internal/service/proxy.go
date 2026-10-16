@@ -2,8 +2,11 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -11,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1296,80 +1300,152 @@ func (s *ProxyService) applyConsumers(settings *model.ProxySettings) error {
 // Subscription fetching
 // ---------------------------------------------------------------------------
 
+// subscriptionAttempt is one way of asking a panel for the subscription.
+// V2Board / XBoard style panels pick the output format from the User-Agent (or
+// a flag query parameter); one of the formats can be broken on a given panel
+// (the Clash template answers 500 when a node type is unsupported) while
+// another works, which is why a browser opens the link fine.
+type subscriptionAttempt struct {
+	label     string
+	userAgent string
+	flag      string
+}
+
+var subscriptionAttempts = []subscriptionAttempt{
+	{label: "Clash", userAgent: proxyUserAgent},
+	{label: "Clash (flag=clash)", userAgent: proxyUserAgent, flag: "flag=clash"},
+	{label: "Clash Meta", userAgent: "mihomo/1.19.0 ClashMeta"},
+	{label: "V2RayN", userAgent: "v2rayN/7.4"},
+	{label: "浏览器", userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"},
+	{label: "Clash Meta (flag=meta)", userAgent: "mihomo/1.19.0 ClashMeta", flag: "flag=meta"},
+}
+
+// proxySubscriptionBudget bounds all attempts together, so a slow panel cannot
+// keep the import request open for several minutes.
+const proxySubscriptionBudget = 90 * time.Second
+
+// subscriptionHTTPError is a non-200 answer. It is worth retrying with another
+// client identity, unlike a transport error (DNS, TLS, timeout) which would
+// fail the same way again.
+type subscriptionHTTPError struct {
+	status  int
+	summary string
+}
+
+func (err *subscriptionHTTPError) Error() string {
+	if err.summary == "" {
+		return fmt.Sprintf("订阅服务器返回 %d", err.status)
+	}
+	return fmt.Sprintf("订阅服务器返回 %d（%s）", err.status, err.summary)
+}
+
 // fetchSubscription downloads a subscription and makes sure the answer can be
-// parsed. Many panels need the Clash conversion flag (?flag=clash), but adding
-// it blindly breaks a few servers, so the URL is requested verbatim first and
-// only retried with the flag when the first answer is unusable.
+// parsed. The URL is first requested exactly as given; other client identities
+// and the conversion flags are only tried when that answer is unusable. The
+// token in the query string is always kept verbatim.
 func (s *ProxyService) fetchSubscription(rawURL string) (string, error) {
 	rawURL = strings.TrimSpace(rawURL)
-	payload, err := s.fetchSubscriptionOnce(rawURL)
+	target, err := s.validateSubscriptionURL(rawURL)
 	if err != nil {
 		return "", err
 	}
-	if _, parseErr := parseSubscriptionPayload(payload); parseErr == nil {
-		return payload, nil
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), proxySubscriptionBudget)
+	defer cancel()
 
-	target, parseURLErr := url.Parse(rawURL)
-	if parseURLErr != nil || hasSubscriptionFlag(target.RawQuery) {
-		// Nothing left to try; let the caller report the original error.
-		return payload, nil
+	flagPresent := hasSubscriptionFlag(target.RawQuery)
+	var (
+		unparsed  string
+		failures  []string
+		firstHTTP *subscriptionHTTPError
+	)
+	for _, attempt := range subscriptionAttempts {
+		if attempt.flag != "" && flagPresent {
+			continue
+		}
+		requestURL := *target
+		if attempt.flag != "" {
+			if requestURL.RawQuery == "" {
+				requestURL.RawQuery = attempt.flag
+			} else {
+				requestURL.RawQuery += "&" + attempt.flag
+			}
+		}
+		payload, fetchErr := s.fetchSubscriptionOnce(ctx, requestURL.String(), attempt.userAgent)
+		if fetchErr != nil {
+			var httpErr *subscriptionHTTPError
+			if !errors.As(fetchErr, &httpErr) {
+				if len(failures) == 0 && unparsed == "" {
+					return "", fmt.Errorf("下载订阅失败: %w", fetchErr)
+				}
+				// Earlier attempts already got an answer; a timeout now only
+				// means the budget ran out.
+				break
+			}
+			if firstHTTP == nil {
+				firstHTTP = httpErr
+			}
+			failures = append(failures, fmt.Sprintf("%s→%d", attempt.label, httpErr.status))
+			continue
+		}
+		if _, parseErr := parseSubscriptionPayload(payload); parseErr == nil {
+			if len(failures) > 0 || unparsed != "" {
+				log.Printf("proxy: 订阅以 %s 格式下载成功（之前失败: %s）", attempt.label, strings.Join(failures, ", "))
+			}
+			return payload, nil
+		}
+		if unparsed == "" {
+			unparsed = payload
+		}
+		failures = append(failures, attempt.label+"→无法解析")
 	}
-	flagged := *target
-	if flagged.RawQuery == "" {
-		flagged.RawQuery = "flag=clash"
-	} else {
-		flagged.RawQuery += "&flag=clash"
+	if unparsed != "" {
+		// Let ImportSubscription report the parse error for the first answer
+		// that actually came back; it explains more than a status code.
+		return unparsed, nil
 	}
-	retried, retryErr := s.fetchSubscriptionOnce(flagged.String())
-	if retryErr != nil {
-		return payload, nil
+	if firstHTTP == nil {
+		return "", fmt.Errorf("下载订阅失败")
 	}
-	if _, retryParseErr := parseSubscriptionPayload(retried); retryParseErr != nil {
-		return payload, nil
-	}
-	return retried, nil
+	return "", fmt.Errorf("下载订阅失败，%s。已尝试 %s，均未拿到可用内容。可在浏览器中打开订阅链接，复制页面内容后切换到「粘贴内容」导入",
+		firstHTTP.Error(), strings.Join(failures, "、"))
 }
 
 func hasSubscriptionFlag(rawQuery string) bool {
 	return strings.Contains(rawQuery, "flag=") || strings.Contains(rawQuery, "target=")
 }
 
-func (s *ProxyService) fetchSubscriptionOnce(rawURL string) (string, error) {
+func (s *ProxyService) validateSubscriptionURL(rawURL string) (*url.URL, error) {
 	target, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || target.Host == "" {
-		return "", fmt.Errorf("订阅链接格式不正确")
+		return nil, fmt.Errorf("订阅链接格式不正确")
 	}
 	if target.Scheme != "http" && target.Scheme != "https" {
-		return "", fmt.Errorf("订阅链接仅支持 http 或 https")
+		return nil, fmt.Errorf("订阅链接仅支持 http 或 https")
 	}
 	if !s.cfg.Proxy.AllowPrivateSubscription {
 		if err := rejectPrivateHost(target.Hostname()); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
+	return target, nil
+}
 
-	request, err := http.NewRequest(http.MethodGet, target.String(), nil)
+func (s *ProxyService) fetchSubscriptionOnce(ctx context.Context, rawURL, userAgent string) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", err
 	}
-	request.Header.Set("User-Agent", proxyUserAgent)
+	request.Header.Set("User-Agent", userAgent)
 	request.Header.Set("Accept", "*/*")
 
 	response, err := s.fetchClient.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("下载订阅失败: %w", err)
+		return "", err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		snippet := ""
-		if body, readErr := io.ReadAll(io.LimitReader(response.Body, 256)); readErr == nil {
-			snippet = summarizePayload(string(body))
-		}
-		if snippet == "" || snippet == "(空内容)" {
-			return "", fmt.Errorf("下载订阅失败，订阅服务器返回 %d", response.StatusCode)
-		}
-		return "", fmt.Errorf("下载订阅失败，订阅服务器返回 %d：%s", response.StatusCode, snippet)
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return "", &subscriptionHTTPError{status: response.StatusCode, summary: summarizeErrorBody(string(body))}
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, proxySubscriptionLimit+1))
 	if err != nil {
@@ -1380,9 +1456,30 @@ func (s *ProxyService) fetchSubscriptionOnce(rawURL string) (string, error) {
 	}
 	text := strings.TrimSpace(string(body))
 	if text == "" {
-		return "", fmt.Errorf("订阅内容为空")
+		return "", &subscriptionHTTPError{status: response.StatusCode, summary: "空内容"}
 	}
 	return text, nil
+}
+
+var htmlTitlePattern = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+
+// summarizeErrorBody turns an error page into something readable: the HTML
+// title when there is one, otherwise a short plain-text preview. Dumping the
+// first bytes of an HTML page only shows doctype and inline CSS.
+func summarizeErrorBody(body string) string {
+	if match := htmlTitlePattern.FindStringSubmatch(body); len(match) == 2 {
+		if title := strings.Join(strings.Fields(html.UnescapeString(match[1])), " "); title != "" {
+			return title
+		}
+	}
+	if strings.Contains(strings.ToLower(body), "<html") {
+		return "HTML 错误页"
+	}
+	summary := summarizePayload(body)
+	if summary == "(空内容)" {
+		return ""
+	}
+	return summary
 }
 
 func rejectPrivateHost(host string) error {
