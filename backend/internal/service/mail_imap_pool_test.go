@@ -5,14 +5,9 @@ import (
 	"time"
 )
 
-func pooledConn(idle, age time.Duration, broken bool) *pooledIMAPConn {
+func idleConn(accountID int64, route string, idle, age time.Duration) *pooledIMAPConn {
 	now := time.Now()
-	return &pooledIMAPConn{
-		accountID:  1,
-		broken:     broken,
-		createdAt:  now.Add(-age),
-		lastUsedAt: now.Add(-idle),
-	}
+	return &pooledIMAPConn{accountID: accountID, routeKey: route, createdAt: now.Add(-age), lastUsedAt: now.Add(-idle)}
 }
 
 func TestImapPoolReusable(t *testing.T) {
@@ -22,10 +17,9 @@ func TestImapPoolReusable(t *testing.T) {
 		conn *pooledIMAPConn
 		want bool
 	}{
-		{"fresh", pooledConn(time.Second, time.Minute, false), true},
-		{"idle past ttl", pooledConn(imapPoolIdleTTL+time.Second, time.Minute, false), false},
-		{"older than max age", pooledConn(time.Second, imapPoolMaxAge+time.Second, false), false},
-		{"broken", pooledConn(time.Second, time.Minute, true), false},
+		{"fresh", idleConn(1, "direct", time.Second, time.Minute), true},
+		{"idle past ttl", idleConn(1, "direct", imapPoolIdleTTL+time.Second, time.Minute), false},
+		{"older than max age", idleConn(1, "direct", time.Second, imapPoolMaxAge+time.Second), false},
 		{"nil", nil, false},
 	}
 	for _, tc := range cases {
@@ -35,34 +29,53 @@ func TestImapPoolReusable(t *testing.T) {
 	}
 }
 
-func TestImapPoolReleaseFailureDropsConnection(t *testing.T) {
+// A leased connection must leave the pool, otherwise two concurrent requests
+// would issue commands on the same IMAP socket.
+func TestImapPoolTakeRemovesLeasedConnection(t *testing.T) {
 	svc := &MailService{imapPool: map[int64][]*pooledIMAPConn{}}
-	conn := &pooledIMAPConn{accountID: 7, createdAt: time.Now(), lastUsedAt: time.Now()}
-	conn.mu.Lock()
-	svc.imapPool[7] = []*pooledIMAPConn{conn}
+	first := idleConn(7, "direct", time.Second, time.Minute)
+	second := idleConn(7, "direct", time.Second, time.Minute)
+	svc.imapPool[7] = []*pooledIMAPConn{first, second}
 
-	svc.releaseIMAP(conn, true)
+	taken := svc.takePooledIMAP(7, "direct")
+	if taken != first {
+		t.Fatalf("expected the first idle connection, got %+v", taken)
+	}
+	if len(svc.imapPool[7]) != 1 || svc.imapPool[7][0] != second {
+		t.Fatalf("leased connection is still pooled: %+v", svc.imapPool[7])
+	}
+	if svc.takePooledIMAP(7, "direct") != second || svc.takePooledIMAP(7, "direct") != nil {
+		t.Fatal("pool handed out a connection twice")
+	}
+}
 
-	if !conn.broken {
-		t.Fatal("a connection that failed was returned to the pool")
+func TestImapPoolSkipsConnectionsFromAnotherRoute(t *testing.T) {
+	svc := &MailService{imapPool: map[int64][]*pooledIMAPConn{}}
+	svc.imapPool[7] = []*pooledIMAPConn{idleConn(7, "socks5|proxy|7890", time.Second, time.Minute)}
+
+	if conn := svc.takePooledIMAP(7, "direct"); conn != nil {
+		t.Fatal("a connection dialled through the proxy was reused for a direct route")
 	}
 	if len(svc.imapPool[7]) != 0 {
-		t.Fatalf("pool still holds the failed connection: %+v", svc.imapPool[7])
+		t.Fatal("the mismatched connection should have been dropped")
+	}
+}
+
+func TestImapPoolReleaseFailureDropsConnection(t *testing.T) {
+	svc := &MailService{imapPool: map[int64][]*pooledIMAPConn{}}
+	svc.releaseIMAP(idleConn(7, "direct", 0, 0), true)
+	if len(svc.imapPool[7]) != 0 {
+		t.Fatalf("a failed connection was returned to the pool: %+v", svc.imapPool[7])
 	}
 }
 
 func TestImapPoolReleaseAtCapacity(t *testing.T) {
 	svc := &MailService{imapPool: map[int64][]*pooledIMAPConn{}}
-	full := make([]*pooledIMAPConn, 0, imapPoolMaxPerAcct)
 	for i := 0; i < imapPoolMaxPerAcct; i++ {
-		full = append(full, &pooledIMAPConn{accountID: 7, createdAt: time.Now(), lastUsedAt: time.Now()})
+		svc.releaseIMAP(idleConn(7, "direct", 0, 0), false)
 	}
-	svc.imapPool[7] = full
-
-	extra := &pooledIMAPConn{accountID: 7, createdAt: time.Now(), lastUsedAt: time.Now()}
-	extra.mu.Lock()
+	extra := idleConn(7, "direct", 0, 0)
 	svc.releaseIMAP(extra, false)
-
 	if len(svc.imapPool[7]) != imapPoolMaxPerAcct {
 		t.Fatalf("pool exceeded its capacity: %d", len(svc.imapPool[7]))
 	}
@@ -73,38 +86,18 @@ func TestImapPoolReleaseAtCapacity(t *testing.T) {
 	}
 }
 
-func TestImapPoolForgetConn(t *testing.T) {
+func TestImapPoolInvalidateRejectsLeasedConnection(t *testing.T) {
 	svc := &MailService{imapPool: map[int64][]*pooledIMAPConn{}}
-	first := &pooledIMAPConn{accountID: 7}
-	second := &pooledIMAPConn{accountID: 7}
-	other := &pooledIMAPConn{accountID: 8}
-	svc.imapPool[7] = []*pooledIMAPConn{first, second}
-	svc.imapPool[8] = []*pooledIMAPConn{other}
+	leased := idleConn(7, "direct", 0, 0)
+	svc.imapPool[8] = []*pooledIMAPConn{idleConn(8, "direct", 0, 0)}
 
-	svc.forgetIMAPConn(first)
-	if len(svc.imapPool[7]) != 1 || svc.imapPool[7][0] != second {
-		t.Fatalf("unexpected pool after forget: %+v", svc.imapPool[7])
+	svc.invalidateIMAPPool(7)
+	svc.releaseIMAP(leased, false)
+
+	if len(svc.imapPool[7]) != 0 {
+		t.Fatal("a connection leased before invalidation was returned to the pool")
 	}
-	if len(svc.imapPool[8]) != 1 || svc.imapPool[8][0] != other {
-		t.Fatal("forgetting a connection touched another account")
-	}
-}
-
-func TestImapPoolInvalidateDropsAccount(t *testing.T) {
-	svc := &MailService{imapPool: map[int64][]*pooledIMAPConn{}}
-	svc.imapPool[7] = []*pooledIMAPConn{{accountID: 7, client: nil}}
-	svc.imapPool[8] = []*pooledIMAPConn{{accountID: 8, client: nil}}
-
-	// Only the map entry is asserted; closing nil clients is guarded by the
-	// caller in production, so invalidate is exercised through the map state.
-	svc.imapPoolMu.Lock()
-	delete(svc.imapPool, 7)
-	svc.imapPoolMu.Unlock()
-
-	if _, ok := svc.imapPool[7]; ok {
-		t.Fatal("account 7 is still pooled after invalidation")
-	}
-	if _, ok := svc.imapPool[8]; !ok {
-		t.Fatal("account 8 was dropped with account 7")
+	if len(svc.imapPool[8]) != 1 {
+		t.Fatal("invalidating one account touched another")
 	}
 }
