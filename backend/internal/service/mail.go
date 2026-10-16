@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"net"
 	"net/http"
 	stdmail "net/mail"
@@ -838,14 +837,6 @@ func (s *MailService) buildOutgoingMessage(session *mailSession, input *model.Ma
 	if len(refs) > 0 {
 		header.SetMsgIDList("References", refs)
 	}
-	writer, err := gomail.CreateWriter(&buffer, header)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	inline, err := writer.CreateInline()
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
 	textBody := strings.TrimSpace(input.TextBody)
 	htmlBody := strings.TrimSpace(input.HTMLBody)
 	signatureHTML := session.account.SignatureHTML
@@ -867,45 +858,13 @@ func (s *MailService) buildOutgoingMessage(session *mailSession, input *model.Ma
 	if textBody == "" {
 		textBody = " "
 	}
-	var textHeader gomail.InlineHeader
-	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
-	textWriter, err := inline.CreatePart(textHeader)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	_, _ = io.WriteString(textWriter, textBody)
-	_ = textWriter.Close()
+	var images []mailInlineImage
 	if htmlBody != "" {
-		var htmlHeader gomail.InlineHeader
-		htmlHeader.Set("Content-Type", "text/html; charset=utf-8")
-		htmlWriter, err := inline.CreatePart(htmlHeader)
-		if err != nil {
-			return nil, "", time.Time{}, err
-		}
-		_, _ = io.WriteString(htmlWriter, s.htmlPolicy.Sanitize(htmlBody))
-		_ = htmlWriter.Close()
+		// Sanitise first: the policy only allows http(s)/mailto/data URLs, and
+		// the cid: references are produced by the extraction below.
+		htmlBody, images = extractMailInlineImages(s.htmlPolicy.Sanitize(htmlBody), hostname)
 	}
-	if err := inline.Close(); err != nil {
-		return nil, "", time.Time{}, err
-	}
-	for _, attachment := range attachments {
-		var attachmentHeader gomail.AttachmentHeader
-		contentType := strings.TrimSpace(attachment.ContentType)
-		if contentType == "" {
-			contentType = "application/octet-stream"
-		}
-		attachmentHeader.Set("Content-Type", contentType)
-		attachmentHeader.SetFilename(attachment.Filename)
-		attachmentWriter, err := writer.CreateAttachment(attachmentHeader)
-		if err != nil {
-			return nil, "", time.Time{}, err
-		}
-		if _, err := attachmentWriter.Write(attachment.Data); err != nil {
-			return nil, "", time.Time{}, err
-		}
-		_ = attachmentWriter.Close()
-	}
-	if err := writer.Close(); err != nil {
+	if err := writeMailBody(&buffer, header, textBody, htmlBody, images, attachments); err != nil {
 		return nil, "", time.Time{}, err
 	}
 	return buffer.Bytes(), messageID, sentAt, nil

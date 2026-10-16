@@ -20,6 +20,24 @@ interface MailBodyFrameProps {
   className?: string;
   /** Height used before the content is measured (and as the minimum). */
   minHeight?: number;
+  /** Called with every previewable image when one of them is clicked. */
+  onImageClick?: (images: MailFrameImage[], index: number) => void;
+}
+
+export interface MailFrameImage {
+  src: string;
+  alt: string;
+}
+
+// Logos, avatars and signature icons are too small to be worth a preview.
+const MIN_PREVIEW_SIZE = 48;
+
+function previewableImages(doc: Document): HTMLImageElement[] {
+  return Array.from(doc.images).filter(
+    (image) =>
+      Boolean(image.currentSrc || image.src) &&
+      (image.naturalWidth >= MIN_PREVIEW_SIZE || image.naturalHeight >= MIN_PREVIEW_SIZE),
+  );
 }
 
 export default function MailBodyFrame({
@@ -27,7 +45,10 @@ export default function MailBodyFrame({
   title,
   className = "",
   minHeight = 160,
+  onImageClick,
 }: MailBodyFrameProps) {
+  const imageClickRef = useRef(onImageClick);
+  imageClickRef.current = onImageClick;
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const [height, setHeight] = useState<number | null>(null);
   const [scaled, setScaled] = useState(false);
@@ -89,6 +110,20 @@ export default function MailBodyFrame({
         inner.observe(root);
       }
       doc.addEventListener("load", () => schedule(true), true);
+      doc.addEventListener("click", (event) => {
+        const handler = imageClickRef.current;
+        const target = event.target as Element | null;
+        const image = target?.closest?.("img") as HTMLImageElement | null;
+        if (!handler || !image) return;
+        const images = previewableImages(doc);
+        const index = images.indexOf(image);
+        if (index < 0) return;
+        event.preventDefault();
+        handler(
+          images.map((item) => ({ src: item.currentSrc || item.src, alt: item.alt || "" })),
+          index,
+        );
+      });
     };
     frame.addEventListener("load", handleLoad);
     if (frame.contentDocument?.readyState === "complete") handleLoad();

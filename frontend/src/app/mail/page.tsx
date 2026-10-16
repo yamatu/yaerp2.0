@@ -60,12 +60,23 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import { AuthGuard } from "@/components/auth/AuthGuard";
-import MailBodyFrame, { MAIL_FRAME_ROOT_ID } from "@/components/mail/MailBodyFrame";
+import MailBodyFrame, {
+  MAIL_FRAME_ROOT_ID,
+  type MailFrameImage,
+} from "@/components/mail/MailBodyFrame";
 import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
 import PullToRefresh from "@/components/mail/PullToRefresh";
 import SwipeableRow from "@/components/mail/SwipeableRow";
 import { FilePreviewModal, type FilePreviewItem } from "@/components/ui/FilePreviewModal";
 import api from "@/lib/api";
+import {
+  buildMailQuote,
+  buildOutgoingMail,
+  decorateMailThread,
+  decoratePlainThread,
+  htmlToPlainText,
+  type MailQuote,
+} from "@/lib/mailThread";
 import { getStoredUser, isAdmin } from "@/lib/auth";
 import type { AuthUser } from "@/types";
 
@@ -271,6 +282,8 @@ interface ComposeState {
   requestReadReceipt: boolean;
   context: "new" | "reply" | "forward";
   signatureID: "auto" | "none" | string;
+  /** Original message kept below the user's own text on reply / forward. */
+  quote: MailQuote | null;
 }
 
 interface MessageContextMenu {
@@ -323,6 +336,7 @@ const emptyCompose: ComposeState = {
   requestReadReceipt: false,
   context: "new",
   signatureID: "auto",
+  quote: null,
 };
 
 const emptySignature: MailSignatureInput = {
@@ -493,14 +507,11 @@ function textToHTML(value: string) {
 }
 
 function htmlToText(value: string) {
-  if (typeof document === "undefined") return value.replace(/<[^>]+>/g, " ");
-  const element = document.createElement("div");
-  element.innerHTML = value;
-  return element.textContent || "";
+  return htmlToPlainText(value);
 }
 
 function iframeDocument(html: string) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><base target="_blank"><style>html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;-webkit-text-size-adjust:100%}html{overflow-x:hidden}#${MAIL_FRAME_ROOT_ID}{display:flow-root}td,th{overflow-wrap:anywhere}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}table{max-width:100%;border-collapse:collapse}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body><div id="${MAIL_FRAME_ROOT_ID}">${html}</div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><base target="_blank"><style>img{cursor:zoom-in}html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;-webkit-text-size-adjust:100%}html{overflow-x:hidden}#${MAIL_FRAME_ROOT_ID}{display:flow-root}td,th{overflow-wrap:anywhere}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}table{max-width:100%;border-collapse:collapse}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body><div id="${MAIL_FRAME_ROOT_ID}">${html}</div></body></html>`;
 }
 
 const mailFrameSandbox = "allow-popups allow-popups-to-escape-sandbox";
@@ -607,6 +618,15 @@ export default function MailPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [compose, setCompose] = useState<ComposeState | null>(null);
   const [composeView, setComposeView] = useState<"edit" | "preview">("edit");
+  const composeBodyRef = useRef<HTMLTextAreaElement | null>(null);
+  // Set when a reply / forward opens, so the caret lands at the top of the
+  // empty body ready for typing.
+  const focusComposeBodyRef = useRef(false);
+  const [quoteExpanded, setQuoteExpanded] = useState(true);
+  const [inlineImagePreview, setInlineImagePreview] = useState<{
+    items: FilePreviewItem[];
+    index: number;
+  } | null>(null);
   const [composeFiles, setComposeFiles] = useState<globalThis.File[]>([]);
   const [sending, setSending] = useState(false);
   const [bulkJobs, setBulkJobs] = useState<MailBulkJob[]>([]);
@@ -764,14 +784,33 @@ export default function MailPage() {
     compose?.signatureID === "none"
       ? ""
       : activeSignature?.html_content || account?.signature_html || "";
+  const composeOutgoing = useMemo(
+    () =>
+      compose
+        ? buildOutgoingMail({
+            format: compose.format,
+            textBody: compose.textBody,
+            htmlBody: compose.htmlBody,
+            quote: compose.quote,
+            signatureHTML: activeSignatureHTML,
+          })
+        : null,
+    [activeSignatureHTML, compose],
+  );
   const composePreview = useMemo(() => {
-    if (!compose) return "";
+    if (!compose || !composeOutgoing) return "";
+    if (compose.quote?.include) return composeOutgoing.html;
     const body =
       compose.format === "html"
         ? compose.htmlBody
         : textToHTML(compose.textBody);
     return `${body}${activeSignatureHTML ? `<br><br>${activeSignatureHTML}` : ""}`;
-  }, [activeSignatureHTML, compose]);
+  }, [activeSignatureHTML, compose, composeOutgoing]);
+  const composeQuoteDisplay = useMemo(
+    () =>
+      compose?.quote ? iframeDocument(decorateMailThread(compose.quote.html)) : "",
+    [compose?.quote],
+  );
   const hasActiveBulkJobs = bulkJobs.some(
     (job) => job.status === "queued" || job.status === "running",
   );
@@ -784,8 +823,8 @@ export default function MailPage() {
         )
         .join("");
     }
-    if (selected?.html_body) return selected.html_body;
-    return textToHTML(selected?.text_body || "（无正文）");
+    if (selected?.html_body) return decorateMailThread(selected.html_body);
+    return decoratePlainThread(selected?.text_body || "（无正文）");
   }, [selected, translation]);
 
   const loadAccount = useCallback(async () => {
@@ -998,6 +1037,26 @@ export default function MailPage() {
     oscillator.stop(now + 0.3);
   }, [account?.user_id]);
 
+  const previewFrameImages = useCallback(
+    (images: MailFrameImage[], index: number) => {
+      setInlineImagePreview({
+        items: images.map((image, position) => {
+          const dataType = image.src.startsWith("data:")
+            ? image.src.slice(5, image.src.search(/[;,]/))
+            : "";
+          return {
+            key: `${position}:${image.src.slice(-48)}`,
+            name: image.alt || `邮件图片 ${position + 1}`,
+            url: image.src,
+            mimeType: dataType.startsWith("image/") ? dataType : "image/*",
+          };
+        }),
+        index,
+      });
+    },
+    [],
+  );
+
   const pollMailSummary = useCallback(async () => {
     if (!account || mailStatusPollingRef.current) return;
     mailStatusPollingRef.current = true;
@@ -1087,6 +1146,19 @@ export default function MailPage() {
   useEffect(() => {
     setSenderCardOpen(false);
   }, [selected?.folder, selected?.uid]);
+  useEffect(() => {
+    if (!compose || !focusComposeBodyRef.current) return;
+    focusComposeBodyRef.current = false;
+    setQuoteExpanded(true);
+    const timer = window.setTimeout(() => {
+      const body = composeBodyRef.current;
+      if (!body) return;
+      body.focus();
+      body.setSelectionRange(0, 0);
+      body.scrollTop = 0;
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, [compose]);
   useEffect(() => {
     if (!account || !hasActiveBulkJobs) return;
     const timer = window.setInterval(() => void loadBulkJobs(), 2000);
@@ -1674,22 +1746,18 @@ export default function MailPage() {
   ) => {
     const ownAddress = account?.email_address.toLowerCase();
     const baseSubject = detail.subject.replace(/^(re|fwd):\s*/i, "");
-    const sender = mailAddressLabel(detail.from);
-    // Phones reply in plain text: editing the quoted HTML source on a small
-    // touch keyboard is not workable. The HTML quote is kept in the state, so
-    // switching the format back to HTML still works.
     const phone = isMobileViewport();
-    const quotedText = `\n\n\n--- ${sender} 于 ${formatDate(detail.date, true)} 写道 ---\n${detail.text_body || htmlToText(detail.html_body || "").trim()}`;
-    const originalHTML = detail.html_body || textToHTML(detail.text_body || "");
-    const quotedHTML = `<p><br></p><blockquote style="margin:0;padding-left:14px;border-left:3px solid #cbd5e1"><div style="color:#64748b">${escapeHTML(sender)} 于 ${escapeHTML(formatDate(detail.date, true))} 写道：</div>${originalHTML}</blockquote>`;
+    // Replies and forwards start with an empty plain-text box at the top; the
+    // original stays below as a formatted quote (tables and images intact)
+    // and is attached under the user's text when sending.
+    const quote = buildMailQuote(detail);
     if (mode === "forward") {
+      focusComposeBodyRef.current = true;
       setCompose({
         ...emptyCompose,
         context: "forward",
         subject: `Fwd: ${baseSubject}`,
-        textBody: quotedText,
-        htmlBody: quotedHTML,
-        format: detail.html_body ? "html" : "text",
+        quote,
         references: [
           ...(detail.references || []),
           detail.message_id || "",
@@ -1726,15 +1794,14 @@ export default function MailPage() {
                 ),
             )
           : [];
+      focusComposeBodyRef.current = true;
       setCompose({
         ...emptyCompose,
         context: "reply",
         to: addressValues(replyTargets),
         cc: addressValues(all),
         subject: `Re: ${baseSubject}`,
-        textBody: quotedText,
-        htmlBody: quotedHTML,
-        format: detail.html_body && !phone ? "html" : "text",
+        quote,
         inReplyTo: detail.message_id || "",
         references: [
           ...(detail.references || []),
@@ -1743,12 +1810,10 @@ export default function MailPage() {
       });
       setComposeFiles([]);
     }
-    // Forwarding an HTML mail on a phone opens on the rendered preview rather
+    // Re-editing an HTML mail on a phone opens on the rendered preview rather
     // than on the raw markup.
     setComposeView(
-      phone && detail.html_body && (mode === "forward" || mode === "edit")
-        ? "preview"
-        : "edit",
+      phone && detail.html_body && mode === "edit" ? "preview" : "edit",
     );
   };
 
@@ -1783,11 +1848,15 @@ export default function MailPage() {
     setError("");
     try {
       const form = new FormData();
-      const htmlBody = compose.format === "html" ? compose.htmlBody : "";
-      const textBody =
-        compose.format === "html"
-          ? htmlToText(compose.htmlBody)
-          : compose.textBody;
+      const outgoing = buildOutgoingMail({
+        format: compose.format,
+        textBody: compose.textBody,
+        htmlBody: compose.htmlBody,
+        quote: compose.quote,
+        signatureHTML: activeSignatureHTML,
+      });
+      const htmlBody = outgoing.html;
+      const textBody = outgoing.text;
       const message = {
         to: compose.bulk ? [] : recipients,
         cc: compose.bulk ? [] : splitAddresses(compose.cc),
@@ -1800,7 +1869,7 @@ export default function MailPage() {
         save_to_sent: true,
         priority: compose.priority,
         request_read_receipt: compose.requestReadReceipt,
-        signature_html: activeSignatureHTML,
+        signature_html: outgoing.signatureHTML,
       };
       form.append(
         "payload",
@@ -3841,6 +3910,7 @@ export default function MailPage() {
                       key={messageKey(selected)}
                       title="邮件正文"
                       srcDoc={iframeDocument(displayedMailHTML)}
+                      onImageClick={previewFrameImages}
                     />
                   </div>
                 </div>
@@ -3926,6 +3996,18 @@ export default function MailPage() {
           }}
           onClose={closeAttachmentPreview}
           emptyHint="该附件类型暂不支持在线预览，请下载后查看。"
+        />
+      )}
+      {inlineImagePreview && (
+        <FilePreviewModal
+          items={inlineImagePreview.items}
+          index={inlineImagePreview.index}
+          onIndexChange={(next) =>
+            setInlineImagePreview((current) =>
+              current ? { ...current, index: next } : current,
+            )
+          }
+          onClose={() => setInlineImagePreview(null)}
         />
       )}
       {attachmentPreviewLoading && (
@@ -5329,6 +5411,7 @@ export default function MailPage() {
                 />
               ) : (
                 <textarea
+                  ref={composeBodyRef}
                   value={compose.textBody}
                   onChange={(event) =>
                     setCompose((current) =>
@@ -5337,9 +5420,69 @@ export default function MailPage() {
                         : current,
                     )
                   }
-                  placeholder="邮件正文"
-                  className="mt-3 min-h-[40vh] w-full sm:min-h-[42dvh] resize-y rounded-lg border border-slate-200 p-3 text-sm leading-7 outline-none focus:border-sky-400"
+                  placeholder={
+                    compose.quote
+                      ? compose.context === "forward"
+                        ? "在这里输入转发说明…"
+                        : "在这里输入回复内容…"
+                      : "邮件正文"
+                  }
+                  className={`mt-3 w-full resize-y rounded-lg border border-slate-200 p-3 text-sm leading-7 outline-none focus:border-sky-400 ${compose.quote ? "min-h-[22vh] sm:min-h-[200px]" : "min-h-[40vh] sm:min-h-[42dvh]"}`}
                 />
+              )}
+              {compose.quote && composeView === "edit" && (
+                <div className="mt-4">
+                  <div className="flex items-center gap-2">
+                    <div className="h-0.5 flex-1 bg-sky-500" />
+                    <span className="shrink-0 rounded-full bg-sky-500 px-3 py-0.5 text-[11px] font-semibold text-white">
+                      {compose.context === "forward" ? "转发的原邮件" : "原邮件 · 往来记录"}
+                    </span>
+                    <div className="h-0.5 flex-1 bg-sky-500" />
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+                    <label className="inline-flex items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        checked={compose.quote.include}
+                        onChange={(event) =>
+                          setCompose((current) =>
+                            current?.quote
+                              ? {
+                                  ...current,
+                                  quote: {
+                                    ...current.quote,
+                                    include: event.target.checked,
+                                  },
+                                }
+                              : current,
+                          )
+                        }
+                        className="h-3.5 w-3.5 accent-sky-600"
+                      />
+                      随邮件一起发送原邮件（保留表格和图片）
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setQuoteExpanded((current) => !current)}
+                      className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-sky-700 hover:bg-sky-50"
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                      {quoteExpanded ? "收起原邮件" : "展开原邮件"}
+                    </button>
+                  </div>
+                  {quoteExpanded && (
+                    <div
+                      className={`mt-2 overflow-hidden rounded-lg border border-slate-200 bg-white px-3 py-2 ${compose.quote.include ? "" : "opacity-50"}`}
+                    >
+                      <MailBodyFrame
+                        title="原邮件"
+                        srcDoc={composeQuoteDisplay}
+                        minHeight={120}
+                        onImageClick={previewFrameImages}
+                      />
+                    </div>
+                  )}
+                </div>
               )}
               {composeFiles.length > 0 && (
                 <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
