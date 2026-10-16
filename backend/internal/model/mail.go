@@ -42,6 +42,7 @@ type MailAccount struct {
 	ClientSecretConfigured bool       `json:"client_secret_configured"`
 	IsDefault              bool       `json:"is_default"`
 	SignatureHTML          string     `json:"signature_html"`
+	ProxyMode              string     `json:"proxy_mode"`
 	Enabled                bool       `json:"enabled"`
 	AutoForwardEnabled     bool       `json:"auto_forward_enabled"`
 	AutoForwardTo          []string   `json:"auto_forward_to"`
@@ -67,6 +68,7 @@ type MailAccountInput struct {
 	ClientSecret       string   `json:"client_secret"`
 	IsDefault          bool     `json:"is_default"`
 	SignatureHTML      string   `json:"signature_html"`
+	ProxyMode          string   `json:"proxy_mode"`
 	Enabled            bool     `json:"enabled"`
 	AutoForwardEnabled bool     `json:"auto_forward_enabled"`
 	AutoForwardTo      []string `json:"auto_forward_to"`

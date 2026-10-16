@@ -1699,22 +1699,90 @@ func (r *TradeRepo) CreateCustomerQuoteRound(round *model.TradeCustomerQuoteRoun
 	if round.Status == "accepted" {
 		itemStatus = "客户确认"
 	}
-	for _, item := range round.Items {
-		result, err := tx.Exec(
-			`UPDATE trade_order_items SET quoted_price=$3,status=$4,updated_at=NOW() WHERE id=$1 AND order_id=$2`,
-			item.OrderItemID, round.OrderID, item.UnitPrice, itemStatus,
-		)
-		if err != nil {
-			return err
-		}
-		if affected, _ := result.RowsAffected(); affected == 0 {
-			return fmt.Errorf("customer quote item %d does not belong to order", item.OrderItemID)
+	// A draft is private to the salesman: it must not overwrite the prices and
+	// statuses the order already carries from an earlier round.
+	if round.Status != "draft" {
+		for _, item := range round.Items {
+			result, err := tx.Exec(
+				`UPDATE trade_order_items SET quoted_price=$3,status=$4,updated_at=NOW() WHERE id=$1 AND order_id=$2`,
+				item.OrderItemID, round.OrderID, item.UnitPrice, itemStatus,
+			)
+			if err != nil {
+				return err
+			}
+			if affected, _ := result.RowsAffected(); affected == 0 {
+				return fmt.Errorf("customer quote item %d does not belong to order", item.OrderItemID)
+			}
 		}
 	}
 	if _, err := tx.Exec(`UPDATE trade_orders SET currency=$2,total_amount=$3,quoted_goods_amount=$4,
 	 quote_exchange_rate_cny=$5,freight_mode=$6,quoted_freight_amount=$7,updated_at=NOW()
 	 WHERE id=$1 AND deleted_at IS NULL`,
 		round.OrderID, round.Currency, round.TotalAmount, round.GoodsAmount, round.ExchangeRateCNY,
+		round.FreightMode, round.FreightAmount); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UpdateCustomerQuoteRound rewrites a round that has not been answered yet.
+// Accepting is final, so accepted and superseded rounds are refused here as
+// well as in the service.
+func (r *TradeRepo) UpdateCustomerQuoteRound(orderID int64, round *model.TradeCustomerQuoteRound) error {
+	if round == nil || round.ID <= 0 || round.OrderID != orderID || len(round.Items) == 0 {
+		return fmt.Errorf("invalid customer quote round")
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var stage, status string
+	if err := tx.QueryRow(`SELECT stage FROM trade_orders WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, orderID).Scan(&stage); err != nil {
+		return err
+	}
+	if stage != model.TradeStageQuotation {
+		return fmt.Errorf("trade order is not in customer quotation stage")
+	}
+	if err := tx.QueryRow(`SELECT status FROM trade_customer_quote_rounds WHERE id=$1 AND order_id=$2 FOR UPDATE`, round.ID, orderID).Scan(&status); err != nil {
+		return err
+	}
+	if status != "draft" && status != "sent" {
+		return fmt.Errorf("customer quote round %d can no longer be changed", round.ID)
+	}
+	itemsRaw, err := json.Marshal(round.Items)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE trade_customer_quote_rounds SET currency=$3,status=$4::varchar(24),
+	 goods_amount=$5,exchange_rate_cny=$6,profit_margin_percent=$7,freight_mode=$8,freight_amount=$9,
+	 total_amount=$10,total_amount_cny=$11,item_prices=$12,customer_feedback=$13,notes=$14,
+	 sent_at=CASE WHEN $4::varchar(24)='sent' THEN COALESCE(sent_at,NOW()) ELSE sent_at END,updated_at=NOW()
+	 WHERE id=$1 AND order_id=$2`,
+		round.ID, orderID, round.Currency, round.Status, round.GoodsAmount, round.ExchangeRateCNY,
+		round.ProfitMarginPercent, round.FreightMode, round.FreightAmount, round.TotalAmount, round.TotalAmountCNY,
+		itemsRaw, round.CustomerFeedback, round.Notes,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE trade_order_items SET workflow_data=workflow_data-'customer_declined',updated_at=NOW()
+	 WHERE order_id=$1 AND workflow_data ? 'customer_declined'`, orderID); err != nil {
+		return err
+	}
+	if round.Status != "draft" {
+		for _, item := range round.Items {
+			if _, err := tx.Exec(
+				`UPDATE trade_order_items SET quoted_price=$3,status='已报价',updated_at=NOW() WHERE id=$1 AND order_id=$2`,
+				item.OrderItemID, orderID, item.UnitPrice,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`UPDATE trade_orders SET currency=$2,total_amount=$3,quoted_goods_amount=$4,
+	 quote_exchange_rate_cny=$5,freight_mode=$6,quoted_freight_amount=$7,updated_at=NOW()
+	 WHERE id=$1 AND deleted_at IS NULL`,
+		orderID, round.Currency, round.TotalAmount, round.GoodsAmount, round.ExchangeRateCNY,
 		round.FreightMode, round.FreightAmount); err != nil {
 		return err
 	}
@@ -1799,7 +1867,7 @@ func (r *TradeRepo) UpdateCustomerQuoteRoundStatus(orderID, quoteID int64, statu
 		}
 		if !otherAccepted {
 			for _, item := range round.Items {
-				if _, err := tx.Exec(`UPDATE trade_order_items SET status='已报价',workflow_data=workflow_data-'customer_declined',updated_at=NOW() WHERE id=$1 AND order_id=$2`, item.OrderItemID, orderID); err != nil {
+				if _, err := tx.Exec(`UPDATE trade_order_items SET quoted_price=$3,status='已报价',workflow_data=workflow_data-'customer_declined',updated_at=NOW() WHERE id=$1 AND order_id=$2`, item.OrderItemID, orderID, item.UnitPrice); err != nil {
 					return err
 				}
 			}

@@ -73,6 +73,10 @@ type MailService struct {
 	aliTokenCalls map[int64]*aliMailTokenCall
 	aliContactMu  sync.Mutex
 	aliContacts   map[int64]aliMailContactCache
+	aliFolderMu   sync.Mutex
+	aliFolders    map[int64]aliMailFolderCache
+	imapPoolMu    sync.Mutex
+	imapPool      map[int64][]*pooledIMAPConn
 	aliHTTPMu     sync.Mutex
 	aliHTTPClient map[string]*http.Client
 	aliRateMu     sync.Mutex
@@ -113,6 +117,7 @@ func NewMailService(mailRepo *repo.MailRepo, permSvc *PermissionService, encrypt
 		aliTokens:     make(map[int64]aliMailToken),
 		aliTokenCalls: make(map[int64]*aliMailTokenCall),
 		aliContacts:   make(map[int64]aliMailContactCache),
+		aliFolders:    make(map[int64]aliMailFolderCache),
 		aliHTTPClient: make(map[string]*http.Client),
 		bulkSendSem:   make(chan struct{}, 4),
 	}
@@ -341,14 +346,16 @@ func (s *MailService) TestOwnAccount(userID int64, input *model.MailAccountInput
 		return nil, err
 	}
 	result := &model.MailConnectionTest{Provider: "imap"}
-	imapConn, err := s.connectIMAP(settings, account.LoginUsername, secret)
+	// The probe connection is deliberately not pooled: it authenticates
+	// credentials that may be about to change.
+	imapConn, err := s.connectIMAP(settings, account, account.LoginUsername, secret)
 	if err != nil {
 		result.Message = "IMAP 连接失败: " + cleanMailError(err)
 		return result, fmt.Errorf("%s", result.Message)
 	}
 	result.IMAPConnected = true
 	_ = imapConn.Logout()
-	smtpConn, err := s.connectSMTP(settings, account.LoginUsername, secret)
+	smtpConn, err := s.connectSMTP(settings, account, account.LoginUsername, secret)
 	if err != nil {
 		result.Message = "SMTP 连接失败: " + cleanMailError(err)
 		return result, fmt.Errorf("%s", result.Message)
@@ -432,13 +439,13 @@ func (s *MailService) Summary(userID int64) (*model.MailSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.connectIMAP(settings, account.LoginUsername, password)
+	conn, releaseIMAP, err := s.acquireIMAP(&mailSession{settings: settings, account: account, password: password})
 	if err != nil {
 		_ = s.repo.UpdateAccountStatus(account.ID, false, false, cleanMailError(err))
 		result.LastError = cleanMailError(err)
 		return result, nil
 	}
-	defer conn.Logout()
+	defer func() { releaseIMAP(err) }()
 	status, err := conn.Status(imap.InboxName, []imap.StatusItem{imap.StatusMessages, imap.StatusUnseen})
 	if err != nil {
 		_ = s.repo.UpdateAccountStatus(account.ID, false, false, cleanMailError(err))
@@ -467,16 +474,18 @@ func (s *MailService) ListFolders(userID int64) ([]model.MailFolder, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.connectIMAP(session.settings, session.account.LoginUsername, session.password)
+	conn, releaseIMAP, err := s.acquireIMAP(session)
 	if err != nil {
 		s.recordFailure(userID, err)
 		return nil, err
 	}
-	defer conn.Logout()
-	folders, err := listMailFolders(conn)
-	if err != nil {
-		s.recordFailure(userID, err)
-		return nil, err
+	var opErr error
+	defer func() { releaseIMAP(opErr) }()
+	folders, listErr := listMailFolders(conn)
+	if listErr != nil {
+		opErr = listErr
+		s.recordFailure(userID, listErr)
+		return nil, listErr
 	}
 	_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	return folders, nil
@@ -756,7 +765,7 @@ func (s *MailService) sendMessageForAccount(account *model.MailAccount, input *m
 	if err != nil {
 		return nil, err
 	}
-	smtpConn, err := s.connectSMTP(session.settings, session.account.LoginUsername, session.password)
+	smtpConn, err := s.connectSMTP(session.settings, session.account, session.account.LoginUsername, session.password)
 	if err != nil {
 		s.recordFailure(account.UserID, err)
 		return nil, err
@@ -990,6 +999,7 @@ func (s *MailService) accountFromInput(userID, accountID int64, input *model.Mai
 		EmailAddress: emailAddress, DisplayName: strings.TrimSpace(input.DisplayName),
 		SignatureHTML: s.htmlPolicy.Sanitize(input.SignatureHTML), Enabled: enabled,
 		IsDefault: isDefault,
+		ProxyMode: normalizeMailAccountProxyMode(input.ProxyMode, existing),
 	}
 	if account.DisplayName == "" && existing != nil {
 		account.DisplayName = existing.DisplayName
@@ -1087,12 +1097,12 @@ func (s *MailService) verifyMailAccount(account *model.MailAccount, secret strin
 }
 
 func (s *MailService) verifyConnections(settings *model.MailServerSettings, account *model.MailAccount, password string) error {
-	imapConn, err := s.connectIMAP(settings, account.LoginUsername, password)
+	imapConn, err := s.connectIMAP(settings, account, account.LoginUsername, password)
 	if err != nil {
 		return fmt.Errorf("IMAP 登录失败: %w", err)
 	}
 	_ = imapConn.Logout()
-	smtpConn, err := s.connectSMTP(settings, account.LoginUsername, password)
+	smtpConn, err := s.connectSMTP(settings, account, account.LoginUsername, password)
 	if err != nil {
 		return fmt.Errorf("SMTP 登录失败: %w", err)
 	}
@@ -1115,15 +1125,16 @@ func (s *MailService) withIMAP(userID int64, fn func(*imapclient.Client) error) 
 	if err != nil {
 		return err
 	}
-	conn, err := s.connectIMAP(session.settings, session.account.LoginUsername, session.password)
+	conn, releaseIMAP, err := s.acquireIMAP(session)
 	if err != nil {
 		s.recordFailure(userID, err)
 		return err
 	}
-	defer conn.Logout()
-	if err := fn(conn); err != nil {
-		s.recordFailure(userID, err)
-		return err
+	opErr := fn(conn)
+	releaseIMAP(opErr)
+	if opErr != nil {
+		s.recordFailure(userID, opErr)
+		return opErr
 	}
 	_ = s.repo.UpdateAccountStatus(session.account.ID, false, true, "")
 	return nil
@@ -1144,10 +1155,10 @@ func (s *MailService) recordFailure(userID int64, err error) {
 	}
 }
 
-func (s *MailService) connectIMAP(settings *model.MailServerSettings, username, password string) (*imapclient.Client, error) {
+func (s *MailService) connectIMAP(settings *model.MailServerSettings, account *model.MailAccount, username, password string) (*imapclient.Client, error) {
 	address := net.JoinHostPort(settings.IMAPHost, fmt.Sprintf("%d", settings.IMAPPort))
 	tlsConfig := &tls.Config{ServerName: settings.IMAPHost, MinVersion: tls.VersionTLS12, InsecureSkipVerify: settings.AllowInsecureTLS} // #nosec G402 -- explicit administrator option for private poste.io deployments.
-	dialer, err := s.mailDialer(settings)
+	dialer, err := s.mailDialer(settings, account)
 	if err != nil {
 		return nil, err
 	}
@@ -1175,9 +1186,9 @@ func (s *MailService) connectIMAP(settings *model.MailServerSettings, username, 
 	return conn, nil
 }
 
-func (s *MailService) mailDialer(settings *model.MailServerSettings) (imapclient.Dialer, error) {
+func (s *MailService) mailDialer(settings *model.MailServerSettings, account *model.MailAccount) (imapclient.Dialer, error) {
 	base := &net.Dialer{Timeout: mailConnectionTimeout}
-	proxySettings := s.mailProxySettings(settings)
+	proxySettings := s.mailProxySettings(settings, account)
 	if proxySettings == nil || normalizeMailProxyType(proxySettings.ProxyType) == "none" {
 		return base, nil
 	}
@@ -1211,9 +1222,34 @@ func (s *MailService) SetProxyOverrideProvider(provider func() *model.MailServer
 	s.proxyOverrideProvider = provider
 }
 
-// mailProxySettings resolves which proxy configuration must be used. A global
-// override returned by the XTLS/Mihomo switch always wins.
-func (s *MailService) mailProxySettings(settings *model.MailServerSettings) *model.MailServerSettings {
+// mailProxySettings resolves which proxy configuration must be used for one
+// mailbox. The mailbox setting wins over the global XTLS/Mihomo switch:
+// "on" always uses the core, "off" always connects directly.
+func (s *MailService) mailProxySettings(settings *model.MailServerSettings, account *model.MailAccount) *model.MailServerSettings {
+	mode := ""
+	if account != nil {
+		mode = strings.ToLower(strings.TrimSpace(account.ProxyMode))
+	}
+	switch {
+	case mode == "off":
+		if settings == nil {
+			return &model.MailServerSettings{ProxyType: "none"}
+		}
+		direct := *settings
+		direct.ProxyType = "none"
+		return &direct
+	case mode == "on":
+		if s.proxyOverrideProvider == nil {
+			return settings
+		}
+		// A mailbox that forces the proxy still prefers the per-mail server
+		// SOCKS5 settings when the core switch is off, so an explicit mailbox
+		// choice keeps working without the global toggle.
+		if override := s.proxyOverrideProvider(); override != nil {
+			return override
+		}
+		return settings
+	}
 	if s.proxyOverrideProvider == nil {
 		return settings
 	}
@@ -1223,10 +1259,10 @@ func (s *MailService) mailProxySettings(settings *model.MailServerSettings) *mod
 	return settings
 }
 
-func (s *MailService) connectSMTP(settings *model.MailServerSettings, username, password string) (*smtp.Client, error) {
+func (s *MailService) connectSMTP(settings *model.MailServerSettings, account *model.MailAccount, username, password string) (*smtp.Client, error) {
 	address := net.JoinHostPort(settings.SMTPHost, fmt.Sprintf("%d", settings.SMTPPort))
 	tlsConfig := &tls.Config{ServerName: settings.SMTPHost, MinVersion: tls.VersionTLS12, InsecureSkipVerify: settings.AllowInsecureTLS} // #nosec G402 -- explicit administrator option for private poste.io deployments.
-	dialer, err := s.mailDialer(settings)
+	dialer, err := s.mailDialer(settings, account)
 	if err != nil {
 		return nil, err
 	}
@@ -1301,27 +1337,34 @@ func sendSMTPMessage(client *smtp.Client, from string, recipients []string, raw 
 }
 
 func (s *MailService) appendSentMessage(session *mailSession, raw []byte, sentAt time.Time) error {
-	conn, err := s.connectIMAP(session.settings, session.account.LoginUsername, session.password)
+	conn, releaseIMAP, err := s.acquireIMAP(session)
 	if err != nil {
 		return err
 	}
-	defer conn.Logout()
+	var opErr error
+	defer func() { releaseIMAP(opErr) }()
 	folders, err := listMailFolders(conn)
 	if err != nil {
+		opErr = err
 		return err
 	}
 	sentFolder := folderForRole(folders, "sent")
 	if sentFolder == "" {
 		sentFolder = "Sent"
 		if err := conn.Create(sentFolder); err != nil && !strings.Contains(strings.ToLower(err.Error()), "exist") {
+			opErr = err
 			return err
 		}
 	}
-	return conn.Append(sentFolder, []string{imap.SeenFlag}, sentAt, bytes.NewReader(raw))
+	if err := conn.Append(sentFolder, []string{imap.SeenFlag}, sentAt, bytes.NewReader(raw)); err != nil {
+		opErr = err
+		return err
+	}
+	return nil
 }
 
 func (s *MailService) currentInboxCursor(settings *model.MailServerSettings, account *model.MailAccount, password string) (uint32, uint32, error) {
-	conn, err := s.connectIMAP(settings, account.LoginUsername, password)
+	conn, err := s.connectIMAP(settings, account, account.LoginUsername, password)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1475,6 +1518,32 @@ func normalizeMailProxyType(value string) string {
 		return "socks5"
 	}
 	return "none"
+}
+
+// Mailbox proxy modes. "global" follows the XTLS core's 邮箱流量 switch, "on"
+// and "off" let a single mailbox opt in or out of the proxy regardless of it.
+const (
+	mailProxyModeGlobal = "global"
+	mailProxyModeOn     = "on"
+	mailProxyModeOff    = "off"
+)
+
+// normalizeMailAccountProxyMode resolves the mode saved from the settings form.
+// An empty value keeps whatever the account already had, so a partial update
+// (for example renaming a mailbox) does not silently reset the choice.
+func normalizeMailAccountProxyMode(value string, existing *model.MailAccount) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case mailProxyModeOn:
+		return mailProxyModeOn
+	case mailProxyModeOff:
+		return mailProxyModeOff
+	case mailProxyModeGlobal:
+		return mailProxyModeGlobal
+	}
+	if existing != nil {
+		return normalizeMailAccountProxyMode(existing.ProxyMode, nil)
+	}
+	return mailProxyModeGlobal
 }
 
 func normalizeMailForwardAddresses(ownAddress string, values []string) ([]string, error) {

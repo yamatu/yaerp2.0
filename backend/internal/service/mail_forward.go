@@ -80,7 +80,7 @@ func (s *MailService) processForwardingAccount(settings *model.MailServerSetting
 	if err != nil {
 		return err
 	}
-	conn, err := s.connectIMAP(settings, account.LoginUsername, password)
+	conn, err := s.connectIMAP(settings, account, account.LoginUsername, password)
 	if err != nil {
 		return err
 	}
@@ -198,7 +198,7 @@ func (s *MailService) forwardParsedMessage(settings *model.MailServerSettings, a
 	if err != nil {
 		return err
 	}
-	smtpConn, err := s.connectSMTP(settings, account.LoginUsername, password)
+	smtpConn, err := s.connectSMTP(settings, account, account.LoginUsername, password)
 	if err != nil {
 		return err
 	}
