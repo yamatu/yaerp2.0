@@ -222,5 +222,6 @@ version=... controller=...` 表示已恢复。如果 `docker compose ps` 显示�
 | 改了代理端口后宿主机连不上 | 容器内部的 AI / WhatsApp / 邮箱会立即生效；宿主机需要同步 `.env` 的 `MIHOMO_MIXED_PORT` / `MIHOMO_PUBLISH_PORT` 并重建 proxy 容器 |
 | 连接成功但 WhatsApp 仍然直连 | 打开 WhatsApp 开关后会自动重启会话；若仍失败请重启该员工账号 |
 | 邮箱打不开 | 邮箱走 SOCKS5（内核 mixed 端口）。关闭邮箱开关即可恢复直连 |
+| 导入订阅提示“订阅服务器返回 500（Server Error）”，浏览器却能打开 | V2Board/XBoard 面板按 User-Agent 选择输出格式，某种格式的模板坏了就会 500。后端会依次以 Clash、Clash Meta、V2RayN、浏览器身份重试，拿到第一份能解析的内容为止；全部失败时可在浏览器打开订阅链接，复制内容后用“粘贴内容”导入 |
 | 切换节点无效果 | 节点必须属于 `PROXY` 分组；测速超时的节点切换后依然不可用 |
 | 想重置内核状态 | `docker compose down proxy && docker volume rm yaerp2.0_mihomo_config`，然后重新导入订阅 |
