@@ -38,6 +38,8 @@ interface MailSignatureEditorProps {
   onUploadImage: (file: File) => Promise<string>;
   displayName?: string;
   emailAddress?: string;
+  /** Extra values offered by the "插入变量" menu, keyed by label. */
+  variables?: Record<string, string>;
 }
 
 type EditorMode = "visual" | "html";
@@ -107,6 +109,7 @@ export default function MailSignatureEditor({
   onUploadImage,
   displayName = "姓名",
   emailAddress = "name@example.com",
+  variables = {},
 }: MailSignatureEditorProps) {
   const editorRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -207,6 +210,32 @@ export default function MailSignatureEditor({
     insertHTML(
       '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;border-collapse:collapse"><tbody><tr><td style="padding:0 16px 0 0;vertical-align:top"><strong>姓名 / Name</strong><br><span style="color:#64748b">职位 / 公司</span></td><td style="padding:0;vertical-align:top;color:#475569">电话 / Phone<br>邮箱 / Email</td></tr></tbody></table>',
     );
+  };
+
+  // Values written at insert time, not placeholders. Mail clients do not expand
+  // template tokens, so the sender's real details have to be baked into the HTML.
+  const insertVariable = (key: string) => {
+    const raw =
+      key === "email"
+        ? emailAddress
+        : key === "name"
+          ? displayName
+          : variables[key];
+    const text = (raw || "").trim();
+    if (!text) return;
+    if (key === "email") {
+      insertHTML(
+        `<a href="mailto:${escapeAttribute(text)}" style="color:#0284c7">${escapeAttribute(text)}</a>`,
+      );
+      return;
+    }
+    if (key === "phone") {
+      insertHTML(
+        `<a href="tel:${escapeAttribute(text.replace(/[^\d+]/g, ""))}" style="color:inherit;text-decoration:none">${escapeAttribute(text)}</a>`,
+      );
+      return;
+    }
+    insertHTML(`<span>${escapeAttribute(text)}</span>`);
   };
 
   const insertTemplate = (template: string) => {
@@ -362,6 +391,26 @@ export default function MailSignatureEditor({
           <option value="trade">外贸名片</option>
           <option value="compact">单行紧凑</option>
           <option value="disclaimer">保密声明</option>
+        </select>
+        <select
+          defaultValue=""
+          onChange={(event) => {
+            insertVariable(event.target.value);
+            event.target.value = "";
+          }}
+          onMouseDown={saveSelection}
+          disabled={mode !== "visual"}
+          title="插入发件人信息"
+          className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-600 outline-none disabled:opacity-50"
+        >
+          <option value="">插入变量</option>
+          <option value="name">姓名 / Name</option>
+          <option value="email">邮箱 / Email</option>
+          {Object.keys(variables).map((key) => (
+            <option key={key} value={key}>
+              {key}
+            </option>
+          ))}
         </select>
       </div>
 

@@ -44,6 +44,7 @@ import {
   Type,
   UserPlus,
   Users,
+  Waypoints,
   X,
 } from "lucide-react";
 import {
@@ -68,6 +69,8 @@ import api from "@/lib/api";
 import { getStoredUser, isAdmin } from "@/lib/auth";
 import type { AuthUser } from "@/types";
 
+type MailProxyMode = "global" | "on" | "off";
+
 interface MailAccount {
   id: number;
   user_id: number;
@@ -83,6 +86,7 @@ interface MailAccount {
   client_secret_configured: boolean;
   is_default: boolean;
   signature_html: string;
+  proxy_mode: MailProxyMode;
   enabled: boolean;
   auto_forward_enabled: boolean;
   auto_forward_to: string[];
@@ -104,6 +108,7 @@ interface MailAccountInput {
   client_secret: string;
   is_default: boolean;
   signature_html: string;
+  proxy_mode: MailProxyMode;
   enabled: boolean;
   auto_forward_enabled: boolean;
   auto_forward_to: string[];
@@ -290,6 +295,7 @@ const emptyAccountInput: MailAccountInput = {
   client_secret: "",
   is_default: true,
   signature_html: "",
+  proxy_mode: "global",
   enabled: true,
   auto_forward_enabled: false,
   auto_forward_to: [],
@@ -409,6 +415,7 @@ function accountToInput(account: MailAccount): MailAccountInput {
     client_secret: "",
     is_default: account.is_default,
     signature_html: account.signature_html || "",
+    proxy_mode: account.proxy_mode || "global",
     enabled: account.enabled,
     auto_forward_enabled: account.auto_forward_enabled,
     auto_forward_to: account.auto_forward_to || [],
@@ -4198,34 +4205,54 @@ export default function MailPage() {
                   </div>
                 ) : (
                   signatures.map((signature) => (
-                    <button
+                    <div
                       key={signature.id}
-                      type="button"
-                      onClick={() => editSignature(signature)}
-                      className={`min-w-52 rounded-lg border p-3 text-left transition lg:min-w-0 ${editingSignatureID === signature.id ? "border-sky-300 bg-white shadow-sm" : "border-slate-200 bg-white/70 hover:border-slate-300"}`}
+                      className={`group min-w-52 rounded-lg border p-3 transition lg:min-w-0 ${editingSignatureID === signature.id ? "border-sky-300 bg-white shadow-sm" : "border-slate-200 bg-white/70 hover:border-slate-300"}`}
                     >
-                      <div className="truncate text-sm font-semibold text-slate-800">
-                        {signature.title}
-                      </div>
-                      <div className="mt-2 flex flex-wrap gap-1">
-                        {signature.apply_to_new && (
-                          <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700">
-                            新邮件
-                          </span>
-                        )}
-                        {signature.apply_to_reply && (
-                          <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">
-                            回复/转发
-                          </span>
-                        )}
-                        {!signature.apply_to_new &&
-                          !signature.apply_to_reply && (
-                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
-                              手动选择
+                      <button
+                        type="button"
+                        onClick={() => editSignature(signature)}
+                        className="block w-full text-left"
+                      >
+                        <div className="truncate text-sm font-semibold text-slate-800">
+                          {signature.title}
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {signature.apply_to_new && (
+                            <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700">
+                              新邮件
                             </span>
                           )}
-                      </div>
-                    </button>
+                          {signature.apply_to_reply && (
+                            <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">
+                              回复/转发
+                            </span>
+                          )}
+                          {!signature.apply_to_new &&
+                            !signature.apply_to_reply && (
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                                手动选择
+                              </span>
+                            )}
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSignatureDraft({
+                            title: `${signature.title} 副本`,
+                            html_content: signature.html_content,
+                            apply_to_new: false,
+                            apply_to_reply: false,
+                          })
+                        }
+                        disabled={signatures.length >= 10}
+                        className="mt-2 hidden items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-sky-700 disabled:opacity-40 group-hover:inline-flex lg:inline-flex lg:opacity-0 lg:group-hover:opacity-100"
+                      >
+                        <Copy className="h-3 w-3" />
+                        复制一份
+                      </button>
+                    </div>
                   ))
                 )}
               </div>
@@ -5800,6 +5827,61 @@ function AccountForm({
           )}
         </div>
       )}
+      <div className="rounded-lg border border-slate-200 p-3 sm:col-span-2">
+        <div className="flex items-center gap-2">
+          <Waypoints className="h-4 w-4 text-slate-500" />
+          <div className="text-sm font-medium text-slate-800">网络出口</div>
+        </div>
+        <div className="mt-0.5 text-xs leading-5 text-slate-500">
+          单独决定这个邮箱是否经过 XTLS 代理。收发信和阿里邮箱接口都按这里的选择走。
+        </div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+          {(
+            [
+              ["global", "跟随全局", "由 /proxy 页的「邮箱流量」开关决定"],
+              ["on", "始终走代理", "忽略全局开关，本邮箱强制经代理发送和收取"],
+              ["off", "始终直连", "本邮箱绕过代理，直接连接邮件服务器"],
+            ] as const
+          ).map(([mode, title, hint]) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => onChange({ ...value, proxy_mode: mode })}
+              className={`rounded-lg border p-3 text-left transition ${
+                value.proxy_mode === mode
+                  ? "border-sky-400 bg-sky-50 ring-1 ring-sky-200"
+                  : "border-slate-200 bg-white hover:border-slate-300"
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${
+                    value.proxy_mode === mode
+                      ? "border-sky-500"
+                      : "border-slate-300"
+                  }`}
+                >
+                  {value.proxy_mode === mode && (
+                    <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
+                  )}
+                </span>
+                <span
+                  className={`text-sm font-medium ${
+                    value.proxy_mode === mode
+                      ? "text-sky-900"
+                      : "text-slate-700"
+                  }`}
+                >
+                  {title}
+                </span>
+              </div>
+              <div className="mt-1 text-xs leading-5 text-slate-500">
+                {hint}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
       <label className="flex items-center gap-3 rounded-lg border border-slate-200 p-3 sm:col-span-2">
         <input
           type="checkbox"

@@ -269,8 +269,12 @@ func (s *MailService) mailSignatureFromInput(userID, signatureID int64, input *m
 	}, nil
 }
 
-func (s *MailService) ListCorrespondence(userID int64, email string, page, pageSize int) (*model.MailMessagePage, error) {
-	parsed, err := stdmail.ParseAddress(strings.TrimSpace(email))
+// correspondenceScanLimit caps how many matched messages a single thread request
+// is allowed to drain from the provider, so a very long thread cannot turn one
+// page view into an unbounded number of upstream calls.
+const correspondenceScanLimit = 1000
+
+func (s *MailService) ListCorrespondence(userID int64, email string, page, pageSize int) (*model.MailMessagePage, error) {	parsed, err := stdmail.ParseAddress(strings.TrimSpace(email))
 	if err != nil || !strings.Contains(parsed.Address, "@") {
 		return nil, fmt.Errorf("请选择有效的客户邮箱")
 	}
@@ -291,15 +295,18 @@ func (s *MailService) ListCorrespondence(userID int64, email string, page, pageS
 	if sent := folderForRole(folders, "sent"); sent != "" && !strings.EqualFold(sent, targets[0]) {
 		targets = append(targets, sent)
 	}
-	needed := page * pageSize
-	if needed < 100 {
-		needed = 100
+	// The mail provider does not expose a filtered total for "messages with this
+	// participant", so pages are drained from the source and sliced locally. One
+	// page more than the requested one is drained so a merged
+	// inbox + sent timeline can still be ordered correctly across the boundary.
+	needed := (page + 1) * pageSize
+	if needed > correspondenceScanLimit {
+		needed = correspondenceScanLimit
 	}
-	if needed > 500 {
-		needed = 500
-	}
-	all := make([]model.MailMessageSummary, 0, needed*len(targets))
-	total := 0
+	all := make([]model.MailMessageSummary, 0, needed)
+	// True when at least one source folder did not run out of messages, which
+	// means more matches may exist beyond the drained window.
+	sourceHasMore := false
 	for _, folder := range targets {
 		fetched := 0
 		for sourcePage := 1; fetched < needed; sourcePage++ {
@@ -307,17 +314,19 @@ func (s *MailService) ListCorrespondence(userID int64, email string, page, pageS
 			if listErr != nil {
 				return nil, listErr
 			}
-			if sourcePage == 1 {
-				total += result.Total
-			}
 			all = append(all, result.Messages...)
 			fetched += len(result.Messages)
 			if !result.HasMore || len(result.Messages) == 0 {
 				break
 			}
+			sourceHasMore = true
 		}
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].Date.After(all[j].Date) })
+	hasMore := len(all) > needed || (sourceHasMore && len(all) >= needed)
+	if len(all) > needed {
+		all = all[:needed]
+	}
 	offset := (page - 1) * pageSize
 	if offset > len(all) {
 		offset = len(all)
@@ -328,7 +337,7 @@ func (s *MailService) ListCorrespondence(userID int64, email string, page, pageS
 	}
 	return &model.MailMessagePage{
 		Folder: "CORRESPONDENCE", Messages: all[offset:end], Page: page,
-		PageSize: pageSize, Total: total, HasMore: page*pageSize < total,
+		PageSize: pageSize, Total: len(all), HasMore: hasMore,
 	}, nil
 }
 

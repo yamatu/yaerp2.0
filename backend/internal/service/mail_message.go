@@ -88,12 +88,12 @@ func (s *MailService) ListMessages(userID int64, folder string, page, pageSize i
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.connectIMAP(session.settings, session.account.LoginUsername, session.password)
+	conn, releaseIMAP, err := s.acquireIMAP(session)
 	if err != nil {
 		s.recordFailure(userID, err)
 		return nil, err
 	}
-	defer conn.Logout()
+	defer func() { releaseIMAP(err) }()
 	if _, err := conn.Select(folder, true); err != nil {
 		s.recordFailure(userID, err)
 		return nil, err
@@ -317,12 +317,12 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.connectIMAP(session.settings, session.account.LoginUsername, session.password)
+	conn, releaseIMAP, err := s.acquireIMAP(session)
 	if err != nil {
 		s.recordFailure(userID, err)
 		return nil, err
 	}
-	defer conn.Logout()
+	defer func() { releaseIMAP(err) }()
 	if _, err := conn.Select(folder, false); err != nil {
 		return nil, err
 	}
@@ -437,11 +437,11 @@ func (s *MailService) downloadAttachmentUncached(userID int64, folder string, ui
 	if err != nil {
 		return "", "", nil, err
 	}
-	conn, err := s.connectIMAP(session.settings, session.account.LoginUsername, session.password)
+	conn, releaseIMAP, err := s.acquireIMAP(session)
 	if err != nil {
 		return "", "", nil, err
 	}
-	defer conn.Logout()
+	defer func() { releaseIMAP(err) }()
 	if _, err := conn.Select(folder, true); err != nil {
 		return "", "", nil, err
 	}

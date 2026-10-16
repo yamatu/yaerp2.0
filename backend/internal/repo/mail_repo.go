@@ -133,7 +133,7 @@ func (r *MailRepo) SaveAccount(account *model.MailAccount) error {
 			     provider=$3, email_address=$4, display_name=$5, username=$6,
 			     password_encrypted=$7, api_base_url=$8, client_id=$9,
 			     client_secret_encrypted=$10, is_default=$11,
-			     signature_html=$12, enabled=$13,
+			     signature_html=$12, proxy_mode=$21, enabled=$13,
 			     auto_forward_enabled=$14, auto_forward_to=$15, forward_attachments=$16,
 			     forward_uid_validity=$17, forward_last_uid=$18,
 			     last_verified_at=$19, last_error=$20, updated_at=NOW()
@@ -144,21 +144,23 @@ func (r *MailRepo) SaveAccount(account *model.MailAccount) error {
 			account.ClientSecretEncrypted, account.IsDefault, account.SignatureHTML, account.Enabled,
 			account.AutoForwardEnabled, pq.Array(account.AutoForwardTo), account.ForwardAttachments,
 			account.ForwardUIDValidity, account.ForwardLastUID, account.LastVerifiedAt, account.LastError,
+			normalizeMailProxyMode(account.ProxyMode),
 		).Scan(&account.CreatedAt, &account.UpdatedAt)
 	} else {
 		err = tx.QueryRow(
 			`INSERT INTO mail_accounts (
 			     user_id,provider,email_address,display_name,username,password_encrypted,
 			     api_base_url,client_id,client_secret_encrypted,is_default,
-			     signature_html,enabled,auto_forward_enabled,auto_forward_to,forward_attachments,
+			     signature_html,proxy_mode,enabled,auto_forward_enabled,auto_forward_to,forward_attachments,
 			     forward_uid_validity,forward_last_uid,last_verified_at,last_error,created_at,updated_at
-			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW())
+			 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$20,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW())
 			 RETURNING id,created_at,updated_at`,
 			account.UserID, account.Provider, account.EmailAddress, account.DisplayName,
 			account.LoginUsername, account.PasswordEncrypted, account.APIBaseURL, account.ClientID,
 			account.ClientSecretEncrypted, account.IsDefault, account.SignatureHTML, account.Enabled,
 			account.AutoForwardEnabled, pq.Array(account.AutoForwardTo), account.ForwardAttachments,
 			account.ForwardUIDValidity, account.ForwardLastUID, account.LastVerifiedAt, account.LastError,
+			normalizeMailProxyMode(account.ProxyMode),
 		).Scan(&account.ID, &account.CreatedAt, &account.UpdatedAt)
 	}
 	if err != nil {
@@ -187,8 +189,20 @@ func (r *MailRepo) SaveAccount(account *model.MailAccount) error {
 	return tx.Commit()
 }
 
-func nonNilMailAddresses(addresses []string) []string {
-	if addresses == nil {
+// normalizeMailProxyMode keeps the stored value inside the values allowed by the
+// mail_accounts_proxy_mode_check constraint.
+func normalizeMailProxyMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "on":
+		return "on"
+	case "off":
+		return "off"
+	default:
+		return "global"
+	}
+}
+
+func nonNilMailAddresses(addresses []string) []string {	if addresses == nil {
 		return []string{}
 	}
 	return addresses
@@ -364,7 +378,7 @@ func mailAccountSelectSQL() string {
 	              account.provider, account.email_address, account.display_name, account.username,
 	              account.password_encrypted, account.api_base_url, account.client_id,
 	              account.client_secret_encrypted, account.is_default,
-	              account.signature_html, account.enabled,
+	              account.signature_html, account.proxy_mode, account.enabled,
 	              account.auto_forward_enabled, account.auto_forward_to, account.forward_attachments,
 	              account.forward_uid_validity, account.forward_last_uid,
 	              account.last_verified_at, account.last_sync_at, account.last_error,
@@ -377,7 +391,7 @@ func scanMailAccount(scanner mailScanner) (*model.MailAccount, error) {
 	var account model.MailAccount
 	var id sql.NullInt64
 	var provider, emailAddress, displayName, loginUsername, encryptedPassword sql.NullString
-	var apiBaseURL, clientID, encryptedClientSecret, signature, lastError sql.NullString
+	var apiBaseURL, clientID, encryptedClientSecret, signature, proxyMode, lastError sql.NullString
 	var isDefault, enabled sql.NullBool
 	var autoForwardEnabled, forwardAttachments sql.NullBool
 	var forwardUIDValidity, forwardLastUID sql.NullInt64
@@ -385,7 +399,7 @@ func scanMailAccount(scanner mailScanner) (*model.MailAccount, error) {
 	err := scanner.Scan(
 		&id, &account.UserID, &account.Username, &account.UserEmail,
 		&provider, &emailAddress, &displayName, &loginUsername, &encryptedPassword,
-		&apiBaseURL, &clientID, &encryptedClientSecret, &isDefault, &signature, &enabled,
+		&apiBaseURL, &clientID, &encryptedClientSecret, &isDefault, &signature, &proxyMode, &enabled,
 		&autoForwardEnabled, pq.Array(&account.AutoForwardTo), &forwardAttachments,
 		&forwardUIDValidity, &forwardLastUID,
 		&verifiedAt, &syncAt, &lastError, &createdAt, &updatedAt,
@@ -417,6 +431,7 @@ func scanMailAccount(scanner mailScanner) (*model.MailAccount, error) {
 	account.ClientSecretConfigured = strings.TrimSpace(encryptedClientSecret.String) != ""
 	account.IsDefault = isDefault.Bool
 	account.SignatureHTML = signature.String
+	account.ProxyMode = normalizeMailProxyMode(proxyMode.String)
 	account.Enabled = enabled.Bool
 	account.AutoForwardEnabled = autoForwardEnabled.Bool
 	account.ForwardAttachments = !forwardAttachments.Valid || forwardAttachments.Bool

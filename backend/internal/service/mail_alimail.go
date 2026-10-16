@@ -89,6 +89,11 @@ type aliMailContactCache struct {
 	ExpiresAt time.Time
 }
 
+type aliMailFolderCache struct {
+	Folders   []model.MailFolder
+	ExpiresAt time.Time
+}
+
 type aliMailRecipient struct {
 	Email string `json:"email"`
 	Name  string `json:"name"`
@@ -150,15 +155,15 @@ type aliMailFolder struct {
 	ID               string            `json:"id"`
 	DisplayName      string            `json:"displayName"`
 	ParentFolderID   string            `json:"parentFolderId"`
-	ChildFolderCount int               `json:"childFolderCount"`
-	TotalItemCount   int64             `json:"totalItemCount"`
-	UnreadItemCount  int64             `json:"unreadItemCount"`
+	ChildFolderCount aliMailInt64      `json:"childFolderCount"`
+	TotalItemCount   aliMailInt64      `json:"totalItemCount"`
+	UnreadItemCount  aliMailInt64      `json:"unreadItemCount"`
 	Extensions       map[string]string `json:"extensions"`
 }
 
 type aliMailAttachment struct {
 	Name      string            `json:"name"`
-	Size      int64             `json:"size"`
+	Size      aliMailInt64      `json:"size"`
 	ContentID string            `json:"contentId"`
 	ID        string            `json:"id"`
 	Inline    bool              `json:"isInline"`
@@ -205,16 +210,18 @@ func (s *MailService) invalidateAliMailToken(accountID int64) {
 	s.aliContactMu.Lock()
 	delete(s.aliContacts, accountID)
 	s.aliContactMu.Unlock()
+	s.invalidateAliMailFolders(accountID)
+	s.invalidateIMAPPool(accountID)
 }
 
-func (s *MailService) aliMailHTTPClient() (*http.Client, error) {
+func (s *MailService) aliMailHTTPClient(account *model.MailAccount) (*http.Client, error) {
 	settings := &model.MailServerSettings{ProxyType: "none"}
 	if s.repo != nil {
 		if current, err := s.repo.GetSettings(); err == nil && current != nil {
 			settings = current
 		}
 	}
-	proxySettings := s.mailProxySettings(settings)
+	proxySettings := s.mailProxySettings(settings, account)
 	cacheKey := strings.Join([]string{
 		normalizeMailProxyType(proxySettings.ProxyType), proxySettings.ProxyHost,
 		strconv.Itoa(proxySettings.ProxyPort), proxySettings.ProxyUsername, proxySettings.ProxyPasswordEncrypted,
@@ -234,7 +241,7 @@ func (s *MailService) aliMailHTTPClient() (*http.Client, error) {
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	if normalizeMailProxyType(proxySettings.ProxyType) != "none" {
-		dialer, dialErr := s.mailDialer(proxySettings)
+		dialer, dialErr := s.mailDialer(proxySettings, account)
 		if dialErr != nil {
 			return nil, dialErr
 		}
@@ -267,7 +274,7 @@ func (s *MailService) resetAliMailHTTPClients() {
 }
 
 func (s *MailService) aliMailAcquireToken(account *model.MailAccount, secret string) (aliMailToken, error) {
-	client, err := s.aliMailHTTPClient()
+	client, err := s.aliMailHTTPClient(account)
 	if err != nil {
 		return aliMailToken{}, err
 	}
@@ -413,7 +420,7 @@ func (s *MailService) aliMailDoWithToken(account *model.MailAccount, token, meth
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	client, err := s.aliMailHTTPClient()
+	client, err := s.aliMailHTTPClient(account)
 	if err != nil {
 		return err
 	}
@@ -558,7 +565,38 @@ func (s *MailService) aliMailAccountForUser(userID int64) (*model.MailAccount, e
 	return account, nil
 }
 
+// aliMailFolderCacheTTL keeps the folder tree (used for unread counts and for
+// resolving a folder id to its display name) from being re-walked on every
+// message page. The tree only changes when the user adds or deletes a folder.
+const aliMailFolderCacheTTL = 60 * time.Second
+
 func (s *MailService) aliMailFolders(account *model.MailAccount) ([]model.MailFolder, error) {
+	s.aliFolderMu.Lock()
+	if cached, ok := s.aliFolders[account.ID]; ok && time.Now().Before(cached.ExpiresAt) {
+		s.aliFolderMu.Unlock()
+		return cached.Folders, nil
+	}
+	s.aliFolderMu.Unlock()
+	folders, err := s.aliMailFetchFolders(account)
+	if err != nil {
+		return nil, err
+	}
+	s.aliFolderMu.Lock()
+	s.aliFolders[account.ID] = aliMailFolderCache{Folders: folders, ExpiresAt: time.Now().Add(aliMailFolderCacheTTL)}
+	s.aliFolderMu.Unlock()
+	return folders, nil
+}
+
+func (s *MailService) invalidateAliMailFolders(accountID int64) {
+	if accountID <= 0 {
+		return
+	}
+	s.aliFolderMu.Lock()
+	delete(s.aliFolders, accountID)
+	s.aliFolderMu.Unlock()
+}
+
+func (s *MailService) aliMailFetchFolders(account *model.MailAccount) ([]model.MailFolder, error) {
 	result := make([]model.MailFolder, 0)
 	queue := []string{""}
 	visited := map[string]struct{}{"": {}}
@@ -584,7 +622,7 @@ func (s *MailService) aliMailFolders(account *model.MailAccount) ([]model.MailFo
 			result = append(result, model.MailFolder{
 				Name: folder.ID, DisplayName: mailFolderDisplayNameByRole(role, firstNonEmptyMail(folder.DisplayName, folder.ID)),
 				Delimiter: "/", Role: role,
-				Total: clampMailUint32(folder.TotalItemCount), Unread: clampMailUint32(folder.UnreadItemCount),
+				Total: clampMailUint32(int64(folder.TotalItemCount)), Unread: clampMailUint32(int64(folder.UnreadItemCount)),
 				Selectable: true,
 			})
 			if folder.ChildFolderCount > 0 {
@@ -707,7 +745,11 @@ func (s *MailService) aliMailCreateFolder(account *model.MailAccount, name strin
 	}
 	payload := map[string]any{"displayName": name}
 	endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/mailFolders"
-	return s.aliMailDo(account, http.MethodPost, endpoint, nil, payload, nil)
+	if err := s.aliMailDo(account, http.MethodPost, endpoint, nil, payload, nil); err != nil {
+		return err
+	}
+	s.invalidateAliMailFolders(account.ID)
+	return nil
 }
 
 func (s *MailService) aliMailRenameFolder(account *model.MailAccount, folderID, displayName string) error {
@@ -719,7 +761,11 @@ func (s *MailService) aliMailRenameFolder(account *model.MailAccount, folderID, 
 		return err
 	}
 	endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/mailFolders/" + url.PathEscape(folderID)
-	return s.aliMailDo(account, http.MethodPatch, endpoint, nil, map[string]any{"displayName": displayName}, nil)
+	if err := s.aliMailDo(account, http.MethodPatch, endpoint, nil, map[string]any{"displayName": displayName}, nil); err != nil {
+		return err
+	}
+	s.invalidateAliMailFolders(account.ID)
+	return nil
 }
 
 func (s *MailService) aliMailDeleteFolder(account *model.MailAccount, folderID string) error {
@@ -727,7 +773,11 @@ func (s *MailService) aliMailDeleteFolder(account *model.MailAccount, folderID s
 		return fmt.Errorf("邮件文件夹不存在")
 	}
 	endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/mailFolders/" + url.PathEscape(folderID)
-	return s.aliMailDo(account, http.MethodDelete, endpoint, nil, nil, nil)
+	if err := s.aliMailDo(account, http.MethodDelete, endpoint, nil, nil, nil); err != nil {
+		return err
+	}
+	s.invalidateAliMailFolders(account.ID)
+	return nil
 }
 
 func (s *MailService) aliMailListMessages(account *model.MailAccount, folder string, page, pageSize int, options MailMessageListOptions) (*model.MailMessagePage, error) {
@@ -1009,7 +1059,7 @@ func (s *MailService) aliMailAttachments(account *model.MailAccount, remoteID st
 		}
 		result = append(result, model.MailAttachment{
 			PartID: attachment.ID, Filename: sanitizeMailFilename(attachment.Name), ContentType: contentType,
-			Size: attachment.Size, Inline: attachment.Inline, ContentID: attachment.ContentID,
+			Size: int64(attachment.Size), Inline: attachment.Inline, ContentID: attachment.ContentID,
 		})
 	}
 	return result, nil
@@ -1041,7 +1091,7 @@ func (s *MailService) aliMailDownloadAttachment(account *model.MailAccount, uid 
 		return "", "", nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
-	client, err := s.aliMailHTTPClient()
+	client, err := s.aliMailHTTPClient(account)
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -1249,7 +1299,7 @@ func (s *MailService) aliMailUploadAttachment(account *model.MailAccount, messag
 	if err != nil {
 		return err
 	}
-	client, err := s.aliMailHTTPClient()
+	client, err := s.aliMailHTTPClient(account)
 	if err != nil {
 		return err
 	}

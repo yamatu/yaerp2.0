@@ -398,7 +398,7 @@ export default function ProxyPage() {
               {([
                 { key: 'proxy_ai' as const, label: 'AI 接口流量', hint: 'OpenAI / 兼容接口的对话与工具调用', icon: Sparkles, value: status.proxy_ai },
                 { key: 'proxy_whatsapp' as const, label: 'WhatsApp 流量', hint: '保存后会自动重启已登录的会话以套用代理', icon: MessageCircle, value: status.proxy_whatsapp },
-                { key: 'proxy_mail' as const, label: '邮箱流量', hint: 'IMAP / SMTP / 网页版邮箱请求（SOCKS5）', icon: Mail, value: status.proxy_mail },
+                { key: 'proxy_mail' as const, label: '邮箱流量', hint: '默认策略；单个邮箱可在邮箱账号设置里改为始终走代理或始终直连（SOCKS5）', icon: Mail, value: status.proxy_mail },
               ]).map((item) => {
                 const Icon = item.icon
                 return (

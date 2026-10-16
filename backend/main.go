@@ -170,6 +170,7 @@ func main() {
 	}
 	defer scheduleService.Stop()
 	go mailService.StartAutoForward(context.Background(), 2*time.Minute)
+	mailService.StartIMAPPoolJanitor(context.Background())
 	if err := mailService.StartBulkWorkers(context.Background()); err != nil {
 		log.Fatalf("failed to start bulk mail workers: %v", err)
 	}
@@ -385,6 +386,7 @@ func main() {
 		api.DELETE("/trade/orders/:id/supplier-quotes/:quoteId", tradeHandler.DeleteSupplierQuote)
 		api.POST("/trade/orders/:id/supplier-quotes/:quoteId/select", tradeHandler.SelectSupplierQuote)
 		api.POST("/trade/orders/:id/customer-quotes", tradeHandler.CreateCustomerQuoteRound)
+		api.PUT("/trade/orders/:id/customer-quotes/:quoteId", tradeHandler.UpdateCustomerQuoteRound)
 		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/status", tradeHandler.UpdateCustomerQuoteRoundStatus)
 		api.PUT("/trade/orders/:id/customer-quotes/:quoteId/payment", tradeHandler.UpdateCustomerQuotePayment)
 		api.POST("/trade/orders/:id/customer-quotes/:quoteId/payment-proofs", tradeHandler.UploadCustomerPaymentProof)
