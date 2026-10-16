@@ -314,13 +314,15 @@ func (s *ProxyService) AIProxyURL() string {
 	return s.httpProxyURL()
 }
 
-// MailProxySettings returns a SOCKS5 override for IMAP/SMTP/HTTP mail traffic.
-func (s *ProxyService) MailProxySettings() *model.MailServerSettings {
+// MailProxySettings returns the SOCKS5 entry point for mail traffic. With
+// forced=false it honours the 邮箱流量 switch; forced=true is used by a mailbox
+// set to "始终走代理" and only requires the core to be connected.
+func (s *ProxyService) MailProxySettings(forced bool) *model.MailServerSettings {
 	if !s.cfg.Proxy.Enabled {
 		return nil
 	}
 	settings := s.snapshot()
-	if settings == nil || !settings.Enabled || !settings.ProxyMail {
+	if settings == nil || !settings.Enabled || (!forced && !settings.ProxyMail) {
 		return nil
 	}
 	host, port := hostPortFromAddr(s.mixedAddr())

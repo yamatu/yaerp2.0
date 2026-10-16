@@ -11,9 +11,8 @@ import (
 
 // Reusing an authenticated IMAP connection removes a full TCP + TLS + LOGIN
 // round trip from every page view, which is the bulk of the latency on the mail
-// page. Connections are kept per mailbox account and verified with a cheap NOOP
-// before being handed out again, because providers drop idle sessions on their
-// own schedule.
+// page. Idle connections are kept per mailbox account; a leased connection is
+// taken out of the pool so concurrent requests never share one socket.
 const (
 	imapPoolIdleTTL       = 90 * time.Second
 	imapPoolMaxAge        = 10 * time.Minute
@@ -23,111 +22,164 @@ const (
 )
 
 type pooledIMAPConn struct {
-	client     *imapclient.Client
-	accountID  int64
+	client    *imapclient.Client
+	accountID int64
+	// routeKey records the network path (direct or a specific proxy) the
+	// connection was dialled over; a changed proxy switch must not reuse it.
+	routeKey string
+	// generation is the account's pool generation at dial time; invalidating
+	// the account bumps it so leased connections are not returned.
+	generation uint64
 	createdAt  time.Time
 	lastUsedAt time.Time
-	mu         sync.Mutex
-	broken     bool
 }
-
-// imapLease pins one pooled connection for the duration of a request. IMAP
-// multiplexes commands on a single socket, so a lease is never shared; the
-// embedded mutex keeps a connection from being handed out twice.
-type imapLease struct {
-	conn *pooledIMAPConn
-	svc  *MailService
-}
-
-func (lease *imapLease) Client() *imapclient.Client { return lease.conn.client }
-
-// Release returns the connection to the pool. Pass the error the caller saw (or
-// nil on success) so a dead socket is closed instead of being reused.
-func (lease *imapLease) Release(err error) { lease.svc.releaseIMAP(lease.conn, err != nil) }
 
 // acquireIMAP hands out a live connection for one mailbox and a release
 // function that must be called exactly once, with the operation's error.
 func (s *MailService) acquireIMAP(session *mailSession) (*imapclient.Client, func(err error), error) {
-	lease, err := s.leaseIMAP(session)
+	route, err := s.resolveMailRoute(session.settings, session.account)
 	if err != nil {
 		return nil, nil, err
 	}
-	return lease.Client(), lease.Release, nil
+	routeKey := route.key()
+	accountID := session.account.ID
+	for {
+		conn := s.takePooledIMAP(accountID, routeKey)
+		if conn == nil {
+			break
+		}
+		if s.imapConnAlive(conn.client) {
+			conn.lastUsedAt = time.Now()
+			return conn.client, func(opErr error) { s.releaseIMAP(conn, opErr != nil) }, nil
+		}
+		go closePooledIMAP(conn)
+	}
+
+	s.imapPoolMu.Lock()
+	generation := s.imapPoolGen[accountID]
+	s.imapPoolMu.Unlock()
+	client, err := s.dialIMAP(session)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := time.Now()
+	conn := &pooledIMAPConn{
+		client: client, accountID: accountID, routeKey: routeKey,
+		generation: generation, createdAt: now, lastUsedAt: now,
+	}
+	return client, func(opErr error) { s.releaseIMAP(conn, opErr != nil) }, nil
 }
 
-// imapPoolReusable reports whether a pooled connection is still worth handing
+// takePooledIMAP removes and returns one reusable idle connection, closing
+// any that expired or were dialled over a different route.
+func (s *MailService) takePooledIMAP(accountID int64, routeKey string) *pooledIMAPConn {
+	now := time.Now()
+	var taken *pooledIMAPConn
+	stale := make([]*pooledIMAPConn, 0)
+	s.imapPoolMu.Lock()
+	kept := make([]*pooledIMAPConn, 0, len(s.imapPool[accountID]))
+	for _, conn := range s.imapPool[accountID] {
+		switch {
+		case !imapPoolReusable(conn, now) || conn.routeKey != routeKey:
+			stale = append(stale, conn)
+		case taken == nil:
+			taken = conn
+		default:
+			kept = append(kept, conn)
+		}
+	}
+	if s.imapPool != nil {
+		s.imapPool[accountID] = kept
+	}
+	s.imapPoolMu.Unlock()
+	for _, conn := range stale {
+		go closePooledIMAP(conn)
+	}
+	return taken
+}
+
+// imapPoolReusable reports whether an idle connection is still worth handing
 // out. Idle and total age are bounded because providers silently drop sessions.
 func imapPoolReusable(conn *pooledIMAPConn, now time.Time) bool {
-	if conn == nil || conn.broken {
+	if conn == nil {
 		return false
 	}
 	return now.Sub(conn.lastUsedAt) <= imapPoolIdleTTL && now.Sub(conn.createdAt) <= imapPoolMaxAge
 }
 
-func (s *MailService) leaseIMAP(session *mailSession) (*imapLease, error) {
-	accountID := session.account.ID
-	for {
-		s.imapPoolMu.Lock()
-		conns := s.imapPool[accountID]
-		now := time.Now()
-		var reusable *pooledIMAPConn
-		kept := make([]*pooledIMAPConn, 0, len(conns))
-		for _, conn := range conns {
-			if !imapPoolReusable(conn, now) {
-				continue
-			}
-			if reusable == nil {
-				reusable = conn
-			}
-			kept = append(kept, conn)
-		}
-		s.imapPool[accountID] = kept
+// releaseIMAP returns a connection to the pool, or closes it when the caller's
+// operation failed, the account was invalidated meanwhile or the pool is full.
+func (s *MailService) releaseIMAP(conn *pooledIMAPConn, failed bool) {
+	if conn == nil {
+		return
+	}
+	if failed {
+		go terminatePooledIMAP(conn)
+		return
+	}
+	conn.lastUsedAt = time.Now()
+	s.imapPoolMu.Lock()
+	if s.imapPool == nil {
+		s.imapPool = make(map[int64][]*pooledIMAPConn)
+	}
+	if conn.generation != s.imapPoolGen[conn.accountID] || len(s.imapPool[conn.accountID]) >= imapPoolMaxPerAcct {
 		s.imapPoolMu.Unlock()
-
-		// Anything dropped from `kept` is closed outside the lock.
-		for _, conn := range conns {
-			if conn.broken || containsPooledIMAP(kept, conn) {
-				continue
-			}
-			go closePooledIMAP(conn)
-		}
-
-		if reusable == nil {
-			break
-		}
-		reusable.mu.Lock()
-		if s.imapConnAlive(reusable.client) {
-			reusable.lastUsedAt = now
-			return &imapLease{conn: reusable, svc: s}, nil
-		}
-		reusable.broken = true
-		reusable.mu.Unlock()
-		_ = reusable.client.Terminate()
+		go closePooledIMAP(conn)
+		return
 	}
-
-	conn, err := s.dialIMAP(session)
-	if err != nil {
-		return nil, err
-	}
-	pooled := &pooledIMAPConn{client: conn, accountID: accountID, createdAt: time.Now(), lastUsedAt: time.Now()}
-	pooled.mu.Lock()
-	return &imapLease{conn: pooled, svc: s}, nil
+	s.imapPool[conn.accountID] = append(s.imapPool[conn.accountID], conn)
+	s.imapPoolMu.Unlock()
 }
 
-func containsPooledIMAP(conns []*pooledIMAPConn, target *pooledIMAPConn) bool {
-	for _, conn := range conns {
-		if conn == target {
-			return true
-		}
+func closePooledIMAP(conn *pooledIMAPConn) {
+	if conn != nil && conn.client != nil {
+		_ = conn.client.Logout()
 	}
-	return false
+}
+
+func terminatePooledIMAP(conn *pooledIMAPConn) {
+	if conn != nil && conn.client != nil {
+		_ = conn.client.Terminate()
+	}
+}
+
+// imapConnAlive probes an idle connection before reuse. NOOP is the cheapest
+// command that proves the session still works, so a provider that silently
+// dropped the socket is detected here instead of failing the caller's command.
+// A connection that selected a mailbox is in SelectedState, which includes the
+// authenticated bit.
+func (s *MailService) imapConnAlive(conn *imapclient.Client) bool {
+	if conn == nil || conn.State()&imap.AuthenticatedState == 0 {
+		return false
+	}
+	conn.Timeout = imapPoolVerifyTTL
+	err := conn.Noop()
+	conn.Timeout = mailConnectionTimeout
+	return err == nil
+}
+
+// invalidateIMAPPool drops every idle connection for a mailbox and makes sure
+// connections currently leased are closed instead of returned. Credentials,
+// server settings or the proxy choice changed, so nothing pooled is trusted.
+func (s *MailService) invalidateIMAPPool(accountID int64) {
+	s.imapPoolMu.Lock()
+	if s.imapPoolGen == nil {
+		s.imapPoolGen = make(map[int64]uint64)
+	}
+	s.imapPoolGen[accountID]++
+	conns := s.imapPool[accountID]
+	delete(s.imapPool, accountID)
+	s.imapPoolMu.Unlock()
+	for _, conn := range conns {
+		go closePooledIMAP(conn)
+	}
 }
 
 var imapPoolJanitorOnce sync.Once
 
-// StartIMAPPoolJanitor closes pooled connections that went idle. Pooled sockets
-// are otherwise only reaped when the same mailbox is used again, so an idle
-// deployment would keep provider sessions open indefinitely.
+// StartIMAPPoolJanitor closes idle connections. They are otherwise only reaped
+// when the same mailbox is used again, so an idle deployment would keep
+// provider sessions open indefinitely.
 func (s *MailService) StartIMAPPoolJanitor(ctx context.Context) {
 	imapPoolJanitorOnce.Do(func() {
 		go func() {
@@ -147,16 +199,14 @@ func (s *MailService) StartIMAPPoolJanitor(ctx context.Context) {
 
 func (s *MailService) sweepIMAPPool() {
 	now := time.Now()
-	s.imapPoolMu.Lock()
 	stale := make([]*pooledIMAPConn, 0)
+	s.imapPoolMu.Lock()
 	for accountID, conns := range s.imapPool {
 		kept := make([]*pooledIMAPConn, 0, len(conns))
 		for _, conn := range conns {
 			if imapPoolReusable(conn, now) {
 				kept = append(kept, conn)
-				continue
-			}
-			if !conn.broken {
+			} else {
 				stale = append(stale, conn)
 			}
 		}
@@ -168,81 +218,6 @@ func (s *MailService) sweepIMAPPool() {
 	}
 	s.imapPoolMu.Unlock()
 	for _, conn := range stale {
-		go closePooledIMAP(conn)
-	}
-}
-
-func (s *MailService) releaseIMAP(conn *pooledIMAPConn, failed bool) {
-	if conn == nil {
-		return
-	}
-	if failed {
-		conn.broken = true
-		conn.mu.Unlock()
-		s.forgetIMAPConn(conn)
-		if conn.client != nil {
-			_ = conn.client.Terminate()
-		}
-		return
-	}
-	conn.lastUsedAt = time.Now()
-	conn.mu.Unlock()
-
-	s.imapPoolMu.Lock()
-	defer s.imapPoolMu.Unlock()
-	if s.imapPool == nil {
-		s.imapPool = make(map[int64][]*pooledIMAPConn)
-	}
-	if len(s.imapPool[conn.accountID]) >= imapPoolMaxPerAcct {
-		go closePooledIMAP(conn)
-		return
-	}
-	s.imapPool[conn.accountID] = append(s.imapPool[conn.accountID], conn)
-}
-
-func (s *MailService) forgetIMAPConn(conn *pooledIMAPConn) {
-	s.imapPoolMu.Lock()
-	defer s.imapPoolMu.Unlock()
-	conns := s.imapPool[conn.accountID]
-	kept := make([]*pooledIMAPConn, 0, len(conns))
-	for _, candidate := range conns {
-		if candidate != conn {
-			kept = append(kept, candidate)
-		}
-	}
-	s.imapPool[conn.accountID] = kept
-}
-
-func closePooledIMAP(conn *pooledIMAPConn) {
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-	conn.broken = true
-	if conn.client != nil {
-		_ = conn.client.Logout()
-	}
-}
-
-// imapConnAlive probes a pooled connection before reuse. NOOP is the cheapest
-// command that proves the session still works, so a provider that silently
-// dropped the socket is detected here instead of failing the caller's command.
-func (s *MailService) imapConnAlive(conn *imapclient.Client) bool {
-	if conn == nil || conn.State() != imap.AuthenticatedState {
-		return false
-	}
-	conn.Timeout = imapPoolVerifyTTL
-	err := conn.Noop()
-	conn.Timeout = mailConnectionTimeout
-	return err == nil
-}
-
-// invalidateIMAPPool drops every pooled connection for a mailbox. Credentials,
-// server settings or the account itself changed, so nothing pooled is trusted.
-func (s *MailService) invalidateIMAPPool(accountID int64) {
-	s.imapPoolMu.Lock()
-	conns := s.imapPool[accountID]
-	delete(s.imapPool, accountID)
-	s.imapPoolMu.Unlock()
-	for _, conn := range conns {
 		go closePooledIMAP(conn)
 	}
 }

@@ -5833,13 +5833,13 @@ function AccountForm({
           <div className="text-sm font-medium text-slate-800">网络出口</div>
         </div>
         <div className="mt-0.5 text-xs leading-5 text-slate-500">
-          单独决定这个邮箱是否经过 XTLS 代理。收发信和阿里邮箱接口都按这里的选择走。
+          单独决定这个邮箱是否经过 XTLS 代理。内网或本机的邮件服务器（如自建 Poste.io）不会经过 XTLS 节点。
         </div>
         <div className="mt-3 grid gap-2 sm:grid-cols-3">
           {(
             [
-              ["global", "跟随全局", "由 /proxy 页的「邮箱流量」开关决定"],
-              ["on", "始终走代理", "忽略全局开关，本邮箱强制经代理发送和收取"],
+              ["global", "跟随全局", "按 /proxy 页「邮箱流量」开关；代理连不上时自动改为直连"],
+              ["on", "始终走代理", "不看全局开关，只要代理已连接就走代理；连不上时报错，不会直连"],
               ["off", "始终直连", "本邮箱绕过代理，直接连接邮件服务器"],
             ] as const
           ).map(([mode, title, hint]) => (

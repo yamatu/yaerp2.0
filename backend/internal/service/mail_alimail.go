@@ -9,7 +9,6 @@ import (
 	"hash/fnv"
 	"io"
 	"mime"
-	"net"
 	"net/http"
 	stdmail "net/mail"
 	"net/url"
@@ -221,11 +220,11 @@ func (s *MailService) aliMailHTTPClient(account *model.MailAccount) (*http.Clien
 			settings = current
 		}
 	}
-	proxySettings := s.mailProxySettings(settings, account)
-	cacheKey := strings.Join([]string{
-		normalizeMailProxyType(proxySettings.ProxyType), proxySettings.ProxyHost,
-		strconv.Itoa(proxySettings.ProxyPort), proxySettings.ProxyUsername, proxySettings.ProxyPasswordEncrypted,
-	}, "|")
+	route, err := s.resolveMailRoute(settings, account)
+	if err != nil {
+		return nil, err
+	}
+	cacheKey := route.key()
 	s.aliHTTPMu.Lock()
 	if client := s.aliHTTPClient[cacheKey]; client != nil {
 		s.aliHTTPMu.Unlock()
@@ -240,15 +239,13 @@ func (s *MailService) aliMailHTTPClient(account *model.MailAccount) (*http.Clien
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
-	if normalizeMailProxyType(proxySettings.ProxyType) != "none" {
-		dialer, dialErr := s.mailDialer(proxySettings, account)
+	if route.proxy != nil {
+		dialer, dialErr := s.dialerForRoute(route)
 		if dialErr != nil {
 			return nil, dialErr
 		}
 		transport.Proxy = nil
-		transport.DialContext = func(_ context.Context, network, address string) (net.Conn, error) {
-			return dialer.Dial(network, address)
-		}
+		transport.DialContext = dialer.DialContext
 	}
 	client := &http.Client{Transport: transport, Timeout: 45 * time.Second}
 	s.aliHTTPMu.Lock()

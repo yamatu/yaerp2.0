@@ -27,7 +27,6 @@ import (
 	gomail "github.com/emersion/go-message/mail"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/net/proxy"
 
 	"yaerp/internal/model"
 	"yaerp/internal/repo"
@@ -77,15 +76,15 @@ type MailService struct {
 	aliFolders    map[int64]aliMailFolderCache
 	imapPoolMu    sync.Mutex
 	imapPool      map[int64][]*pooledIMAPConn
+	imapPoolGen   map[int64]uint64
 	aliHTTPMu     sync.Mutex
 	aliHTTPClient map[string]*http.Client
 	aliRateMu     sync.Mutex
 	aliRateNext   time.Time
 	rdb           *redis.Client
-	// proxyOverrideProvider returns the outbound proxy forced by the global
-	// XTLS/Mihomo switch. When it returns a non-nil value it wins over the
-	// mail server settings so IMAP/SMTP/HTTP traffic honours the switch.
-	proxyOverrideProvider func() *model.MailServerSettings
+	// proxyOverrideProvider returns the XTLS core entry point for mail traffic;
+	// see resolveMailRoute for how it combines with the mailbox proxy mode.
+	proxyOverrideProvider func(forced bool) *model.MailServerSettings
 	bulkSendSem           chan struct{}
 
 	attachmentCacheOnce sync.Once
@@ -1184,79 +1183,6 @@ func (s *MailService) connectIMAP(settings *model.MailServerSettings, account *m
 		return nil, err
 	}
 	return conn, nil
-}
-
-func (s *MailService) mailDialer(settings *model.MailServerSettings, account *model.MailAccount) (imapclient.Dialer, error) {
-	base := &net.Dialer{Timeout: mailConnectionTimeout}
-	proxySettings := s.mailProxySettings(settings, account)
-	if proxySettings == nil || normalizeMailProxyType(proxySettings.ProxyType) == "none" {
-		return base, nil
-	}
-	if strings.TrimSpace(proxySettings.ProxyHost) == "" || proxySettings.ProxyPort < 1 || proxySettings.ProxyPort > 65535 {
-		return nil, fmt.Errorf("SOCKS5 代理地址或端口无效")
-	}
-	var auth *proxy.Auth
-	if strings.TrimSpace(proxySettings.ProxyUsername) != "" {
-		password := ""
-		if strings.TrimSpace(proxySettings.ProxyPasswordEncrypted) != "" {
-			value, err := s.decryptSecret(proxySettings.ProxyPasswordEncrypted)
-			if err != nil {
-				return nil, fmt.Errorf("SOCKS5 代理密码无法读取: %w", err)
-			}
-			password = value
-		}
-		auth = &proxy.Auth{User: strings.TrimSpace(proxySettings.ProxyUsername), Password: password}
-	}
-	return proxy.SOCKS5(
-		"tcp",
-		net.JoinHostPort(strings.TrimSpace(proxySettings.ProxyHost), fmt.Sprintf("%d", proxySettings.ProxyPort)),
-		auth,
-		base,
-	)
-}
-
-// SetProxyOverrideProvider installs the callback that returns the globally
-// managed proxy for mail traffic. Returning nil keeps the per-mail proxy
-// settings untouched.
-func (s *MailService) SetProxyOverrideProvider(provider func() *model.MailServerSettings) {
-	s.proxyOverrideProvider = provider
-}
-
-// mailProxySettings resolves which proxy configuration must be used for one
-// mailbox. The mailbox setting wins over the global XTLS/Mihomo switch:
-// "on" always uses the core, "off" always connects directly.
-func (s *MailService) mailProxySettings(settings *model.MailServerSettings, account *model.MailAccount) *model.MailServerSettings {
-	mode := ""
-	if account != nil {
-		mode = strings.ToLower(strings.TrimSpace(account.ProxyMode))
-	}
-	switch {
-	case mode == "off":
-		if settings == nil {
-			return &model.MailServerSettings{ProxyType: "none"}
-		}
-		direct := *settings
-		direct.ProxyType = "none"
-		return &direct
-	case mode == "on":
-		if s.proxyOverrideProvider == nil {
-			return settings
-		}
-		// A mailbox that forces the proxy still prefers the per-mail server
-		// SOCKS5 settings when the core switch is off, so an explicit mailbox
-		// choice keeps working without the global toggle.
-		if override := s.proxyOverrideProvider(); override != nil {
-			return override
-		}
-		return settings
-	}
-	if s.proxyOverrideProvider == nil {
-		return settings
-	}
-	if override := s.proxyOverrideProvider(); override != nil {
-		return override
-	}
-	return settings
 }
 
 func (s *MailService) connectSMTP(settings *model.MailServerSettings, account *model.MailAccount, username, password string) (*smtp.Client, error) {
