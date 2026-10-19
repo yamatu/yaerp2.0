@@ -667,6 +667,9 @@ export default function MailPage() {
   );
   const [assistants, setAssistants] = useState<AIAssistant[]>([]);
   const [assistantID, setAssistantID] = useState(0);
+  const [translationEngineModel, setTranslationEngineModel] = useState<
+    string | null
+  >(null);
   const [targetLanguage, setTargetLanguage] = useState("zh-CN");
   const [translation, setTranslation] = useState<AITranslationResult | null>(
     null,
@@ -937,11 +940,20 @@ export default function MailPage() {
   }, [account]);
 
   const loadAssistants = useCallback(async () => {
-    const res = await api.get<AIAssistant[]>("/ai/assistants");
+    const [res, engineRes] = await Promise.all([
+      api.get<AIAssistant[]>("/ai/assistants"),
+      api.get<{ enabled: boolean; model?: string }>("/ai/translation-engine"),
+    ]);
+    const engineModel =
+      engineRes.code === 0 && engineRes.data?.enabled
+        ? engineRes.data.model || ""
+        : null;
+    setTranslationEngineModel(engineModel);
     if (res.code !== 0 || !res.data) return;
     setAssistants(res.data);
     const preferred = res.data.find((item) => item.is_default) || res.data[0];
-    if (preferred) setAssistantID(preferred.id);
+    if (engineModel !== null) setAssistantID(0);
+    else if (preferred) setAssistantID(preferred.id);
   }, []);
 
   const loadMessages = useCallback(async (silent = false) => {
@@ -3824,14 +3836,20 @@ export default function MailPage() {
                         </option>
                       ))}
                     </select>
-                    {assistants.length > 1 && (
+                    {assistants.length + (translationEngineModel !== null ? 1 : 0) > 1 && (
                       <select
                         value={assistantID}
                         onChange={(event) =>
                           setAssistantID(Number(event.target.value))
                         }
                         className="h-10 max-w-52 rounded-lg border border-slate-200 bg-white px-2 md:h-8"
+                        aria-label="翻译方式"
                       >
+                        {translationEngineModel !== null && (
+                          <option value={0}>
+                            翻译引擎 · {translationEngineModel}
+                          </option>
+                        )}
                         {assistants.map((assistant) => (
                           <option key={assistant.id} value={assistant.id}>
                             {assistant.name} · {assistant.model}

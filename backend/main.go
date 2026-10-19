@@ -558,6 +558,7 @@ func main() {
 
 		// AI Chat
 		api.GET("/ai/assistants", aiHandler.ListAvailableAssistants)
+		api.GET("/ai/translation-engine", aiHandler.GetTranslationEngine)
 		api.GET("/me/permissions", aiHandler.MyPermissions)
 		api.POST("/ai/chat", aiHandler.Chat)
 		api.POST("/ai/chat/stream", aiHandler.ChatStream)
@@ -645,6 +646,9 @@ func main() {
 			admin.DELETE("/admin/ai/assistants/:id", aiHandler.DeleteAssistant)
 			admin.POST("/admin/ai/assistants/:id/default", aiHandler.SetDefaultAssistant)
 			admin.POST("/admin/ai/assistants/:id/test", aiHandler.TestAssistant)
+			admin.GET("/admin/ai/translation-engine", aiHandler.GetTranslationEngineAdmin)
+			admin.PUT("/admin/ai/translation-engine", aiHandler.UpdateTranslationEngine)
+			admin.POST("/admin/ai/translation-engine/test", aiHandler.TestTranslationEngine)
 			admin.POST("/admin/ai/spreadsheet/preview", aiHandler.PreviewSpreadsheetPlan)
 			admin.POST("/admin/ai/spreadsheet/apply", aiHandler.ApplySpreadsheetPlan)
 
