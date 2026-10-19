@@ -271,6 +271,9 @@ func (s *AIService) TranslateText(userID, assistantID int64, sourceText, targetL
 	if text == "" {
 		return nil, fmt.Errorf("翻译内容不能为空")
 	}
+	if engine := s.GetTranslationEngine(true); assistantID <= 0 && engine.Enabled {
+		return s.translateWithEngine(engine, text, targetLanguage, false)
+	}
 	assistant, err := s.resolveAIAssistant(assistantID)
 	if err != nil {
 		return nil, err
@@ -302,6 +305,9 @@ func (s *AIService) TranslateTextAligned(userID, assistantID int64, sourceText, 
 	segments := splitTranslationSegments(sourceText)
 	if len(segments) == 0 {
 		return nil, fmt.Errorf("翻译内容不能为空")
+	}
+	if engine := s.GetTranslationEngine(true); assistantID <= 0 && engine.Enabled {
+		return s.translateWithEngine(engine, sourceText, targetLanguage, true)
 	}
 	assistant, err := s.resolveAIAssistant(assistantID)
 	if err != nil {

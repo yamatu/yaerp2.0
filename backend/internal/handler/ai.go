@@ -222,6 +222,39 @@ func (h *AIHandler) UpdateConfig(c *gin.Context) {
 	response.OKMsg(c, "AI config updated")
 }
 
+func (h *AIHandler) GetTranslationEngine(c *gin.Context) {
+	response.OK(c, h.aiService.GetTranslationEngine(false))
+}
+
+func (h *AIHandler) GetTranslationEngineAdmin(c *gin.Context) {
+	response.OK(c, h.aiService.GetTranslationEngine(true))
+}
+
+func (h *AIHandler) UpdateTranslationEngine(c *gin.Context) {
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	result, err := h.aiService.UpdateTranslationEngine(req.Endpoint)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
+func (h *AIHandler) TestTranslationEngine(c *gin.Context) {
+	result, err := h.aiService.TestTranslationEngine()
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *AIHandler) PreviewSpreadsheetPlan(c *gin.Context) {
 	var req service.SpreadsheetPlanRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

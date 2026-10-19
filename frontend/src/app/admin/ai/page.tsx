@@ -7,6 +7,7 @@ import { AdminShell } from '@/components/admin/AdminShell'
 import { aiHelp } from '@/components/admin/adminHelp'
 import { ensureOk, errorText } from '@/components/admin/adminApi'
 import { useConfirm, useToast } from '@/components/admin/feedback'
+import { TranslationEngineCard } from '@/components/admin/TranslationEngineCard'
 import {
   Button,
   CheckboxRow,
@@ -363,6 +364,8 @@ export default function AdminAIPage() {
       {!loading && assistants.length === 0 && !loadError && (
         <Notice tone="warning" title="还没有可用的 AI 助手">员工目前无法使用任何 AI 功能。在下方填写第一个助手的配置并保存，它会自动成为默认助手。</Notice>
       )}
+
+      <TranslationEngineCard />
 
       <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)]">
         <SectionCard title="助手列表" description="★ 为默认助手；灰点表示已停用" icon={Bot} flush className="lg:sticky lg:top-[84px] lg:self-start">

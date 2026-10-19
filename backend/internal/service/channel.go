@@ -589,7 +589,7 @@ func (s *ChannelService) TranslateMessage(userID, channelID, messageID int64, re
 	assistantID := int64(0)
 	if req != nil && req.AssistantID > 0 {
 		assistantID = req.AssistantID
-	} else if channel.AIAssistantID != nil {
+	} else if channel.AIAssistantID != nil && !s.aiSvc.translationEngineEnabled() {
 		assistantID = *channel.AIAssistantID
 	}
 	result, err := s.aiSvc.TranslateText(userID, assistantID, sourceContent, targetLanguage)
