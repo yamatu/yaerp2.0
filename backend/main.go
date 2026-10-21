@@ -106,6 +106,15 @@ func main() {
 	permService := service.NewPermissionService(permRepo, userRepo, sheetRepo, folderRepo, departmentRepo)
 	departmentService := service.NewDepartmentService(departmentRepo, userRepo)
 	historyService := service.NewSheetHistoryService(historyRepo, sheetRepo, permService)
+	go func() {
+		compacted, err := historyRepo.CompactOversizedOperationLogs(200, 50*time.Millisecond)
+		if err != nil {
+			log.Printf("compact operation logs: %v", err)
+		}
+		if compacted > 0 {
+			log.Printf("operation log maintenance completed: compacted=%d", compacted)
+		}
+	}()
 	sheetService := service.NewSheetService(sheetRepo, permService, historyService)
 	uploadService := service.NewUploadService(minioClient, attachRepo, channelRepo, cfg.JWT.Secret)
 	go func() {

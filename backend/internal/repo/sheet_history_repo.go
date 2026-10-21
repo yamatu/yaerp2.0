@@ -437,3 +437,80 @@ func nullableJSON(value json.RawMessage) any {
 	}
 	return value
 }
+
+const (
+	compactOperationLogsJob     = "compact_operation_log_field_changes"
+	operationFieldOmittedNotice = "（内容较大，已省略；可在版本历史中对比）"
+)
+
+// CompactOversizedOperationLogs shrinks history entries that stored whole
+// sheet configs as before/after values in metadata.field_changes: values over
+// 2KB are replaced by a short notice, as new entries are written. It walks the
+// table in id ranges so each statement stays small, and records completion in
+// maintenance_jobs so it runs once.
+func (r *SheetHistoryRepo) CompactOversizedOperationLogs(batchSize int, pause time.Duration) (int64, error) {
+	var done bool
+	if err := r.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM maintenance_jobs WHERE name = $1)`, compactOperationLogsJob).Scan(&done); err != nil {
+		return 0, fmt.Errorf("check maintenance job: %w", err)
+	}
+	if done {
+		return 0, nil
+	}
+
+	var compacted int64
+	var lastID int64
+	for {
+		var upperID sql.NullInt64
+		if err := r.db.QueryRow(
+			`SELECT MAX(id) FROM (SELECT id FROM operation_logs WHERE id > $1 ORDER BY id LIMIT $2) AS batch`,
+			lastID, batchSize,
+		).Scan(&upperID); err != nil {
+			return compacted, fmt.Errorf("find operation log batch: %w", err)
+		}
+		if !upperID.Valid {
+			break
+		}
+		result, err := r.db.Exec(
+			`UPDATE operation_logs AS l
+			 SET metadata = jsonb_set(l.metadata, '{field_changes}', compacted.changes)
+			 FROM (
+			     SELECT o.id,
+			            COALESCE(jsonb_agg(
+			                CASE WHEN length(change::text) > 4096 THEN jsonb_build_object(
+			                    'field', change->>'field',
+			                    'old_value', CASE WHEN length(COALESCE(change->'old_value', 'null'::jsonb)::text) > 2048
+			                        THEN to_jsonb($3::text) ELSE change->'old_value' END,
+			                    'new_value', CASE WHEN length(COALESCE(change->'new_value', 'null'::jsonb)::text) > 2048
+			                        THEN to_jsonb($3::text) ELSE change->'new_value' END
+			                ) ELSE change END
+			                ORDER BY ordinality
+			            ), '[]'::jsonb) AS changes
+			     FROM (
+			         SELECT id, metadata FROM operation_logs
+			         WHERE id > $1 AND id <= $2
+			           AND jsonb_typeof(metadata->'field_changes') = 'array'
+			           AND pg_column_size(metadata) > 16384
+			     ) AS o
+			     CROSS JOIN LATERAL jsonb_array_elements(o.metadata->'field_changes') WITH ORDINALITY AS entries(change, ordinality)
+			     GROUP BY o.id
+			 ) AS compacted
+			 WHERE l.id = compacted.id
+			   AND length(compacted.changes::text) < length((l.metadata->'field_changes')::text)`,
+			lastID, upperID.Int64, operationFieldOmittedNotice,
+		)
+		if err != nil {
+			return compacted, fmt.Errorf("compact operation logs %d-%d: %w", lastID, upperID.Int64, err)
+		}
+		affected, _ := result.RowsAffected()
+		compacted += affected
+		lastID = upperID.Int64
+		if pause > 0 {
+			time.Sleep(pause)
+		}
+	}
+
+	if _, err := r.db.Exec(`INSERT INTO maintenance_jobs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, compactOperationLogsJob); err != nil {
+		return compacted, fmt.Errorf("record maintenance job: %w", err)
+	}
+	return compacted, nil
+}
