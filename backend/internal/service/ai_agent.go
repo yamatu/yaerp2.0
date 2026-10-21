@@ -2781,6 +2781,11 @@ func agentUniverCell(value any) map[string]any {
 		cell["f"] = formula
 	} else {
 		cell["v"] = value
+		if encoded, err := json.Marshal(value); err == nil {
+			if cellType := univerCellValueType(encoded); cellType != "" {
+				cell["t"] = json.RawMessage(cellType)
+			}
+		}
 	}
 	if len(style) > 0 {
 		cell["s"] = style

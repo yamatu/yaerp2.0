@@ -1468,9 +1468,15 @@ func patchSnapshotCells(config, columns json.RawMessage, changes []model.CellUpd
 		if json.Unmarshal(value, &text) == nil && strings.HasPrefix(strings.TrimSpace(text), "=") {
 			cell["f"] = value
 			delete(cell, "v")
+			delete(cell, "t")
 		} else {
 			cell["v"] = value
 			delete(cell, "f")
+			if cellType := univerCellValueType(value); cellType != "" {
+				cell["t"] = json.RawMessage(cellType)
+			} else {
+				delete(cell, "t")
+			}
 		}
 		encodedCell, err := json.Marshal(cell)
 		if err != nil {

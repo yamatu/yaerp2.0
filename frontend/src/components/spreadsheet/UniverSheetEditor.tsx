@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Sigma, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
@@ -256,13 +257,31 @@ const NUMBER_FORMAT_PRESETS = [
   { id: 'scientific', label: '科学计数', pattern: '0.00E+00', sample: '4.32E+02' },
 ] as const
 
+// Shows its label to the left of the wrapped button as soon as the pointer is
+// over it. Rendered in a portal with fixed positioning: the expanded tool list
+// scrolls, and an absolutely positioned hint inside it is clipped.
 function FloatingToolHint({ label, children }: { label: string; children: ReactNode }) {
+  const anchorRef = useRef<HTMLDivElement>(null)
+  const [anchor, setAnchor] = useState<{ right: number; top: number } | null>(null)
+  const show = () => {
+    const rect = anchorRef.current?.getBoundingClientRect()
+    if (rect) setAnchor({ right: window.innerWidth - rect.left + 8, top: rect.top + rect.height / 2 })
+  }
+  const hide = () => setAnchor(null)
+  useEffect(() => {
+    if (!anchor) return
+    window.addEventListener('scroll', hide, true)
+    return () => window.removeEventListener('scroll', hide, true)
+  }, [anchor])
   return (
-    <div className="group relative">
-      <span className="pointer-events-none absolute right-12 top-1/2 z-10 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100 group-focus-within:opacity-100">
-        {label}
-      </span>
+    <div ref={anchorRef} className="relative" onPointerEnter={show} onPointerLeave={hide} onFocus={show} onBlur={hide}>
       {children}
+      {anchor && createPortal(
+        <span role="tooltip" className="pointer-events-none fixed z-[1200] max-w-[16rem] -translate-y-1/2 rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium leading-snug text-white shadow-lg" style={{ right: anchor.right, top: anchor.top }}>
+          {label}
+        </span>,
+        document.body,
+      )}
     </div>
   )
 }
@@ -1028,6 +1047,23 @@ function revealSearchHit(
     // Fall back to scrolling.
   }
   worksheet.scrollToCell(Math.max(0, row - 3), Math.max(0, column - 1))
+}
+
+// Cells written by the server (AI agent, cell API, older imports) may carry a
+// number or boolean value without its type. Univer then renders it as text:
+// left aligned and ignoring number formats. Fills in the missing type.
+function inferMissingCellTypes(snapshot: Partial<IWorksheetData>): Partial<IWorksheetData> {
+  const cellData = snapshot.cellData as Record<string, Record<string, ICellData | null>> | undefined
+  if (!cellData) return snapshot
+  for (const row of Object.values(cellData)) {
+    if (!row) continue
+    for (const cell of Object.values(row)) {
+      if (!cell || cell.t != null || cell.f || cell.si) continue
+      if (typeof cell.v === 'number') cell.t = 2
+      else if (typeof cell.v === 'boolean') cell.t = 3
+    }
+  }
+  return snapshot
 }
 
 function cloneJsonSnapshot<T>(value: T): T {
@@ -3560,7 +3596,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         if (nextConfig.univerSheetData && typeof nextConfig.univerSheetData === 'object') {
           // Snapshots are the source of truth; only fall back to the legacy row
           // API for worksheets that have not been migrated yet.
-          serverSnapshot = cloneJsonSnapshot(nextConfig.univerSheetData as Partial<IWorksheetData>)
+          serverSnapshot = inferMissingCellTypes(cloneJsonSnapshot(nextConfig.univerSheetData as Partial<IWorksheetData>))
         } else {
           const rowsResponse = await api.get<Row[]>(`/sheets/${sheetId}/data`)
           if (rowsResponse.code !== 0) {
@@ -4039,7 +4075,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         let workbookData: IWorkbookData
 
         if (config.univerSheetData && typeof config.univerSheetData === 'object') {
-          const worksheetSnapshot = cloneJsonSnapshot(config.univerSheetData as Partial<IWorksheetData>)
+          const worksheetSnapshot = inferMissingCellTypes(cloneJsonSnapshot(config.univerSheetData as Partial<IWorksheetData>))
           workbookData = wrapWorksheetData(
             workbookId, currentSheet,
             worksheetSnapshot,
@@ -5881,17 +5917,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
       {/* Floating toolbar — collapsible, hidden when any overlay/panel is open */}
       {showFabs && (
-        <div className={`sheet-floating-stack pointer-events-none fixed bottom-36 z-[70] flex flex-col items-end gap-2 opacity-70 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 [&_button]:pointer-events-auto md:bottom-20 ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
+        <div className={`sheet-floating-stack pointer-events-none fixed bottom-36 z-[70] flex flex-col items-end gap-2 opacity-70 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 [&_button]:pointer-events-auto md:bottom-[calc(var(--sheet-tabbar-offset)+5.5rem)] ${univerSidebarOpen ? 'right-[22rem] md:right-[24rem]' : 'right-4'}`}>
           {/* Expanded tools — slide up when toggled */}
           {toolbarExpanded && (
-            <div className="pointer-events-auto flex max-h-[min(62vh,32rem)] flex-col items-end gap-2 overflow-y-auto overscroll-contain pr-0.5 animate-in fade-in slide-in-from-bottom-2 duration-150">
+            <div className="pointer-events-auto flex max-h-[min(calc(100vh-28rem),32rem)] flex-col items-end gap-2 overflow-y-auto overscroll-contain pr-0.5 animate-in fade-in slide-in-from-bottom-2 duration-150">
               <FloatingToolHint label="数字与默认格式">
                 <button
                   type="button"
                   onClick={openNumberFormatPanel}
                   disabled={editLocked}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-sky-200 bg-sky-50 text-sky-700 shadow-lg transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="数字与默认格式"
                   aria-label="数字与默认格式"
                 >
                   <Hash className="h-4 w-4" />
@@ -5903,7 +5938,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={openFieldControls}
                   disabled={editLocked}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="字段控件（下拉/复选框）"
                   aria-label="字段控件"
                 >
                   <ListChecks className="h-4 w-4" />
@@ -5915,7 +5949,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={openApprovalFlowPanel}
                   disabled={editLocked}
                   className="relative flex h-10 w-10 items-center justify-center rounded-full border border-amber-200 bg-amber-50 text-amber-700 shadow-lg transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="配置选区审批流程"
                   aria-label="审批流程"
                 >
                   <ClipboardCheck className="h-4 w-4" />
@@ -5931,7 +5964,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                       ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
                       : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
                   }`}
-                  title="保护设置"
                   aria-label="保护设置"
                 >
                   <Shield className="h-4 w-4" />
@@ -5947,7 +5979,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                       ? 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100'
                       : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
                   } disabled:cursor-not-allowed disabled:opacity-50`}
-                  title={hasFilter ? '清除筛选' : '启用筛选'}
                   aria-label={hasFilter ? '清除筛选' : '启用筛选'}
                 >
                   {hasFilter ? <FilterX className="h-4 w-4" /> : <Filter className="h-4 w-4" />}
@@ -5959,7 +5990,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={() => void handleDownloadSheet()}
                   disabled={!effectiveCanExportSheet || exportAction !== ''}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-lg transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="下载当前表 Excel"
                   aria-label="下载当前表 Excel"
                 >
                   <Download className="h-4 w-4" />
@@ -5971,7 +6001,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={() => void handleDownloadWorkbookExcel()}
                   disabled={!effectiveCanExportSheet || exportAction !== ''}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 shadow-lg transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="下载工作簿 Excel"
                   aria-label="下载工作簿 Excel"
                 >
                   <Files className="h-4 w-4" />
@@ -5984,7 +6013,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                     onClick={() => void handleDownloadOriginalWorkbook()}
                     disabled={!effectiveCanExportSheet || exportAction !== ''}
                     className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-white text-emerald-700 shadow-lg transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
-                    title="下载原始 Excel"
                     aria-label="下载原始 Excel"
                   >
                     <FileSpreadsheet className="h-4 w-4" />
@@ -5997,7 +6025,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={() => void handlePrintSheet()}
                   disabled={!effectiveCanExportSheet || exportAction !== ''}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="打印当前表"
                   aria-label="打印当前表"
                 >
                   <Printer className="h-4 w-4" />
@@ -6009,7 +6036,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={openPdfExportPanel}
                   disabled={!effectiveCanExportSheet || exportAction !== ''}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="PDF 导出与预览"
                   aria-label="PDF 导出与预览"
                 >
                   <FileOutput className="h-4 w-4" />
@@ -6027,7 +6053,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   onClick={openImagePicker}
                   disabled={editLocked}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 shadow-lg transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                  title="插入图片"
                   aria-label="插入图片"
                 >
                   <ImagePlus className="h-4 w-4" />
@@ -6043,7 +6068,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
               onClick={convertPlainTextSelection}
               disabled={editLocked}
               className="flex h-10 w-10 items-center justify-center rounded-full border border-amber-200 bg-white text-amber-600 shadow-lg transition hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
-              title="转为纯文本（所选区域）"
               aria-label="转为纯文本（所选区域）"
             >
               <RemoveFormatting className="h-4 w-4" />
@@ -6061,16 +6085,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   ? 'bg-emerald-500 text-white'
                   : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
               } disabled:cursor-not-allowed disabled:opacity-50`}
-              title="保存表格 (Ctrl+S)"
               aria-label="保存表格"
             >
               <Save className="h-4 w-4" />
             </button>
           </FloatingToolHint>
-          <div className="group relative">
-            <span className="pointer-events-none absolute right-12 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100">
-              {toolbarExpanded ? '收起表格工具' : '展开表格工具'}
-            </span>
+          <FloatingToolHint label={toolbarExpanded ? '收起表格工具' : '展开表格工具'}>
             <button
               type="button"
               onClick={() => setToolbarExpanded((v) => !v)}
@@ -6079,12 +6099,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   ? 'bg-slate-700 text-white hover:bg-slate-600'
                   : 'bg-slate-900 text-white hover:bg-slate-800'
               }`}
-              title={toolbarExpanded ? '收起表格工具' : '展开表格工具'}
               aria-label={toolbarExpanded ? '收起表格工具' : '展开表格工具'}
             >
               {toolbarExpanded ? <ChevronUp className="h-5 w-5" /> : <Wrench className="h-5 w-5" />}
             </button>
-          </div>
+          </FloatingToolHint>
         </div>
       )}
 
