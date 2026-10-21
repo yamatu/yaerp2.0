@@ -466,6 +466,61 @@ func (h *AIHandler) GenerateSummaryPage(c *gin.Context) {
 	response.OK(c, item)
 }
 
+// GenerateSummaryPageStream generates a summary page and streams the analysis
+// steps (tool_start/tool_end/notice) as server-sent events, ending with an
+// "agent_end" event carrying the page or an "error" event.
+func (h *AIHandler) GenerateSummaryPageStream(c *gin.Context) {
+	var req model.AISummaryGenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		response.ServerError(c, "当前服务器不支持流式响应")
+		return
+	}
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	flusher.Flush()
+
+	ctx := c.Request.Context()
+	write := func(payload any) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", encoded); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+	// Only progress events go to the browser; streamed model text is the JSON
+	// report being written and is not useful to show.
+	emit := func(event service.AgentEvent) error {
+		switch event.Type {
+		case service.AgentEventToolStart, service.AgentEventToolEnd, service.AgentEventTurnStart:
+			return write(event)
+		case service.AgentEventError:
+			return write(map[string]any{"type": "notice", "message": event.Error})
+		}
+		return nil
+	}
+	page, err := h.aiService.GenerateAISummaryPageWithProgress(ctx, c.GetInt64("user_id"), &req, emit)
+	if err != nil {
+		_ = write(map[string]any{"type": "error", "error": err.Error()})
+		return
+	}
+	_ = write(map[string]any{"type": "agent_end", "page": page})
+}
+
 func (h *AIHandler) GetSummaryPage(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {

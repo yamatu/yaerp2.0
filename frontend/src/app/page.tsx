@@ -107,6 +107,7 @@ import {
   isAdmin,
 } from "@/lib/auth";
 import { wsClient } from "@/lib/ws";
+import { AI_CONTEXT_DRAG_MIME, type AIContextDragPayload } from "@/lib/dataEvents";
 import type {
   AuthUser,
   Channel,
@@ -880,7 +881,10 @@ export default function HomePage() {
       updatedAt: workbook.updated_at,
       badges,
       pinned: pinnedKeySet.has(key),
-      canDrag: canManageWorkbook(workbook),
+      // Any visible workbook can be dragged to the AI chat; moving it into a
+      // folder still needs manage rights (canMove).
+      canDrag: true,
+      canMove: canManageWorkbook(workbook),
       canDrop: false,
       excelSource,
       locked: workbook.is_locked,
@@ -914,7 +918,7 @@ export default function HomePage() {
       updatedAt: folder.updated_at,
       badges,
       pinned: pinnedKeySet.has(key),
-      canDrag: false,
+      canDrag: true,
       canDrop: canWriteFolder(folder),
       shared,
     };
@@ -1855,22 +1859,28 @@ export default function HomePage() {
     item: BrowserItem,
     event: React.DragEvent<HTMLElement>,
   ) => {
-    const ids = selectedKeys.includes(item.key)
-      ? browserItems
-          .filter(
-            (entry) =>
-              entry.kind === "workbook" &&
-              entry.canDrag &&
-              selectedKeys.includes(entry.key),
-          )
-          .map((entry) => entry.id)
-      : [item.id];
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData(WORKBOOK_DRAG_MIME, ids.join(","));
-    event.dataTransfer.setData("text/plain", ids.join(","));
-    if (ids.length > 1) {
+    if (item.kind === "folder") {
+      const payload: AIContextDragPayload = { folder: { id: item.id, name: item.name } };
+      event.dataTransfer.effectAllowed = "copy";
+      event.dataTransfer.setData(AI_CONTEXT_DRAG_MIME, JSON.stringify(payload));
+      setDraggedWorkbookIds([]);
+      return;
+    }
+    const draggedItems = selectedKeys.includes(item.key)
+      ? browserItems.filter(
+          (entry) => entry.kind === "workbook" && selectedKeys.includes(entry.key),
+        )
+      : [item];
+    const payload: AIContextDragPayload = {
+      workbooks: draggedItems.map((entry) => ({ id: entry.id, name: entry.name })),
+    };
+    event.dataTransfer.setData(AI_CONTEXT_DRAG_MIME, JSON.stringify(payload));
+    const ids = draggedItems.filter((entry) => entry.canMove).map((entry) => entry.id);
+    event.dataTransfer.effectAllowed = ids.length > 0 ? "copyMove" : "copy";
+    if (ids.length > 0) event.dataTransfer.setData(WORKBOOK_DRAG_MIME, ids.join(","));
+    if (draggedItems.length > 1) {
       const ghost = document.createElement("div");
-      ghost.textContent = `移动 ${ids.length} 个工作簿`;
+      ghost.textContent = `${draggedItems.length} 个工作簿`;
       ghost.style.cssText =
         "position:fixed;top:-200px;left:-200px;padding:6px 12px;border-radius:8px;background:#0f172a;color:#fff;font:600 12px system-ui,sans-serif;";
       document.body.appendChild(ghost);

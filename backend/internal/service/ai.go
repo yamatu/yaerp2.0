@@ -32,6 +32,7 @@ type AIService struct {
 	automationService *AutomationService
 	tradeService      *TradeService
 	historyService    *SheetHistoryService
+	folderService     *FolderService
 	tools             map[string]ToolFunc
 	// proxyURLProvider returns the outbound proxy used for AI requests. It is
 	// wired to the XTLS/Mihomo proxy service and returns "" when AI traffic
@@ -45,6 +46,11 @@ type AIService struct {
 // is routed through the managed outbound proxy.
 func (s *AIService) SetAIProxyURLProvider(provider func() string) {
 	s.proxyURLProvider = provider
+}
+
+// SetFolderService lets the agent resolve folders dragged into the chat.
+func (s *AIService) SetFolderService(folderService *FolderService) {
+	s.folderService = folderService
 }
 
 // SetHistoryService wires the version-history service used by the agent facing
@@ -134,8 +140,12 @@ type ChatRequest struct {
 }
 
 type ChatContext struct {
-	WorkbookID    *int64                `json:"workbook_id"`
-	SheetIDs      []int64               `json:"sheet_ids"`
+	WorkbookID *int64  `json:"workbook_id"`
+	SheetIDs   []int64 `json:"sheet_ids"`
+	// WorkbookIDs and FolderID are workbooks the employee dragged into the
+	// chat: the question is about them unless it says otherwise.
+	WorkbookIDs   []int64               `json:"workbook_ids,omitempty"`
+	FolderID      *int64                `json:"folder_id,omitempty"`
 	AttachmentIDs []int64               `json:"attachment_ids"`
 	Selection     *ChatSelectionContext `json:"selection,omitempty"`
 }

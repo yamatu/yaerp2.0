@@ -361,7 +361,13 @@ body.ai-panel-open .sheet-floating-stack {
  * --mobile-tabbar-offset, which `has-mobile-tabbar` sets on the same element.
  */
 body {
-  --mobile-fab-bottom: max(var(--mobile-tabbar-offset), env(safe-area-inset-bottom));
+  --sheet-tabbar-offset: 0px;
+  --mobile-fab-bottom: calc(max(var(--mobile-tabbar-offset), env(safe-area-inset-bottom)) + var(--sheet-tabbar-offset));
+}
+
+/* The workbook editor's bottom sheet-tab bar; floating buttons sit above it. */
+body.has-sheet-tabbar {
+  --sheet-tabbar-offset: 40px;
 }
 
 @media (max-width: 767px) {

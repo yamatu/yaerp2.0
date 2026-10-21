@@ -447,6 +447,27 @@ func (r *SheetRepo) GetNextSheetSortOrder(workbookID int64) (int, error) {
 	return nextSortOrder, nil
 }
 
+// UpdateSheetSortOrders numbers the given sheets of a workbook 0..n-1.
+func (r *SheetRepo) UpdateSheetSortOrders(workbookID int64, sheetIDs []int64) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sheet reorder: %w", err)
+	}
+	defer tx.Rollback()
+	for index, id := range sheetIDs {
+		if _, err := tx.Exec(
+			`UPDATE sheets SET sort_order = $1 WHERE id = $2 AND workbook_id = $3 AND sort_order <> $1`,
+			index, id, workbookID,
+		); err != nil {
+			return fmt.Errorf("update sheet sort order: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sheet reorder: %w", err)
+	}
+	return nil
+}
+
 func (r *SheetRepo) GetSheet(id int64) (*model.Sheet, error) {
 	var s model.Sheet
 	err := r.db.QueryRow(

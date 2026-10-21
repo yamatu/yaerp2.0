@@ -154,6 +154,13 @@ type CreateSheetRequest struct {
 	Columns json.RawMessage `json:"columns"`
 }
 
+// UpdateSheetTabsRequest reorders sheet tabs (Order lists sheet ids from left
+// to right) and sets tab colors (sheet id -> "#rrggbb", "" clears).
+type UpdateSheetTabsRequest struct {
+	Order  []int64           `json:"order"`
+	Colors map[string]string `json:"colors"`
+}
+
 type UpdateSheetRequest struct {
 	Name        *string          `json:"name"`
 	Columns     *json.RawMessage `json:"columns"`

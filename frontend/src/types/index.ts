@@ -867,6 +867,7 @@ export interface AISummarySection {
   title: string;
   body: string;
   bullets?: string[];
+  table?: { columns: string[]; rows: string[][] };
 }
 
 export interface AISummarySource {

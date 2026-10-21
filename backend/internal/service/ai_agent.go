@@ -123,6 +123,7 @@ func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 		"run_sheet_formulas":     s.toolRunSheetFormulas,
 		"sort_sheet_range":       s.toolSortSheetRange,
 		"filter_sheet_rows":      s.toolFilterSheetRows,
+		"aggregate_sheet_rows":   s.toolAggregateSheetRows,
 		"dedupe_sheet_rows":      s.toolDedupeSheetRows,
 		"run_spreadsheet_script": s.toolRunSpreadsheetScript,
 		"list_sheet_versions":    s.toolListSheetVersions,
@@ -172,6 +173,16 @@ func (s *AIService) buildAgentConversation(userID int64, assistant *activeAIAssi
 		}
 		contextMessage := map[string]any{"role": "system", "content": content}
 		conversation = append(append([]map[string]any{}, conversation[:1]...), append([]map[string]any{contextMessage}, conversation[1:]...)...)
+	}
+	if chatContext != nil && (chatContext.FolderID != nil || len(chatContext.WorkbookIDs) > 0) {
+		pinned, err := s.buildPinnedWorkbooksContext(userID, chatContext)
+		if err != nil {
+			return nil, err
+		}
+		if pinned != "" {
+			pinnedMessage := map[string]any{"role": "system", "content": pinned}
+			conversation = append(append([]map[string]any{}, conversation[:1]...), append([]map[string]any{pinnedMessage}, conversation[1:]...)...)
+		}
 	}
 	if chatContext != nil && chatContext.Selection != nil && chatContext.Selection.SheetID > 0 {
 		selection := chatContext.Selection
@@ -958,6 +969,30 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 				"limit": map[string]any{"type": "integer", "description": "Maximum rows to return, 1-500. Default 100."},
 			},
 			"required": []string{"sheet_id", "conditions"},
+		}),
+		buildToolDefinition("aggregate_sheet_rows", "Group the visible rows of one sheet by up to 3 columns and compute sum/avg/min/max/count per group over ALL rows, e.g. profit by product, amount by supplier or by month. The server does the arithmetic exactly: use it instead of adding numbers yourself or paging through rows. Omit group_by for whole-sheet totals. Read only.", map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sheet_id": map[string]any{"type": "integer"},
+				"group_by": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Column keys (or exact names) to group by, at most 3."},
+				"metrics": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"column_key": map[string]any{"type": "string"},
+							"op":         map[string]any{"type": "string", "enum": []string{"sum", "avg", "min", "max", "count", "count_non_empty"}},
+						},
+						"required": []string{"op"},
+					},
+					"description": "Results are keyed like sum(profit); count without column_key counts rows.",
+				},
+				"conditions": map[string]any{"type": "array", "items": map[string]any{"type": "object"}, "description": "Optional row filter, same format as filter_sheet_rows conditions."},
+				"sort_by":    map[string]any{"type": "string", "description": "Metric label such as sum(profit), or rows. Defaults to the first metric."},
+				"descending": map[string]any{"type": "boolean", "description": "Default true."},
+				"limit":      map[string]any{"type": "integer", "description": "Groups to return, default 50, max 500."},
+			},
+			"required": []string{"sheet_id"},
 		}),
 		buildToolDefinition("dedupe_sheet_rows", "Group rows by one or more key columns and report duplicate groups. With apply=true it clears the merge_column on the duplicate rows so only the first occurrence stays authoritative; with apply=false it only reports, which is the safe default.", map[string]any{
 			"type": "object",

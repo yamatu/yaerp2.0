@@ -52,6 +52,7 @@ export default function AIChatWrapper() {
     <>
       <AIChatFAB
         onClick={() => setChatOpen((v) => !v)}
+        onContextDrop={() => setChatOpen(true)}
         isOpen={chatOpen}
       />
       <AIChatPanel open={chatOpen} onClose={() => setChatOpen(false)} />

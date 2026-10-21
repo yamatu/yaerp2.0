@@ -48,9 +48,17 @@ type AISummaryMetric struct {
 }
 
 type AISummarySection struct {
-	Title   string   `json:"title"`
-	Body    string   `json:"body"`
-	Bullets []string `json:"bullets,omitempty"`
+	Title   string          `json:"title"`
+	Body    string          `json:"body"`
+	Bullets []string        `json:"bullets,omitempty"`
+	Table   *AISummaryTable `json:"table,omitempty"`
+}
+
+// AISummaryTable is a small result table (for example profit by product)
+// shown inside a summary section.
+type AISummaryTable struct {
+	Columns []string   `json:"columns"`
+	Rows    [][]string `json:"rows"`
 }
 
 type AISummarySource struct {
@@ -82,7 +90,9 @@ type AISummaryPage struct {
 
 type AISummaryGenerateRequest struct {
 	Title       string  `json:"title" binding:"required"`
-	WorkbookIDs []int64 `json:"workbook_ids" binding:"required,min=1"`
+	WorkbookIDs []int64 `json:"workbook_ids"`
+	// FolderIDs adds every workbook the user can open inside these folders.
+	FolderIDs   []int64 `json:"folder_ids"`
 	AssistantID *int64  `json:"assistant_id"`
 	Prompt      string  `json:"prompt"`
 }

@@ -152,17 +152,19 @@ export default function SheetHistoryPanel({ sheetId, sheetName, canManage, onClo
     setLogs(Array.isArray(response.data.list) ? response.data.list : [])
   }, [sheetId])
 
+  // Only the open tab is loaded: operation logs can be large and are not
+  // needed to pick a version to restore.
   const reload = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      await Promise.all([loadVersions(), loadLogs()])
+      await (tab === 'versions' ? loadVersions() : loadLogs())
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '加载历史失败')
     } finally {
       setLoading(false)
     }
-  }, [loadLogs, loadVersions])
+  }, [loadLogs, loadVersions, tab])
 
   useEffect(() => {
     void reload()

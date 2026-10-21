@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, Plus, RefreshCw, RotateCcw, Search, Send, Sparkles, Square, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
+import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, FolderOpen, Loader2, Maximize2, Minimize2, Plus, RefreshCw, RotateCcw, Search, Send, Sparkles, Square, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useFloatingDrag, computeTopLeftResize } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
@@ -10,7 +10,7 @@ import { useAIConversations } from '@/hooks/useAIConversations'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
-import { getActiveSheet, prepareDataMutation, subscribeActiveSheet, type ActiveSheetDetail } from '@/lib/dataEvents'
+import { AI_CONTEXT_DROP_EVENT, getActiveSheet, isContextDrag, prepareDataMutation, readContextDrag, subscribeActiveSheet, type ActiveSheetDetail, type AIContextDragPayload } from '@/lib/dataEvents'
 import type { AIAssistant, AIChatToolTrace, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
 
 interface PersistedMessage {
@@ -564,6 +564,10 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
   const [contextSelection, setContextSelection] = useState<AIComposeSelection | null>(null)
+  // Workbooks or a folder the employee dragged into the chat.
+  const [contextFolder, setContextFolder] = useState<{ id: number; name: string } | null>(null)
+  const [contextExtraWorkbooks, setContextExtraWorkbooks] = useState<{ id: number; name: string }[]>([])
+  const [contextDropActive, setContextDropActive] = useState(false)
   const [loadingContextWorkbookId, setLoadingContextWorkbookId] = useState<number | null>(null)
   const [suggestionSeed, setSuggestionSeed] = useState(0)
   const { workbooks } = useWorkbooks()
@@ -681,6 +685,20 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const contextAutoRef = useRef(false)
   const contextWorkbookRef = useRef<Workbook | null>(null)
   contextWorkbookRef.current = contextWorkbook
+  const hasContext = Boolean(contextWorkbook || contextFolder || contextExtraWorkbooks.length)
+  const contextLabel = contextFolder
+    ? `文件夹「${contextFolder.name}」· 含子文件夹`
+    : contextWorkbook
+      ? `${contextWorkbook.name}${contextExtraWorkbooks.length ? ` 等 ${contextExtraWorkbooks.length + 1} 个工作簿` : contextSelection ? ` · ${contextSelection.range_label}` : contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}`
+      : ''
+  const chatContextPayload = useMemo(() => {
+    if (!contextWorkbook && !contextFolder && contextExtraWorkbooks.length === 0) return undefined
+    return {
+      ...(contextWorkbook ? { workbook_id: contextWorkbook.id, sheet_ids: contextSheetIds, selection: contextSelection || undefined } : {}),
+      ...(contextExtraWorkbooks.length ? { workbook_ids: contextExtraWorkbooks.map((workbook) => workbook.id) } : {}),
+      ...(contextFolder ? { folder_id: contextFolder.id } : {}),
+    }
+  }, [contextExtraWorkbooks, contextFolder, contextSelection, contextSheetIds, contextWorkbook])
   useEffect(() => {
     const follow = async (detail: ActiveSheetDetail | null) => {
       if (!detail) {
@@ -699,6 +717,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       const current = getActiveSheet()
       if (current?.workbookId !== detail.workbookId || current.sheetId !== detail.sheetId) return
       contextAutoRef.current = true
+      setContextFolder(null)
+      setContextExtraWorkbooks([])
       setContextWorkbook(workbook)
       setContextSheetIds([detail.sheetId])
       setContextSelection(null)
@@ -808,11 +828,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     setSendError('')
     try {
       await prepareDataMutation()
-      await cloud.start(prompt, assistantId, contextWorkbook ? {
-        workbook_id: contextWorkbook.id,
-        sheet_ids: contextSheetIds,
-        selection: contextSelection || undefined,
-      } : undefined)
+      await cloud.start(prompt, assistantId, chatContextPayload)
     } catch (error) {
       setSendError(error instanceof Error ? error.message : '提交失败，请重试')
       if (cloud.isCurrent(origin)) setInputValue(prompt)
@@ -839,9 +855,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     setSendError('')
     try {
       await prepareDataMutation()
-      await cloud.startAction(messageId, kind, agentMode, assistantId, contextWorkbook ? {
-        workbook_id: contextWorkbook.id, sheet_ids: contextSheetIds, selection: contextSelection || undefined,
-      } : undefined)
+      await cloud.startAction(messageId, kind, agentMode, assistantId, chatContextPayload)
     } catch (error) {
       setSendError(error instanceof Error ? error.message : '提交确认方案失败')
     }
@@ -947,6 +961,8 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
 
   const selectContextWorkbook = useCallback(async (workbook: Workbook) => {
     contextAutoRef.current = false
+    setContextFolder(null)
+    setContextExtraWorkbooks([])
     setLoadingContextWorkbookId(workbook.id)
     try {
       const res = await api.get<Workbook>(`/workbooks/${workbook.id}`)
@@ -958,6 +974,41 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
       setLoadingContextWorkbookId(null)
     }
   }, [])
+
+  const clearContext = useCallback(() => {
+    contextAutoRef.current = false
+    setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null)
+    setContextFolder(null); setContextExtraWorkbooks([])
+    setContextPickerOpen(false)
+  }, [])
+
+  const applyContextDrop = useCallback(async (payload: AIContextDragPayload) => {
+    contextAutoRef.current = false
+    setContextSelection(null)
+    setContextPickerOpen(false)
+    if (payload.folder) {
+      setContextFolder(payload.folder); setContextExtraWorkbooks([])
+      setContextWorkbook(null); setContextSheetIds([])
+      return
+    }
+    const dropped = payload.workbooks ?? []
+    if (dropped.length === 0) return
+    const res = await api.get<Workbook>(`/workbooks/${dropped[0].id}`)
+    if (res.code !== 0 || !res.data) { setSendError(res.message || '无法读取拖入的工作簿'); return }
+    setContextFolder(null)
+    setContextExtraWorkbooks(dropped.slice(1))
+    setContextWorkbook(res.data); setContextSheetIds([])
+  }, [])
+
+  // The AI button outside the panel accepts drops too and forwards them here.
+  useEffect(() => {
+    const onContextDrop = (event: Event) => {
+      const payload = (event as CustomEvent<AIContextDragPayload>).detail
+      if (payload) void applyContextDrop(payload)
+    }
+    window.addEventListener(AI_CONTEXT_DROP_EVENT, onContextDrop)
+    return () => window.removeEventListener(AI_CONTEXT_DROP_EVENT, onContextDrop)
+  }, [applyContextDrop])
 
   const toggleContextSheet = useCallback((sheetId: number) => {
     contextAutoRef.current = false
@@ -984,7 +1035,25 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         '--ai-panel-height': `${panelSize.height}px`,
         ...(isDesktopViewport && panelDrag.style ? panelDrag.style : {}),
       } as React.CSSProperties}
+      onDragEnterCapture={(event) => { if (isContextDrag(event.dataTransfer)) { event.preventDefault(); setContextDropActive(true) } }}
+      onDragOverCapture={(event) => { if (isContextDrag(event.dataTransfer)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }}
+      onDragLeave={(event) => { if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget))) setContextDropActive(false) }}
+      onDropCapture={(event) => {
+        if (!isContextDrag(event.dataTransfer)) return
+        event.preventDefault()
+        event.stopPropagation()
+        setContextDropActive(false)
+        const payload = readContextDrag(event.dataTransfer)
+        if (payload) void applyContextDrop(payload)
+      }}
     >
+      {contextDropActive && (
+        <div className="pointer-events-none absolute inset-2 z-[60] flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-amber-400 bg-amber-50/90 text-center text-sm font-semibold text-amber-800">
+          <FolderOpen className="h-8 w-8" />
+          松开后让 AI 读取这些工作簿
+          <span className="text-xs font-normal text-amber-700">只会读取你有权限查看的内容</span>
+        </div>
+      )}
       <button
         type="button"
         onPointerDown={handleResizeStart}
@@ -1315,15 +1384,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         </div>
         <div className="relative mb-2">
           <div className="flex min-w-0 items-center gap-2">
-            <button type="button" onClick={() => setContextPickerOpen((current) => !current)} className={`inline-flex h-9 shrink-0 md:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${contextWorkbook ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="选择 AI 需要读取的工作簿或工作表">
+            <button type="button" onClick={() => setContextPickerOpen((current) => !current)} className={`inline-flex h-9 shrink-0 md:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${hasContext ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="选择 AI 需要读取的工作簿或工作表，也可以把工作簿或文件夹直接拖进对话框">
               <Table2 className="h-3.5 w-3.5" />
-              {contextWorkbook ? '已选择表格' : '选择表格'}
+              {hasContext ? '已选择表格' : '选择表格'}
               <ChevronDown className="h-3.5 w-3.5" />
             </button>
-            {contextWorkbook && (
+            {hasContext && (
               <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5 text-xs text-slate-600">
-                <span className="min-w-0 flex-1 truncate font-medium">{contextWorkbook.name}{contextSelection ? ` · ${contextSelection.range_label}` : contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}</span>
-                <button type="button" onClick={() => { contextAutoRef.current = false; setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null); setContextPickerOpen(false) }} className="-my-1 inline-flex h-8 w-8 shrink-0 items-center justify-center text-slate-400 hover:text-slate-700 md:my-0 md:h-auto md:w-auto" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
+                {contextFolder && <FolderOpen className="h-3.5 w-3.5 shrink-0 text-amber-600" />}
+                <span className="min-w-0 flex-1 truncate font-medium" title={contextLabel}>{contextLabel}</span>
+                <button type="button" onClick={clearContext} className="-my-1 inline-flex h-8 w-8 shrink-0 items-center justify-center text-slate-400 hover:text-slate-700 md:my-0 md:h-auto md:w-auto" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
               </div>
             )}
           </div>

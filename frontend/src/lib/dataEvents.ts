@@ -1,3 +1,27 @@
+/** Drag data for handing workbooks or a folder to the AI chat as context. */
+export const AI_CONTEXT_DRAG_MIME = 'application/x-yaerp-ai-context'
+
+export interface AIContextDragPayload {
+  workbooks?: { id: number; name: string }[]
+  folder?: { id: number; name: string }
+}
+
+/** Dispatched with an AIContextDragPayload when something is dropped on the AI button. */
+export const AI_CONTEXT_DROP_EVENT = 'yaerp:ai-context-drop'
+
+export function isContextDrag(dataTransfer: DataTransfer | null) {
+  return Boolean(dataTransfer && Array.from(dataTransfer.types || []).includes(AI_CONTEXT_DRAG_MIME))
+}
+
+export function readContextDrag(dataTransfer: DataTransfer): AIContextDragPayload | null {
+  try {
+    const payload = JSON.parse(dataTransfer.getData(AI_CONTEXT_DRAG_MIME) || 'null')
+    return payload && (payload.folder || Array.isArray(payload.workbooks)) ? payload : null
+  } catch {
+    return null
+  }
+}
+
 export const ACTIVE_SHEET_EVENT = 'yaerp:active-sheet'
 
 export interface ActiveSheetDetail {

@@ -147,6 +147,7 @@ func main() {
 	mailService.SetTradeService(tradeService)
 	aiService.SetAutomationService(automationService)
 	aiService.SetHistoryService(historyService)
+	aiService.SetFolderService(folderService)
 
 	// Global XTLS / Mihomo outbound proxy
 	proxyService := service.NewProxyService(cfg, proxyRepo)
@@ -441,6 +442,7 @@ func main() {
 
 		// Sheets
 		api.POST("/workbooks/:id/sheets", sheetHandler.CreateSheet)
+		api.PUT("/workbooks/:id/sheet-tabs", sheetHandler.UpdateSheetTabs)
 		api.POST("/sheets/:id/duplicate", sheetHandler.DuplicateSheet)
 
 		// Cells
@@ -579,6 +581,7 @@ func main() {
 		api.POST("/ai/erp/import/apply", aiHandler.ApplyERPOrderImport)
 		api.GET("/ai/summaries", aiHandler.ListSummaryPages)
 		api.POST("/ai/summaries/generate", aiHandler.GenerateSummaryPage)
+		api.POST("/ai/summaries/generate/stream", aiHandler.GenerateSummaryPageStream)
 		api.GET("/ai/summaries/:id", aiHandler.GetSummaryPage)
 		api.PUT("/ai/summaries/:id", aiHandler.UpdateSummaryPage)
 		api.DELETE("/ai/summaries/:id", aiHandler.DeleteSummaryPage)

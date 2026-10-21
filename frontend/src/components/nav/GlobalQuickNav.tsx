@@ -504,7 +504,7 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
         onClick={() => setOpen(true)}
         title={`快捷导航（${isMac ? '⌘' : 'Ctrl'} + K）· 可拖动`}
         aria-label="打开快捷导航"
-        className={`fixed bottom-[calc(var(--mobile-fab-bottom)+0.75rem)] left-3 z-[70] h-10 touch-none select-none items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-xs font-semibold text-slate-600 shadow-lg backdrop-blur transition hover:border-sky-200 hover:text-sky-700 md:bottom-4 md:left-4 md:inline-flex md:h-9 ${
+        className={`fixed bottom-[calc(var(--mobile-fab-bottom)+0.75rem)] left-3 z-[70] h-10 touch-none select-none items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 text-xs font-semibold text-slate-600 shadow-lg backdrop-blur transition hover:border-sky-200 hover:text-sky-700 md:bottom-[calc(var(--sheet-tabbar-offset)+1rem)] md:left-4 md:inline-flex md:h-9 ${
           hideLauncherOnPhone ? 'hidden' : 'inline-flex'
         } ${
           drag.dragging

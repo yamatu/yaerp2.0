@@ -20,7 +20,7 @@ const agentSystemPrompt = `你是 YaERP 智能表格 Agent，用工具查询和�
 
 【少走轮次】每一轮模型调用都会让用户多等几秒：
 1. 上下文给出了当前工作表的数据预览且标明“全部数据”时，直接基于预览回答或写入，不要再重复读取。
-2. 否则：按内容找数据用 search_sheet_content（默认先搜当前工作簿，已知表时传 sheet_id）；按条件筛选用 filter_sheet_rows；统计用 calculate_sheet_metrics；需要逐页读取才用 query_sheet，并检查 has_more / next_start_row，不得把未读完的结果说成“不存在”。只知道表名时用 search_spreadsheets 找 ID；禁止逐表全量扫描。
+2. 否则：按内容找数据用 search_sheet_content（默认先搜当前工作簿，已知表时传 sheet_id）；按条件筛选用 filter_sheet_rows；统计用 calculate_sheet_metrics；按某列分组求和/平均（如各产品利润、各供应商金额）用 aggregate_sheet_rows，不要自己逐行相加；需要逐页读取才用 query_sheet，并检查 has_more / next_start_row，不得把未读完的结果说成“不存在”。只知道表名时用 search_spreadsheets 找 ID；禁止逐表全量扫描。
 3. 互不依赖的只读工具在同一轮里一起调用。
 
 【修改表格】
@@ -275,6 +275,126 @@ func (s *AIService) inheritRowFormulas(userID, sheetID int64, row int, rowValues
 		return map[string]any{}
 	}
 	return inherited
+}
+
+const (
+	pinnedContextMaxWorkbooks = 40
+	pinnedContextMaxBytes     = 24000
+	pinnedContextFolderDepth  = 3
+)
+
+// expandFolderWorkbookIDs lists the workbooks the user can open in a folder
+// and its sub folders (breadth first, a few levels deep), up to limit.
+func (s *AIService) expandFolderWorkbookIDs(userID, folderID int64, limit int) ([]int64, string, error) {
+	if s.folderService == nil {
+		return nil, "", fmt.Errorf("文件夹服务未启用")
+	}
+	folder, err := s.folderService.Get(folderID)
+	if err != nil {
+		return nil, "", fmt.Errorf("文件夹不存在: %w", err)
+	}
+	ids := make([]int64, 0, limit)
+	type pending struct {
+		id    int64
+		depth int
+	}
+	queue := []pending{{folderID, 0}}
+	for len(queue) > 0 && len(ids) < limit {
+		current := queue[0]
+		queue = queue[1:]
+		id := current.id
+		contents, err := s.folderService.ListContents(&id, userID)
+		if err != nil {
+			if current.depth == 0 {
+				return nil, "", fmt.Errorf("无权查看文件夹「%s」: %w", folder.Name, err)
+			}
+			continue
+		}
+		for _, workbook := range contents.Workbooks {
+			if len(ids) < limit {
+				ids = append(ids, workbook.ID)
+			}
+		}
+		if current.depth+1 < pinnedContextFolderDepth {
+			for _, child := range contents.Folders {
+				queue = append(queue, pending{child.ID, current.depth + 1})
+			}
+		}
+	}
+	return ids, folder.Name, nil
+}
+
+// buildPinnedWorkbooksContext describes the workbooks the employee dragged
+// into the chat (a folder, searched recursively, and/or single workbooks) so
+// the agent knows which data the question is about. Only workbooks the
+// employee can open are listed.
+func (s *AIService) buildPinnedWorkbooksContext(userID int64, chatContext *ChatContext) (string, error) {
+	scope := s.permService.NewAccessScope()
+	ids := make([]int64, 0, pinnedContextMaxWorkbooks)
+	seen := map[int64]bool{}
+	add := func(id int64) {
+		if id > 0 && !seen[id] && len(ids) < pinnedContextMaxWorkbooks {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range chatContext.WorkbookIDs {
+		add(id)
+	}
+
+	folderLabel := ""
+	if chatContext.FolderID != nil && *chatContext.FolderID > 0 {
+		folderIDs, name, err := s.expandFolderWorkbookIDs(userID, *chatContext.FolderID, pinnedContextMaxWorkbooks)
+		if err != nil {
+			return "", err
+		}
+		for _, id := range folderIDs {
+			add(id)
+		}
+		folderLabel = name
+	}
+
+	var body strings.Builder
+	listed := 0
+	for _, id := range ids {
+		workbook, err := s.getSearchWorkbook(userID, id, scope)
+		if err != nil {
+			continue
+		}
+		payload, err := marshalAgentWorkbookContext(workbook, nil)
+		if err != nil {
+			continue
+		}
+		if body.Len()+len(payload) > pinnedContextMaxBytes {
+			break
+		}
+		body.WriteString(payload)
+		body.WriteByte('\n')
+		listed++
+	}
+	if listed == 0 {
+		if folderLabel != "" {
+			return fmt.Sprintf("用户拖入了文件夹「%s」作为问题范围，但其中没有该账号可查看的工作簿。", folderLabel), nil
+		}
+		return "", nil
+	}
+
+	var out strings.Builder
+	if folderLabel != "" {
+		fmt.Fprintf(&out, "用户把文件夹「%s」拖进了对话（含子文件夹）", folderLabel)
+		if len(chatContext.WorkbookIDs) > 0 {
+			out.WriteString("和若干工作簿")
+		}
+	} else {
+		out.WriteString("用户把以下工作簿拖进了对话")
+	}
+	fmt.Fprintf(&out, "，问题默认针对这些工作簿（已按当前账号权限过滤，共列出 %d 个", listed)
+	if listed < len(ids) {
+		fmt.Fprintf(&out, "，另有 %d 个因篇幅未列出", len(ids)-listed)
+	}
+	out.WriteString("）。查找内容时用 search_sheet_content 并传 workbook_id 或 sheet_id 限定在这些工作簿内，统计用 calculate_sheet_metrics / filter_sheet_rows；除非用户要求，不要扩大到范围以外的工作簿。以下为表结构，不含单元格数据：\n")
+	out.WriteString(body.String())
+	return out.String(), nil
 }
 
 // saveSheetAsUser persists a sheet's columns/config change through the same

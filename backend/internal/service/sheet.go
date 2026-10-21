@@ -224,6 +224,7 @@ func duplicatedWorkbookMetadata(metadata json.RawMessage) (json.RawMessage, erro
 		payload = make(map[string]interface{})
 	}
 	delete(payload, "workbookState")
+	delete(payload, sheetTabColorsKey)
 	delete(payload, "source_workbook_id")
 	delete(payload, "assigned_by")
 	delete(payload, "assigned_at")
