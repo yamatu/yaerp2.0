@@ -383,3 +383,21 @@ func cloneIntPtr(value *int) *int {
 func stringPtr(value string) *string    { return &value }
 func float64Ptr(value float64) *float64 { return &value }
 func intPtr(value int) *int             { return &value }
+
+// univerCellValueType is the Univer CellValueType ("t") matching a JSON cell
+// value: 1 string, 2 number, 3 boolean; "" for null or other values. Without
+// it Univer shows numbers as text (left aligned, number formats ignored).
+func univerCellValueType(value json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(value))
+	switch {
+	case trimmed == "" || trimmed == "null":
+		return ""
+	case trimmed == "true" || trimmed == "false":
+		return "3"
+	case trimmed[0] == '"':
+		return "1"
+	case trimmed[0] == '-' || (trimmed[0] >= '0' && trimmed[0] <= '9'):
+		return "2"
+	}
+	return ""
+}
