@@ -239,12 +239,18 @@ export default function SheetMobileControls(props: Props) {
   }
   const closeSearch = () => { setSearchOpen(false); remember(false, query) }
   openSearchRef.current = () => {
+    // Univer keeps focus in its hidden cell editor so typing starts an edit.
+    // Leave it before the search box is mounted, or the first keys of the
+    // search text would be typed into the selected cell.
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active !== inputRef.current) active.blur()
     if (!searchOpen) {
       const text = query || readLastQuery()
       if (text !== query) setQuery(text)
       setSearchOpen(true); remember(true, text)
     }
-    window.setTimeout(() => { inputRef.current?.focus(); inputRef.current?.select() }, 30)
+    inputRef.current?.focus()
+    window.setTimeout(() => { inputRef.current?.focus(); inputRef.current?.select() }, 0)
   }
   const toggleSearch = () => {
     if (searchOpen) { closeSearch(); return }

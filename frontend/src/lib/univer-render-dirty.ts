@@ -33,7 +33,7 @@ export function skipEditorTextRepaints(univer: unknown, unitId: string): { dispo
   const install = (): boolean => {
     const injector = (univer as { __getInjector?: () => { get: <T>(token: unknown) => T } } | null)?.__getInjector?.()
     const renderManager = injector?.get<IRenderManagerService | undefined>(IRenderManagerService)
-    const controller = renderManager?.getRenderById(unitId)?.with(SheetRenderController) as unknown as RenderControllerLike | undefined
+    const controller = renderManager?.getRenderUnitById(unitId)?.with(SheetRenderController) as unknown as RenderControllerLike | undefined
     const original = controller?._markUnitDirty
     if (!controller || typeof original !== 'function') return false
     const patched = function patchedMarkUnitDirty(this: RenderControllerLike, command: MutationLike) {

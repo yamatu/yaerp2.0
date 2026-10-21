@@ -285,7 +285,7 @@ video {
  */
 
 /* Make sure Univer's own root wrapper fills its container */
-.univer-app-layout {
+[data-u-comp="app-layout"] {
   width: 100% !important;
   height: 100% !important;
 }
@@ -297,8 +297,7 @@ video {
  * and prevent scroll chaining from leaving a stale editor over the page.
  */
 .univer-theme,
-.univer-workbench-container,
-.univer-workbench-container-canvas {
+[data-u-comp="workbench-layout"] {
   overscroll-behavior: contain;
 }
 
@@ -310,9 +309,7 @@ video {
  * wheel events in UniverSheetEditor, but the browser must not start its own
  * panning/zoom gesture first, otherwise the sheet still will not move.
  */
-.univer-render-canvas,
-.univer-sheet-container,
-.univer-workbench-container-canvas {
+[data-u-comp="render-canvas"] {
   touch-action: none !important;
   overscroll-behavior: contain;
   -webkit-user-select: none;

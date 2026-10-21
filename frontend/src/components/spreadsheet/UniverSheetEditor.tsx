@@ -774,8 +774,8 @@ function getLargestVisibleElement(root: HTMLElement, selector: string) {
 
 function getWheelPointerOffset(root: HTMLElement, event: WheelEvent) {
   const viewport =
-    getLargestVisibleElement(root, '.univer-render-canvas') ||
-    getLargestVisibleElement(root, '.univer-sheet-container') ||
+    getLargestVisibleElement(root, UNIVER_RENDER_CANVAS) ||
+    getLargestVisibleElement(root, '[data-u-comp="workbench-layout"]') ||
     root
   const rect = viewport.getBoundingClientRect()
   const x = Math.min(rect.width, Math.max(0, event.clientX - rect.left))
@@ -815,7 +815,7 @@ function attachUniverTouchPanning(root: HTMLElement) {
   let velocityY = 0
   let momentumFrame = 0
 
-  const getCanvas = () => getLargestVisibleElement(root, '.univer-render-canvas')
+  const getCanvas = () => getLargestVisibleElement(root, UNIVER_RENDER_CANVAS)
 
   const cancelMomentum = () => {
     if (momentumFrame) {
@@ -873,7 +873,7 @@ function attachUniverTouchPanning(root: HTMLElement) {
   const onTouchStart = (event: TouchEvent) => {
     cancelMomentum()
     // Never turn toolbar, menu or editor-input gestures into canvas scrolling.
-    if (!(event.target instanceof Element) || !event.target.closest('.univer-render-canvas')) {
+    if (!(event.target instanceof Element) || !event.target.closest(UNIVER_RENDER_CANVAS)) {
       tracking = false
       return
     }
@@ -1001,7 +1001,7 @@ function attachUniverTouchPanning(root: HTMLElement) {
  * phone's arrow pad yank the sheet around on every step.
  */
 function revealCell(
-  worksheet: { getVisibleRange?: () => { startRow: number; endRow: number; startColumn: number; endColumn: number }; scrollToCell: (row: number, column: number) => unknown } | null | undefined,
+  worksheet: { getVisibleRange?: () => { startRow: number; endRow: number; startColumn: number; endColumn: number } | null; scrollToCell: (row: number, column: number) => unknown } | null | undefined,
   row: number,
   column: number
 ) {
@@ -1692,8 +1692,17 @@ function getYaerpProtectionContextMenuItem(target: EventTarget | null) {
   return YAERP_PROTECTION_CONTEXT_MENU_LABELS.some((label) => text.includes(label)) ? menuItem : null
 }
 
+// Univer 1.x marks its components with data-u-comp instead of class names.
+const UNIVER_RENDER_CANVAS = '[data-u-comp="render-canvas"]'
+const UNIVER_EDITOR = '[data-u-comp="editor"]'
+
 function getVisibleUniverCellEditor(root: HTMLElement | null) {
-  const editor = root?.querySelector<HTMLElement>('.univer-editor-container')
+  // The formula bar and hidden editors share the marker; the cell editor is
+  // the one with a real size.
+  const editor = [...(root?.querySelectorAll<HTMLElement>(UNIVER_EDITOR) ?? [])].find((element) => {
+    const box = element.getBoundingClientRect()
+    return box.width > 4 && box.height > 4 && !element.closest('[data-u-comp="formula-bar"]')
+  })
   if (!editor) return null
 
   const rect = editor.getBoundingClientRect()
@@ -1999,7 +2008,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       ariaHidden: string | null
     }>()
     const hideNativeDropdowns = () => {
-      document.querySelectorAll<HTMLElement>('.univer-dv-list-dropdown').forEach((dropdown) => {
+      document.querySelectorAll<HTMLElement>('[data-u-comp="sheets-dropdown-list"]').forEach((dropdown) => {
         const host = dropdown.closest<HTMLElement>('section') || dropdown
         if (!hiddenHosts.has(host)) {
           hiddenHosts.set(host, {
@@ -2038,7 +2047,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const root = containerRef.current
     if (!getVisibleUniverCellEditor(root)) return false
 
-    const confirmButton = root?.querySelector<HTMLElement>('.univer-formula-icon .univer-icon-container-success')
+    // Formula bar actions are: cancel, confirm, fx.
+    const confirmButton = root?.querySelector<HTMLElement>('[data-u-comp="formula-bar-actions"] > span:nth-child(2)')
     confirmButton?.click()
     return Boolean(confirmButton)
   }, [])
@@ -2677,15 +2687,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   // Watch Univer blocking dialogs and side panels separately.
   useEffect(() => {
     const check = () => {
-      const overlays = document.querySelectorAll('.univer-dialog, .univer-confirm-modal')
-      const sidebars = document.querySelectorAll('.univer-sidebar')
+      const overlays = document.querySelectorAll('[role="dialog"][class*="univer-"]')
+      // Univer keeps its sidebar elements mounted with zero width while closed.
+      const sidebars = document.querySelectorAll('[data-u-comp="sidebar"], [data-u-comp="right-sidebar"]')
       let hasVisible = false
       overlays.forEach((el) => {
         if ((el as HTMLElement).offsetParent !== null) hasVisible = true
       })
       let hasVisibleSidebar = false
       sidebars.forEach((el) => {
-        if ((el as HTMLElement).offsetParent !== null) hasVisibleSidebar = true
+        if (el.getBoundingClientRect().width > 0) hasVisibleSidebar = true
       })
       setUniverHasOverlay(hasVisible)
       setUniverSidebarOpen(hasVisibleSidebar)
@@ -3749,7 +3760,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     const isUniverEditorTarget = (target: EventTarget | null) => {
       if (!(target instanceof Node)) return false
       if (root.contains(target)) return true
-      return target instanceof Element && Boolean(target.closest('.univer-editor'))
+      return target instanceof Element && Boolean(target.closest(UNIVER_EDITOR))
     }
 
     const handleCompositionStart = (event: CompositionEvent) => {
@@ -4020,18 +4031,25 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 	// until Univer is done with them.
 	let mountHost: HTMLDivElement | null = null
 
+	// Univer unmounts its own React roots synchronously while disposing. Doing
+	// that inside this effect's cleanup (React's commit phase) races React, so
+	// the old instance is hidden now and disposed right after the commit.
 	const disposeCreatedUniver = () => {
-	  if (createdUniver) {
-		try {
-		  ;(createdUniver.univer as { dispose?: () => void }).dispose?.()
-		} catch (disposeError) {
-		  console.error('Failed to dispose Univer instance:', disposeError)
-		} finally {
-		  createdUniver = null
-		}
-	  }
-	  mountHost?.remove()
+	  const instance = createdUniver
+	  const host = mountHost
+	  createdUniver = null
 	  mountHost = null
+	  if (host) host.style.display = 'none'
+	  window.setTimeout(() => {
+		if (instance) {
+		  try {
+			;(instance.univer as { dispose?: () => void }).dispose?.()
+		  } catch (disposeError) {
+			console.error('Failed to dispose Univer instance:', disposeError)
+		  }
+		}
+		host?.remove()
+	  }, 0)
 	}
 
     const mount = async () => {
@@ -4176,7 +4194,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         univerAPI.registerComponent(PLAIN_TEXT_BADGE_COMPONENT_KEY, PlainTextBadgeComponent)
         univerApiRef.current = univerResult
 
-        const workbookApi = univerAPI.createUniverSheet(workbookData)
+        const workbookApi = univerAPI.createWorkbook(workbookData)
         if (process.env.NODE_ENV !== 'production') {
           // Development only: lets browser automation drive the live sheet.
           ;(window as unknown as { __yaerpSheetDebug?: unknown }).__yaerpSheetDebug = { univerAPI, workbookApi, univer: univerResult.univer }
@@ -5833,7 +5851,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         <div
           ref={presenceWidgetRef}
           style={presenceDrag.style}
-          className={`absolute right-2 top-12 z-[22] w-auto sm:right-4 sm:top-14 max-w-[min(16rem,calc(100%-1rem))] sm:max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 ${presenceDrag.dragging ? 'cursor-grabbing opacity-100 select-none' : 'cursor-grab'}`}
+          className={`absolute right-14 top-32 z-[22] w-auto sm:right-16 max-w-[min(16rem,calc(100%-1rem))] sm:max-w-[min(20rem,calc(100%-2rem))] opacity-80 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100 ${presenceDrag.dragging ? 'cursor-grabbing opacity-100 select-none' : 'cursor-grab'}`}
         >
           <button
             {...presenceDrag.handleProps}

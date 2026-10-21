@@ -18,7 +18,7 @@
  * menu entry that flattens a whole selection is registered from here as well,
  * because it has to agree with the very same rule.
  */
-import { CellValueType, CommandType, CustomRangeType, ICommandService, IUniverInstanceService, RANGE_TYPE } from '@univerjs/core'
+import { CellValueType, CommandType, CustomRangeType, ICommandService, IUniverInstanceService, RANGE_TYPE, UniverInstanceType, type Workbook } from '@univerjs/core'
 import {
   ContextMenuGroup,
   ContextMenuPosition,
@@ -210,7 +210,7 @@ export function createWorksheetCellReader(
   try {
     const injector = getInjector(univer)
     const instanceService = injector?.get<IUniverInstanceService | undefined>(IUniverInstanceService)
-    const workbook = instanceService?.getUniverSheetInstance(unitId)
+    const workbook = instanceService?.getUnit<Workbook>(unitId, UniverInstanceType.UNIVER_SHEET)
     const worksheet = workbook?.getSheetBySheetId?.(subUnitId) as WorksheetLike | null | undefined
     if (!worksheet) return null
     return (row, column) => worksheet.getCell(row, column)
