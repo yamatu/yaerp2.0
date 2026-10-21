@@ -1005,6 +1005,33 @@ function revealCell(
   worksheet.scrollToCell(row, column)
 }
 
+/**
+ * Scrolls a search hit into view with some context around it. Plain
+ * `scrollToCell` pins the hit to the top-left corner, under the toolbar edge,
+ * and the bottom rows sit behind the docked search bar, so both edges keep a
+ * margin.
+ */
+function revealSearchHit(
+  worksheet: Parameters<typeof revealCell>[0],
+  row: number,
+  column: number
+) {
+  if (!worksheet) return
+  try {
+    const visible = worksheet.getVisibleRange?.()
+    if (
+      visible &&
+      row > visible.startRow &&
+      row < visible.endRow - 4 &&
+      column >= visible.startColumn &&
+      column < visible.endColumn
+    ) return
+  } catch {
+    // Fall back to scrolling.
+  }
+  worksheet.scrollToCell(Math.max(0, row - 3), Math.max(0, column - 1))
+}
+
 function cloneJsonSnapshot<T>(value: T): T {
   try {
     if (typeof structuredClone === 'function') {
@@ -5579,7 +5606,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           containerRef.current?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
           const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
           worksheet?.getRange(row, column, 1, 1).activate()
-          worksheet?.scrollToCell(row, column)
+          revealSearchHit(worksheet, row, column)
           syncSelectionState()
         }}
         moveCell={async (rowDelta, columnDelta) => {

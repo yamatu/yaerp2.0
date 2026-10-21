@@ -22,7 +22,16 @@
 }
 
 .ai-markdown {
-  line-height: 1.75;
+  line-height: 1.7;
+}
+
+.ai-markdown .katex {
+  font-size: 1em;
+}
+
+.ai-markdown strong {
+  font-weight: 600;
+  color: #0f172a;
 }
 
 .ai-markdown > :first-child {
@@ -96,18 +105,26 @@
 }
 
 .ai-markdown code {
+  border: 1px solid #e2e8f0;
   border-radius: 0.25rem;
-  background: #e2e8f0;
-  padding: 0.1rem 0.3rem;
-  font-size: 0.82em;
+  background: #f8fafc;
+  padding: 0.05rem 0.3rem;
+  font-size: 0.85em;
+  color: #334155;
 }
 
 .ai-markdown pre {
   overflow-x: auto;
   border-radius: 0.5rem;
-  background: #0f172a;
-  padding: 0.75rem;
-  color: #f8fafc;
+  background: #1e293b;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: #f1f5f9;
+}
+
+.ai-markdown pre code {
+  border: 0;
 }
 
 .ai-markdown pre code {
@@ -122,23 +139,45 @@
   overflow-x: auto;
 }
 
+.ai-markdown-table-wrap {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.5rem;
+}
+
 .ai-markdown table {
   min-width: 100%;
   border-collapse: collapse;
   font-size: 0.8rem;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
 }
 
 .ai-markdown th,
 .ai-markdown td {
-  border: 1px solid #cbd5e1;
-  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid #f1f5f9;
+  padding: 0.4rem 0.6rem;
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.ai-markdown td {
+  color: #334155;
+}
+
+.ai-markdown tr:last-child td {
+  border-bottom: 0;
 }
 
 .ai-markdown th {
-  background: #e2e8f0;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
   font-weight: 600;
+  color: #475569;
+}
+
+.ai-markdown tbody tr:hover td {
+  background: #f8fafc;
 }
 
 .ai-markdown hr {

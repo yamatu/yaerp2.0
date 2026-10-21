@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronDown, ChevronUp, ClipboardPaste, Eraser, Move, Pencil, Redo2, Scaling, Search, Undo2, X } from 'lucide-react'
 import { columnIndexToLetter } from '@/lib/spreadsheet'
 
@@ -223,15 +223,20 @@ export default function SheetMobileControls(props: Props) {
     setEditCell(selected); setValue(selected.value); setEditing(true)
   }
   const buttonClass = 'flex h-11 min-w-11 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 shadow-sm active:bg-sky-100 disabled:opacity-40'
+  const searchButtonClass = 'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-600 hover:bg-slate-100 active:bg-sky-100 disabled:opacity-30 md:h-8 md:w-8'
   const canEditSelection = props.ready && props.selectionEditable && !busy
   // Sits above the global quick-nav button (fixed in the bottom-left corner)
   // and above the cell editor form while that is open.
   const barBottom = editing ? 112 + keyboardInset : 56
+  // On desktop the find bar sits beside the trigger at the bottom, so jumping
+  // to a hit (which scrolls it towards the top) never hides it under the bar.
+  const searchBarStyle = { '--sheet-search-bottom': `${barBottom - 6}px` } as CSSProperties
 
   return <>
-    <div className="pointer-events-auto absolute left-2 z-[60] max-w-[calc(100%-1rem)] rounded-xl border border-slate-200 bg-white/95 p-1 shadow-lg" style={{ bottom: barBottom }} data-sheet-mobile-controls onPointerDown={(event) => { if (editing) event.preventDefault() }}>
+    {/* Desktop keeps only the search trigger, sized to sit on the row-number gutter instead of over data. */}
+    <div className="pointer-events-auto absolute left-2 z-[60] max-w-[calc(100%-1rem)] rounded-xl border border-slate-200 bg-white/95 p-1 shadow-lg md:left-1.5 md:rounded-lg md:border-0 md:bg-transparent md:p-0 md:shadow-none" style={{ bottom: barBottom }} data-sheet-mobile-controls onPointerDown={(event) => { if (editing) event.preventDefault() }}>
       <div className="flex items-center gap-1">
-        <button type="button" className={buttonClass} disabled={!props.ready} title="搜索当前表内容" aria-label="搜索当前表内容" onClick={toggleSearch}><Search className="h-5 w-5" /></button>
+        <button type="button" className={`${buttonClass} md:h-8 md:min-w-8 md:rounded-md md:shadow-md ${searchOpen ? 'border-sky-300 bg-sky-50 text-sky-700' : ''}`} disabled={!props.ready} title="搜索当前表内容" aria-label="搜索当前表内容" aria-expanded={searchOpen} onClick={toggleSearch}><Search className="h-5 w-5 md:h-4 md:w-4" /></button>
         <button type="button" className={`${buttonClass} md:hidden`} disabled={!props.ready || !props.editable || busy} title="撤销上一步" aria-label="撤销上一步" onClick={() => void run(props.undo)}><Undo2 className="h-5 w-5" /></button>
         <button type="button" className={`${buttonClass} md:hidden`} disabled={!props.ready || !props.editable || busy} title="重做" aria-label="重做" onClick={() => void run(props.redo)}><Redo2 className="h-5 w-5" /></button>
         {!editing && <button type="button" className={`${buttonClass} md:hidden`} disabled={!canEditSelection} title="编辑选中单元格" aria-label="编辑选中单元格" onClick={startEditing}><Pencil className="h-5 w-5" /></button>}
@@ -252,16 +257,17 @@ export default function SheetMobileControls(props: Props) {
         </div>
       </div>}
     </div>
-    {searchOpen && <div className="absolute left-2 right-2 top-2 z-[65] rounded-xl border border-sky-200 bg-white/95 p-2 shadow-xl md:left-4 md:right-auto md:w-96" role="search" aria-label="当前表内容搜索">
-      <div className="flex items-center gap-1">
-        <Search className="h-5 w-5 shrink-0 text-sky-600" />
-        <input ref={inputRef} type="search" value={query} onChange={(event) => { jumpToFirstRef.current = true; setQuery(event.target.value); remember(true, event.target.value) }} placeholder="搜索当前表中的数据" className="h-11 min-w-0 flex-1 rounded-lg bg-slate-50 px-2 text-base outline-none focus:ring-2 focus:ring-sky-300" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } if (event.key === 'Escape') closeSearch() }} />
-        <button type="button" className={buttonClass} aria-label="关闭搜索" onClick={closeSearch}><X className="h-4 w-4" /></button>
-      </div>
-      <div className="mt-1 flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate text-xs text-slate-600" aria-live="polite">{searching ? '正在读取最新数据…' : !query.trim() ? '支持文字、编号、数字；仅搜索你可见的数据' : hits.length ? `${index + 1} / ${hits.length} · ${columnIndexToLetter(hits[index]?.column ?? 0)}${(hits[index]?.row ?? 0) + 1} · ${hits[index]?.text.split('\n')[0]}` : '没有找到匹配内容'}</span>
-        <div className="flex gap-1"><button type="button" className={buttonClass} disabled={!hits.length || searching} aria-label="上一个搜索结果" onClick={() => navigate(-1)}><ChevronUp className="h-4 w-4" /></button><button type="button" className={buttonClass} disabled={!hits.length || searching} aria-label="下一个搜索结果" onClick={() => navigate(1)}><ChevronDown className="h-4 w-4" /></button></div>
-      </div>
+    {searchOpen && <div className="absolute left-2 right-2 top-2 z-[65] flex items-center gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-lg md:bottom-[var(--sheet-search-bottom)] md:left-11 md:right-auto md:top-auto md:w-[440px] md:rounded-lg" style={searchBarStyle} role="search" aria-label="当前表内容搜索">
+      <label className="relative flex min-w-0 flex-1 items-center">
+        <Search className="pointer-events-none absolute left-2.5 h-4 w-4 text-slate-400" />
+        <input ref={inputRef} type="search" value={query} onChange={(event) => { jumpToFirstRef.current = true; setQuery(event.target.value); remember(true, event.target.value) }} placeholder="搜索当前表（仅你可见的数据）" className="h-10 w-full min-w-0 rounded-lg bg-slate-50 pl-8 pr-2 text-base text-slate-800 outline-none focus:bg-white focus:ring-2 focus:ring-sky-200 md:h-8 md:text-sm [&::-webkit-search-cancel-button]:hidden" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } if (event.key === 'Escape') closeSearch() }} />
+      </label>
+      <span className={`shrink-0 px-1 text-xs tabular-nums ${query.trim() && !searching && !hits.length ? 'text-rose-500' : 'text-slate-500'}`} aria-live="polite" title={hits[index] ? `${columnIndexToLetter(hits[index].column)}${hits[index].row + 1} · ${hits[index].text.split('\n')[0]}` : undefined}>
+        {searching ? '读取中…' : !query.trim() ? '' : hits.length ? `${index + 1}/${hits.length}` : '无结果'}
+      </span>
+      <button type="button" className={searchButtonClass} disabled={!hits.length || searching} aria-label="上一个搜索结果" title="上一个（Shift+Enter）" onClick={() => navigate(-1)}><ChevronUp className="h-4 w-4" /></button>
+      <button type="button" className={searchButtonClass} disabled={!hits.length || searching} aria-label="下一个搜索结果" title="下一个（Enter）" onClick={() => navigate(1)}><ChevronDown className="h-4 w-4" /></button>
+      <button type="button" className={searchButtonClass} aria-label="关闭搜索" title="关闭（Esc）" onClick={closeSearch}><X className="h-4 w-4" /></button>
     </div>}
     {editing && editCell && <form className="absolute left-2 right-2 z-[75] rounded-xl border border-sky-200 bg-white p-3 shadow-xl" style={{ bottom: 8 + keyboardInset }} data-sheet-mobile-editor onSubmit={(event) => { event.preventDefault(); void run(async () => { await props.writeSelected(value, editCell); setEditing(false) }) }}>
       <div className="mb-2 flex items-center justify-between text-sm font-semibold"><span>编辑 {columnIndexToLetter(editCell.column)}{editCell.row + 1}</span><button type="button" aria-label="取消编辑" className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 active:bg-slate-100" onClick={() => setEditing(false)}><X className="h-5 w-5" /></button></div>

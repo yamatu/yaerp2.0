@@ -48,7 +48,7 @@ import {
 } from "@/hooks/useUserPreference";
 import { getStoredUser, isAdmin } from "@/lib/auth";
 import api from "@/lib/api";
-import { prepareDataMutation } from "@/lib/dataEvents";
+import { prepareDataMutation, publishActiveSheet } from "@/lib/dataEvents";
 import { consumeReturnTarget } from "@/lib/returnNavigation";
 import type { AuthUser, Sheet } from "@/types";
 
@@ -393,6 +393,13 @@ export default function WorkbookEditorShell({
     if (!currentUser?.id || !activeSheet?.id) return;
     rememberLastViewedSheet(currentUser.id, workbookId, activeSheet.id);
   }, [activeSheet?.id, currentUser?.id, workbookId]);
+
+  useEffect(() => {
+    if (!activeSheet?.id) return;
+    publishActiveSheet({ workbookId: Number(workbookId), sheetId: activeSheet.id });
+  }, [activeSheet?.id, workbookId]);
+
+  useEffect(() => () => publishActiveSheet(null), []);
 
   useEffect(() => {
     if (isMobileLayout) setMobileSheetPanelOpen(false);
