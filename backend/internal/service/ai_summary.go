@@ -181,7 +181,7 @@ func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs [
 			if err := s.ensureSheetViewAccess(userID, sheet.ID); err != nil {
 				continue
 			}
-			rows, err := s.sheetRepo.GetRows(sheet.ID)
+			rows, err := s.loadAgentRows(&sheet)
 			if err != nil {
 				return nil, fmt.Errorf("读取工作表 %s 失败: %w", sheet.Name, err)
 			}
@@ -543,7 +543,7 @@ func (s *AIService) CreateFinancialReportWorkbook(userID int64, name string, sou
 		if err != nil {
 			return 0, 0, 0, err
 		}
-		rows, err := s.sheetRepo.GetRows(sheetID)
+		rows, err := s.loadAgentRows(sheet)
 		if err != nil {
 			return 0, 0, 0, err
 		}

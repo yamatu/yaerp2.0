@@ -85,6 +85,9 @@ type AIConversationService struct {
 	cancels  map[int64]context.CancelFunc
 	slots    chan struct{}
 	finished func(userID int64, result *ChatResponse)
+	// sheetsChanged fires after every committed tool write so open sheets
+	// refresh while a long run is still going.
+	sheetsChanged func(userID int64, sheetIDs []int64)
 	// Test seam for the worker; production uses AIService.RunAgentStream.
 	runAgent    func(context.Context, int64, int64, []ChatMessage, *ChatContext, AgentEventSink) (*ChatResponse, error)
 	applyAction func(context.Context, int64, *ApprovedConversationAction) (*ChatResponse, error)
@@ -110,6 +113,10 @@ func NewAIConversationService(db *sql.DB, ai *AIService) (*AIConversationService
 
 func (s *AIConversationService) SetFinishedCallback(callback func(int64, *ChatResponse)) {
 	s.finished = callback
+}
+
+func (s *AIConversationService) SetSheetsChangedCallback(callback func(int64, []int64)) {
+	s.sheetsChanged = callback
 }
 
 func conversationMessageID() (string, error) {
@@ -605,6 +612,9 @@ func (s *AIConversationService) execute(ctx context.Context, cancel context.Canc
 			if event.Type == AgentEventToolEnd {
 				activity = "已完成" + event.Tool.Label
 				msg.ToolTraces = append(msg.ToolTraces, ChatToolTrace{Name: event.Tool.Name, Status: event.Tool.Status, Summary: event.Tool.Summary, Data: event.Tool.Data, TouchedSheetIDs: event.Tool.TouchedSheetIDs})
+				if len(event.Tool.ChangedSheetIDs) > 0 && s.sheetsChanged != nil {
+					s.sheetsChanged(userID, event.Tool.ChangedSheetIDs)
+				}
 			}
 		}
 		if event.Type == AgentEventDelta {

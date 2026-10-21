@@ -430,6 +430,175 @@ func shiftRowIndex(row, worksheetRow int, insert bool) (int, bool) {
 	return row, true
 }
 
+// shiftFormulaColumnsForInsert moves every reference at or right of the
+// 0-based column insertAt one column to the right.
+func shiftFormulaColumnsForInsert(formula, sheetName string, insertAt int) string {
+	move := func(ref formulaRef) formulaRef {
+		if index := columnLettersToIndex(ref.col); index >= insertAt {
+			ref.col = columnIndexToLetters(index + 1)
+		}
+		return ref
+	}
+	return rewriteFormulaRefs(formula, sheetName, func(start formulaRef, end *formulaRef) string {
+		if end == nil {
+			return move(start).String()
+		}
+		return move(start).String() + ":" + move(*end).String()
+	})
+}
+
+// shiftSnapshotColumnsInConfig opens an empty column at the 0-based column
+// index in the Univer snapshot: cells, column metadata and merges right of it
+// move one column over and formulas keep pointing at the same data. Configs
+// without a snapshot are returned untouched.
+func shiftSnapshotColumnsInConfig(config json.RawMessage, sheetName string, column int, header string) (json.RawMessage, error) {
+	if len(config) == 0 || column < 0 {
+		return config, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return nil, fmt.Errorf("parse sheet config: %w", err)
+	}
+	sheetRaw, ok := payload["univerSheetData"]
+	if !ok || len(sheetRaw) == 0 {
+		return config, nil
+	}
+	var sheet map[string]json.RawMessage
+	if err := json.Unmarshal(sheetRaw, &sheet); err != nil || sheet == nil {
+		return config, nil
+	}
+	if name, ok := rawString(sheet["name"]); ok && name != "" {
+		sheetName = name
+	}
+	shift := func(index int) int {
+		if index >= column {
+			return index + 1
+		}
+		return index
+	}
+
+	rowsRaw, otherRows, hasCells := decodeIndexedRawMap(sheet["cellData"])
+	if hasCells {
+		cells := make(map[int]map[int]snapshotCell, len(rowsRaw))
+		passthrough := make(map[int]json.RawMessage)
+		for row, raw := range rowsRaw {
+			columnsRaw, otherColumns, ok := decodeIndexedRawMap(raw)
+			if !ok || len(otherColumns) > 0 {
+				passthrough[row] = raw
+				continue
+			}
+			columns := make(map[int]snapshotCell, len(columnsRaw))
+			for index, cellRaw := range columnsRaw {
+				var cell snapshotCell
+				if err := json.Unmarshal(cellRaw, &cell); err != nil || cell == nil {
+					cell = snapshotCell{opaqueCellKey: cellRaw}
+				}
+				columns[index] = cell
+			}
+			cells[row] = columns
+		}
+		expandSharedFormulaCells(cells)
+		if _, ok := cells[0]; !ok && header != "" {
+			if _, opaque := passthrough[0]; !opaque {
+				cells[0] = map[int]snapshotCell{}
+			}
+		}
+
+		shifted := make(map[int]json.RawMessage, len(cells)+len(passthrough))
+		for row, columns := range cells {
+			encodedColumns := make(map[int]json.RawMessage, len(columns)+1)
+			if row == 0 && header != "" {
+				encodedHeader, err := json.Marshal(map[string]string{"v": header})
+				if err != nil {
+					return nil, err
+				}
+				encodedColumns[column] = encodedHeader
+			}
+			for index, cell := range columns {
+				if raw, opaque := cell[opaqueCellKey]; opaque {
+					encodedColumns[shift(index)] = raw
+					continue
+				}
+				if formula, ok := rawString(cell["f"]); ok && strings.HasPrefix(formula, "=") {
+					if next := shiftFormulaColumnsForInsert(formula, sheetName, column); next != formula {
+						encoded, err := json.Marshal(next)
+						if err != nil {
+							return nil, fmt.Errorf("marshal shifted formula: %w", err)
+						}
+						cell["f"] = encoded
+						delete(cell, "v")
+					}
+				}
+				encoded, err := json.Marshal(cell)
+				if err != nil {
+					return nil, fmt.Errorf("marshal shifted cell: %w", err)
+				}
+				encodedColumns[shift(index)] = encoded
+			}
+			encodedRow, err := encodeIndexedRawMap(encodedColumns, nil)
+			if err != nil {
+				return nil, fmt.Errorf("marshal shifted row: %w", err)
+			}
+			shifted[row] = encodedRow
+		}
+		for row, raw := range passthrough {
+			shifted[row] = raw
+		}
+		encodedCells, err := encodeIndexedRawMap(shifted, otherRows)
+		if err != nil {
+			return nil, fmt.Errorf("marshal shifted cell data: %w", err)
+		}
+		sheet["cellData"] = encodedCells
+	}
+
+	if columnData, otherColumnData, ok := decodeIndexedRawMap(sheet["columnData"]); ok {
+		shifted := make(map[int]json.RawMessage, len(columnData))
+		for index, raw := range columnData {
+			shifted[shift(index)] = raw
+		}
+		encoded, err := encodeIndexedRawMap(shifted, otherColumnData)
+		if err != nil {
+			return nil, fmt.Errorf("marshal shifted column data: %w", err)
+		}
+		sheet["columnData"] = encoded
+	}
+
+	if mergeRaw, ok := sheet["mergeData"]; ok && len(mergeRaw) > 0 {
+		var merges []map[string]json.RawMessage
+		if err := json.Unmarshal(mergeRaw, &merges); err == nil {
+			for _, merge := range merges {
+				var startColumn, endColumn int
+				if json.Unmarshal(merge["startColumn"], &startColumn) != nil || json.Unmarshal(merge["endColumn"], &endColumn) != nil {
+					continue
+				}
+				merge["startColumn"] = json.RawMessage(strconv.Itoa(shift(startColumn)))
+				merge["endColumn"] = json.RawMessage(strconv.Itoa(shift(endColumn)))
+			}
+			encoded, err := json.Marshal(merges)
+			if err != nil {
+				return nil, fmt.Errorf("marshal shifted merges: %w", err)
+			}
+			sheet["mergeData"] = encoded
+		}
+	}
+
+	var columnCount int
+	if json.Unmarshal(sheet["columnCount"], &columnCount) == nil && columnCount > 0 {
+		sheet["columnCount"] = json.RawMessage(strconv.Itoa(columnCount + 1))
+	}
+
+	encodedSheet, err := json.Marshal(sheet)
+	if err != nil {
+		return nil, fmt.Errorf("marshal shifted worksheet: %w", err)
+	}
+	payload["univerSheetData"] = encodedSheet
+	encodedConfig, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal shifted sheet config: %w", err)
+	}
+	return encodedConfig, nil
+}
+
 // shiftSnapshotRowsInConfig inserts an empty worksheet row at worksheetRow
 // (0-based, the header is row 0) or deletes that row from the Univer snapshot
 // in config, and rewrites the formulas so they keep pointing at the same data.

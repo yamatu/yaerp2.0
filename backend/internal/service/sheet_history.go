@@ -10,6 +10,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -30,12 +31,73 @@ type SheetHistoryService struct {
 	historyRepo *repo.SheetHistoryRepo
 	sheetRepo   *repo.SheetRepo
 	permService *PermissionService
+	normalized  normalizedSnapshotCache
+}
+
+// normalizedSheetSnapshot is a sheet snapshot decoded and canonicalised once.
+// Normalising a large sheet is the expensive part of recording history, so a
+// mutation keeps the result instead of redoing it for checksum, save and diff.
+type normalizedSheetSnapshot struct {
+	Normalized json.RawMessage
+	Snapshot   *model.SheetVersionSnapshot
+	Checksum   string
+}
+
+func normalizeSheetSnapshot(raw json.RawMessage) (*normalizedSheetSnapshot, error) {
+	normalized, snapshot, checksum, err := normalizeSheetVersionSnapshot(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &normalizedSheetSnapshot{Normalized: normalized, Snapshot: snapshot, Checksum: checksum}, nil
+}
+
+const normalizedSnapshotCacheSize = 64
+
+// normalizedSnapshotCache remembers the last normalised state of recently
+// written sheets. The state after one mutation is the state before the next,
+// so consecutive edits skip one of their two normalisations. Entries are keyed
+// by a hash of the raw snapshot, so a sheet changed elsewhere simply misses.
+type normalizedSnapshotCache struct {
+	mu      sync.Mutex
+	entries map[int64]normalizedSnapshotCacheEntry
+}
+
+type normalizedSnapshotCacheEntry struct {
+	rawHash [sha256.Size]byte
+	value   *normalizedSheetSnapshot
+}
+
+func (c *normalizedSnapshotCache) normalize(sheetID int64, raw json.RawMessage) (*normalizedSheetSnapshot, error) {
+	rawHash := sha256.Sum256(raw)
+	c.mu.Lock()
+	entry, ok := c.entries[sheetID]
+	c.mu.Unlock()
+	if ok && entry.rawHash == rawHash {
+		return entry.value, nil
+	}
+	value, err := normalizeSheetSnapshot(raw)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.entries == nil {
+		c.entries = make(map[int64]normalizedSnapshotCacheEntry)
+	}
+	if _, exists := c.entries[sheetID]; !exists && len(c.entries) >= normalizedSnapshotCacheSize {
+		for key := range c.entries {
+			delete(c.entries, key)
+			break
+		}
+	}
+	c.entries[sheetID] = normalizedSnapshotCacheEntry{rawHash: rawHash, value: value}
+	c.mu.Unlock()
+	return value, nil
 }
 
 type sheetMutationHistory struct {
 	UserID     int64
 	SheetID    int64
-	Before     json.RawMessage
+	Before     *normalizedSheetSnapshot
 	Source     string
 	Action     string
 	Summary    string
@@ -54,18 +116,22 @@ func (s *SheetHistoryService) prepareMutation(userID, sheetID int64, source, act
 	if s == nil || s.historyRepo == nil {
 		return nil, nil
 	}
-	snapshot, err := s.historyRepo.LoadSheetSnapshot(sheetID)
+	raw, err := s.historyRepo.LoadSheetSnapshot(sheetID)
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := s.captureSnapshot(model.SheetVersionCapture{
+	before, err := s.normalized.normalize(sheetID, raw)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.historyRepo.SaveSheetVersion(model.SheetVersionCapture{
 		UserID: userID, SheetID: sheetID, Source: "baseline",
 		Summary: "历史记录初始状态",
-	}, snapshot); err != nil {
+	}, before.Normalized, before.Checksum, sheetVersionCoalesceWindow); err != nil {
 		return nil, err
 	}
 	return &sheetMutationHistory{
-		UserID: userID, SheetID: sheetID, Before: snapshot,
+		UserID: userID, SheetID: sheetID, Before: before,
 		Source: normalizeHistorySource(source), Action: action,
 		Summary: strings.TrimSpace(summary), Coalesce: coalesce, PreparedAt: time.Now(),
 	}, nil
@@ -75,26 +141,23 @@ func (s *SheetHistoryService) completeMutation(history *sheetMutationHistory) er
 	if s == nil || history == nil || s.historyRepo == nil {
 		return nil
 	}
-	after, err := s.historyRepo.LoadSheetSnapshot(history.SheetID)
+	raw, err := s.historyRepo.LoadSheetSnapshot(history.SheetID)
 	if err != nil {
 		return err
 	}
-	beforeChecksum, err := sheetSnapshotChecksum(history.Before)
+	after, err := s.normalized.normalize(history.SheetID, raw)
 	if err != nil {
 		return err
 	}
-	afterChecksum, err := sheetSnapshotChecksum(after)
-	if err != nil {
-		return err
-	}
+	beforeChecksum, afterChecksum := history.Before.Checksum, after.Checksum
 	if beforeChecksum == afterChecksum {
 		return nil
 	}
 
-	version, changed, err := s.captureSnapshot(model.SheetVersionCapture{
+	version, changed, err := s.historyRepo.SaveSheetVersion(model.SheetVersionCapture{
 		UserID: history.UserID, SheetID: history.SheetID, Source: history.Source,
 		Summary: history.Summary, Coalesce: history.Coalesce,
-	}, after)
+	}, after.Normalized, after.Checksum, sheetVersionCoalesceWindow)
 	if err != nil {
 		return err
 	}
@@ -103,21 +166,17 @@ func (s *SheetHistoryService) completeMutation(history *sheetMutationHistory) er
 	}
 
 	metadata := metadataMap(history.Metadata)
-	_, beforeSnapshot, _, normalizeBeforeErr := normalizeSheetVersionSnapshot(history.Before)
-	_, afterSnapshot, _, normalizeAfterErr := normalizeSheetVersionSnapshot(after)
-	if normalizeBeforeErr == nil && normalizeAfterErr == nil {
-		diff := buildSheetVersionDiff(beforeSnapshot, afterSnapshot, 100)
-		metadata["changed_cells"] = diff.ChangedCells
-		metadata["added_rows"] = diff.AddedRows
-		metadata["removed_rows"] = diff.RemovedRows
-		metadata["modified_rows"] = diff.ModifiedRows
-		metadata["field_changes"] = diff.FieldChanges
-		metadata["cell_changes"] = diff.CellChanges
-		metadata["cell_changes_limited"] = diff.CellChangesLimited
-		if history.OldValue == nil && history.NewValue == nil && len(diff.CellChanges) == 1 {
-			history.OldValue = diff.CellChanges[0].OldValue
-			history.NewValue = diff.CellChanges[0].NewValue
-		}
+	diff := buildSheetVersionDiff(history.Before.Snapshot, after.Snapshot, 100)
+	metadata["changed_cells"] = diff.ChangedCells
+	metadata["added_rows"] = diff.AddedRows
+	metadata["removed_rows"] = diff.RemovedRows
+	metadata["modified_rows"] = diff.ModifiedRows
+	metadata["field_changes"] = compactFieldChanges(diff.FieldChanges, operationFieldValueLimit)
+	metadata["cell_changes"] = diff.CellChanges
+	metadata["cell_changes_limited"] = diff.CellChangesLimited
+	if history.OldValue == nil && history.NewValue == nil && len(diff.CellChanges) == 1 {
+		history.OldValue = diff.CellChanges[0].OldValue
+		history.NewValue = diff.CellChanges[0].NewValue
 	}
 	metadata["version_id"] = version.ID
 	metadata["version_number"] = version.VersionNumber
@@ -491,11 +550,6 @@ func canonicalJSON(raw json.RawMessage) (json.RawMessage, any, error) {
 	return canonical, value, nil
 }
 
-func sheetSnapshotChecksum(raw json.RawMessage) (string, error) {
-	_, _, checksum, err := normalizeSheetVersionSnapshot(raw)
-	return checksum, err
-}
-
 func buildSheetVersionDiff(version, current *model.SheetVersionSnapshot, limit int) *model.SheetVersionDiff {
 	diff := &model.SheetVersionDiff{FieldChanges: make([]model.SheetVersionFieldChange, 0), CellChanges: make([]model.SheetVersionCellChange, 0)}
 	fields := []struct {
@@ -512,7 +566,10 @@ func buildSheetVersionDiff(version, current *model.SheetVersionSnapshot, limit i
 	for _, field := range fields {
 		oldValue, _ := json.Marshal(field.old)
 		newValue, _ := json.Marshal(field.new)
-		if jsonValuesEqual(oldValue, newValue) {
+		// Both snapshots are normalised (canonical JSON), so equal values are
+		// byte-identical; decoding a whole worksheet config to compare it was
+		// the costliest step of every history entry.
+		if bytes.Equal(oldValue, newValue) {
 			continue
 		}
 		diff.FieldChanges = append(diff.FieldChanges, model.SheetVersionFieldChange{Field: field.name, OldValue: oldValue, NewValue: newValue})
@@ -597,6 +654,27 @@ func rawObject(raw json.RawMessage) map[string]json.RawMessage {
 	result := make(map[string]json.RawMessage)
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &result)
+	}
+	return result
+}
+
+// operationFieldValueLimit caps each before/after value kept in an operation
+// log. The sheet config holds the whole worksheet, so storing it verbatim made
+// every edit of a large sheet write megabytes of audit data.
+const operationFieldValueLimit = 2048
+
+var omittedFieldValue = json.RawMessage(`"（内容较大，已省略；可在版本历史中对比）"`)
+
+func compactFieldChanges(changes []model.SheetVersionFieldChange, limit int) []model.SheetVersionFieldChange {
+	result := make([]model.SheetVersionFieldChange, len(changes))
+	for index, change := range changes {
+		if len(change.OldValue) > limit {
+			change.OldValue = omittedFieldValue
+		}
+		if len(change.NewValue) > limit {
+			change.NewValue = omittedFieldValue
+		}
+		result[index] = change
 	}
 	return result
 }

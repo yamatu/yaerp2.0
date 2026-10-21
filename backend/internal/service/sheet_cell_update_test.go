@@ -198,3 +198,42 @@ func TestPrepareSheetCellChangesMergesStyleOnlySave(t *testing.T) {
 		t.Fatalf("local style was lost: a1 style = %#v", got)
 	}
 }
+
+func TestPatchSnapshotCellsTouchesOnlyChangedCells(t *testing.T) {
+	config := json.RawMessage(`{"protections":[1],"univerSheetData":{"name":"S","cellData":{"0":{"0":{"v":"A"},"1":{"v":"B"}},"1":{"0":{"v":"old","s":"style-1"},"1":{"f":"=A2","v":3}},"2":{"0":{"v":"keep"}}}}}`)
+	columns := json.RawMessage(`[{"key":"a","name":"A"},{"key":"b","name":"B"}]`)
+	next, changed, err := patchSnapshotCells(config, columns, []model.CellUpdate{
+		{SheetID: 1, Row: 0, Col: "a", Value: json.RawMessage(`"new"`)},
+		{SheetID: 1, Row: 0, Col: "b", Value: json.RawMessage(`7`)},
+		{SheetID: 1, Row: 3, Col: "b", Value: json.RawMessage(`"=A2*2"`)},
+	})
+	if err != nil || !changed {
+		t.Fatalf("patch failed: changed=%v err=%v", changed, err)
+	}
+	var payload struct {
+		Protections []int `json:"protections"`
+		Sheet       struct {
+			Name     string                               `json:"name"`
+			CellData map[string]map[string]map[string]any `json:"cellData"`
+		} `json:"univerSheetData"`
+	}
+	if err := json.Unmarshal(next, &payload); err != nil {
+		t.Fatal(err)
+	}
+	cells := payload.Sheet.CellData
+	if len(payload.Protections) != 1 || payload.Sheet.Name != "S" || cells["2"]["0"]["v"] != "keep" || cells["0"]["1"]["v"] != "B" {
+		t.Fatalf("untouched data changed: %s", next)
+	}
+	if cells["1"]["0"]["v"] != "new" || cells["1"]["0"]["s"] != "style-1" {
+		t.Fatalf("value write lost the style: %v", cells["1"]["0"])
+	}
+	if _, hasFormula := cells["1"]["1"]["f"]; hasFormula || cells["1"]["1"]["v"] != float64(7) {
+		t.Fatalf("literal must replace the formula: %v", cells["1"]["1"])
+	}
+	if cells["4"]["1"]["f"] != "=A2*2" {
+		t.Fatalf("formula write = %v", cells["4"]["1"])
+	}
+	if _, changed, _ := patchSnapshotCells(json.RawMessage(`{"x":1}`), columns, nil); changed {
+		t.Fatal("config without a snapshot must be left alone")
+	}
+}

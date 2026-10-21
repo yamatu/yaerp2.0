@@ -99,16 +99,12 @@ func (s *AIService) buildToolRegistry() map[string]ToolFunc {
 		"lookup_sheet_records":      s.toolLookupSheetRecords,
 		"calculate_sheet_metrics":   s.toolCalculateSheetMetrics,
 		"calculate_expression":      s.toolCalculateExpression,
-		"update_cell":               s.toolUpdateCell,
 		"insert_row":                s.toolInsertRow,
 		"delete_row":                s.toolDeleteRow,
 		"insert_column":             s.toolInsertColumn,
-		"auto_fill_column":          s.toolAutoFillColumn,
 		"generate_report":           s.toolGenerateReport,
 		"schedule_daily_report":     s.toolScheduleDailyReport,
-		"run_workflow":              s.toolRunWorkflow,
 		"preview_spreadsheet_plan":  s.toolPreviewSpreadsheetPlan,
-		"apply_spreadsheet_plan":    s.toolApplySpreadsheetPlan,
 		"create_workbook":           s.toolCreateWorkbook,
 		"create_sheet":              s.toolCreateSheet,
 		"update_workbook":           s.toolUpdateWorkbook,
@@ -156,14 +152,25 @@ func (s *AIService) buildAgentConversation(userID int64, assistant *activeAIAssi
 		if err != nil {
 			return nil, err
 		}
-		contextMessage := map[string]any{
-			"role": "system",
-			"content": fmt.Sprintf(
-				"用户当前打开的工作簿为「%s」。以下仅包含已授权的表结构，不含单元格数据。查找内容直接调用 search_sheet_content（默认先搜此工作簿），已知 sheet_id 时用 search_sheet_rows。不得把表结构当作内容或猜测单元格值；写入前必须用读取/预览工具确认真实坐标。\n\n%s",
-				workbook.Name,
-				payload,
-			),
+		workbookSheetIDs := make([]int64, 0, len(workbook.Sheets))
+		for _, sheet := range workbook.Sheets {
+			workbookSheetIDs = append(workbookSheetIDs, sheet.ID)
 		}
+		previews := make([]string, 0, agentSheetPreviewSheets)
+		for _, sheetID := range previewSheetIDs(chatContext, workbookSheetIDs) {
+			preview, _, err := s.buildAgentSheetPreview(userID, sheetID)
+			if err != nil || preview == "" {
+				continue
+			}
+			previews = append(previews, preview)
+		}
+		content := fmt.Sprintf("用户当前打开的工作簿为「%s」，已授权的表结构如下：\n%s", workbook.Name, payload)
+		if len(previews) > 0 {
+			content += "\n\n当前工作表的数据预览（TSV，第一列 row 是 0-based 数据行号，可直接用作写入工具的 row；界面行号 = row+2）。预览标明“全部数据”时无需再读取即可回答或修改：\n\n" + strings.Join(previews, "\n\n")
+		} else {
+			content += "\n\n以上不含单元格数据：查找内容调用 search_sheet_content（默认先搜此工作簿），不得猜测单元格值。"
+		}
+		contextMessage := map[string]any{"role": "system", "content": content}
 		conversation = append(append([]map[string]any{}, conversation[:1]...), append([]map[string]any{contextMessage}, conversation[1:]...)...)
 	}
 	if chatContext != nil && chatContext.Selection != nil && chatContext.Selection.SheetID > 0 {
@@ -309,9 +316,6 @@ func (s *AIService) chatWithTools(userID, assistantID int64, messages []ChatMess
 			}
 			if result.PendingERPPlan != nil {
 				pendingERPPlan = result.PendingERPPlan
-			}
-			if call.Function.Name == "apply_spreadsheet_plan" {
-				pendingOperations = nil
 			}
 			toolTraces = append(toolTraces, ChatToolTrace{
 				Name:            call.Function.Name,
@@ -489,31 +493,7 @@ func (s *AIService) buildAgentMessages(userID int64, assistant *activeAIAssistan
 	result := []map[string]any{
 		{
 			"role": "system",
-			"content": fmt.Sprintf(
-				"你是 YaERP 智能表格 Agent。你必须优先使用工具来查询或修改表格，不要编造不存在的数据。"+
-					"所有工具都按当前登录账号执行；不得尝试读取、推断或写入该账号无权访问的工作簿、工作表、行、列或单元格。只读账号只能查询，不能写回来源表。"+
-					"动手之前先确认能力边界：当员工询问自己能看到或操作什么、或你准备提出写入/删除方案时，调用 get_my_permissions 查明当前账号的角色、可用功能和每张工作表的查看/编辑/删除/导出权限以及行列单元格级限制；被拒绝的能力要如实说明缺少哪种权限，不要尝试绕过。"+
-					"当用户只提供工作簿名、工作表名或业务关键词时，先调用 get_user_context 或 search_spreadsheets 定位准确 ID，再调用 query_sheet 读取实际单元格内容。query_sheet 是分页工具：必须检查 total_rows、returned_rows、has_more 和 next_start_row；用户要求完整读取、逐行核对或基于全表下结论时，不得只读取第一行或第一页。优先使用 profile 理解全表分布，需要精确逐行数据时按 next_start_row 继续读取；统计问题优先使用 calculate_sheet_metrics，检索问题优先使用 search_sheet_rows 或 lookup_sheet_records。"+
-					"编辑表格时优先使用批量工具，不要反复调用 update_cell 逐格写入：整段区域一次性写入用 batch_update_cells；给一整列写公式用 run_sheet_formulas（{{row}} 为 Excel 行号，{{column_key}} 引用同行其他列）；排序用 sort_sheet_range；按条件筛选用 filter_sheet_rows；查重合并用 dedupe_sheet_rows；多步骤条件处理用 run_spreadsheet_script（脚本里的 sort 只改变处理顺序、compute 只返回统计结果，真正重排工作表必须调用 sort_sheet_range）。动手前如果不知道确切的列 key，先调用 inspect_sheet_range 查看列结构与取值样例。"+
-					"硬性规则一：列类型为 formula 的列是派生列，只能写以 = 开头的公式。向公式列写入普通值会被拒绝并返回 COLUMN_TYPE_FORMULA；除非用户明确要求用普通值覆盖公式列，否则不得设置 disable_formula=true，也不得改列类型来绕过。"+
-					"硬性规则二：每次 batch_update_cells 返回后必须核对回执中的 invariants_ok、total_rows_before、total_rows_after 与 affected_columns。只允许改动预期列；一旦 total_rows_after 小于 total_rows_before、invariants_ok=false，或 affected_columns 出现未预期列，立即停止后续写入，如实把回执报告给用户，不要重试或“修复”后再写入。"+
-					"硬性规则三：不得用逐行脚本或多次 update_cell 重建整张表；写入范围必须由用户在界面上确认过的坐标或 query_sheet 读到的真实坐标决定，不能按当前可见的少量行推断整表结构。"+
-					"硬性规则四：数据被误删或误覆盖时，优先用 list_sheet_versions 查看历史版本，选定版本后经用户确认再调用 restore_sheet_version（必须 confirm=true）。不得靠重新导入、逐行重写或推测原值来“修复”数据。"+
-					"硬性规则五（检索顺序）：按内容找数据时直接调用 search_sheet_content，它自动识别界面工作簿；上下文已明确当前工作簿时不要额外调用 get_open_workbook_context 或 get_user_context 浪费一轮。已知表名可传 workbook_name/sheet_name，已知 sheet_id 用 search_sheet_rows 或 sheet_ids 精确检索。仅当前工作簿没有命中且 has_more=false，或用户明确要求全库时才设置 scope=all。必须检查 has_more/truncated/next_start_row，不得把未完成检索说成不存在。禁止逐表 query_sheet 全扫描；search_spreadsheets 只搜索名称。"+
-					"如果用户要查询、统计、修改、批量填充、生成报表，请调用合适的工具；完成后用中文总结结果。"+
-					"如果回复包含步骤、对比、表格或代码，请使用清晰的 Markdown；数学公式使用标准 LaTeX，行内公式写为 $...$，独立公式写为 $$...$$。"+
-					"如果用户要求修改表格，默认先调用 preview_spreadsheet_plan 生成待确认方案；只有当用户明确要求立即执行时，才调用 apply_spreadsheet_plan 或其他写入工具直接执行。"+
-					"如果用户询问客户、询价、SKU、供应商报价、对客报价或外贸流程，必须优先使用 get_erp_context、search_erp_customers、search_erp_orders、get_erp_order、search_erp_suppliers 读取真实 ERP 数据。ERP 工具返回的数据已经按当前员工权限遮罩；不得猜测被遮罩字段，也不得改用底层工作表工具绕过 ERP 权限。"+
-					"任何 ERP 新增、修改、报价录入或流程推进都必须调用 preview_erp_action 生成一项待确认操作，即使用户要求立即执行也不能直接写入。每次只准备一个明确步骤；客户、业务单、产品或供应商匹配不唯一时必须列出候选并询问，不能擅自选择。确认执行后，再根据最新阶段和 advance_blockers 指导下一步。"+
-					"注意：工作表第一可见行通常是表头行，query_sheet 返回的 rows 只包含真实数据行，不包含表头；rows[*].row 一律表示 0-based 数据行索引（第一条数据行为 0，不是界面里显示的第 2 行），display_row 才是界面中的行号；如果 total_rows=0 但 columns/header_row 有内容，表示该表只有表头结构，没有数据行。"+
-					"\n\n%s"+
-					"\n\n支持的列类型：text（文本）、number（数字）、currency（货币）、date（日期）、select（下拉选择）、checkbox（是/否复选框）、image（图片）、formula（公式）。"+
-					"\n支持的公式：SUM、AVERAGE、COUNT、MAX、MIN、IF、VLOOKUP、CONCATENATE 等 Excel 兼容公式。公式模板可使用 {{row}} 表示当前 Excel 行号，也应优先使用 {{column_key}} 引用字段，例如 ={{quantity}}*{{unit_price}}，不要猜测 Excel 列字母。"+
-					"\n你可以创建和管理工作簿/工作表：使用 create_workbook 创建工作簿，create_sheet 创建工作表，update_workbook 修改工作簿名称/描述，update_sheet_name 重命名工作表，set_cell_format 修改列类型、下拉/复选框与选项颜色，format_cell_range 设计单元格颜色、字体、对齐、边框、行高和列宽，configure_approval_flow 为精确选区建立审批流程。create_sheet 的 columns 必须使用 key、name、type、width、options；select 的选项放入 options 数组，供应商等长列表应设置 searchable=true，checkbox 默认使用“是/否”。"+
-					"\n审批流程必须继承当前登录账号权限：管理员 Agent 可按管理员权限配置，普通员工 Agent 不得越权。配置 hold_changes 审批后，待审值不会进入正式单元格，只有最终通过才写入，驳回保持原值。"+
-					"\n当用户明确要求美化、排版、设置表头颜色或区分数据区域时，可以直接调用 format_cell_range；必须使用用户有写权限且未被他人保护的范围。颜色优先使用 #RRGGBB。"+
-					"\n用户明确要求财务分析工作簿时，使用 create_financial_report；需要跨工作簿网页总结时，使用 create_summary_page；需要编辑既有总结时，先 list_summary_pages 再 update_summary_page。"+
-					"%s\n\n当前用户可访问的数据摘要如下：\n\n%s",
+			"content": fmt.Sprintf(agentSystemPrompt+"\n\n%s%s\n\n当前用户可访问的数据摘要如下：\n\n%s",
 				roleHint,
 				customPrompt,
 				context,
@@ -676,26 +656,16 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"expression"},
 		}),
-		buildToolDefinition("update_cell", "Update one cell value.", map[string]any{
+		buildToolDefinition("insert_row", "Insert one data row. The new row gets index `row` and rows below move down (formulas follow). Use row = current row count to append.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id":   map[string]any{"type": "integer"},
-				"row":        map[string]any{"type": "integer"},
-				"column_key": map[string]any{"type": "string"},
-				"value":      map[string]any{},
-			},
-			"required": []string{"sheet_id", "row", "column_key", "value"},
-		}),
-		buildToolDefinition("insert_row", "Insert a row at target position.", map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"sheet_id":   map[string]any{"type": "integer"},
-				"row":        map[string]any{"type": "integer"},
-				"row_values": map[string]any{"type": "object"},
+				"row":        map[string]any{"type": "integer", "description": "0-based data row the new row will occupy."},
+				"row_values": map[string]any{"type": "object", "description": "Map of column key to value for the new row."},
 			},
 			"required": []string{"sheet_id", "row"},
 		}),
-		buildToolDefinition("delete_row", "Delete one row.", map[string]any{
+		buildToolDefinition("delete_row", "Delete one data row; rows below move up (formulas follow).", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"sheet_id": map[string]any{"type": "integer"},
@@ -716,17 +686,6 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "column_key", "column_name"},
 		}),
-		buildToolDefinition("auto_fill_column", "Fill a column with formula template.", map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"sheet_id":         map[string]any{"type": "integer"},
-				"column_key":       map[string]any{"type": "string"},
-				"formula_template": map[string]any{"type": "string"},
-				"start_row":        map[string]any{"type": "integer"},
-				"end_row":          map[string]any{"type": "integer"},
-			},
-			"required": []string{"sheet_id", "column_key", "formula_template"},
-		}),
 		buildToolDefinition("generate_report", "Generate an Excel report for a sheet.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -745,7 +704,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 			},
 			"required": []string{"sheet_id", "time"},
 		}),
-		buildToolDefinition("run_workflow", "Execute multiple spreadsheet operations after validating every operation. Supported kinds: update_cell, insert_row, delete_row, insert_column, fill_formula.", map[string]any{
+		buildToolDefinition("preview_spreadsheet_plan", "Propose spreadsheet changes for the employee to confirm in the UI instead of writing them. Pass the exact operations; nothing is written until the employee confirms. Use only for risky edits (deleting several rows, overwriting many filled cells, unclear targets).", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"operations": map[string]any{
@@ -755,7 +714,7 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 						"properties": map[string]any{
 							"kind":                    map[string]any{"type": "string", "enum": []string{"update_cell", "insert_row", "delete_row", "insert_column", "fill_formula"}},
 							"sheet_id":                map[string]any{"type": "integer"},
-							"row":                     map[string]any{"type": "integer"},
+							"row":                     map[string]any{"type": "integer", "description": "0-based data row"},
 							"column_key":              map[string]any{"type": "string"},
 							"column_name":             map[string]any{"type": "string"},
 							"value":                   map[string]any{},
@@ -765,26 +724,11 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 							"start_row":               map[string]any{"type": "integer"},
 							"end_row":                 map[string]any{"type": "integer"},
 							"formula_template":        map[string]any{"type": "string"},
+							"reason":                  map[string]any{"type": "string", "description": "Short Chinese reason shown to the employee."},
 						},
 						"required": []string{"kind", "sheet_id"},
 					},
 				},
-			},
-			"required": []string{"operations"},
-		}),
-		buildToolDefinition("preview_spreadsheet_plan", "Preview spreadsheet operations from a prompt.", map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"workbook_id": map[string]any{"type": "integer"},
-				"sheet_ids":   map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
-				"prompt":      map[string]any{"type": "string"},
-			},
-			"required": []string{"workbook_id", "sheet_ids", "prompt"},
-		}),
-		buildToolDefinition("apply_spreadsheet_plan", "Apply structured spreadsheet operations.", map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"operations": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			},
 			"required": []string{"operations"},
 		}),
@@ -969,9 +913,9 @@ func (s *AIService) buildToolDefinitions() []openAIToolDefinition {
 						"required": []string{"row", "column_key", "value"},
 					},
 				},
+				"disable_formula": map[string]any{"type": "boolean", "description": "Never set this on the first request. Writing a plain value into a type=formula column breaks its calculation, so first tell the employee the column is calculated and ask whether to replace the formula with a fixed value. Set true only after the employee has confirmed that in a later message."},
 			},
-			"disable_formula": map[string]any{"type": "boolean", "description": "Set true only when the user explicitly wants to overwrite a formula column with plain values. Otherwise writing a literal into a type=formula column is rejected with COLUMN_TYPE_FORMULA."},
-			"required":        []string{"sheet_id"},
+			"required": []string{"sheet_id"},
 		}),
 		buildToolDefinition("run_sheet_formulas", "Write one formula into every row of a column over a range in a single call. Use {{row}} as the placeholder for the Excel row number and {{column_key}} to reference another column of the same row, for example ={{quantity}}*{{unit_price}}. This is the spreadsheet programming entry point: do not write 100 update_cell calls to fill 100 rows.", map[string]any{
 			"type": "object",
@@ -1371,7 +1315,7 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 		return nil, err
 	}
 
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -1645,7 +1589,7 @@ func (s *AIService) toolLookupSheetRecords(userID int64, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -1728,7 +1672,7 @@ func (s *AIService) toolCalculateSheetMetrics(userID int64, args map[string]any)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -1830,76 +1774,6 @@ func (s *AIService) toolCalculateExpression(_ int64, args map[string]any) (*tool
 	}, nil
 }
 
-func (s *AIService) toolUpdateCell(userID int64, args map[string]any) (*toolExecutionResult, error) {
-	sheetID, err := int64Arg(args, "sheet_id")
-	if err != nil {
-		return nil, err
-	}
-	row, err := intArg(args, "row")
-	if err != nil {
-		return nil, err
-	}
-	columnKey, err := stringArg(args, "column_key")
-	if err != nil {
-		return nil, err
-	}
-	value, ok := args["value"]
-	if !ok {
-		return nil, fmt.Errorf("value is required")
-	}
-
-	operation, err := s.resolveSpreadsheetOperationForExecution(SpreadsheetOperation{
-		Kind:      "update_cell",
-		SheetID:   sheetID,
-		Row:       row,
-		ColumnKey: columnKey,
-		Value:     value,
-	})
-	if err != nil {
-		return nil, err
-	}
-	sheetID = operation.SheetID
-	row = operation.Row
-	columnKey = operation.ColumnKey
-
-	if err := s.validateCellWriteAccess(userID, sheetID, row, columnKey); err != nil {
-		return nil, err
-	}
-
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("marshal cell value: %w", err)
-	}
-
-	writeResult, err := s.sheetService.UpdateCellsWithSourceDetailed(userID, []model.CellUpdate{{SheetID: sheetID, Row: row, Col: columnKey, Value: raw}}, "ai")
-	if err != nil {
-		return nil, err
-	}
-
-	cacheWarning := ""
-	if len(writeResult.AppliedChanges) > 0 {
-		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-			cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
-		}
-	}
-	pending := len(writeResult.PendingStates) > 0
-	summary := fmt.Sprintf("已更新第 %d 行的 %s", row+1, columnKey)
-	if pending {
-		summary = fmt.Sprintf("第 %d 行的 %s 已提交审批，审批通过后才会写入", row+1, columnKey)
-	}
-	if cacheWarning != "" {
-		summary += "；" + cacheWarning
-	}
-
-	return &toolExecutionResult{
-		Data:             map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "column_key": columnKey, "value": value, "pending_approval": pending, "approval_states": writeResult.PendingStates, "warning": cacheWarning},
-		TouchedSheetIDs:  []int64{sheetID},
-		ChangedSheetIDs:  changedSheetIDsWhen(len(writeResult.AppliedChanges) > 0, sheetID),
-		ResourcesChanged: pending,
-		Summary:          summary,
-	}, nil
-}
-
 func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecutionResult, error) {
 	sheetID, err := int64Arg(args, "sheet_id")
 	if err != nil {
@@ -1910,6 +1784,9 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 		return nil, err
 	}
 	rowValues := mapArg(args, "row_values")
+	if len(rowValues) == 0 {
+		rowValues = mapArg(args, "values")
+	}
 
 	operation, err := s.resolveSpreadsheetOperationForExecution(SpreadsheetOperation{
 		Kind:      "insert_row",
@@ -1924,7 +1801,7 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 	row = operation.Row
 	rowValues = operation.RowValues
 
-	existingRows, err := s.sheetRepo.GetRows(sheetID)
+	_, existingRows, err := s.loadAgentRowsByID(sheetID)
 	if err != nil {
 		return nil, err
 	}
@@ -1942,16 +1819,25 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 		}
 	}
 
+	inherited := map[string]any{}
 	if !isEmptySheet {
 		afterRow := row - 1
 		if err := s.sheetService.InsertRowWithSource(userID, sheetID, afterRow, "ai"); err != nil {
 			return nil, err
 		}
+		inherited = s.inheritRowFormulas(userID, sheetID, row, rowValues)
+	}
+	writeValues := make(map[string]any, len(rowValues)+len(inherited))
+	for key, value := range inherited {
+		writeValues[key] = value
+	}
+	for key, value := range rowValues {
+		writeValues[key] = value
 	}
 
-	if len(rowValues) > 0 {
-		changes := make([]model.CellUpdate, 0, len(rowValues))
-		for key, value := range rowValues {
+	if len(writeValues) > 0 {
+		changes := make([]model.CellUpdate, 0, len(writeValues))
+		for key, value := range writeValues {
 			raw, err := json.Marshal(value)
 			if err != nil {
 				return nil, fmt.Errorf("marshal inserted row value: %w", err)
@@ -1963,12 +1849,8 @@ func (s *AIService) toolInsertRow(userID int64, args map[string]any) (*toolExecu
 		}
 	}
 
-	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-		return nil, err
-	}
-
 	return &toolExecutionResult{
-		Data:            map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "row_values": rowValues},
+		Data:            map[string]any{"ok": true, "sheet_id": sheetID, "row": row, "row_values": rowValues, "inherited_formulas": inherited},
 		TouchedSheetIDs: []int64{sheetID},
 		ChangedSheetIDs: []int64{sheetID},
 		Summary:         fmt.Sprintf("已插入第 %d 行", row+1),
@@ -2000,9 +1882,6 @@ func (s *AIService) toolDeleteRow(userID int64, args map[string]any) (*toolExecu
 		return nil, err
 	}
 	if err := s.sheetService.DeleteRowWithSource(userID, sheetID, row, "ai"); err != nil {
-		return nil, err
-	}
-	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
 		return nil, err
 	}
 
@@ -2046,34 +1925,6 @@ func (s *AIService) toolInsertColumn(userID int64, args map[string]any) (*toolEx
 	}
 
 	return &toolExecutionResult{Data: map[string]any{"ok": true, "sheet_id": sheetID, "column_key": columnKey}, TouchedSheetIDs: touched, ChangedSheetIDs: touched, Summary: fmt.Sprintf("已新增列 %s", columnKey)}, nil
-}
-
-func (s *AIService) toolAutoFillColumn(userID int64, args map[string]any) (*toolExecutionResult, error) {
-	sheetID, err := int64Arg(args, "sheet_id")
-	if err != nil {
-		return nil, err
-	}
-	columnKey, err := stringArg(args, "column_key")
-	if err != nil {
-		return nil, err
-	}
-	formulaTemplate, err := stringArg(args, "formula_template")
-	if err != nil {
-		return nil, err
-	}
-	startRow, hasStart := intPtrArg(args, "start_row")
-	endRow, hasEnd := intPtrArg(args, "end_row")
-
-	// Legacy tool name, shared safe write path. Never bypass cell approvals by
-	// applying fill_formula through a raw row upsert.
-	batchArgs := map[string]any{"sheet_id": sheetID, "column_key": columnKey, "formula": formulaTemplate}
-	if hasStart && startRow != nil {
-		batchArgs["start_row"] = *startRow
-	}
-	if hasEnd && endRow != nil {
-		batchArgs["end_row"] = *endRow
-	}
-	return s.toolRunSheetFormulas(userID, batchArgs)
 }
 
 func (s *AIService) toolGenerateReport(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -2141,19 +1992,10 @@ func (s *AIService) GenerateSheetReport(userID, sheetID int64, filename string) 
 	return attachment, url, nil
 }
 
-func (s *AIService) toolRunWorkflow(userID int64, args map[string]any) (*toolExecutionResult, error) {
-	operations, err := spreadsheetOperationsArg(args, "operations")
-	if err != nil {
-		return nil, err
-	}
-	touched, err := s.executeSpreadsheetOperations(userID, operations)
-	if err != nil {
-		return nil, err
-	}
-	return &toolExecutionResult{Data: map[string]any{"ok": true, "applied": len(operations)}, TouchedSheetIDs: touched, ChangedSheetIDs: touched, Summary: fmt.Sprintf("已执行 %d 条工作流操作", len(operations))}, nil
-}
-
 func (s *AIService) toolPreviewSpreadsheetPlan(userID int64, args map[string]any) (*toolExecutionResult, error) {
+	if _, ok := args["operations"]; ok {
+		return s.previewAgentOperations(userID, args)
+	}
 	workbookID, err := int64Arg(args, "workbook_id")
 	if err != nil {
 		return nil, err
@@ -2187,18 +2029,6 @@ func (s *AIService) toolPreviewSpreadsheetPlan(userID int64, args map[string]any
 		return nil, err
 	}
 	return &toolExecutionResult{Data: result, Summary: fmt.Sprintf("已生成 %d 条待确认修改", len(result.Operations)), PendingOperations: result.Operations}, nil
-}
-
-func (s *AIService) toolApplySpreadsheetPlan(userID int64, args map[string]any) (*toolExecutionResult, error) {
-	operations, err := spreadsheetOperationsArg(args, "operations")
-	if err != nil {
-		return nil, err
-	}
-	touched, err := s.executeSpreadsheetOperations(userID, operations)
-	if err != nil {
-		return nil, err
-	}
-	return &toolExecutionResult{Data: map[string]any{"ok": true, "applied": len(operations)}, TouchedSheetIDs: touched, ChangedSheetIDs: touched, Summary: fmt.Sprintf("已写入 %d 条表格修改", len(operations))}, nil
 }
 
 func (s *AIService) toolCreateWorkbook(userID int64, args map[string]any) (*toolExecutionResult, error) {
@@ -2332,7 +2162,7 @@ func (s *AIService) toolUpdateSheetName(userID int64, args map[string]any) (*too
 	}
 
 	sheet.Name = name
-	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.rename", "AI 重命名工作表", false); err != nil {
+	if err := s.saveSheetAsUser(userID, sheet, "sheet.rename", "AI 重命名工作表"); err != nil {
 		return nil, fmt.Errorf("重命名工作表失败: %w", err)
 	}
 
@@ -2456,12 +2286,8 @@ func (s *AIService) toolSetCellFormat(userID int64, args map[string]any) (*toolE
 		return nil, fmt.Errorf("序列化列定义失败: %w", err)
 	}
 	sheet.Columns = nextColumns
-	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.column.format", "AI 设置列格式", true); err != nil {
+	if err := s.saveSheetAsUser(userID, sheet, "sheet.column.format", "AI 设置列格式"); err != nil {
 		return nil, fmt.Errorf("更新列格式失败: %w", err)
-	}
-
-	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-		return nil, err
 	}
 
 	return &toolExecutionResult{
@@ -2583,6 +2409,9 @@ func (s *AIService) toolFormatCellRange(userID int64, args map[string]any) (*too
 	if scope != "header" && scope != "data" && scope != "all" {
 		return nil, fmt.Errorf("scope 必须是 header、data 或 all")
 	}
+	if err := s.ensureSheetEditAccess(userID, sheetID); err != nil {
+		return nil, err
+	}
 
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
@@ -2600,7 +2429,7 @@ func (s *AIService) toolFormatCellRange(userID int64, args map[string]any) (*too
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -2625,6 +2454,9 @@ func (s *AIService) toolFormatCellRange(userID int64, args map[string]any) (*too
 	}
 	if maxDataRow >= 0 && endRow > maxDataRow {
 		endRow = maxDataRow
+	}
+	if scope == "data" && (maxDataRow < 0 || startRow > endRow) {
+		return nil, fmt.Errorf("数据行范围无效：工作表只有第 0-%d 行数据", maxDataRow)
 	}
 
 	backgroundColor, err := optionalAgentColor(args, "background_color")
@@ -2772,11 +2604,8 @@ func (s *AIService) toolFormatCellRange(userID int64, args map[string]any) (*too
 	}
 	sheet.Config = nextConfig
 	sheet.Columns = nextColumns
-	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.range.format", "AI 设置单元格样式", true); err != nil {
+	if err := s.saveSheetAsUser(userID, sheet, "sheet.range.format", "AI 设置单元格样式"); err != nil {
 		return nil, fmt.Errorf("更新单元格格式失败: %w", err)
-	}
-	if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-		return nil, err
 	}
 
 	return &toolExecutionResult{
@@ -2832,7 +2661,11 @@ func ensureAgentWorksheetSnapshot(sheet *model.Sheet, columns []sheetColumnPaylo
 		}
 	}
 	worksheet, _ := configPayload["univerSheetData"].(map[string]any)
-	if worksheet == nil {
+	if worksheet != nil {
+		// An existing snapshot is what the editor shows; merging rows-table
+		// values into it would resurrect cells the user has since cleared.
+		rows = nil
+	} else {
 		worksheet = map[string]any{
 			"id": fmt.Sprintf("sheet-%d", sheet.ID), "name": sheet.Name,
 			"rowCount": 200, "columnCount": maxIntValue(len(columns), 26),
@@ -2881,8 +2714,10 @@ func ensureAgentWorksheetSnapshot(sheet *model.Sheet, columns []sheetColumnPaylo
 			}
 		}
 	}
-	worksheet["rowCount"] = maxIntValue(maxWorksheetRow+25, 200)
-	worksheet["columnCount"] = maxIntValue(len(columns), 26)
+	existingRowCount, _ := worksheet["rowCount"].(float64)
+	existingColumnCount, _ := worksheet["columnCount"].(float64)
+	worksheet["rowCount"] = maxIntValue(maxIntValue(maxWorksheetRow+25, 200), int(existingRowCount))
+	worksheet["columnCount"] = maxIntValue(maxIntValue(len(columns), 26), int(existingColumnCount))
 	worksheet["cellData"] = cellData
 	return configPayload, worksheet, cellData, nil
 }
@@ -3319,12 +3154,6 @@ func (s *AIService) executeSpreadsheetOperationsContext(ctx context.Context, use
 		touchedSheets[normalized.SheetID] = struct{}{}
 	}
 
-	for sheetID := range touchedSheets {
-		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-			return nil, err
-		}
-	}
-
 	return sortedTouchedSheetIDs(touchedSheets), nil
 }
 
@@ -3431,12 +3260,12 @@ func (s *AIService) resolveSpreadsheetOperationForExecution(operation Spreadshee
 		}
 	}
 
-	rows, err := s.sheetRepo.GetRows(operation.SheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return operation, err
 	}
 	rowBase := getSheetRowBase(rows)
-	rowCount := len(rows)
+	rowCount := agentRowCount(rows) - rowBase
 
 	adjust := func(value int) int {
 		if rowCount == 0 {
@@ -3484,26 +3313,31 @@ type snapshotRow struct {
 // Row 0 is the header row and is skipped. Column numeric indexes are mapped
 // to column keys using the provided columns definition.
 func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayload) []snapshotRow {
-	if len(config) == 0 || len(columns) == 0 {
-		return nil
+	rows, _ := snapshotDataRows(config, columns)
+	return rows
+}
+
+// snapshotDataRows reads the data rows of the Univer snapshot. ok reports
+// whether the sheet has a snapshot at all: when it does, the editor renders
+// only the snapshot, so it is the authoritative copy of the sheet's data and
+// the legacy rows table must not be consulted.
+func snapshotDataRows(config json.RawMessage, columns []sheetColumnPayload) ([]snapshotRow, bool) {
+	if len(config) == 0 {
+		return nil, false
 	}
 
 	var payload map[string]interface{}
 	if err := json.Unmarshal(config, &payload); err != nil {
-		return nil
+		return nil, false
 	}
 
-	rawSheet, ok := payload["univerSheetData"]
-	if !ok {
-		return nil
+	sheetData, ok := payload["univerSheetData"].(map[string]interface{})
+	if !ok || sheetData == nil {
+		return nil, false
 	}
-	sheetData, ok := rawSheet.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	rawCellData, ok := sheetData["cellData"].(map[string]interface{})
-	if !ok {
-		return nil
+	rawCellData, _ := sheetData["cellData"].(map[string]interface{})
+	if len(columns) == 0 {
+		return nil, true
 	}
 
 	// Build column index -> key mapping
@@ -3540,7 +3374,7 @@ func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayloa
 				data[colKey] = cellValue
 				continue
 			}
-			if value, exists := cellMap["v"]; exists && value != nil {
+			if value, exists := cellMap["v"]; exists && value != nil && value != "" {
 				data[colKey] = value
 				continue
 			}
@@ -3550,6 +3384,10 @@ func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayloa
 					formula = "=" + formula
 				}
 				data[colKey] = formula
+				continue
+			}
+			if text := richTextCellValue(cellMap["p"]); text != "" {
+				data[colKey] = text
 			}
 		}
 		if len(data) > 0 {
@@ -3562,15 +3400,107 @@ func extractRowsFromSnapshot(config json.RawMessage, columns []sheetColumnPayloa
 		return rows[i].RowIndex < rows[j].RowIndex
 	})
 
-	return rows
+	return rows, true
 }
 
-func (s *AIService) invalidateSheetByID(userID, sheetID int64) error {
+// richTextCellValue returns the plain text of a Univer rich text cell (`p`).
+func richTextCellValue(raw any) string {
+	document, _ := raw.(map[string]interface{})
+	body, _ := document["body"].(map[string]interface{})
+	stream, _ := body["dataStream"].(string)
+	return strings.TrimRight(stream, "\r\n")
+}
+
+// loadAgentRows returns the sheet's data rows exactly as the editor shows
+// them: from the Univer snapshot when the sheet has one, otherwise from the
+// rows table. Row indexes are 0-based data rows. A snapshot row 0 that is
+// blank is still returned (empty) so callers see a zero-based sheet.
+func (s *AIService) loadAgentRows(sheet *model.Sheet) ([]model.Row, error) {
+	columns, err := parseSheetColumns(sheet.Columns)
+	if err != nil {
+		return nil, err
+	}
+	snapshotRows, ok := snapshotDataRows(sheet.Config, columns)
+	if !ok {
+		return s.sheetRepo.GetRows(sheet.ID)
+	}
+	return snapshotRowsToModelRows(sheet.ID, snapshotRows), nil
+}
+
+func (s *AIService) loadAgentRowsByID(sheetID int64) (*model.Sheet, []model.Row, error) {
 	sheet, err := s.sheetRepo.GetSheet(sheetID)
 	if err != nil {
-		return fmt.Errorf("reload touched sheet: %w", err)
+		return nil, nil, err
 	}
-	return s.invalidateSheetSnapshot(userID, sheet)
+	rows, err := s.loadAgentRows(sheet)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sheet, rows, nil
+}
+
+func snapshotRowsToModelRows(sheetID int64, snapshotRows []snapshotRow) []model.Row {
+	result := make([]model.Row, 0, len(snapshotRows)+1)
+	if len(snapshotRows) > 0 && snapshotRows[0].RowIndex > 1 {
+		result = append(result, model.Row{SheetID: sheetID, RowIndex: 0, Data: json.RawMessage(`{}`)})
+	}
+	for _, row := range snapshotRows {
+		encoded, err := json.Marshal(row.Data)
+		if err != nil {
+			continue
+		}
+		result = append(result, model.Row{SheetID: sheetID, RowIndex: row.RowIndex - 1, Data: encoded})
+	}
+	return result
+}
+
+// agentSheetRowCount counts data row slots without materialising cell values;
+// write receipts only need the row domain, not the data.
+func (s *AIService) agentSheetRowCount(sheet *model.Sheet) (int, error) {
+	if count, ok := snapshotRowSlotCount(sheet.Config); ok {
+		return count, nil
+	}
+	rows, err := s.sheetRepo.GetRows(sheet.ID)
+	if err != nil {
+		return 0, err
+	}
+	if err := ensureZeroBasedSheetRows(rows); err != nil {
+		return 0, err
+	}
+	return agentRowCount(rows), nil
+}
+
+func snapshotRowSlotCount(config json.RawMessage) (int, bool) {
+	var payload struct {
+		Sheet *struct {
+			CellData map[string]json.RawMessage `json:"cellData"`
+		} `json:"univerSheetData"`
+	}
+	if len(config) == 0 || json.Unmarshal(config, &payload) != nil || payload.Sheet == nil {
+		return 0, false
+	}
+	count := 0
+	for key, raw := range payload.Sheet.CellData {
+		row, err := strconv.Atoi(key)
+		if err != nil || row < 1 || row <= count {
+			continue
+		}
+		if trimmed := bytes.TrimSpace(raw); len(trimmed) > 2 && !bytes.Equal(trimmed, []byte("null")) {
+			count = row
+		}
+	}
+	return count, true
+}
+
+// agentRowCount is the number of data row slots up to the last non-empty row.
+func agentRowCount(rows []model.Row) int {
+	count := 0
+	for _, row := range rows {
+		if row.RowIndex+1 > count {
+			count = row.RowIndex + 1
+		}
+	}
+	return count
 }
 
 func int64Arg(args map[string]any, key string) (int64, error) {
@@ -3750,6 +3680,13 @@ func (s *AIService) visibleRowData(userID, sheetID int64, rowIndex int, data map
 		// CheckCellPermission would repeat role/sheet/workbook database queries.
 		if permissionMatrixAllowsCell(filter.matrix, key, rowIndex, "read") &&
 			!protectionHidesCell(filter.protections, rowIndex, key, userID, filter.isAdmin, filter.departmentSet) {
+			// A formula without a cached result is read as its text; when the
+			// formula is hidden from this user the editor shows an empty cell
+			// (stripCellFormula), so the agent must not see the text either.
+			if text, ok := value.(string); ok && strings.HasPrefix(text, "=") &&
+				protectionHidesFormula(filter.protections, rowIndex, key, userID, filter.isAdmin, filter.departmentSet) {
+				value = ""
+			}
 			filtered[key] = value
 		}
 	}

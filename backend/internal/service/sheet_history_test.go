@@ -106,3 +106,17 @@ func TestNormalizeHistoryPageAndSource(t *testing.T) {
 		t.Fatal("history source normalization failed")
 	}
 }
+
+func TestCompactFieldChangesOmitsLargeValues(t *testing.T) {
+	large := json.RawMessage(`"` + strings.Repeat("x", 3000) + `"`)
+	got := compactFieldChanges([]model.SheetVersionFieldChange{
+		{Field: "config", OldValue: large, NewValue: large},
+		{Field: "name", OldValue: json.RawMessage(`"a"`), NewValue: json.RawMessage(`"b"`)},
+	}, 2048)
+	if string(got[0].OldValue) != string(omittedFieldValue) || string(got[0].NewValue) != string(omittedFieldValue) {
+		t.Fatalf("large values kept: %d bytes", len(got[0].OldValue))
+	}
+	if string(got[1].OldValue) != `"a"` || string(got[1].NewValue) != `"b"` {
+		t.Fatalf("small values changed: %+v", got[1])
+	}
+}

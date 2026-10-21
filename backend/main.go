@@ -262,12 +262,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize AI conversations: %v", err)
 	}
-	conversationService.SetFinishedCallback(func(userID int64, result *service.ChatResponse) {
-		for _, sheetID := range result.ChangedSheetIDs {
+	broadcastSheetSync := func(userID int64, sheetIDs []int64) {
+		for _, sheetID := range sheetIDs {
 			payload, _ := json.Marshal(ws.Message{Type: "sheet_sync", SheetID: sheetID, UserID: userID})
 			hub.BroadcastToSheetExceptClientID(sheetID, payload, "")
 		}
+	}
+	conversationService.SetFinishedCallback(func(userID int64, result *service.ChatResponse) {
+		broadcastSheetSync(userID, result.ChangedSheetIDs)
 	})
+	conversationService.SetSheetsChangedCallback(broadcastSheetSync)
 	aiHandler.SetConversations(conversationService)
 	automationHandler := handler.NewAutomationHandler(automationService)
 	tradeHandler := handler.NewTradeHandler(tradeService)
