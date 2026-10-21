@@ -141,7 +141,7 @@ export function useAIConversations(userId: number, open: boolean) {
     let timer: ReturnType<typeof setTimeout>
     const refresh = async () => {
       try { await load(conversationId) } catch (err) { if (!cancelled) setError(`${err instanceof Error ? err.message : '连接中断'}；后台任务仍会继续，正在重连`) }
-      if (!cancelled) timer = setTimeout(refresh, active ? 1000 : 4000)
+      if (!cancelled) timer = setTimeout(refresh, active ? 500 : 4000)
     }
     const onVisible = () => { if (document.visibilityState === 'visible') { void load(conversationId).catch(() => {}); void list().catch(() => {}) } }
     timer = setTimeout(refresh, 500)

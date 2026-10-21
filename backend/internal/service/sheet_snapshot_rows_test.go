@@ -231,3 +231,68 @@ func TestInsertShiftsProtectionOfTheRowBelow(t *testing.T) {
 		t.Fatalf("row above the insert must stay, got %d %v", next, keep)
 	}
 }
+
+func TestShiftFormulaColumnsForInsert(t *testing.T) {
+	cases := []struct{ formula, want string }{
+		{"=B2*C2", "=B2*D2"},
+		{"=SUM(A2:C2)", "=SUM(A2:D2)"},
+		{"=$C$1+A1", "=$D$1+A1"},
+		{"=Other!C2+C2", "=Other!C2+D2"},
+		{"=\"C2\"&C2", "=\"C2\"&D2"},
+	}
+	for _, tc := range cases {
+		if got := shiftFormulaColumnsForInsert(tc.formula, "Sheet1", 2); got != tc.want {
+			t.Errorf("insert at column C: %s => %s, want %s", tc.formula, got, tc.want)
+		}
+	}
+}
+
+func TestShiftSnapshotColumnsInConfigMovesCellsAndSetsHeader(t *testing.T) {
+	config := json.RawMessage(`{"other":1,"univerSheetData":{"name":"Sheet1","columnCount":3,
+		"cellData":{"0":{"0":{"v":"A"},"1":{"v":"B"},"2":{"v":"C"}},"1":{"0":{"v":1},"1":{"v":2},"2":{"f":"=A2*B2","v":2}}},
+		"columnData":{"1":{"w":80},"2":{"w":90}},
+		"mergeData":[{"startRow":3,"endRow":3,"startColumn":0,"endColumn":2}]}}`)
+	next, err := shiftSnapshotColumnsInConfig(config, "Sheet1", 1, "新列")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Other int `json:"other"`
+		Sheet struct {
+			ColumnCount int                                  `json:"columnCount"`
+			CellData    map[string]map[string]map[string]any `json:"cellData"`
+			ColumnData  map[string]map[string]float64        `json:"columnData"`
+			MergeData   []map[string]int                     `json:"mergeData"`
+		} `json:"univerSheetData"`
+	}
+	if err := json.Unmarshal(next, &payload); err != nil {
+		t.Fatal(err)
+	}
+	sheet := payload.Sheet
+	if payload.Other != 1 || sheet.ColumnCount != 4 {
+		t.Fatalf("config = %s", next)
+	}
+	if sheet.CellData["0"]["1"]["v"] != "新列" || sheet.CellData["0"]["2"]["v"] != "B" || sheet.CellData["0"]["3"]["v"] != "C" {
+		t.Fatalf("header = %v", sheet.CellData["0"])
+	}
+	if sheet.CellData["1"]["0"]["v"] != float64(1) || sheet.CellData["1"]["2"]["v"] != float64(2) {
+		t.Fatalf("data row = %v", sheet.CellData["1"])
+	}
+	if formula := sheet.CellData["1"]["3"]["f"]; formula != "=A2*C2" {
+		t.Fatalf("formula = %v, want =A2*C2", formula)
+	}
+	if sheet.ColumnData["2"]["w"] != 80 || sheet.ColumnData["3"]["w"] != 90 {
+		t.Fatalf("column data = %v", sheet.ColumnData)
+	}
+	if merge := sheet.MergeData[0]; merge["startColumn"] != 0 || merge["endColumn"] != 3 {
+		t.Fatalf("merge = %v", merge)
+	}
+}
+
+func TestShiftSnapshotColumnsInConfigWithoutSnapshot(t *testing.T) {
+	config := json.RawMessage(`{"protections":[]}`)
+	next, err := shiftSnapshotColumnsInConfig(config, "Sheet1", 0, "x")
+	if err != nil || string(next) != string(config) {
+		t.Fatalf("config without snapshot changed: %s %v", next, err)
+	}
+}

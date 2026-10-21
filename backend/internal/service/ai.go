@@ -32,6 +32,7 @@ type AIService struct {
 	automationService *AutomationService
 	tradeService      *TradeService
 	historyService    *SheetHistoryService
+	folderService     *FolderService
 	tools             map[string]ToolFunc
 	// proxyURLProvider returns the outbound proxy used for AI requests. It is
 	// wired to the XTLS/Mihomo proxy service and returns "" when AI traffic
@@ -45,6 +46,11 @@ type AIService struct {
 // is routed through the managed outbound proxy.
 func (s *AIService) SetAIProxyURLProvider(provider func() string) {
 	s.proxyURLProvider = provider
+}
+
+// SetFolderService lets the agent resolve folders dragged into the chat.
+func (s *AIService) SetFolderService(folderService *FolderService) {
+	s.folderService = folderService
 }
 
 // SetHistoryService wires the version-history service used by the agent facing
@@ -134,8 +140,12 @@ type ChatRequest struct {
 }
 
 type ChatContext struct {
-	WorkbookID    *int64                `json:"workbook_id"`
-	SheetIDs      []int64               `json:"sheet_ids"`
+	WorkbookID *int64  `json:"workbook_id"`
+	SheetIDs   []int64 `json:"sheet_ids"`
+	// WorkbookIDs and FolderID are workbooks the employee dragged into the
+	// chat: the question is about them unless it says otherwise.
+	WorkbookIDs   []int64               `json:"workbook_ids,omitempty"`
+	FolderID      *int64                `json:"folder_id,omitempty"`
 	AttachmentIDs []int64               `json:"attachment_ids"`
 	Selection     *ChatSelectionContext `json:"selection,omitempty"`
 }
@@ -500,14 +510,11 @@ func (s *AIService) tryBuildLocalRandomDataPlan(req *SpreadsheetPlanRequest) (*S
 			return nil, false, fmt.Errorf("工作表 %s 缺少列结构，无法生成随机数据方案", sheet.Name)
 		}
 
-		rows, err := s.sheetRepo.GetRows(sheet.ID)
+		rows, err := s.loadAgentRows(&sheet)
 		if err != nil {
 			return nil, false, fmt.Errorf("load rows for sheet %d: %w", sheet.ID, err)
 		}
-		existingRowCount := len(rows)
-		if existingRowCount == 0 {
-			existingRowCount = len(extractRowsFromSnapshot(sheet.Config, columns))
-		}
+		existingRowCount := agentRowCount(rows)
 
 		for i := 0; i < rowCount; i++ {
 			operations = append(operations, SpreadsheetOperation{
@@ -721,7 +728,7 @@ func (s *AIService) buildSpreadsheetContext(userID, workbookID int64, sheetIDs [
 			continue
 		}
 
-		rows, err := s.sheetRepo.GetRows(sheet.ID)
+		rows, err := s.loadAgentRows(&sheet)
 		if err != nil {
 			return "", nil, fmt.Errorf("load rows for sheet %d: %w", sheet.ID, err)
 		}
@@ -1003,6 +1010,19 @@ func enrichSpreadsheetOperations(operations []SpreadsheetOperation, meta map[int
 }
 
 func buildAIPreviewRows(sheet *model.Sheet, columns []sheetColumnPayload, rows []model.Row) []aiPreviewRow {
+	// The editor renders the snapshot alone, so the rows table (which can hold
+	// values the user has since cleared or rows that have since moved) must not
+	// leak into what the agent reads.
+	if snapshotRows, ok := snapshotDataRows(sheet.Config, columns); ok {
+		modelRows := snapshotRowsToModelRows(sheet.ID, snapshotRows)
+		result := make([]aiPreviewRow, 0, len(modelRows))
+		for _, row := range modelRows {
+			data := make(map[string]interface{})
+			_ = json.Unmarshal(row.Data, &data)
+			result = append(result, aiPreviewRow{Row: row.RowIndex, SourceRow: row.RowIndex, DisplayRow: row.RowIndex + 2, Data: data})
+		}
+		return result
+	}
 	rowBase := getSheetRowBase(rows)
 	merged := make(map[int]aiPreviewRow, len(rows))
 	sourceRowToNormalized := make(map[int]int, len(rows))
@@ -1102,9 +1122,9 @@ func (s *AIService) applyInsertRowOperation(userID int64, operation SpreadsheetO
 		return fmt.Errorf("insert row: %w", err)
 	}
 
-	rowValues := operation.RowValues
-	if rowValues == nil {
-		rowValues = map[string]interface{}{}
+	rowValues := s.inheritRowFormulas(userID, operation.SheetID, operation.Row, operation.RowValues)
+	for key, value := range operation.RowValues {
+		rowValues[key] = value
 	}
 	if len(rowValues) == 0 {
 		return nil
@@ -1184,6 +1204,11 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 			return &FormulaColumnLiteralError{ColumnKey: newColumn.Key, ColumnName: newColumn.Name, SheetID: operation.SheetID}
 		}
 	}
+	rows, err := s.loadAgentRows(sheet)
+	if err != nil {
+		return fmt.Errorf("load rows for column insert: %w", err)
+	}
+
 	columns = append(columns, sheetColumnPayload{})
 	copy(columns[insertIndex+1:], columns[insertIndex:])
 	columns[insertIndex] = newColumn
@@ -1192,39 +1217,41 @@ func (s *AIService) applyInsertColumnOperation(userID int64, operation Spreadshe
 	if err != nil {
 		return fmt.Errorf("marshal inserted column metadata: %w", err)
 	}
+	// The snapshot addresses cells by column position, so the cells right of
+	// the new column have to move with their column metadata.
+	nextConfig, err := shiftSnapshotColumnsInConfig(sheet.Config, sheet.Name, insertIndex, newColumn.Name)
+	if err != nil {
+		return err
+	}
+	if insertIndex < len(columns)-1 {
+		if nextConfig, err = bumpSheetStructureRevision(nextConfig); err != nil {
+			return err
+		}
+	}
 	sheet.Columns = nextColumns
-	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.column.insert", "AI 新增工作表列", true); err != nil {
+	sheet.Config = nextConfig
+	if err := s.saveSheetAsUser(userID, sheet, "sheet.column.insert", "AI 新增工作表列"); err != nil {
 		return fmt.Errorf("persist inserted column: %w", err)
 	}
 
-	rows, err := s.sheetRepo.GetRows(operation.SheetID)
-	if err != nil {
-		return fmt.Errorf("load rows after column insert: %w", err)
+	if operation.FormulaTemplate == "" && operation.Value == nil {
+		return nil
 	}
+	changes := make([]model.CellUpdate, 0, len(rows))
 	for _, row := range rows {
-		data := make(map[string]interface{})
-		if err := json.Unmarshal(row.Data, &data); err != nil {
-			data = make(map[string]interface{})
-		}
-
+		var value any = operation.Value
 		if operation.FormulaTemplate != "" {
-			data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, row.RowIndex, columns)
-		} else if operation.Value != nil {
-			data[operation.ColumnKey] = operation.Value
+			value = expandFormulaTemplate(operation.FormulaTemplate, row.RowIndex, columns)
 		}
-
-		encoded, err := json.Marshal(data)
+		raw, err := json.Marshal(value)
 		if err != nil {
-			return fmt.Errorf("marshal inserted column row data: %w", err)
+			return fmt.Errorf("marshal inserted column value: %w", err)
 		}
-		if err := s.sheetRepo.UpsertRow(operation.SheetID, row.RowIndex, encoded, userID); err != nil {
-			return fmt.Errorf("apply inserted column values: %w", err)
-		}
+		changes = append(changes, model.CellUpdate{SheetID: operation.SheetID, Row: row.RowIndex, Col: operation.ColumnKey, Value: raw})
 	}
-	if _, err := s.sheetService.CaptureCurrentVersion(userID, operation.SheetID, "ai", "AI 新增工作表列并填充数据", true); err != nil {
-		return err
+	if err := s.sheetService.UpdateCellsWithSource(userID, changes, "ai"); err != nil {
+		return fmt.Errorf("apply inserted column values: %w", err)
 	}
-
 	return nil
 }
 
@@ -1233,13 +1260,9 @@ func (s *AIService) applyFillFormulaOperation(userID int64, operation Spreadshee
 		return fmt.Errorf("fill_formula requires column_key and formula_template")
 	}
 
-	rows, err := s.sheetRepo.GetRows(operation.SheetID)
+	sheet, rows, err := s.loadAgentRowsByID(operation.SheetID)
 	if err != nil {
 		return fmt.Errorf("load rows for formula fill: %w", err)
-	}
-	sheet, err := s.sheetRepo.GetSheet(operation.SheetID)
-	if err != nil {
-		return fmt.Errorf("load sheet for formula fill: %w", err)
 	}
 	columns, err := parseSheetColumns(sheet.Columns)
 	if err != nil {
@@ -1264,59 +1287,17 @@ func (s *AIService) applyFillFormulaOperation(userID int64, operation Spreadshee
 		endRow = startRow
 	}
 
-	rowMap := make(map[int]map[string]interface{})
-	for _, row := range rows {
-		data := make(map[string]interface{})
-		if err := json.Unmarshal(row.Data, &data); err != nil {
-			data = make(map[string]interface{})
-		}
-		rowMap[row.RowIndex] = data
-	}
-
+	changes := make([]model.CellUpdate, 0, endRow-startRow+1)
 	for rowIndex := startRow; rowIndex <= endRow; rowIndex++ {
-		data := rowMap[rowIndex]
-		if data == nil {
-			data = make(map[string]interface{})
-		}
-		data[operation.ColumnKey] = expandFormulaTemplate(operation.FormulaTemplate, rowIndex, columns)
-		encoded, err := json.Marshal(data)
+		raw, err := json.Marshal(expandFormulaTemplate(operation.FormulaTemplate, rowIndex, columns))
 		if err != nil {
-			return fmt.Errorf("marshal formula fill row data: %w", err)
+			return fmt.Errorf("marshal formula fill value: %w", err)
 		}
-		if err := s.sheetRepo.UpsertRow(operation.SheetID, rowIndex, encoded, userID); err != nil {
-			return fmt.Errorf("apply formula fill: %w", err)
-		}
+		changes = append(changes, model.CellUpdate{SheetID: operation.SheetID, Row: rowIndex, Col: operation.ColumnKey, Value: raw})
 	}
-	if _, err := s.sheetService.CaptureCurrentVersion(userID, operation.SheetID, "ai", "AI 批量填充公式", true); err != nil {
-		return err
+	if err := s.sheetService.UpdateCellsWithSource(userID, changes, "ai"); err != nil {
+		return fmt.Errorf("apply formula fill: %w", err)
 	}
-
-	return nil
-}
-
-func (s *AIService) invalidateSheetSnapshot(userID int64, sheet *model.Sheet) error {
-	if len(sheet.Config) == 0 {
-		return nil
-	}
-
-	var payload map[string]interface{}
-	if err := json.Unmarshal(sheet.Config, &payload); err != nil {
-		return nil
-	}
-
-	delete(payload, "univerSheetData")
-	delete(payload, "univerStyles")
-
-	nextConfig, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal invalidated sheet config: %w", err)
-	}
-
-	sheet.Config = nextConfig
-	if err := s.sheetService.UpdateSheetWithSource(userID, sheet, "ai", "sheet.snapshot.invalidate", "AI 刷新工作表缓存", true); err != nil {
-		return fmt.Errorf("persist invalidated sheet config: %w", err)
-	}
-
 	return nil
 }
 

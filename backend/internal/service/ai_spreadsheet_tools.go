@@ -73,14 +73,10 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	totalRowsBefore, err := s.agentSheetRowCount(sheet)
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureZeroBasedSheetRows(rows); err != nil {
-		return nil, err
-	}
-	totalRowsBefore := len(rows)
 	disableFormula := boolArg(args, "disable_formula")
 
 	cellUpdates := make([]model.CellUpdate, 0, len(updates))
@@ -108,19 +104,14 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 	if err != nil {
 		return nil, err
 	}
-	cacheWarning := ""
-	if len(writeResult.AppliedChanges) > 0 {
-		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-			cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
-		}
-	}
-
 	// Post-write receipt: the agent must be able to see whether the write changed
 	// the row domain or touched an unexpected column, instead of trusting a bare
 	// "updated_cells" count.
 	totalRowsAfter := totalRowsBefore
-	if reloaded, err := s.sheetRepo.GetRows(sheetID); err == nil {
-		totalRowsAfter = len(reloaded)
+	if reloaded, err := s.sheetRepo.GetSheet(sheetID); err == nil {
+		if count, err := s.agentSheetRowCount(reloaded); err == nil {
+			totalRowsAfter = count
+		}
 	}
 	affectedColumns := distinctColumnKeys(writeResult.AppliedChanges)
 	invariantsOK := totalRowsAfter >= totalRowsBefore
@@ -135,9 +126,6 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 	summary := fmt.Sprintf("已写入 %d 个单元格，%d 个等待审批（涉及 %d 行，总行数 %d→%d）", len(writeResult.AppliedChanges), len(applied)-len(writeResult.AppliedChanges), distinctRowCount(applied), totalRowsBefore, totalRowsAfter)
 	if !invariantsOK {
 		summary += "；警告：写入后总行数减少，请立即检查"
-	}
-	if cacheWarning != "" {
-		summary += "；" + cacheWarning
 	}
 
 	return &toolExecutionResult{
@@ -154,7 +142,6 @@ func (s *AIService) toolBatchUpdateCells(userID int64, args map[string]any) (*to
 			"post_write_invariants": postWriteInvariants,
 			"pending_approval":      pending,
 			"approval_states":       writeResult.PendingStates,
-			"warning":               cacheWarning,
 		},
 		TouchedSheetIDs:  []int64{sheetID},
 		ChangedSheetIDs:  changedSheetIDsWhen(len(writeResult.AppliedChanges) > 0, sheetID),
@@ -290,7 +277,7 @@ func (s *AIService) toolRunSheetFormulas(userID int64, args map[string]any) (*to
 	if err := validateFormulaTemplateReferences(template, columns); err != nil {
 		return nil, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -323,23 +310,14 @@ func (s *AIService) toolRunSheetFormulas(userID int64, args map[string]any) (*to
 	if err != nil {
 		return nil, err
 	}
-	cacheWarning := ""
-	if len(writeResult.AppliedChanges) > 0 {
-		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-			cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
-		}
-	}
 	pending := len(writeResult.PendingStates) > 0
 	summary := fmt.Sprintf("公式已写入 %d 行，%d 行等待审批", len(writeResult.AppliedChanges), len(updates)-len(writeResult.AppliedChanges))
-	if cacheWarning != "" {
-		summary += "；" + cacheWarning
-	}
 	return &toolExecutionResult{
 		Data: map[string]any{
 			"ok": true, "sheet_id": sheetID, "column_key": key, "formula": template,
 			"start_row": startRow, "end_row": endRow, "row_count": len(updates),
 			"applied_cells": len(writeResult.AppliedChanges), "pending_approval": pending,
-			"approval_states": writeResult.PendingStates, "warning": cacheWarning,
+			"approval_states": writeResult.PendingStates,
 		},
 		TouchedSheetIDs:  []int64{sheetID},
 		ChangedSheetIDs:  changedSheetIDsWhen(len(writeResult.AppliedChanges) > 0, sheetID),
@@ -354,11 +332,7 @@ func (s *AIService) resolveSheetRowRange(userID, sheetID int64, args map[string]
 	if err := s.ensureSheetEditAccess(userID, sheetID); err != nil {
 		return 0, 0, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
-	if err != nil {
-		return 0, 0, err
-	}
-	sheet, err := s.sheetRepo.GetSheet(sheetID)
+	sheet, rows, err := s.loadAgentRowsByID(sheetID)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -425,7 +399,7 @@ func (s *AIService) toolSortSheetRange(userID int64, args map[string]any) (*tool
 		return nil, fmt.Errorf("单次最多排序 %d 行，本次 %d 行", maxSortRangeRows, endRow-startRow+1)
 	}
 
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -495,13 +469,6 @@ func (s *AIService) toolSortSheetRange(userID int64, args map[string]any) (*tool
 	if err != nil {
 		return nil, err
 	}
-	cacheWarning := ""
-	if len(writeResult.AppliedChanges) > 0 {
-		if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-			cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
-		}
-	}
-
 	direction := "升序"
 	if descending {
 		direction = "降序"
@@ -511,15 +478,12 @@ func (s *AIService) toolSortSheetRange(userID int64, args map[string]any) (*tool
 	if pending {
 		summary = fmt.Sprintf("排序未全部生效：已写入 %d 格，%d 格等待审批；请完成审批后核对数据", len(writeResult.AppliedChanges), len(cellUpdates)-len(writeResult.AppliedChanges))
 	}
-	if cacheWarning != "" {
-		summary += "；" + cacheWarning
-	}
 	return &toolExecutionResult{
 		Data: map[string]any{
 			"ok": !pending, "sheet_id": sheetID, "column_key": key,
 			"sorted": !pending, "start_row": startRow, "end_row": endRow,
 			"row_count": endRow - startRow + 1, "pending_approval": pending,
-			"approval_states": writeResult.PendingStates, "warning": cacheWarning,
+			"approval_states": writeResult.PendingStates,
 		},
 		TouchedSheetIDs:  []int64{sheetID},
 		ChangedSheetIDs:  changedSheetIDsWhen(len(writeResult.AppliedChanges) > 0, sheetID),
@@ -572,7 +536,7 @@ func (s *AIService) toolFilterSheetRows(userID int64, args map[string]any) (*too
 		conditions[index].ColumnKey = key
 	}
 
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -605,18 +569,63 @@ func (s *AIService) toolFilterSheetRows(userID int64, args map[string]any) (*too
 		matches = append(matches, entry)
 	}
 
+	data := map[string]any{
+		"ok":          true,
+		"sheet_id":    sheetID,
+		"match_count": total,
+		"returned":    len(matches),
+		"truncated":   total > len(matches),
+		"rows":        matches,
+	}
+	if total == 0 {
+		// An empty result used to send the model on several verification
+		// rounds. Showing how each condition fares on its own settles it.
+		data["condition_breakdown"] = filterConditionBreakdown(visible, conditions)
+		data["note"] = "已扫描全部可见行，组合条件确实没有匹配；condition_breakdown 给出每个条件单独的命中数和该列常见取值"
+	}
 	return &toolExecutionResult{
-		Data: map[string]any{
-			"ok":          true,
-			"sheet_id":    sheetID,
-			"match_count": total,
-			"returned":    len(matches),
-			"truncated":   total > len(matches),
-			"rows":        matches,
-		},
+		Data:            data,
 		TouchedSheetIDs: []int64{sheetID},
 		Summary:         fmt.Sprintf("按条件筛出 %d 行", total),
 	}, nil
+}
+
+func filterConditionBreakdown(rows []aiPreviewRow, conditions []filterCondition) []map[string]any {
+	result := make([]map[string]any, 0, len(conditions))
+	for _, condition := range conditions {
+		matched := 0
+		counts := map[string]int{}
+		for _, row := range rows {
+			if sheetValuesMatch(row.Data, []filterCondition{condition}) {
+				matched++
+			}
+			if value, ok := row.Data[condition.ColumnKey]; ok && value != nil {
+				counts[fmt.Sprint(value)]++
+			}
+		}
+		values := make([]string, 0, len(counts))
+		for value := range counts {
+			values = append(values, value)
+		}
+		sort.Slice(values, func(i, j int) bool {
+			if counts[values[i]] != counts[values[j]] {
+				return counts[values[i]] > counts[values[j]]
+			}
+			return values[i] < values[j]
+		})
+		top := make([]map[string]any, 0, 8)
+		for _, value := range values {
+			if len(top) == 8 {
+				break
+			}
+			top = append(top, map[string]any{"value": value, "rows": counts[value]})
+		}
+		result = append(result, map[string]any{
+			"column_key": condition.ColumnKey, "op": condition.Op, "value": condition.Value,
+			"matched_alone": matched, "distinct_values": len(counts), "top_values": top,
+		})
+	}
+	return result
 }
 
 // filterCondition is one predicate of filter_sheet_rows and dedupe matching.
@@ -641,7 +650,11 @@ func parseFilterConditions(args map[string]any) ([]filterCondition, error) {
 		if columnKey == "" || columnKey == "<nil>" {
 			return nil, fmt.Errorf("conditions[%d] 缺少 column_key", index)
 		}
-		op := strings.ToLower(strings.TrimSpace(fmt.Sprint(entry["op"])))
+		rawOp, hasOp := entry["op"]
+		if !hasOp {
+			rawOp = entry["operator"]
+		}
+		op := strings.ToLower(strings.TrimSpace(fmt.Sprint(rawOp)))
 		if op == "" || op == "<nil>" {
 			op = "equals"
 		}
@@ -813,7 +826,7 @@ func (s *AIService) toolDedupeSheetRows(userID int64, args map[string]any) (*too
 		keys[index] = key
 	}
 
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -876,7 +889,6 @@ func (s *AIService) toolDedupeSheetRows(userID int64, args map[string]any) (*too
 	apply := boolArg(args, "apply")
 	mergeColumn, _ := stringArgWithDefault(args, "merge_column", "")
 	appliedCells := 0
-	cacheWarning := ""
 	var approvalStates []model.CellApprovalState
 	if apply && len(duplicateRows) > 0 {
 		if err := ensureZeroBasedSheetRows(rows); err != nil {
@@ -909,11 +921,6 @@ func (s *AIService) toolDedupeSheetRows(userID int64, args map[string]any) (*too
 		}
 		appliedCells = len(writeResult.AppliedChanges)
 		approvalStates = writeResult.PendingStates
-		if appliedCells > 0 {
-			if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-				cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
-			}
-		}
 	}
 
 	data := map[string]any{
@@ -927,14 +934,10 @@ func (s *AIService) toolDedupeSheetRows(userID int64, args map[string]any) (*too
 		"applied_cells":    appliedCells,
 		"pending_approval": len(approvalStates) > 0,
 		"approval_states":  approvalStates,
-		"warning":          cacheWarning,
 	}
 	summary := fmt.Sprintf("按 %s 发现 %d 行重复数据", strings.Join(keys, "+"), len(duplicateRows))
 	if apply && len(duplicateRows) > 0 {
 		summary = fmt.Sprintf("去重：已清理 %d 行，%d 行等待审批", appliedCells, len(duplicateRows)-appliedCells)
-	}
-	if cacheWarning != "" {
-		summary += "；" + cacheWarning
 	}
 	return &toolExecutionResult{
 		Data:             data,
@@ -976,7 +979,7 @@ func (s *AIService) toolInspectSheetRange(userID int64, args map[string]any) (*t
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -1163,7 +1166,7 @@ func (s *AIService) toolRunSpreadsheetScript(userID int64, args map[string]any) 
 		}
 	}
 
-	rows, err := s.sheetRepo.GetRows(sheetID)
+	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
 		return nil, err
 	}
@@ -1269,7 +1272,6 @@ func (s *AIService) toolRunSpreadsheetScript(userID int64, args map[string]any) 
 
 	changedSheetIDs := []int64(nil)
 	appliedCells := 0
-	cacheWarning := ""
 	var approvalStates []model.CellApprovalState
 	if len(cellUpdates) > 0 {
 		writeResult, err := s.sheetService.UpdateCellsWithSourceDetailed(userID, cellUpdates, "ai")
@@ -1280,22 +1282,16 @@ func (s *AIService) toolRunSpreadsheetScript(userID int64, args map[string]any) 
 		approvalStates = writeResult.PendingStates
 		if appliedCells > 0 {
 			changedSheetIDs = []int64{sheetID}
-			if err := s.invalidateSheetByID(userID, sheetID); err != nil {
-				cacheWarning = fmt.Sprintf("数据已写入，但刷新表格缓存失败：%v", err)
-			}
 		}
 	}
 
 	summary := fmt.Sprintf("脚本执行完成：匹配 %d 行，写入 %d 格，%d 格等待审批（sort 仅改变处理顺序，compute 仅返回统计）", len(selection), appliedCells, len(cellUpdates)-appliedCells)
-	if cacheWarning != "" {
-		summary += "；" + cacheWarning
-	}
 	return &toolExecutionResult{
 		Data: map[string]any{
 			"ok": true, "sheet_id": sheetID, "steps": len(program.Steps),
 			"matched_rows": len(selection), "requested_cells": len(cellUpdates),
 			"written_cells": appliedCells, "pending_approval": len(approvalStates) > 0,
-			"approval_states": approvalStates, "reports": reports, "warning": cacheWarning,
+			"approval_states": approvalStates, "reports": reports,
 		},
 		TouchedSheetIDs:  []int64{sheetID},
 		ChangedSheetIDs:  changedSheetIDs,

@@ -259,6 +259,12 @@ func (h *SheetHandler) CreateWorkbook(c *gin.Context) {
 		response.ServerError(c, err.Error())
 		return
 	}
+	defaultSheet := &model.Sheet{WorkbookID: wb.ID, Name: "Sheet1", Columns: json.RawMessage("[]")}
+	if err := h.sheetService.CreateSheetForUserWithSource(userID, defaultSheet, "web", "创建默认工作表"); err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	wb.Sheets = []model.Sheet{*defaultSheet}
 	response.OK(c, wb)
 }
 
@@ -439,6 +445,28 @@ func (h *SheetHandler) CreateSheet(c *gin.Context) {
 		return
 	}
 	response.OK(c, sheet)
+}
+
+func (h *SheetHandler) UpdateSheetTabs(c *gin.Context) {
+	workbookID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "invalid workbook id")
+		return
+	}
+	var req model.UpdateSheetTabsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid request body")
+		return
+	}
+	if err := h.sheetService.UpdateSheetTabsForUser(c.GetInt64("user_id"), workbookID, &req); err != nil {
+		if errors.Is(err, service.ErrWorkbookAccessDenied) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OKMsg(c, "sheet tabs updated")
 }
 
 func (h *SheetHandler) DuplicateSheet(c *gin.Context) {

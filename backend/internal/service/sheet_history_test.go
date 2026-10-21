@@ -106,3 +106,36 @@ func TestNormalizeHistoryPageAndSource(t *testing.T) {
 		t.Fatal("history source normalization failed")
 	}
 }
+
+func TestCompactFieldChangesOmitsLargeValues(t *testing.T) {
+	large := json.RawMessage(`"` + strings.Repeat("x", 3000) + `"`)
+	got := compactFieldChanges([]model.SheetVersionFieldChange{
+		{Field: "config", OldValue: large, NewValue: large},
+		{Field: "name", OldValue: json.RawMessage(`"a"`), NewValue: json.RawMessage(`"b"`)},
+	}, 2048)
+	if string(got[0].OldValue) != string(omittedFieldValue) || string(got[0].NewValue) != string(omittedFieldValue) {
+		t.Fatalf("large values kept: %d bytes", len(got[0].OldValue))
+	}
+	if string(got[1].OldValue) != `"a"` || string(got[1].NewValue) != `"b"` {
+		t.Fatalf("small values changed: %+v", got[1])
+	}
+}
+
+func TestBuildSheetVersionDiffComparesSnapshotCells(t *testing.T) {
+	columns := json.RawMessage(`[{"key":"name","name":"产品"},{"key":"qty","name":"数量"}]`)
+	before := &model.SheetVersionSnapshot{Sheet: model.SheetVersionSheetSnapshot{Name: "S", Columns: columns,
+		Config: json.RawMessage(`{"univerSheetData":{"name":"S","cellData":{"0":{"0":{"v":"产品"}},"1":{"0":{"v":"苹果"},"1":{"v":10}},"2":{"0":{"v":"香蕉"}}}}}`)}}
+	after := &model.SheetVersionSnapshot{Sheet: model.SheetVersionSheetSnapshot{Name: "S", Columns: columns,
+		Config: json.RawMessage(`{"univerSheetData":{"name":"S","cellData":{"0":{"0":{"v":"产品"}},"1":{"0":{"v":"苹果"},"1":{"v":99}},"3":{"0":{"v":"橙子"}}}}}`)}}
+	diff := buildSheetVersionDiff(before, after, 100)
+	if diff.ChangedCells != 3 || diff.ModifiedRows != 1 || diff.AddedRows != 1 || diff.RemovedRows != 1 {
+		t.Fatalf("diff = %+v", diff)
+	}
+	if len(diff.FieldChanges) != 0 {
+		t.Fatalf("cell edits must not be reported as a config change: %+v", diff.FieldChanges)
+	}
+	first := diff.CellChanges[0]
+	if first.Row != 0 || first.Column != "qty" || string(first.OldValue) != "10" || string(first.NewValue) != "99" {
+		t.Fatalf("first change = %+v", first)
+	}
+}

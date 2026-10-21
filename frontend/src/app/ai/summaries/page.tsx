@@ -21,6 +21,7 @@ import {
   X,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
+import WorkbookScopePicker, { type ScopeItem } from '@/components/ai/WorkbookScopePicker'
 import { MOBILE_QUERY, useHistoryLayer, useMediaQuery } from '@/hooks/useMobileGestures'
 import api from '@/lib/api'
 import { getAccessToken, getStoredUser, isAdmin } from '@/lib/auth'
@@ -33,6 +34,23 @@ import type {
   Channel,
   Workbook,
 } from '@/types'
+
+const PROMPT_EXAMPLES = [
+  '按产品汇总利润，列出利润最高和最低的 10 个产品，并分析原因',
+  '按供应商统计采购金额和平均单价，找出价格明显偏高的供应商',
+  '按月份汇总销售额和订单数，分析增长趋势和异常月份',
+  '检查数据中的缺失值、重复记录和异常数值，给出整改建议',
+]
+
+interface ProgressStep { id: string; label: string; summary?: string; status: 'running' | 'success' | 'error' | 'info' }
+
+interface SummaryStreamEvent {
+  type?: string
+  turn?: number
+  message?: string
+  page?: AISummaryPage
+  tool?: { id: string; label?: string; name: string; status?: string; summary?: string }
+}
 
 const emptyContent: AISummaryContent = {
   headline: '',
@@ -55,8 +73,10 @@ export default function AISummariesPage() {
   const [generatorOpen, setGeneratorOpen] = useState(false)
   const [generateTitle, setGenerateTitle] = useState('经营数据总结')
   const [generatePrompt, setGeneratePrompt] = useState('总结关键指标、异常、趋势和下一步建议，并标明信息来源。')
+  const [progress, setProgress] = useState<ProgressStep[]>([])
   const [generateAssistantId, setGenerateAssistantId] = useState<number | null>(null)
-  const [selectedWorkbookIds, setSelectedWorkbookIds] = useState<number[]>([])
+  const [scope, setScope] = useState<{ workbooks: ScopeItem[]; folders: ScopeItem[] }>({ workbooks: [], folders: [] })
+  const scopeEmpty = scope.workbooks.length === 0 && scope.folders.length === 0
   const [loading, setLoading] = useState(true)
   const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
@@ -134,36 +154,50 @@ export default function AISummariesPage() {
     window.history.replaceState(null, '', `/ai/summaries?selected=${page.id}`)
   }
 
-  const toggleWorkbook = (workbookId: number) => {
-    setSelectedWorkbookIds((current) => current.includes(workbookId)
-      ? current.filter((id) => id !== workbookId)
-      : [...current, workbookId])
-  }
-
   const generateSummary = async () => {
-    if (!generateTitle.trim() || selectedWorkbookIds.length === 0) {
-      setError('请输入标题并至少选择一个工作簿')
+    if (!generateTitle.trim() || scopeEmpty) {
+      setError('请输入标题并至少选择一个工作簿或文件夹')
       return
     }
     setWorking(true)
     setError('')
+    setProgress([{ id: 'start', label: '正在读取工作簿结构', status: 'running' }])
+    let created: AISummaryPage | null = null
     try {
-      const res = await api.post<AISummaryPage>('/ai/summaries/generate', {
+      await api.stream('/ai/summaries/generate/stream', {
         title: generateTitle.trim(),
-        workbook_ids: selectedWorkbookIds,
-        assistant_id: generateAssistantId,
+        workbook_ids: scope.workbooks.map((item) => item.id),
+        folder_ids: scope.folders.map((item) => item.id),
+        assistant_id: generateAssistantId ?? 0,
         prompt: generatePrompt.trim(),
+      }, (raw) => {
+        const event = raw as SummaryStreamEvent
+        if (event.type === 'turn_start') {
+          setProgress((current) => [
+            ...current.map((step) => step.id === 'start' ? { ...step, label: '已读取工作簿结构', status: 'success' as const } : step),
+            ...(event.turn && event.turn > 1 ? [] : [{ id: 'think', label: 'AI 正在规划分析步骤', status: 'running' as const }]),
+          ])
+        } else if (event.type === 'tool_start' && event.tool) {
+          const tool = event.tool
+          setProgress((current) => [...current.map((step) => step.id === 'think' ? { ...step, status: 'success' as const } : step), { id: tool.id, label: tool.label || tool.name, status: 'running' }])
+        } else if (event.type === 'tool_end' && event.tool) {
+          const tool = event.tool
+          setProgress((current) => current.map((step) => step.id === tool.id ? { ...step, summary: tool.summary, status: tool.status === 'error' ? 'error' : 'success' } : step))
+        } else if (event.type === 'notice' && event.message) {
+          setProgress((current) => [...current, { id: `notice-${current.length}`, label: event.message || '', status: 'info' }])
+        } else if (event.type === 'agent_end' && event.page) {
+          created = event.page
+        }
       })
-      if (res.code !== 0 || !res.data) {
-        setError(res.message || '生成汇总失败')
-        return
-      }
+      const page = created as AISummaryPage | null
+      if (!page) throw new Error('生成汇总失败')
       setGeneratorOpen(false)
-      setSelectedWorkbookIds([])
-      await loadData(res.data.id)
-      window.history.replaceState(null, '', `/ai/summaries?selected=${res.data.id}`)
-    } catch {
-      setError('生成汇总失败，请检查 AI 助手配置和工作簿权限')
+      setScope({ workbooks: [], folders: [] })
+      setProgress([])
+      await loadData(page.id)
+      window.history.replaceState(null, '', `/ai/summaries?selected=${page.id}`)
+    } catch (generateError) {
+      setError(generateError instanceof Error ? generateError.message : '生成汇总失败，请检查 AI 助手配置和工作簿权限')
     } finally {
       setWorking(false)
     }
@@ -402,6 +436,14 @@ export default function AISummariesPage() {
                               <div>
                                 <p className="break-words text-sm leading-7 text-slate-600">{section.body}</p>
                                 {section.bullets && section.bullets.length > 0 && <ul className="mt-3 space-y-2 text-sm text-slate-600">{section.bullets.map((bullet, bulletIndex) => <li key={bulletIndex} className="flex gap-2"><span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" /><span className="min-w-0 break-words leading-6">{bullet}</span></li>)}</ul>}
+                                {section.table && section.table.columns.length > 0 && (
+                                  <div className="mt-4 overflow-x-auto rounded-lg border border-slate-200">
+                                    <table className="min-w-full text-sm tabular-nums">
+                                      <thead className="bg-slate-50"><tr>{section.table.columns.map((column, columnIndex) => <th key={columnIndex} className="whitespace-nowrap border-b border-slate-200 px-3 py-2 text-left text-xs font-semibold text-slate-600">{column}</th>)}</tr></thead>
+                                      <tbody className="divide-y divide-slate-100">{section.table.rows.map((row, rowIndex) => <tr key={rowIndex} className="hover:bg-slate-50">{section.table!.columns.map((_, columnIndex) => <td key={columnIndex} className={`whitespace-nowrap px-3 py-2 ${columnIndex === 0 ? 'font-medium text-slate-800' : 'text-slate-600'} ${/^[-+]?[\d,.]+%?$/.test(String(row[columnIndex] ?? '').trim()) ? 'text-right' : ''}`}>{row[columnIndex] ?? ''}</td>)}</tr>)}</tbody>
+                                    </table>
+                                  </div>
+                                )}
                               </div>
                             </div>
                           )}
@@ -438,7 +480,7 @@ export default function AISummariesPage() {
 
         {generatorOpen && (
           <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setGeneratorOpen(false) }}>
-            <div className="flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl border border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:rounded-lg sm:pb-0">
+            <div className="flex max-h-[92dvh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl border border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:rounded-lg sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div className="flex items-center gap-3"><span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-white"><Bot className="h-4 w-4" /></span><div><div className="text-sm font-semibold text-slate-900">生成跨工作簿总结</div><div className="text-xs text-slate-500">仅会读取当前账号有权查看的单元格</div></div></div>
                 <button type="button" onClick={() => !working && setGeneratorOpen(false)} className="inline-flex h-10 w-10 sm:h-9 sm:w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"><X className="h-4 w-4" /></button>
@@ -448,15 +490,32 @@ export default function AISummariesPage() {
                   <label className="space-y-1.5"><span className="text-sm font-medium text-slate-700">页面标题</span><input value={generateTitle} onChange={(event) => setGenerateTitle(event.target.value)} className="h-10 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-slate-400" /></label>
                   <label className="space-y-1.5"><span className="text-sm font-medium text-slate-700">AI 助手</span><select value={generateAssistantId ?? ''} onChange={(event) => setGenerateAssistantId(Number(event.target.value) || null)} className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-slate-400"><option value="">本地权限汇总</option>{assistants.map((assistant) => <option key={assistant.id} value={assistant.id}>{assistant.name} · {assistant.model}</option>)}</select></label>
                 </div>
-                <label className="block space-y-1.5"><span className="text-sm font-medium text-slate-700">分析要求</span><textarea value={generatePrompt} onChange={(event) => setGeneratePrompt(event.target.value)} rows={3} className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm leading-6 outline-none focus:border-slate-400" /></label>
-                <div>
-                  <div className="mb-2 flex items-center justify-between"><span className="text-sm font-medium text-slate-700">工作簿范围</span><span className="text-xs text-slate-400">已选 {selectedWorkbookIds.length}</span></div>
-                  <div className="max-h-64 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-200">
-                    {workbooks.map((workbook) => { const checked = selectedWorkbookIds.includes(workbook.id); return <label key={workbook.id} className={`flex cursor-pointer items-center gap-3 px-3 py-3 transition ${checked ? 'bg-sky-50' : 'hover:bg-slate-50'}`}><input type="checkbox" checked={checked} onChange={() => toggleWorkbook(workbook.id)} className="h-5 w-5 shrink-0 rounded border-slate-300 text-sky-600 sm:h-4 sm:w-4" /><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-slate-800">{workbook.name}</span><span className="block truncate text-xs text-slate-400">{workbook.owner_name || `用户 #${workbook.owner_id}`}</span></span></label> })}
+                <div className="space-y-1.5">
+                  <span className="text-sm font-medium text-slate-700">分析要求</span>
+                  <textarea value={generatePrompt} onChange={(event) => setGeneratePrompt(event.target.value)} rows={4} placeholder="写下你想看的内容，例如：按产品汇总利润，列出利润最高的 10 个产品" className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm leading-6 outline-none focus:border-slate-400" />
+                  <div className="flex flex-wrap gap-1.5">
+                    {PROMPT_EXAMPLES.map((example) => (
+                      <button key={example} type="button" onClick={() => setGeneratePrompt(example)} className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-left text-xs text-slate-600 transition hover:border-slate-300 hover:bg-white hover:text-slate-900">{example}</button>
+                    ))}
                   </div>
+                  <p className="text-xs leading-5 text-slate-400">AI 会读取所选范围内你有权限查看的全部数据，按要求筛选、分组汇总后生成报告，数字由服务器精确计算。</p>
                 </div>
+                <WorkbookScopePicker workbooks={workbooks} selectedWorkbooks={scope.workbooks} selectedFolders={scope.folders} onChange={setScope} />
+                {progress.length > 0 && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3" aria-live="polite">
+                    <div className="mb-2 text-xs font-semibold text-slate-600">分析进度</div>
+                    <ol className="space-y-1.5">
+                      {progress.map((step) => (
+                        <li key={step.id} className="flex items-start gap-2 text-xs">
+                          {step.status === 'running' ? <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-sky-600" /> : step.status === 'error' ? <X className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-500" /> : step.status === 'info' ? <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" /> : <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />}
+                          <span className="min-w-0"><span className="font-medium text-slate-700">{step.label}</span>{step.summary && <span className="text-slate-500"> · {step.summary}</span>}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+                )}
               </div>
-              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setGeneratorOpen(false)} disabled={working} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void generateSummary()} disabled={working || selectedWorkbookIds.length === 0} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{working ? '正在分析...' : '生成页面'}</button></div>
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setGeneratorOpen(false)} disabled={working} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void generateSummary()} disabled={working || scopeEmpty} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{working ? '正在分析…' : '生成报告'}</button></div>
             </div>
           </div>
         )}

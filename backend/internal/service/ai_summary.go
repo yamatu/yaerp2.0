@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -39,53 +40,15 @@ type summaryRowScanner interface {
 }
 
 func (s *AIService) GenerateAISummaryPage(userID int64, req *model.AISummaryGenerateRequest) (*model.AISummaryPage, error) {
-	title := strings.TrimSpace(req.Title)
-	if title == "" {
-		return nil, fmt.Errorf("汇总标题不能为空")
-	}
-	workbookIDs := uniquePositiveInt64s(req.WorkbookIDs, 12)
-	if len(workbookIDs) == 0 {
-		return nil, fmt.Errorf("请至少选择一个工作簿")
-	}
+	return s.GenerateAISummaryPageWithProgress(context.Background(), userID, req, nil)
+}
 
-	build, err := s.buildAISummaryData(userID, title, workbookIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	var assistant *activeAIAssistant
-	requestedAssistantID := int64(0)
-	if req.AssistantID != nil {
-		requestedAssistantID = *req.AssistantID
-	}
-	assistant, assistantErr := s.resolveAIAssistant(requestedAssistantID)
-	if requestedAssistantID > 0 && assistantErr != nil {
-		return nil, assistantErr
-	}
-	if assistantErr == nil {
-		if generated, err := s.generateAISummaryContent(assistant, title, req.Prompt, build.ModelPayload); err == nil {
-			generated.Sources = build.Content.Sources
-			if strings.TrimSpace(generated.Headline) == "" {
-				generated.Headline = title
-			}
-			if strings.TrimSpace(generated.Overview) == "" {
-				generated.Overview = build.Content.Overview
-			}
-			if len(generated.Metrics) == 0 {
-				generated.Metrics = build.Content.Metrics
-			}
-			if len(generated.Sections) == 0 {
-				generated.Sections = build.Content.Sections
-			}
-			build.Content = *generated
-		}
-	}
-
+func (s *AIService) saveAISummaryPage(userID int64, title string, assistant *activeAIAssistant, workbookIDs []int64, content model.AISummaryContent) (*model.AISummaryPage, error) {
 	workbookJSON, err := json.Marshal(workbookIDs)
 	if err != nil {
 		return nil, fmt.Errorf("encode summary sources: %w", err)
 	}
-	contentJSON, err := json.Marshal(build.Content)
+	contentJSON, err := json.Marshal(content)
 	if err != nil {
 		return nil, fmt.Errorf("encode summary content: %w", err)
 	}
@@ -181,7 +144,7 @@ func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs [
 			if err := s.ensureSheetViewAccess(userID, sheet.ID); err != nil {
 				continue
 			}
-			rows, err := s.sheetRepo.GetRows(sheet.ID)
+			rows, err := s.loadAgentRows(&sheet)
 			if err != nil {
 				return nil, fmt.Errorf("读取工作表 %s 失败: %w", sheet.Name, err)
 			}
@@ -543,7 +506,7 @@ func (s *AIService) CreateFinancialReportWorkbook(userID int64, name string, sou
 		if err != nil {
 			return 0, 0, 0, err
 		}
-		rows, err := s.sheetRepo.GetRows(sheetID)
+		rows, err := s.loadAgentRows(sheet)
 		if err != nil {
 			return 0, 0, 0, err
 		}

@@ -409,14 +409,14 @@ type preparedToolCall struct {
 
 func (s *AIService) prepareToolCall(state *agentRunState, call openAIToolCall) preparedToolCall {
 	prepared := preparedToolCall{id: call.ID, name: call.Function.Name}
-	allowed := false
-	for _, definition := range state.toolDefs {
-		if definition.Function.Name == call.Function.Name {
-			allowed = true
+	var definition *openAIToolDefinition
+	for index := range state.toolDefs {
+		if state.toolDefs[index].Function.Name == call.Function.Name {
+			definition = &state.toolDefs[index]
 			break
 		}
 	}
-	if !allowed {
+	if definition == nil {
 		prepared.invalid = fmt.Errorf("本轮未授权工具: %s", call.Function.Name)
 		return prepared
 	}
@@ -437,6 +437,12 @@ func (s *AIService) prepareToolCall(state *agentRunState, call openAIToolCall) p
 	if strings.TrimSpace(call.Function.Arguments) != "" {
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			prepared.invalid = fmt.Errorf("工具参数解析失败: %v", err)
+			return prepared
+		}
+	}
+	if !readOnlyAgentTools[call.Function.Name] {
+		if err := checkWriteToolArguments(*definition, args); err != nil {
+			prepared.invalid = err
 			return prepared
 		}
 	}
@@ -475,9 +481,6 @@ func (s *AIService) recordToolOutcome(
 
 	state.consecutiveErrors = 0
 	state.recordToolResult(result)
-	if call.name == "apply_spreadsheet_plan" {
-		state.pendingOperations = nil
-	}
 	state.traces = append(state.traces, ChatToolTrace{
 		Name:            call.name,
 		Status:          "success",
@@ -574,6 +577,7 @@ var readOnlyAgentTools = map[string]bool{
 	"search_sheet_content":      true,
 	"inspect_sheet_range":       true,
 	"filter_sheet_rows":         true,
+	"aggregate_sheet_rows":      true,
 	"search_spreadsheets":       true,
 	"search_sheet_rows":         true,
 	"lookup_sheet_records":      true,
@@ -608,16 +612,12 @@ var agentToolLabels = map[string]string{
 	"lookup_sheet_records":      "按条件查记录",
 	"calculate_sheet_metrics":   "计算统计指标",
 	"calculate_expression":      "计算表达式",
-	"update_cell":               "更新单元格",
 	"insert_row":                "插入行",
 	"delete_row":                "删除行",
 	"insert_column":             "插入列",
-	"auto_fill_column":          "自动填充列",
 	"generate_report":           "生成报表",
 	"schedule_daily_report":     "创建日报计划",
-	"run_workflow":              "执行批量操作",
 	"preview_spreadsheet_plan":  "生成表格方案",
-	"apply_spreadsheet_plan":    "应用表格方案",
 	"create_workbook":           "创建工作簿",
 	"create_sheet":              "创建工作表",
 	"update_workbook":           "修改工作簿",
@@ -633,6 +633,7 @@ var agentToolLabels = map[string]string{
 	"run_sheet_formulas":        "写入公式",
 	"sort_sheet_range":          "排序数据",
 	"filter_sheet_rows":         "筛选数据",
+	"aggregate_sheet_rows":      "分组汇总",
 	"dedupe_sheet_rows":         "去重合并",
 	"run_spreadsheet_script":    "执行表格脚本",
 	"inspect_sheet_range":       "查看区域结构",

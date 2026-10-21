@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Link from 'next/link'
-import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, Loader2, Maximize2, Minimize2, RefreshCw, RotateCcw, Search, Send, Sparkles, Square, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
+import { BarChart3, Bot, BriefcaseBusiness, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Download, ExternalLink, FileSpreadsheet, FolderOpen, Loader2, Maximize2, Minimize2, Plus, RefreshCw, RotateCcw, Search, Send, Sparkles, Square, Table2, Trash2, Wand2, Workflow, X } from 'lucide-react'
 import AIMessageContent from '@/components/ai/AIMessageContent'
 import { useFloatingDrag, computeTopLeftResize } from '@/hooks/useFloatingDrag'
 import { useWorkbooks } from '@/hooks/useSheet'
@@ -10,7 +10,7 @@ import { useAIConversations } from '@/hooks/useAIConversations'
 import { isBooleanPreference, isNullablePositiveIntegerPreference, useUserPreference } from '@/hooks/useUserPreference'
 import api from '@/lib/api'
 import { getStoredUser } from '@/lib/auth'
-import { prepareDataMutation } from '@/lib/dataEvents'
+import { AI_CONTEXT_DROP_EVENT, getActiveSheet, isContextDrag, prepareDataMutation, readContextDrag, subscribeActiveSheet, type ActiveSheetDetail, type AIContextDragPayload } from '@/lib/dataEvents'
 import type { AIAssistant, AIChatToolTrace, AIERPPendingPlan, AISpreadsheetOperation, Workbook } from '@/types'
 
 interface PersistedMessage {
@@ -165,79 +165,71 @@ function clampPanelSize(size: PanelSize): PanelSize {
   }
 }
 
+const EMPTY_PROMPTS = [
+  '查询销售表里金额大于 10000 的记录',
+  '根据客户、询价主题和 SKU 准备一条 ERP 询价',
+  '检查我负责的订单还缺什么，引导我进入下一步',
+  '我有哪些权限？可以编辑哪些表？',
+]
+
+const EMPTY_PROMPTS_WITH_SHEET = [
+  '汇总这张表的关键数据，列出异常值',
+  '把状态为“待处理”的记录筛出来',
+  '在最后追加一行，并沿用上一行的公式',
+  '把表头设成浅蓝底色并加粗',
+]
+
+const TOOL_TITLES: Record<string, string> = {
+  get_user_context: '读取可访问表格',
+  get_my_permissions: '核对我的权限',
+  get_open_workbook_context: '识别当前工作簿',
+  get_erp_context: 'ERP 权限与任务',
+  search_erp_customers: '搜索 ERP 客户',
+  search_erp_orders: '搜索 ERP 业务单',
+  get_erp_order: '读取 ERP 业务单',
+  search_erp_suppliers: '搜索 ERP 供应商',
+  preview_erp_action: '准备 ERP 待确认操作',
+  query_sheet: '读取工作表',
+  search_sheet_content: '检索表格内容',
+  search_spreadsheets: '按名称找表格',
+  search_sheet_rows: '检索数据行',
+  lookup_sheet_records: '按条件查记录',
+  filter_sheet_rows: '筛选数据',
+  calculate_sheet_metrics: '计算统计指标',
+  calculate_expression: '计算表达式',
+  inspect_sheet_range: '查看列结构',
+  batch_update_cells: '修改单元格',
+  update_cell: '修改单元格',
+  run_sheet_formulas: '填充公式',
+  auto_fill_column: '填充公式',
+  insert_row: '插入行',
+  delete_row: '删除行',
+  insert_column: '插入列',
+  sort_sheet_range: '排序数据',
+  dedupe_sheet_rows: '查重去重',
+  run_spreadsheet_script: '执行表格脚本',
+  preview_spreadsheet_plan: '生成待确认方案',
+  apply_spreadsheet_plan: '执行修改方案',
+  run_workflow: '执行批量操作',
+  generate_report: '生成报表文件',
+  schedule_daily_report: '定时报表',
+  create_workbook: '创建工作簿',
+  create_sheet: '创建工作表',
+  update_workbook: '修改工作簿',
+  update_sheet_name: '重命名工作表',
+  set_cell_format: '设置列类型',
+  format_cell_range: '设置单元格样式',
+  configure_approval_flow: '配置审批流程',
+  create_financial_report: '创建财务分析工作簿',
+  list_summary_pages: '查询 AI 总结页面',
+  create_summary_page: '创建 AI 总结页面',
+  update_summary_page: '更新 AI 总结页面',
+  list_sheet_versions: '查看版本历史',
+  restore_sheet_version: '恢复历史版本',
+}
+
 function toolTitle(name: string) {
-  switch (name) {
-    case 'get_user_context':
-      return '访问范围'
-    case 'get_erp_context':
-      return 'ERP 权限与任务'
-    case 'search_erp_customers':
-      return '搜索 ERP 客户'
-    case 'search_erp_orders':
-      return '搜索 ERP 业务单'
-    case 'get_erp_order':
-      return '读取 ERP 业务单'
-    case 'search_erp_suppliers':
-      return '搜索 ERP 供应商'
-    case 'preview_erp_action':
-      return '准备 ERP 待确认操作'
-    case 'query_sheet':
-      return '读取工作表'
-    case 'search_spreadsheets':
-      return '跨表搜索'
-    case 'search_sheet_rows':
-      return '工作表搜索'
-    case 'lookup_sheet_records':
-      return '记录查询'
-    case 'calculate_sheet_metrics':
-      return '表格统计'
-    case 'calculate_expression':
-      return '数据计算'
-    case 'update_cell':
-      return '修改单元格'
-    case 'insert_row':
-      return '新增数据行'
-    case 'delete_row':
-      return '删除数据行'
-    case 'insert_column':
-      return '新增列'
-    case 'auto_fill_column':
-      return '自动填充'
-    case 'generate_report':
-      return '生成报表文件'
-    case 'schedule_daily_report':
-      return '定时报表'
-    case 'preview_spreadsheet_plan':
-      return '预览修改方案'
-    case 'apply_spreadsheet_plan':
-      return '执行修改方案'
-    case 'run_workflow':
-      return '执行表格工作流'
-    case 'create_workbook':
-      return '创建工作簿'
-    case 'create_sheet':
-      return '创建工作表'
-    case 'update_workbook':
-      return '更新工作簿'
-    case 'update_sheet_name':
-      return '重命名工作表'
-    case 'set_cell_format':
-      return '设置单元格格式'
-    case 'format_cell_range':
-      return '设计单元格样式'
-    case 'configure_approval_flow':
-      return '配置审批流程'
-    case 'create_financial_report':
-      return '创建财务分析工作簿'
-    case 'list_summary_pages':
-      return '查询 AI 总结页面'
-    case 'create_summary_page':
-      return '创建 AI 总结页面'
-    case 'update_summary_page':
-      return '更新 AI 总结页面'
-    default:
-      return name
-  }
+  return TOOL_TITLES[name] || '执行操作'
 }
 
 function operationTitle(operation: AISpreadsheetOperation) {
@@ -305,7 +297,7 @@ function renderTracePreview(trace: AIChatToolTrace) {
   if (trace.name === 'schedule_daily_report') {
     return (
       <div className="text-xs leading-6 text-slate-500">
-        Task #{String(data.schedule_id || '-')} / TZ {String(data.timezone || '-')} / Cron {String(data.cron_expr || '-')}
+        任务 #{String(data.schedule_id || '-')} · 时区 {String(data.timezone || '-')} · 计划 {String(data.cron_expr || '-')}
       </div>
     )
   }
@@ -339,15 +331,15 @@ function renderTracePreview(trace: AIChatToolTrace) {
   }
 
   if (trace.name === 'search_spreadsheets' && Array.isArray(data.matches)) {
-    return <div className="text-xs leading-6 text-slate-600">{data.matches.length} matches found</div>
+    return <div className="text-xs leading-6 text-slate-600">找到 {data.matches.length} 个匹配的表格</div>
   }
 
   if ((trace.name === 'search_sheet_rows' || trace.name === 'lookup_sheet_records') && Array.isArray(data.rows)) {
-    return <div className="text-xs leading-6 text-slate-600">{data.rows.length} rows returned</div>
+    return <div className="text-xs leading-6 text-slate-600">返回 {data.rows.length} 行</div>
   }
 
   if (trace.name === 'calculate_sheet_metrics' && typeof data.matched_rows === 'number') {
-    return <div className="text-xs leading-6 text-slate-600">{data.matched_rows} rows analyzed</div>
+    return <div className="text-xs leading-6 text-slate-600">统计了 {data.matched_rows} 行</div>
   }
 
   if (trace.name === 'calculate_expression' && typeof data.formatted_result === 'string') {
@@ -365,13 +357,14 @@ function renderTraceData(trace: AIChatToolTrace) {
   if (trace.data === undefined) return null
 
   return (
-    <details className="group/data mt-3 rounded-xl border border-slate-200 bg-slate-50">
-      <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-slate-600">
-        <span className="group-open/data:hidden">查看精简工具数据</span>
-        <span className="hidden group-open/data:inline">收起精简工具数据</span>
+    <details className="group/data mt-2 first:mt-0">
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-[11px] font-medium text-slate-400 hover:text-slate-600 [&::-webkit-details-marker]:hidden">
+        <ChevronRight className="h-3 w-3 transition-transform group-open/data:rotate-90" />
+        <span className="group-open/data:hidden">查看返回数据</span>
+        <span className="hidden group-open/data:inline">收起返回数据</span>
       </summary>
-      <div className="border-t border-slate-200 px-3 py-3">
-        <pre className="overflow-x-auto rounded-xl bg-slate-950 px-3 py-2 text-[11px] leading-5 text-slate-100">
+      <div className="mt-1.5">
+        <pre className="max-h-64 overflow-auto rounded-lg bg-slate-900 px-3 py-2 text-[11px] leading-5 text-slate-100">
           {JSON.stringify(trace.data, null, 2)}
         </pre>
       </div>
@@ -380,14 +373,11 @@ function renderTraceData(trace: AIChatToolTrace) {
 }
 
 function ToolTraceCard({ trace }: { trace: AIChatToolTrace }) {
-  const touchedSheetIds = Array.isArray(trace.touched_sheet_ids) ? trace.touched_sheet_ids : []
-  const visibleSheetIds = touchedSheetIds.slice(0, 3)
-
   return (
     <details className="group/trace overflow-hidden rounded-lg border border-slate-200 bg-white">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-2.5 py-2 hover:bg-slate-50 [&::-webkit-details-marker]:hidden">
         <div className="flex min-w-0 items-center gap-2">
-          <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${trace.status === 'success' ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+          <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md ${trace.status === 'success' ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
             {trace.name === 'schedule_daily_report'
               ? <Clock3 className="h-4 w-4" />
               : trace.name === 'preview_spreadsheet_plan'
@@ -397,27 +387,15 @@ function ToolTraceCard({ trace }: { trace: AIChatToolTrace }) {
                   : <Bot className="h-4 w-4" />}
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-slate-900">{toolTitle(trace.name)}</div>
-            <div className={`line-clamp-2 text-xs ${trace.status === 'success' ? 'text-emerald-600' : 'text-rose-600'}`}>
+            <div className="truncate text-[13px] font-semibold text-slate-800">{toolTitle(trace.name)}</div>
+            <div className={`line-clamp-2 text-xs leading-5 ${trace.status === 'success' ? 'text-slate-500' : 'text-rose-600'}`}>
               {trace.summary || (trace.status === 'success' ? '执行成功' : '执行失败')}
             </div>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          {visibleSheetIds.map((sheetId) => (
-            <span key={sheetId} className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
-              Sheet #{sheetId}
-            </span>
-          ))}
-          {touchedSheetIds.length > visibleSheetIds.length && (
-            <span className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
-              +{touchedSheetIds.length - visibleSheetIds.length}
-            </span>
-          )}
-          <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-open/trace:rotate-90" />
-        </div>
+        <ChevronRight className="h-4 w-4 shrink-0 text-slate-300 transition-transform group-open/trace:rotate-90" />
       </summary>
-      <div className="border-t border-slate-200 bg-slate-50/60 px-3 py-3">
+      <div className="border-t border-slate-100 bg-slate-50/60 px-3 py-2.5">
         {renderTracePreview(trace)}
         {renderTraceData(trace)}
       </div>
@@ -431,7 +409,7 @@ function QuerySheetTraceItem({ trace, index }: { trace: AIChatToolTrace; index: 
   const sheetName = typeof data?.sheet_name === 'string' && data.sheet_name.trim()
     ? data.sheet_name.trim()
     : typeof data?.sheet_id === 'number'
-      ? `Sheet #${data.sheet_id}`
+      ? '工作表'
       : `读取记录 ${index + 1}`
   const returned = typeof data?.returned_rows === 'number' ? data.returned_rows : Array.isArray(data?.rows) ? data.rows.length : 0
   const total = typeof data?.total_rows === 'number' ? data.total_rows : Array.isArray(data?.rows) ? data.rows.length : 0
@@ -462,11 +440,6 @@ function QuerySheetTraceItem({ trace, index }: { trace: AIChatToolTrace; index: 
 
 function QuerySheetTraceGroup({ traces }: { traces: AIChatToolTrace[] }) {
   const [open, setOpen] = useState(false)
-  const sheetIds = Array.from(new Set(traces.flatMap((trace) => {
-    const data = trace.data as Record<string, unknown> | undefined
-    const dataSheetId = typeof data?.sheet_id === 'number' ? data.sheet_id : null
-    return [...(trace.touched_sheet_ids || []), ...(dataSheetId ? [dataSheetId] : [])]
-  })))
   const returnedRows = traces.reduce((sum, trace) => {
     const data = trace.data as Record<string, unknown> | undefined
     return sum + (typeof data?.returned_rows === 'number' ? data.returned_rows : Array.isArray(data?.rows) ? data.rows.length : 0)
@@ -485,35 +458,22 @@ function QuerySheetTraceGroup({ traces }: { traces: AIChatToolTrace[] }) {
   const totalRows = Array.from(totalRowsBySheet.values()).reduce((sum, total) => sum + total, 0)
   const hasMoreCount = traces.filter((trace) => (trace.data as Record<string, unknown> | undefined)?.has_more === true).length
   const failedCount = traces.filter((trace) => trace.status !== 'success').length
-  const visibleSheetIds = sheetIds.slice(0, 3)
 
   return (
     <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)} className="group/query-traces overflow-hidden rounded-lg border border-slate-200 bg-white">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-3 [&::-webkit-details-marker]:hidden">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-2.5 py-2 hover:bg-slate-50 [&::-webkit-details-marker]:hidden">
         <div className="flex min-w-0 items-center gap-2">
-          <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${failedCount === 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
-            <Bot className="h-4 w-4" />
+          <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md ${failedCount === 0 ? 'bg-emerald-50 text-emerald-600' : 'bg-rose-50 text-rose-600'}`}>
+            <Table2 className="h-4 w-4" />
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-slate-900">读取工作表</div>
-            <div className={`line-clamp-2 text-xs ${failedCount === 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+            <div className="truncate text-[13px] font-semibold text-slate-800">读取工作表</div>
+            <div className={`line-clamp-2 text-xs leading-5 ${failedCount === 0 ? 'text-slate-500' : 'text-rose-600'}`}>
               已合并 {traces.length} 次读取 · {totalRowsBySheet.size} 张工作表 · 返回 {returnedRows}/{totalRows} 行{hasMoreCount > 0 ? ` · ${hasMoreCount} 张仍有后续数据` : ''}{failedCount > 0 ? ` · ${failedCount} 次失败` : ''}
             </div>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          {visibleSheetIds.map((sheetId) => (
-            <span key={sheetId} className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
-              Sheet #{sheetId}
-            </span>
-          ))}
-          {sheetIds.length > visibleSheetIds.length && (
-            <span className="hidden rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500 sm:inline-flex">
-              +{sheetIds.length - visibleSheetIds.length}
-            </span>
-          )}
-          <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-open/query-traces:rotate-90" />
-        </div>
+        <ChevronRight className="h-4 w-4 shrink-0 text-slate-300 transition-transform group-open/query-traces:rotate-90" />
       </summary>
       {open && (
         <div className="space-y-2 border-t border-slate-200 bg-slate-50/60 p-2.5">
@@ -604,6 +564,10 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   const [contextWorkbook, setContextWorkbook] = useState<Workbook | null>(null)
   const [contextSheetIds, setContextSheetIds] = useState<number[]>([])
   const [contextSelection, setContextSelection] = useState<AIComposeSelection | null>(null)
+  // Workbooks or a folder the employee dragged into the chat.
+  const [contextFolder, setContextFolder] = useState<{ id: number; name: string } | null>(null)
+  const [contextExtraWorkbooks, setContextExtraWorkbooks] = useState<{ id: number; name: string }[]>([])
+  const [contextDropActive, setContextDropActive] = useState(false)
   const [loadingContextWorkbookId, setLoadingContextWorkbookId] = useState<number | null>(null)
   const [suggestionSeed, setSuggestionSeed] = useState(0)
   const { workbooks } = useWorkbooks()
@@ -716,9 +680,58 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     setContextSelection(null)
   }, [contextOnlyMine, contextWorkbook, userId])
 
+  // The context follows the sheet on screen until the employee picks one by
+  // hand; switching to another sheet hands control back to the screen.
+  const contextAutoRef = useRef(false)
+  const contextWorkbookRef = useRef<Workbook | null>(null)
+  contextWorkbookRef.current = contextWorkbook
+  const hasContext = Boolean(contextWorkbook || contextFolder || contextExtraWorkbooks.length)
+  const contextLabel = contextFolder
+    ? `文件夹「${contextFolder.name}」· 含子文件夹`
+    : contextWorkbook
+      ? `${contextWorkbook.name}${contextExtraWorkbooks.length ? ` 等 ${contextExtraWorkbooks.length + 1} 个工作簿` : contextSelection ? ` · ${contextSelection.range_label}` : contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}`
+      : ''
+  const chatContextPayload = useMemo(() => {
+    if (!contextWorkbook && !contextFolder && contextExtraWorkbooks.length === 0) return undefined
+    return {
+      ...(contextWorkbook ? { workbook_id: contextWorkbook.id, sheet_ids: contextSheetIds, selection: contextSelection || undefined } : {}),
+      ...(contextExtraWorkbooks.length ? { workbook_ids: contextExtraWorkbooks.map((workbook) => workbook.id) } : {}),
+      ...(contextFolder ? { folder_id: contextFolder.id } : {}),
+    }
+  }, [contextExtraWorkbooks, contextFolder, contextSelection, contextSheetIds, contextWorkbook])
+  useEffect(() => {
+    const follow = async (detail: ActiveSheetDetail | null) => {
+      if (!detail) {
+        if (contextAutoRef.current) {
+          setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null)
+        }
+        contextAutoRef.current = false
+        return
+      }
+      let workbook = contextWorkbookRef.current?.id === detail.workbookId ? contextWorkbookRef.current : null
+      if (!workbook) {
+        const res = await api.get<Workbook>(`/workbooks/${detail.workbookId}`)
+        if (res.code !== 0 || !res.data) return
+        workbook = res.data
+      }
+      const current = getActiveSheet()
+      if (current?.workbookId !== detail.workbookId || current.sheetId !== detail.sheetId) return
+      contextAutoRef.current = true
+      setContextFolder(null)
+      setContextExtraWorkbooks([])
+      setContextWorkbook(workbook)
+      setContextSheetIds([detail.sheetId])
+      setContextSelection(null)
+    }
+    const current = getActiveSheet()
+    if (current) void follow(current)
+    return subscribeActiveSheet((detail) => { void follow(detail) })
+  }, [])
+
   useEffect(() => {
     const handleCompose = (event: Event) => {
       const detail = (event as CustomEvent<AIComposeEventDetail>).detail || {}
+      contextAutoRef.current = false
       if (detail.prompt) setInputValue(detail.prompt)
       if (detail.selection) setContextSelection(detail.selection)
       if (!detail.workbookId) return
@@ -815,11 +828,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     setSendError('')
     try {
       await prepareDataMutation()
-      await cloud.start(prompt, assistantId, contextWorkbook ? {
-        workbook_id: contextWorkbook.id,
-        sheet_ids: contextSheetIds,
-        selection: contextSelection || undefined,
-      } : undefined)
+      await cloud.start(prompt, assistantId, chatContextPayload)
     } catch (error) {
       setSendError(error instanceof Error ? error.message : '提交失败，请重试')
       if (cloud.isCurrent(origin)) setInputValue(prompt)
@@ -846,9 +855,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     setSendError('')
     try {
       await prepareDataMutation()
-      await cloud.startAction(messageId, kind, agentMode, assistantId, contextWorkbook ? {
-        workbook_id: contextWorkbook.id, sheet_ids: contextSheetIds, selection: contextSelection || undefined,
-      } : undefined)
+      await cloud.startAction(messageId, kind, agentMode, assistantId, chatContextPayload)
     } catch (error) {
       setSendError(error instanceof Error ? error.message : '提交确认方案失败')
     }
@@ -953,6 +960,9 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
   }, [panelSizeStorageKey, panelDrag])
 
   const selectContextWorkbook = useCallback(async (workbook: Workbook) => {
+    contextAutoRef.current = false
+    setContextFolder(null)
+    setContextExtraWorkbooks([])
     setLoadingContextWorkbookId(workbook.id)
     try {
       const res = await api.get<Workbook>(`/workbooks/${workbook.id}`)
@@ -965,7 +975,43 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
     }
   }, [])
 
+  const clearContext = useCallback(() => {
+    contextAutoRef.current = false
+    setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null)
+    setContextFolder(null); setContextExtraWorkbooks([])
+    setContextPickerOpen(false)
+  }, [])
+
+  const applyContextDrop = useCallback(async (payload: AIContextDragPayload) => {
+    contextAutoRef.current = false
+    setContextSelection(null)
+    setContextPickerOpen(false)
+    if (payload.folder) {
+      setContextFolder(payload.folder); setContextExtraWorkbooks([])
+      setContextWorkbook(null); setContextSheetIds([])
+      return
+    }
+    const dropped = payload.workbooks ?? []
+    if (dropped.length === 0) return
+    const res = await api.get<Workbook>(`/workbooks/${dropped[0].id}`)
+    if (res.code !== 0 || !res.data) { setSendError(res.message || '无法读取拖入的工作簿'); return }
+    setContextFolder(null)
+    setContextExtraWorkbooks(dropped.slice(1))
+    setContextWorkbook(res.data); setContextSheetIds([])
+  }, [])
+
+  // The AI button outside the panel accepts drops too and forwards them here.
+  useEffect(() => {
+    const onContextDrop = (event: Event) => {
+      const payload = (event as CustomEvent<AIContextDragPayload>).detail
+      if (payload) void applyContextDrop(payload)
+    }
+    window.addEventListener(AI_CONTEXT_DROP_EVENT, onContextDrop)
+    return () => window.removeEventListener(AI_CONTEXT_DROP_EVENT, onContextDrop)
+  }, [applyContextDrop])
+
   const toggleContextSheet = useCallback((sheetId: number) => {
+    contextAutoRef.current = false
     setContextSelection(null)
     setContextSheetIds((current) => current.includes(sheetId)
       ? current.filter((id) => id !== sheetId)
@@ -989,7 +1035,25 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         '--ai-panel-height': `${panelSize.height}px`,
         ...(isDesktopViewport && panelDrag.style ? panelDrag.style : {}),
       } as React.CSSProperties}
+      onDragEnterCapture={(event) => { if (isContextDrag(event.dataTransfer)) { event.preventDefault(); setContextDropActive(true) } }}
+      onDragOverCapture={(event) => { if (isContextDrag(event.dataTransfer)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }}
+      onDragLeave={(event) => { if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget))) setContextDropActive(false) }}
+      onDropCapture={(event) => {
+        if (!isContextDrag(event.dataTransfer)) return
+        event.preventDefault()
+        event.stopPropagation()
+        setContextDropActive(false)
+        const payload = readContextDrag(event.dataTransfer)
+        if (payload) void applyContextDrop(payload)
+      }}
     >
+      {contextDropActive && (
+        <div className="pointer-events-none absolute inset-2 z-[60] flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-amber-400 bg-amber-50/90 text-center text-sm font-semibold text-amber-800">
+          <FolderOpen className="h-8 w-8" />
+          松开后让 AI 读取这些工作簿
+          <span className="text-xs font-normal text-amber-700">只会读取你有权限查看的内容</span>
+        </div>
+      )}
       <button
         type="button"
         onPointerDown={handleResizeStart}
@@ -1079,28 +1143,28 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2">
-        <select aria-label="选择历史对话" value={cloud.conversationId || ''} onChange={(event) => { setSendError(''); setInputValue(''); void cloud.select(Number(event.target.value)).catch((error) => setSendError(error.message)) }} className="h-11 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 text-sm">
-          {!cloud.ready && <option value="">正在同步账号历史…</option>}
+      <div className="flex shrink-0 items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2" title="对话已云端同步：手机和电脑可以接着聊，关闭页面不会停止后台任务">
+        <select aria-label="选择历史对话" value={cloud.conversationId || ''} onChange={(event) => { setSendError(''); setInputValue(''); void cloud.select(Number(event.target.value)).catch((error) => setSendError(error.message)) }} className="h-10 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 text-[13px] text-slate-700 outline-none focus:border-slate-400 md:h-9">
+          {!cloud.ready && <option value="">正在同步对话…</option>}
           {cloud.conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
         </select>
-        <button type="button" disabled={!cloud.ready} onClick={() => { setSendError(''); setInputValue(''); void cloud.create(assistantId).catch((error) => setSendError(error.message)) }} className="h-11 shrink-0 rounded-lg bg-sky-600 px-3 text-sm text-white disabled:opacity-50">新对话</button>
+        <button type="button" disabled={!cloud.ready} onClick={() => { setSendError(''); setInputValue(''); void cloud.create(assistantId).catch((error) => setSendError(error.message)) }} className="inline-flex h-10 shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 text-[13px] font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-100 disabled:opacity-50 md:h-9"><Plus className="h-4 w-4" />新对话</button>
       </div>
-      <div className="shrink-0 truncate px-3 py-1 text-[11px] text-slate-500">账号历史已云端同步 · 手机/电脑可接着聊 · 关闭页面不停止后台任务</div>
       {(sendError || cloud.error) && <div role="alert" className="shrink-0 bg-rose-50 px-3 py-2 text-xs text-rose-700">{sendError || cloud.error}</div>}
       <div ref={messagesScrollRef} className="app-scroll relative min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-4 md:px-4">
         {messages.length === 0 && (
-          <div className="mt-6 border-y border-slate-200 bg-slate-50 px-5 py-7 text-center">
-            <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-lg bg-slate-900 text-white">
-              <Sparkles className="h-6 w-6" />
+          <div className="mx-auto mt-6 max-w-md px-1 text-center">
+            <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900 text-white">
+              <Sparkles className="h-5 w-5" />
             </div>
-            <div className="text-sm font-semibold text-slate-900">你可以直接这样说</div>
-            <div className="mt-3 grid gap-2 text-left text-xs leading-5 text-slate-500 sm:grid-cols-2">
-              <div>“查询今天销售表里金额大于 10000 的记录”</div>
-              <div>“根据客户、询价主题和 SKU 准备一条 ERP 询价”</div>
-              <div>“把库存表数量加 50，先给我确认方案”</div>
-              <div>“检查我负责的订单还缺什么，再引导我进入下一步”</div>
-              <div>“我有哪些权限？可以编辑哪些表？”</div>
+            <div className="text-sm font-semibold text-slate-900">{contextWorkbook ? `已连接「${contextWorkbook.name}」，可以直接这样说` : '你可以直接这样说'}</div>
+            <div className="mt-1 text-xs text-slate-500">点击示例填入输入框，修改后发送</div>
+            <div className="mt-4 grid gap-2 text-left">
+              {(contextWorkbook ? EMPTY_PROMPTS_WITH_SHEET : EMPTY_PROMPTS).map((prompt) => (
+                <button key={prompt} type="button" onClick={() => { setInputValue(prompt); textareaRef.current?.focus() }} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-left text-[13px] leading-5 text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900">
+                  {prompt}
+                </button>
+              ))}
             </div>
           </div>
         )}
@@ -1129,10 +1193,10 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               )}
 
               <div
-                className={`min-w-0 max-w-full rounded-2xl px-4 py-3 text-sm leading-7 ${
+                className={`min-w-0 max-w-full rounded-2xl text-sm leading-6 ${
                   message.role === 'user'
-                    ? 'whitespace-pre-wrap rounded-br-sm bg-slate-900 text-white'
-                    : 'rounded-bl-sm bg-slate-100 text-slate-900'
+                    ? 'whitespace-pre-wrap rounded-br-md bg-slate-900 px-3.5 py-2.5 text-white'
+                    : 'rounded-bl-md border border-slate-200 bg-white px-4 py-3 text-slate-800'
                 }`}
               >
                 {message.role === 'assistant'
@@ -1141,14 +1205,14 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               </div>
 
               {message.role === 'assistant' && Array.isArray(message.pendingOperations) && message.pendingOperations.length > 0 && (
-                <div className="w-full rounded-[24px] border border-amber-200 bg-amber-50/80 p-4 shadow-sm">
+                <div className="w-full rounded-xl border border-amber-200 bg-amber-50/80 p-3.5">
                   <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-800">
                     <Wand2 className="h-4 w-4" />
                     待确认表格修改方案
                   </div>
                   <div className="space-y-2">
                     {message.pendingOperations.map((operation, index) => (
-                      <div key={`${message.id}-op-${index}`} className="rounded-2xl border border-amber-200 bg-white/90 px-3 py-3">
+                      <div key={`${message.id}-op-${index}`} className="rounded-lg border border-amber-200 bg-white/90 px-3 py-2">
                         <div className="text-sm font-semibold text-slate-900">{operationTitle(operation)}</div>
                         <div className="mt-1 text-xs leading-6 text-slate-500">{operationDetail(operation)}</div>
                       </div>
@@ -1184,7 +1248,7 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
               )}
 
               {message.role === 'assistant' && message.pendingERPPlan && (
-                <div className="w-full rounded-[24px] border border-sky-200 bg-sky-50/80 p-4 shadow-sm">
+                <div className="w-full rounded-xl border border-sky-200 bg-sky-50/80 p-3.5">
                   <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-sky-900">
                     <BriefcaseBusiness className="h-4 w-4" />
                     待确认 ERP 预备数据
@@ -1320,15 +1384,16 @@ export default function AIChatPanel({ open, onClose }: AIChatPanelProps) {
         </div>
         <div className="relative mb-2">
           <div className="flex min-w-0 items-center gap-2">
-            <button type="button" onClick={() => setContextPickerOpen((current) => !current)} className={`inline-flex h-9 shrink-0 md:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${contextWorkbook ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="选择 AI 需要读取的工作簿或工作表">
+            <button type="button" onClick={() => setContextPickerOpen((current) => !current)} className={`inline-flex h-9 shrink-0 md:h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium transition ${hasContext ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`} title="选择 AI 需要读取的工作簿或工作表，也可以把工作簿或文件夹直接拖进对话框">
               <Table2 className="h-3.5 w-3.5" />
-              {contextWorkbook ? '已选择表格' : '选择表格'}
+              {hasContext ? '已选择表格' : '选择表格'}
               <ChevronDown className="h-3.5 w-3.5" />
             </button>
-            {contextWorkbook && (
+            {hasContext && (
               <div className="flex min-w-0 flex-1 items-center gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5 text-xs text-slate-600">
-                <span className="min-w-0 flex-1 truncate font-medium">{contextWorkbook.name}{contextSelection ? ` · ${contextSelection.range_label}` : contextSheetIds.length > 0 ? ` · ${contextSheetIds.length} 张工作表` : ' · 整个工作簿'}</span>
-                <button type="button" onClick={() => { setContextWorkbook(null); setContextSheetIds([]); setContextSelection(null); setContextPickerOpen(false) }} className="-my-1 inline-flex h-8 w-8 shrink-0 items-center justify-center text-slate-400 hover:text-slate-700 md:my-0 md:h-auto md:w-auto" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
+                {contextFolder && <FolderOpen className="h-3.5 w-3.5 shrink-0 text-amber-600" />}
+                <span className="min-w-0 flex-1 truncate font-medium" title={contextLabel}>{contextLabel}</span>
+                <button type="button" onClick={clearContext} className="-my-1 inline-flex h-8 w-8 shrink-0 items-center justify-center text-slate-400 hover:text-slate-700 md:my-0 md:h-auto md:w-auto" title="清除表格上下文"><X className="h-3.5 w-3.5" /></button>
               </div>
             )}
           </div>

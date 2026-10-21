@@ -29,6 +29,8 @@ export interface BrowserItem {
   pinned: boolean;
   /** Workbook that the current user may move (drag source). */
   canDrag: boolean;
+  /** Whether a dragged workbook may be moved into another folder. */
+  canMove?: boolean;
   /** Folder that accepts dropped workbooks. */
   canDrop: boolean;
   /** Workbook imported from an Excel file (has a downloadable source). */

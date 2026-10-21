@@ -147,6 +147,7 @@ func main() {
 	mailService.SetTradeService(tradeService)
 	aiService.SetAutomationService(automationService)
 	aiService.SetHistoryService(historyService)
+	aiService.SetFolderService(folderService)
 
 	// Global XTLS / Mihomo outbound proxy
 	proxyService := service.NewProxyService(cfg, proxyRepo)
@@ -262,12 +263,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize AI conversations: %v", err)
 	}
-	conversationService.SetFinishedCallback(func(userID int64, result *service.ChatResponse) {
-		for _, sheetID := range result.ChangedSheetIDs {
+	broadcastSheetSync := func(userID int64, sheetIDs []int64) {
+		for _, sheetID := range sheetIDs {
 			payload, _ := json.Marshal(ws.Message{Type: "sheet_sync", SheetID: sheetID, UserID: userID})
 			hub.BroadcastToSheetExceptClientID(sheetID, payload, "")
 		}
+	}
+	conversationService.SetFinishedCallback(func(userID int64, result *service.ChatResponse) {
+		broadcastSheetSync(userID, result.ChangedSheetIDs)
 	})
+	conversationService.SetSheetsChangedCallback(broadcastSheetSync)
 	aiHandler.SetConversations(conversationService)
 	automationHandler := handler.NewAutomationHandler(automationService)
 	tradeHandler := handler.NewTradeHandler(tradeService)
@@ -437,6 +442,7 @@ func main() {
 
 		// Sheets
 		api.POST("/workbooks/:id/sheets", sheetHandler.CreateSheet)
+		api.PUT("/workbooks/:id/sheet-tabs", sheetHandler.UpdateSheetTabs)
 		api.POST("/sheets/:id/duplicate", sheetHandler.DuplicateSheet)
 
 		// Cells
@@ -575,6 +581,7 @@ func main() {
 		api.POST("/ai/erp/import/apply", aiHandler.ApplyERPOrderImport)
 		api.GET("/ai/summaries", aiHandler.ListSummaryPages)
 		api.POST("/ai/summaries/generate", aiHandler.GenerateSummaryPage)
+		api.POST("/ai/summaries/generate/stream", aiHandler.GenerateSummaryPageStream)
 		api.GET("/ai/summaries/:id", aiHandler.GetSummaryPage)
 		api.PUT("/ai/summaries/:id", aiHandler.UpdateSummaryPage)
 		api.DELETE("/ai/summaries/:id", aiHandler.DeleteSummaryPage)

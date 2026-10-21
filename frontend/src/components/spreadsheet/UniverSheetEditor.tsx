@@ -9,8 +9,6 @@ import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-
 import { UniverSheetsDrawingPreset } from '@univerjs/preset-sheets-drawing'
 import { UniverSheetsFilterPreset } from '@univerjs/preset-sheets-filter'
 import UniverPresetSheetsFilterZhCN from '@univerjs/preset-sheets-filter/locales/zh-CN'
-import { UniverSheetsFindReplacePreset } from '@univerjs/preset-sheets-find-replace'
-import UniverPresetSheetsFindReplaceZhCN from '@univerjs/preset-sheets-find-replace/locales/zh-CN'
 import { UniverSheetsSortPreset } from '@univerjs/preset-sheets-sort'
 import UniverPresetSheetsSortZhCN from '@univerjs/preset-sheets-sort/locales/zh-CN'
 import { UniverSheetsHyperLinkPreset } from '@univerjs/preset-sheets-hyper-link'
@@ -1003,6 +1001,33 @@ function revealCell(
     // Fall back to scrolling.
   }
   worksheet.scrollToCell(row, column)
+}
+
+/**
+ * Scrolls a search hit into view with some context around it. Plain
+ * `scrollToCell` pins the hit to the top-left corner, under the toolbar edge,
+ * and the bottom rows sit behind the docked search bar, so both edges keep a
+ * margin.
+ */
+function revealSearchHit(
+  worksheet: Parameters<typeof revealCell>[0],
+  row: number,
+  column: number
+) {
+  if (!worksheet) return
+  try {
+    const visible = worksheet.getVisibleRange?.()
+    if (
+      visible &&
+      row > visible.startRow &&
+      row < visible.endRow - 4 &&
+      column >= visible.startColumn &&
+      column < visible.endColumn
+    ) return
+  } catch {
+    // Fall back to scrolling.
+  }
+  worksheet.scrollToCell(Math.max(0, row - 3), Math.max(0, column - 1))
 }
 
 function cloneJsonSnapshot<T>(value: T): T {
@@ -3892,6 +3917,17 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
     const commitBeforeScroll = (event?: Event) => {
       if (event instanceof WheelEvent && (event.ctrlKey || event.metaKey)) return
+      if (event?.type === 'scroll') {
+        // Only a scroll that moves the sheet itself (the page or a container
+        // of the sheet) detaches the editor from its cell. The cell editor's
+        // own scroller fires right after an IME commit, and other panels (the
+        // AI chat auto-scrolling) scroll too; committing on those ended the
+        // edit between two pinyin words, so the next word replaced the first.
+        const target = event.target
+        const movesSheet = target === document || target === document.documentElement ||
+          (target instanceof Element && !root.contains(target) && target.contains(root))
+        if (!movesSheet) return
+      }
       if (imeComposingRef.current) return
       if (!getVisibleUniverCellEditor(root)) return
 
@@ -3940,16 +3976,26 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     let cleanup: (() => void) | null = null
 	let createdUniver: ReturnType<typeof createUniver> | null = null
 	let cancelHeightWait: (() => void) | null = null
+	// Each Univer instance renders into its own host element. Univer unmounts
+	// its React UI asynchronously after dispose(); clearing a shared container
+	// right away made that unmount throw (removeChild of a node that was already
+	// gone), which also broke the instance mounted for the reload, so a version
+	// restore left the sheet blank. A detached host keeps the old nodes intact
+	// until Univer is done with them.
+	let mountHost: HTMLDivElement | null = null
 
 	const disposeCreatedUniver = () => {
-	  if (!createdUniver) return
-	  try {
-		;(createdUniver.univer as { dispose?: () => void }).dispose?.()
-	  } catch (disposeError) {
-		console.error('Failed to dispose Univer instance:', disposeError)
-	  } finally {
-		createdUniver = null
+	  if (createdUniver) {
+		try {
+		  ;(createdUniver.univer as { dispose?: () => void }).dispose?.()
+		} catch (disposeError) {
+		  console.error('Failed to dispose Univer instance:', disposeError)
+		} finally {
+		  createdUniver = null
+		}
 	  }
+	  mountHost?.remove()
+	  mountHost = null
 	}
 
     const mount = async () => {
@@ -4045,6 +4091,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 		}
         if (disposed || !containerRef.current) return
 
+        mountHost = document.createElement('div')
+        mountHost.style.cssText = 'width:100%;height:100%;position:relative'
+        containerRef.current.appendChild(mountHost)
+
         const localeKey = LocaleType.ZH_CN
         const univerResult = createUniver({
           locale: localeKey,
@@ -4052,7 +4102,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           locales: {
             [localeKey]: mergeLocaleBundles(
               UniverPresetSheetsCoreZhCN,
-              UniverPresetSheetsFindReplaceZhCN,
               UniverPresetSheetsSortZhCN,
               UniverPresetSheetsHyperLinkZhCN,
               UniverPresetSheetsFilterZhCN,
@@ -4063,7 +4112,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           },
           presets: [
             UniverSheetsCorePreset({
-              container: containerRef.current,
+              container: mountHost,
               header: true,
               toolbar: true,
               formulaBar: true,
@@ -4073,7 +4122,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             }),
             UniverSheetsDrawingPreset(),
             UniverSheetsFilterPreset(),
-            UniverSheetsFindReplacePreset(),
             UniverSheetsSortPreset(),
             UniverSheetsHyperLinkPreset(),
             UniverSheetsDataValidationPreset({ showEditOnDropdown: true }),
@@ -4833,7 +4881,6 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           setOptionPickerSearch('')
 
 		  disposeCreatedUniver()
-		  containerRef.current?.replaceChildren()
 
 		}
       } catch (mountError) {
@@ -5535,6 +5582,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
       <SheetMobileControls
         sheetId={sheetId}
+        columnNames={latestSheetRef.current.columns?.map((column) => column.name) ?? []}
         ready={!loading && !error && canViewSheet}
         editable={!editLocked}
         selectionEditable={Boolean(selectionState && selectionState.rowIndex >= 0 && !editLocked && !selectedCellCannotEdit && !selectedCellMasked && !selectedCellFormulaHidden)}
@@ -5579,7 +5627,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           containerRef.current?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
           const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
           worksheet?.getRange(row, column, 1, 1).activate()
-          worksheet?.scrollToCell(row, column)
+          revealSearchHit(worksheet, row, column)
           syncSelectionState()
         }}
         moveCell={async (rowDelta, columnDelta) => {

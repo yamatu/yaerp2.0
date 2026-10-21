@@ -55,7 +55,9 @@ func TestBuildAIPreviewRowsPrefersSnapshotData(t *testing.T) {
 	}
 }
 
-func TestBuildAIPreviewRowsMergesPartialSnapshotWithStoredRows(t *testing.T) {
+// The editor renders only the snapshot, so stale rows-table values (cleared
+// cells, rows that moved) must never reach the agent.
+func TestBuildAIPreviewRowsIgnoresRowsTableWhenSnapshotExists(t *testing.T) {
 	columns := []sheetColumnPayload{
 		{Key: "name", Name: "姓名", Type: "text"},
 		{Key: "score", Name: "分数", Type: "number"},
@@ -71,25 +73,21 @@ func TestBuildAIPreviewRowsMergesPartialSnapshotWithStoredRows(t *testing.T) {
 	storedRows := []model.Row{
 		{RowIndex: 0, Data: json.RawMessage(`{"name":"数据库张三","score":60}`)},
 		{RowIndex: 1, Data: json.RawMessage(`{"name":"李四","score":88}`)},
-		{RowIndex: 2, Data: json.RawMessage(`{"name":"王五","score":92}`)},
 	}
 
 	previewRows := buildAIPreviewRows(&model.Sheet{Config: config}, columns, storedRows)
-	if len(previewRows) != 3 {
-		t.Fatalf("buildAIPreviewRows() returned %d rows, want 3", len(previewRows))
+	if len(previewRows) != 1 {
+		t.Fatalf("buildAIPreviewRows() returned %d rows, want 1", len(previewRows))
 	}
 	if got := previewRows[0].Data["name"]; got != "快照张三" {
-		t.Fatalf("merged first row name = %v, want 快照张三", got)
+		t.Fatalf("first row name = %v, want 快照张三", got)
 	}
-	if got := previewRows[0].Data["score"]; got != float64(60) {
-		t.Fatalf("merged first row score = %v, want 60", got)
-	}
-	if got := previewRows[2].Data["name"]; got != "王五" {
-		t.Fatalf("third row name = %v, want 王五", got)
+	if _, exists := previewRows[0].Data["score"]; exists {
+		t.Fatalf("cleared score leaked from rows table: %v", previewRows[0].Data["score"])
 	}
 }
 
-func TestBuildAIPreviewRowsAlignsSnapshotWithNonZeroStoredRowBase(t *testing.T) {
+func TestBuildAIPreviewRowsKeepsSnapshotCoordinates(t *testing.T) {
 	columns := []sheetColumnPayload{{Key: "name", Name: "姓名", Type: "text"}}
 	config := json.RawMessage(`{
 		"univerSheetData": {
@@ -99,20 +97,23 @@ func TestBuildAIPreviewRowsAlignsSnapshotWithNonZeroStoredRowBase(t *testing.T) 
 			}
 		}
 	}`)
-	storedRows := []model.Row{
-		{RowIndex: 5, Data: json.RawMessage(`{"name":"数据库首行"}`)},
-		{RowIndex: 6, Data: json.RawMessage(`{"name":"数据库第二行"}`)},
-	}
 
-	previewRows := buildAIPreviewRows(&model.Sheet{Config: config}, columns, storedRows)
+	previewRows := buildAIPreviewRows(&model.Sheet{Config: config}, columns, nil)
 	if len(previewRows) != 2 {
-		t.Fatalf("buildAIPreviewRows() returned %d rows, want 2", len(previewRows))
+		t.Fatalf("buildAIPreviewRows() returned %d rows, want blank row 0 plus data row 5", len(previewRows))
 	}
-	if got := previewRows[0].Data["name"]; got != "快照首行" {
-		t.Fatalf("aligned first row name = %v, want 快照首行", got)
+	last := previewRows[1]
+	if last.Data["name"] != "快照首行" || last.Row != 5 || last.DisplayRow != 7 {
+		t.Fatalf("snapshot row = %+v, want row 5 display 7", last)
 	}
-	if previewRows[0].Row != 0 || previewRows[0].DisplayRow != 2 {
-		t.Fatalf("aligned row coordinates = row %d display %d", previewRows[0].Row, previewRows[0].DisplayRow)
+}
+
+func TestBuildAIPreviewRowsReadsRichTextCells(t *testing.T) {
+	columns := []sheetColumnPayload{{Key: "note", Name: "备注", Type: "text"}}
+	config := json.RawMessage(`{"univerSheetData":{"cellData":{"1":{"0":{"p":{"body":{"dataStream":"多行\r\n"}}}}}}}`)
+	previewRows := buildAIPreviewRows(&model.Sheet{Config: config}, columns, nil)
+	if len(previewRows) != 1 || previewRows[0].Data["note"] != "多行" {
+		t.Fatalf("rich text preview = %+v", previewRows)
 	}
 }
 

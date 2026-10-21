@@ -224,6 +224,7 @@ func duplicatedWorkbookMetadata(metadata json.RawMessage) (json.RawMessage, erro
 		payload = make(map[string]interface{})
 	}
 	delete(payload, "workbookState")
+	delete(payload, sheetTabColorsKey)
 	delete(payload, "source_workbook_id")
 	delete(payload, "assigned_by")
 	delete(payload, "assigned_at")
@@ -809,6 +810,15 @@ type SheetSaveOutcome struct {
 // column inserts, removals and moves behind the snapshot; protections follow
 // them.
 func (s *SheetService) UpdateSheetForUserWithOps(userID int64, existing, sheet *model.Sheet, ops []model.SheetStructureOp) (*SheetSaveOutcome, error) {
+	return s.UpdateSheetForUserWithSource(userID, existing, sheet, ops, "web", "sheet.update", "更新工作表内容或格式")
+}
+
+// UpdateSheetForUserWithSource is the editor save with every gate the web
+// editor goes through (lifecycle state, structure protections, hidden cells,
+// per-cell authorisation). Server side writers acting for a user, such as the
+// AI agent, use it so they can never change more than the user could in the
+// editor.
+func (s *SheetService) UpdateSheetForUserWithSource(userID int64, existing, sheet *model.Sheet, ops []model.SheetStructureOp, source, action, summary string) (*SheetSaveOutcome, error) {
 	if err := applySheetLifecycleState(existing); err != nil {
 		return nil, err
 	}
@@ -863,7 +873,7 @@ func (s *SheetService) UpdateSheetForUserWithOps(userID int64, existing, sheet *
 		outcome.ComputedValues = recomputed.values
 		outcome.ComputedFormulas = recomputed.formulas
 	}
-	history, err := s.beginHistory(userID, sheet.ID, "web", "sheet.update", "更新工作表内容或格式", true)
+	history, err := s.beginHistory(userID, sheet.ID, source, action, summary, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1375,64 +1385,12 @@ func (s *SheetService) syncCellChangesToSnapshots(changes []model.CellUpdate) er
 		if err != nil {
 			return err
 		}
-		if len(sheet.Config) == 0 {
-			continue
-		}
-		var payload map[string]interface{}
-		if err := json.Unmarshal(sheet.Config, &payload); err != nil {
-			continue
-		}
-		sheetData, ok := payload["univerSheetData"].(map[string]interface{})
-		if !ok || sheetData == nil {
-			continue
-		}
-		cellData, _ := sheetData["cellData"].(map[string]interface{})
-		if cellData == nil {
-			cellData = make(map[string]interface{})
-			sheetData["cellData"] = cellData
-		}
-		columnKeys, err := parseColumnKeys(sheet.Columns)
+		encoded, changed, err := patchSnapshotCells(sheet.Config, sheet.Columns, sheetChanges)
 		if err != nil {
 			return err
 		}
-		columnIndexes := make(map[string]int, len(columnKeys))
-		for index, key := range columnKeys {
-			columnIndexes[key] = index
-		}
-		for _, change := range sheetChanges {
-			columnIndex, exists := columnIndexes[change.Col]
-			if !exists || change.Row < 0 {
-				continue
-			}
-			rowKey := strconv.Itoa(change.Row + 1)
-			columnKey := strconv.Itoa(columnIndex)
-			rowMap, _ := cellData[rowKey].(map[string]interface{})
-			if rowMap == nil {
-				rowMap = make(map[string]interface{})
-				cellData[rowKey] = rowMap
-			}
-			cell, _ := rowMap[columnKey].(map[string]interface{})
-			if cell == nil {
-				cell = make(map[string]interface{})
-			}
-			var value any
-			if len(change.Value) > 0 {
-				if err := json.Unmarshal(change.Value, &value); err != nil {
-					return err
-				}
-			}
-			if formula, ok := value.(string); ok && strings.HasPrefix(strings.TrimSpace(formula), "=") {
-				cell["f"] = formula
-				delete(cell, "v")
-			} else {
-				cell["v"] = value
-				delete(cell, "f")
-			}
-			rowMap[columnKey] = cell
-		}
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			return err
+		if !changed {
+			continue
 		}
 		sheet.Config = encoded
 		if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
@@ -1440,6 +1398,108 @@ func (s *SheetService) syncCellChangesToSnapshots(changes []model.CellUpdate) er
 		}
 	}
 	return nil
+}
+
+// patchSnapshotCells writes cell values into the Univer snapshot of a sheet
+// config. Only the touched rows and cells are decoded; everything else is
+// carried as raw JSON, which keeps single-cell writes cheap on large sheets.
+// changed is false when the config has no snapshot.
+func patchSnapshotCells(config, columns json.RawMessage, changes []model.CellUpdate) (json.RawMessage, bool, error) {
+	if len(config) == 0 {
+		return config, false, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return config, false, nil
+	}
+	sheetRaw, ok := payload["univerSheetData"]
+	if !ok || len(sheetRaw) == 0 || bytes.Equal(bytes.TrimSpace(sheetRaw), []byte("null")) {
+		return config, false, nil
+	}
+	var sheetData map[string]json.RawMessage
+	if err := json.Unmarshal(sheetRaw, &sheetData); err != nil || sheetData == nil {
+		return config, false, nil
+	}
+	cellData := map[string]json.RawMessage{}
+	if raw := sheetData["cellData"]; len(raw) > 0 {
+		_ = json.Unmarshal(raw, &cellData)
+		if cellData == nil {
+			cellData = map[string]json.RawMessage{}
+		}
+	}
+	columnKeys, err := parseColumnKeys(columns)
+	if err != nil {
+		return nil, false, err
+	}
+	columnIndexes := make(map[string]int, len(columnKeys))
+	for index, key := range columnKeys {
+		columnIndexes[key] = index
+	}
+
+	rows := map[string]map[string]json.RawMessage{}
+	for _, change := range changes {
+		columnIndex, exists := columnIndexes[change.Col]
+		if !exists || change.Row < 0 {
+			continue
+		}
+		rowKey := strconv.Itoa(change.Row + 1)
+		columnKey := strconv.Itoa(columnIndex)
+		row, loaded := rows[rowKey]
+		if !loaded {
+			row = map[string]json.RawMessage{}
+			if raw := cellData[rowKey]; len(raw) > 0 {
+				if json.Unmarshal(raw, &row) != nil || row == nil {
+					row = map[string]json.RawMessage{}
+				}
+			}
+			rows[rowKey] = row
+		}
+		cell := map[string]json.RawMessage{}
+		if raw := row[columnKey]; len(raw) > 0 {
+			if json.Unmarshal(raw, &cell) != nil || cell == nil {
+				cell = map[string]json.RawMessage{}
+			}
+		}
+		value := change.Value
+		if len(value) == 0 {
+			value = json.RawMessage("null")
+		}
+		var text string
+		if json.Unmarshal(value, &text) == nil && strings.HasPrefix(strings.TrimSpace(text), "=") {
+			cell["f"] = value
+			delete(cell, "v")
+		} else {
+			cell["v"] = value
+			delete(cell, "f")
+		}
+		encodedCell, err := json.Marshal(cell)
+		if err != nil {
+			return nil, false, err
+		}
+		row[columnKey] = encodedCell
+	}
+	for rowKey, row := range rows {
+		encodedRow, err := json.Marshal(row)
+		if err != nil {
+			return nil, false, err
+		}
+		cellData[rowKey] = encodedRow
+	}
+	encodedCells, err := json.Marshal(cellData)
+	if err != nil {
+		return nil, false, err
+	}
+	sheetData["cellData"] = encodedCells
+	encodedSheet, err := json.Marshal(sheetData)
+	if err != nil {
+		return nil, false, err
+	}
+	payload["univerSheetData"] = encodedSheet
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return encoded, true, nil
 }
 
 func (s *SheetService) PrepareSheetCellChanges(userID int64, existing, next *model.Sheet, changes []model.CellUpdate, source string) (*model.CellUpdateResult, error) {

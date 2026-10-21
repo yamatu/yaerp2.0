@@ -64,36 +64,40 @@ type SheetContentRow struct {
 	Data      json.RawMessage
 }
 
-// searchSheetContentSQL implements buildAIPreviewRows' merge semantics at the
-// database boundary. Web edits live only in config.univerSheetData; searching
-// rows alone would miss those edits, and ignoring the overlay would return stale
-// values. Partial snapshots override only the cells they actually materialize.
-// All values/patterns are parameters; LIKE wildcards in keywords are escaped.
+// searchSheetContentSQL implements buildAIPreviewRows' semantics at the
+// database boundary: the editor renders a sheet from config.univerSheetData
+// alone whenever it exists, so that snapshot is searched and the legacy rows
+// table (which can hold cleared or moved values) is only used for sheets that
+// have no snapshot. All values/patterns are parameters; LIKE wildcards in
+// keywords are escaped.
 const searchSheetContentSQL = `
 WITH target AS (
-    SELECT s.config #> '{univerSheetData,cellData}' AS cells
+    SELECT s.config #> '{univerSheetData,cellData}' AS cells,
+           jsonb_typeof(s.config -> 'univerSheetData') = 'object' AS has_snapshot
     FROM sheets s JOIN workbooks w ON w.id = s.workbook_id
     WHERE s.id = $1 AND w.deleted_at IS NULL
 ), row_base AS (
     SELECT COALESCE(MIN(row_index), 0) AS base FROM rows WHERE sheet_id = $1
-), stored AS MATERIALIZED (
-    SELECT r.row_index AS source_row, r.row_index - b.base AS row_num,
+), stored AS (
+    SELECT r.row_index - b.base AS row_num, r.row_index AS source_row,
            CASE WHEN jsonb_typeof(r.data) = 'object' THEN r.data ELSE '{}'::jsonb END AS data
-    FROM rows r CROSS JOIN row_base b CROSS JOIN target
-    WHERE r.sheet_id = $1
+    FROM rows r CROSS JOIN row_base b CROSS JOIN target t
+    WHERE r.sheet_id = $1 AND t.has_snapshot IS NOT TRUE
 ), snapshot_values AS (
-    SELECT COALESCE(stored.row_num, rp.source_row) AS row_num, rp.source_row,
+    SELECT rp.source_row,
            ($2::text[])[cp.col_index + 1] AS column_key,
            CASE
                WHEN jsonb_typeof(cell.value) <> 'object' THEN cell.value
-               WHEN cell.value ? 'v' AND cell.value->'v' <> 'null'::jsonb THEN cell.value->'v'
+               WHEN cell.value ? 'v' AND cell.value->'v' NOT IN ('null'::jsonb, '""'::jsonb) THEN cell.value->'v'
                WHEN jsonb_typeof(cell.value->'f') = 'string' AND btrim(cell.value->>'f') <> ''
                    THEN to_jsonb(CASE WHEN left(btrim(cell.value->>'f'), 1) = '='
                        THEN btrim(cell.value->>'f') ELSE '=' || btrim(cell.value->>'f') END)
+               WHEN rtrim(cell.value #>> '{p,body,dataStream}', E'\r\n') <> ''
+                   THEN to_jsonb(rtrim(cell.value #>> '{p,body,dataStream}', E'\r\n'))
                ELSE NULL
            END AS cell_value
     FROM target t
-    CROSS JOIN LATERAL jsonb_each(CASE WHEN jsonb_typeof(t.cells) = 'object'
+    CROSS JOIN LATERAL jsonb_each(CASE WHEN t.has_snapshot AND jsonb_typeof(t.cells) = 'object'
         THEN t.cells ELSE '{}'::jsonb END) AS sr(key, value)
     CROSS JOIN LATERAL (SELECT CASE WHEN sr.key ~ '^[0-9]{1,9}$'
         THEN sr.key::integer - 1 ELSE -1 END AS source_row) rp
@@ -101,17 +105,12 @@ WITH target AS (
         THEN sr.value ELSE '{}'::jsonb END) AS cell(key, value)
     CROSS JOIN LATERAL (SELECT CASE WHEN cell.key ~ '^[0-9]{1,9}$'
         THEN cell.key::integer ELSE -1 END AS col_index) cp
-    LEFT JOIN stored ON stored.source_row = rp.source_row
     WHERE rp.source_row >= 0 AND cp.col_index >= 0 AND cp.col_index < cardinality($2::text[])
-), snapshot AS (
-    SELECT row_num, MAX(source_row) AS source_row,
-           jsonb_object_agg(column_key, cell_value ORDER BY source_row) AS data
-    FROM snapshot_values WHERE cell_value IS NOT NULL GROUP BY row_num
 ), effective AS (
-    SELECT COALESCE(sn.row_num, st.row_num) AS row_num,
-           COALESCE(sn.source_row, st.source_row) AS source_row,
-           COALESCE(st.data, '{}'::jsonb) || COALESCE(sn.data, '{}'::jsonb) AS data
-    FROM stored st FULL OUTER JOIN snapshot sn ON sn.row_num = st.row_num
+    SELECT source_row AS row_num, source_row, jsonb_object_agg(column_key, cell_value) AS data
+    FROM snapshot_values WHERE cell_value IS NOT NULL GROUP BY source_row
+    UNION ALL
+    SELECT row_num, source_row, data FROM stored
 )
 SELECT e.row_num, e.source_row, e.data
 FROM effective e
