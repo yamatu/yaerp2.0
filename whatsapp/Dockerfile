@@ -1,4 +1,5 @@
-FROM node:20-bookworm-slim
+# Pinned to a patched release (Oct 2026 Node.js security release); bump on new security releases.
+FROM node:24.22.1-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \

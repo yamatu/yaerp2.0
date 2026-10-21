@@ -259,7 +259,7 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
         return
       }
       const target = event.target as HTMLElement | null
-      if (target?.closest('.univer-editor-container')) return
+      if (target?.closest('[data-u-comp="editor"]')) return
       event.preventDefault()
       setOpen((current) => !current)
     }

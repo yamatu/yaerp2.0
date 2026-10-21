@@ -118,7 +118,7 @@ function normalizeCenteredCellEditorMargin(injector: Injector, resizeService: un
 
   const paddingLeft = layout.paddingData?.l ?? 0
   const instanceService = injector.get<IUniverInstanceService | undefined>(IUniverInstanceService)
-  const documentUnit = instanceService?.getCurrentUnitForType<DocumentDataModel>(UniverInstanceType.UNIVER_DOC)
+  const documentUnit = instanceService?.getCurrentUnitOfType<DocumentDataModel>(UniverInstanceType.UNIVER_DOC)
   if (!documentUnit?.updateDocumentDataMargin) return
 
   documentUnit.updateDocumentDataMargin({ l: paddingLeft })
