@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -551,7 +550,7 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 		}
 		attachmentIndex++
 		contentID := strings.Trim(strings.TrimSpace(part.Header.Get("Content-ID")), "<>")
-		isInline := strings.EqualFold(disposition, "inline") || (contentID != "" && strings.HasPrefix(strings.ToLower(contentType), "image/"))
+		isInline := strings.EqualFold(disposition, "inline") || (contentID != "" && mailInlineImageType(contentType, content) != "")
 		if filename == "" {
 			filename = fmt.Sprintf("attachment-%d%s", attachmentIndex, mailExtensionForType(contentType))
 		}
@@ -563,8 +562,8 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 			Data: content,
 		}
 		result.Attachments = append(result.Attachments, attachment)
-		if contentID != "" && strings.HasPrefix(strings.ToLower(contentType), "image/") && len(content) <= 5<<20 {
-			inlineData[contentID] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(content)
+		if imageType := mailInlineImageType(contentType, content); contentID != "" && imageType != "" && len(content) <= mailInlineImageMaxSize {
+			inlineData[normalizeMailContentID(contentID)] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(content)
 		}
 	}
 	senderName := ""
@@ -578,18 +577,15 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 	if avatarContentID != "" {
 		filtered := result.Attachments[:0]
 		for _, attachment := range result.Attachments {
-			if strings.EqualFold(attachment.ContentID, avatarContentID) {
+			if normalizeMailContentID(attachment.ContentID) == normalizeMailContentID(avatarContentID) {
 				continue
 			}
 			filtered = append(filtered, attachment)
 		}
 		result.Attachments = filtered
 	}
-	for contentID, dataURI := range inlineData {
-		result.HTMLBody = strings.ReplaceAll(result.HTMLBody, "cid:"+contentID, dataURI)
-		result.HTMLBody = strings.ReplaceAll(result.HTMLBody, "CID:"+contentID, dataURI)
-	}
-	result.HTMLBody = forceMailExternalLinksNewTab(s.htmlPolicy.Sanitize(result.HTMLBody))
+	result.HTMLBody = replaceMailCIDImages(result.HTMLBody, inlineData)
+	result.HTMLBody = forceMailExternalLinksNewTab(s.htmlPolicy.Sanitize(inlineMailStyleSheets(result.HTMLBody)))
 	if result.TextBody == "" && result.HTMLBody != "" {
 		result.TextBody = bluemondayText(result.HTMLBody)
 	}
@@ -754,9 +750,17 @@ func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineDa
 				}, " "))
 				nearSender := needle != "" && strings.Contains(strings.ToLower(text), needle)
 				insideSenderSignature := needle != "" && mailHTMLAncestorContainsText(node, context, needle)
-				explicitAvatarHint := strings.Contains(attributes, "avatar") || strings.Contains(attributes, "profile") ||
-					strings.Contains(attributes, "head") || strings.Contains(attributes, "face") || strings.Contains(attributes, "qqmail") ||
-					strings.Contains(attributes, "qlogo") || strings.Contains(attributes, "qpic")
+				// The chosen image is removed from the body, so only clear signs
+				// count: words in the image's own labels, or an avatar URL. Loose
+				// URL substrings ("qpic", "head", "face") also matched every
+				// WeChat image (mmbiz.qpic.cn) and files such as header.png.
+				labels := strings.ToLower(strings.Join([]string{
+					mailHTMLAttribute(node, "class"), mailHTMLAttribute(node, "id"),
+					mailHTMLAttribute(node, "alt"), mailHTMLAttribute(node, "title"),
+				}, " "))
+				lowerSource := strings.ToLower(source)
+				explicitAvatarHint := strings.Contains(labels, "avatar") || strings.Contains(labels, "profile") || strings.Contains(labels, "头像") ||
+					strings.Contains(lowerSource, "avatar") || strings.Contains(lowerSource, "qlogo.cn")
 				brandHint := strings.Contains(attributes, "logo") || strings.Contains(attributes, "brand") ||
 					mailImageMatchesSender(attributes, senderImageHints)
 				nearMessageStart := len([]rune(strings.TrimSpace(visibleText.String()))) <= 1200
@@ -766,10 +770,8 @@ func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineDa
 					score = 100
 				case nearSender || insideSenderSignature:
 					score = 90
-				case nearMessageStart && brandHint:
+				case nearMessageStart && brandHint && mailHTMLImageIsSmallSquare(node):
 					score = 80
-				case nearMessageStart && mailHTMLImageIsSmallSquare(node):
-					score = 60
 				}
 				if score > candidateScore {
 					candidate = node
@@ -963,14 +965,9 @@ func resolveMailImageSource(source string, inlineData map[string]string) (string
 		return "", ""
 	}
 	if strings.HasPrefix(strings.ToLower(value), "cid:") {
-		contentID, err := url.PathUnescape(strings.TrimSpace(value[4:]))
-		if err != nil {
-			contentID = strings.TrimSpace(value[4:])
-		}
-		for candidateID, dataURI := range inlineData {
-			if strings.EqualFold(candidateID, contentID) {
-				return dataURI, candidateID
-			}
+		contentID := normalizeMailContentID(value[4:])
+		if dataURI, ok := inlineData[contentID]; ok {
+			return dataURI, contentID
 		}
 		return "", ""
 	}

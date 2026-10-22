@@ -127,18 +127,30 @@ func newMailHTMLPolicy() *bluemonday.Policy {
 	policy := bluemonday.UGCPolicy()
 	policy.AllowDataURIImages()
 
-	colorValue := regexp.MustCompile(`(?i)^(?:#[0-9a-f]{3,8}|rgba?\(\s*[0-9.]+%?(?:\s*,\s*[0-9.]+%?){2}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)|transparent|currentcolor|black|white|gray|grey|red|blue|green|orange|purple|navy|teal|maroon|silver)$`)
+	// Color keywords include system colors such as Excel's "windowtext".
+	colorValue := regexp.MustCompile(`(?i)^(?:#[0-9a-f]{3,8}|rgba?\(\s*[0-9.]+%?(?:\s*,\s*[0-9.]+%?){2}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)|[a-z]{3,24})$`)
 	fontFamily := regexp.MustCompile(`^[\p{L}\p{N}\s,'"_-]{1,120}$`)
-	fontSize := regexp.MustCompile(`(?i)^(?:xx-small|x-small|small|medium|large|x-large|xx-large|smaller|larger|[0-9]{1,3}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))$`)
-	lengthValue := regexp.MustCompile(`(?i)^(?:0|auto|[0-9]{1,4}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))$`)
-	spacingValue := regexp.MustCompile(`(?i)^(?:0|auto|[0-9]{1,4}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))(?:\s+(?:0|auto|[0-9]{1,4}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))){0,3}$`)
+	fontSize := regexp.MustCompile(`(?i)^(?:xx-small|x-small|small|medium|large|x-large|xx-large|smaller|larger|(?:[0-9]{1,3}(?:\.[0-9]{1,2})?|\.[0-9]{1,2})(?:px|pt|em|rem|%))$`)
+	number := `(?:[0-9]{1,4}(?:\.[0-9]{1,3})?|\.[0-9]{1,3})`
+	unit := `(?:px|pt|em|rem|%|cm|mm|in)`
+	lengthValue := regexp.MustCompile(`(?i)^(?:0|auto|` + number + unit + `)$`)
+	spacingPart := `(?:0|auto|-?` + number + unit + `)`
+	spacingValue := regexp.MustCompile(`(?i)^` + spacingPart + `(?:\s+` + spacingPart + `){0,3}$`)
 	lineHeight := regexp.MustCompile(`(?i)^(?:normal|[0-9](?:\.[0-9]{1,2})?|[0-9]{1,3}(?:\.[0-9]{1,2})?(?:px|pt|em|rem|%))$`)
-	borderValue := regexp.MustCompile(`(?i)^(?:0|none|[0-9]{1,2}px\s+(?:solid|dashed|dotted)\s+(?:#[0-9a-f]{3,8}|rgba?\([^;]+\)|black|white|gray|grey|transparent))$`)
+	// Width, style and color in any order: "1px solid #ccc", Excel's
+	// ".5pt solid windowtext", Outlook's "solid windowtext 1.0pt".
+	borderWidth := `(?:0|thin|medium|thick|(?:[0-9]{1,2}(?:\.[0-9]{1,3})?|\.[0-9]{1,3})(?:px|pt|em))`
+	borderStyle := `(?:none|hidden|solid|dashed|dotted|double|groove|ridge|inset|outset)`
+	borderColor := `(?:#[0-9a-f]{3,8}|rgba?\([0-9.,%\s]+\)|[a-z]{3,24})`
+	borderPart := `(?:` + borderWidth + `|` + borderStyle + `|` + borderColor + `)`
+	borderValue := regexp.MustCompile(`(?i)^` + borderPart + `(?:\s+` + borderPart + `){0,2}$`)
+	borderWidths := regexp.MustCompile(`(?i)^` + borderWidth + `(?:\s+` + borderWidth + `){0,3}$`)
+	borderStyles := regexp.MustCompile(`(?i)^` + borderStyle + `(?:\s+` + borderStyle + `){0,3}$`)
 
-	policy.AllowStyles("color", "background-color", "border-color").Matching(colorValue).Globally()
+	policy.AllowStyles("color", "background-color", "background", "border-color", "border-top-color", "border-right-color", "border-bottom-color", "border-left-color").Matching(colorValue).Globally()
 	policy.AllowStyles("font-family").Matching(fontFamily).Globally()
 	policy.AllowStyles("font-size").Matching(fontSize).Globally()
-	policy.AllowStyles("font-weight").MatchingEnum("normal", "bold", "400", "500", "600", "700").Globally()
+	policy.AllowStyles("font-weight").MatchingEnum("normal", "bold", "bolder", "lighter", "100", "200", "300", "400", "500", "600", "700", "800", "900").Globally()
 	policy.AllowStyles("font-style").MatchingEnum("normal", "italic").Globally()
 	policy.AllowStyles("text-decoration").Matching(regexp.MustCompile(`(?i)^(?:none|underline|line-through|underline line-through)$`)).Globally()
 	policy.AllowStyles("text-align").MatchingEnum("left", "center", "right", "justify").Globally()
@@ -148,7 +160,14 @@ func newMailHTMLPolicy() *bluemonday.Policy {
 	policy.AllowStyles("width", "min-width", "max-width", "height", "min-height", "max-height").Matching(lengthValue).Globally()
 	policy.AllowStyles("margin", "margin-top", "margin-right", "margin-bottom", "margin-left", "padding", "padding-top", "padding-right", "padding-bottom", "padding-left").Matching(spacingValue).Globally()
 	policy.AllowStyles("border", "border-top", "border-right", "border-bottom", "border-left").Matching(borderValue).Globally()
+	policy.AllowStyles("border-width", "border-top-width", "border-right-width", "border-bottom-width", "border-left-width").Matching(borderWidths).Globally()
+	policy.AllowStyles("border-style", "border-top-style", "border-right-style", "border-bottom-style", "border-left-style").Matching(borderStyles).Globally()
+	policy.AllowStyles("border-radius", "border-spacing", "text-indent").Matching(spacingValue).Globally()
 	policy.AllowStyles("border-collapse").MatchingEnum("collapse", "separate").OnElements("table")
+	policy.AllowStyles("table-layout").MatchingEnum("auto", "fixed").OnElements("table")
+	policy.AllowStyles("text-transform").MatchingEnum("none", "uppercase", "lowercase", "capitalize").Globally()
+	policy.AllowStyles("overflow").MatchingEnum("visible", "hidden", "auto").Globally()
+	policy.AllowStyles("overflow-wrap", "word-wrap").MatchingEnum("normal", "break-word", "anywhere").Globally()
 	policy.AllowStyles("display").MatchingEnum("block", "inline", "inline-block", "table", "table-row", "table-cell").Globally()
 	policy.AllowStyles("white-space").MatchingEnum("normal", "nowrap", "pre", "pre-wrap", "pre-line").Globally()
 	policy.AllowStyles("word-break").MatchingEnum("normal", "break-all", "keep-all", "break-word").Globally()
@@ -162,6 +181,12 @@ func newMailHTMLPolicy() *bluemonday.Policy {
 	policy.AllowAttrs("size").Matching(regexp.MustCompile(`^[1-7]$`)).OnElements("font")
 	policy.AllowAttrs("role").Matching(regexp.MustCompile(`(?i)^presentation$`)).OnElements("table")
 	policy.AllowAttrs("cellpadding", "cellspacing", "border").Matching(regexp.MustCompile(`^[0-9]{1,3}$`)).OnElements("table")
+	// Table layouts of newsletters and Excel/Outlook mail rely on these.
+	policy.AllowAttrs("bgcolor", "bordercolor").Matching(colorValue).OnElements("table", "thead", "tbody", "tfoot", "tr", "td", "th")
+	policy.AllowAttrs("align").Matching(regexp.MustCompile(`(?i)^(?:left|center|right)$`)).OnElements("table", "div", "p", "h1", "h2", "h3", "h4", "h5", "h6")
+	policy.AllowAttrs("align").Matching(regexp.MustCompile(`(?i)^(?:left|right|top|middle|bottom)$`)).OnElements("img")
+	policy.AllowAttrs("width", "height").Matching(regexp.MustCompile(`^[0-9]{1,4}(?:\.[0-9]+)?%?$`)).OnElements("table", "tr", "td", "th", "col", "colgroup", "img")
+	policy.AllowAttrs("span").Matching(regexp.MustCompile(`^[0-9]{1,3}$`)).OnElements("col", "colgroup")
 	policy.AllowAttrs("target").Matching(regexp.MustCompile(`(?i)^_(?:blank|self)$`)).OnElements("a")
 
 	return policy

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1010,7 +1011,7 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 		MailMessageSummary: summary,
 		CC:                 aliMailAddresses(response.Message.CC), BCC: aliMailAddresses(response.Message.BCC),
 		ReplyTo: aliMailAddresses(response.Message.ReplyTo), TextBody: response.Message.Body.Text,
-		HTMLBody: s.htmlPolicy.Sanitize(response.Message.Body.HTML), Attachments: attachments,
+		HTMLBody: s.htmlPolicy.Sanitize(inlineMailStyleSheets(s.aliMailEmbedInlineImages(account, uid, response.Message.Body.HTML, attachments))), Attachments: attachments,
 		InReplyTo:  aliMailHeaderValue(response.Message.InternetMessageHeaders, "In-Reply-To"),
 		References: parseAliMailReferences(aliMailHeaderValue(response.Message.InternetMessageHeaders, "References")),
 	}
@@ -1024,6 +1025,31 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 	}
 	_ = s.repo.UpdateAccountStatus(account.ID, false, true, "")
 	return detail, nil
+}
+
+// aliMailEmbedInlineImages replaces the cid: images of an AliMail body with the
+// attachment bytes. The API returns the body with cid: references only, which
+// a browser cannot load.
+func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, uid uint32, htmlValue string, attachments []model.MailAttachment) string {
+	referenced := referencedMailContentIDs(htmlValue)
+	if len(referenced) == 0 {
+		return htmlValue
+	}
+	inlineData := map[string]string{}
+	for _, attachment := range attachments {
+		contentID := normalizeMailContentID(attachment.ContentID)
+		if contentID == "" || !referenced[contentID] || attachment.Size > mailInlineImageMaxSize {
+			continue
+		}
+		_, contentType, data, err := s.aliMailDownloadAttachment(account, uid, attachment.PartID)
+		if err != nil || len(data) == 0 || len(data) > mailInlineImageMaxSize {
+			continue
+		}
+		if imageType := mailInlineImageType(firstNonEmptyMail(attachment.ContentType, contentType), data); imageType != "" {
+			inlineData[contentID] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(data)
+		}
+	}
+	return replaceMailCIDImages(htmlValue, inlineData)
 }
 
 func parseAliMailReferences(value string) []string {
