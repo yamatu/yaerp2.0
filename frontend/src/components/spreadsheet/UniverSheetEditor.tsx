@@ -5659,12 +5659,14 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           const hiddenColumns = new Set(rules.columns.filter((rule) => rule.masked_for_current_user).map((rule) => rule.column_key))
           const hiddenCells = new Set(rules.cells.filter((rule) => rule.masked_for_current_user).map((rule) => `${rule.row_index}:${rule.column_key}`))
           let visited = 0
+          const maxRows = worksheet.getMaxRows()
+          const maxColumns = worksheet.getMaxColumns()
           for (const [rowKey, rowData] of Object.entries(snapshot?.cellData || {})) {
             const row = Number(rowKey)
-            if (!Number.isInteger(row) || row < 1) continue
+            if (!Number.isInteger(row) || row < 1 || row >= maxRows) continue
             for (const [columnKey, cell] of Object.entries((rowData || {}) as Record<string, ICellData | null>)) {
               const column = Number(columnKey)
-              if (!Number.isInteger(column) || !cell) continue
+              if (!Number.isInteger(column) || !cell || column >= maxColumns) continue
               const definition = latestSheetRef.current.columns?.[column]
               if (!definition || !permissions?.sheet.canView || resolveCellPermission(permissions, definition.key, row - 1) === 'none' || hiddenRows.has(row - 1) || hiddenColumns.has(definition.key) || hiddenCells.has(`${row - 1}:${definition.key}`)) continue
               const displayed = worksheet.getRange(row, column, 1, 1).getDisplayValue()
@@ -5680,7 +5682,10 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         focusCell={(row, column) => {
           containerRef.current?.dispatchEvent(new Event('yaerp-stop-touch-pan'))
           const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
-          worksheet?.getRange(row, column, 1, 1).activate()
+          // A hit found before rows were deleted or the sheet was reloaded can
+          // point past the end of the sheet; Univer throws for such ranges.
+          if (!worksheet || row < 0 || column < 0 || row >= worksheet.getMaxRows() || column >= worksheet.getMaxColumns()) return
+          worksheet.getRange(row, column, 1, 1).activate()
           revealSearchHit(worksheet, row, column)
           syncSelectionState()
         }}
@@ -5780,8 +5785,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         getSheet={() => univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet() ?? null}
         focusCell={(row, column) => {
           const worksheet = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()
-          worksheet?.getRange(row, column, 1, 1).activate()
-          worksheet?.scrollToCell(row, column)
+          if (!worksheet || row < 0 || column < 0 || row >= worksheet.getMaxRows() || column >= worksheet.getMaxColumns()) return
+          worksheet.getRange(row, column, 1, 1).activate()
+          worksheet.scrollToCell(row, column)
           syncSelectionState()
         }}
         onRepaired={() => schedulePersistRef.current?.()}
