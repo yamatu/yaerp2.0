@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Sigma, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
-import { RANGE_TYPE, CommandType, VerticalAlign, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
+import { RANGE_TYPE, CommandType, VerticalAlign, getDisplayValueFromCell, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
 import UniverPresetSheetsCoreZhCN from '@univerjs/preset-sheets-core/locales/zh-CN'
@@ -1748,6 +1748,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
   // are redrawn whenever that happens (see src/lib/univer-mark-layer.ts).
   const protectionMarkLayerRef = useRef<MarkLayer | null>(null)
   const approvalMarkLayerRef = useRef<MarkLayer | null>(null)
+  const searchMarkLayerRef = useRef<MarkLayer | null>(null)
+  const searchHighlightRef = useRef<{ hits: SheetSearchCell[]; current: number }>({ hits: [], current: -1 })
+  // Bumped by every read so an outdated read stops instead of finishing.
+  const searchReadGenerationRef = useRef(0)
+  // Cell edits re-index the search, debounced so a typing burst reads once.
+  const [searchDataVersion, setSearchDataVersion] = useState(0)
+  const searchDataTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const approvalHighlightRendererRef = useRef<() => void>(() => undefined)
   const overlayRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [presenceRedrawToken, setPresenceRedrawToken] = useState(0)
@@ -2216,6 +2223,41 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     })
   }, [clearApprovalHighlights])
   approvalHighlightRendererRef.current = renderApprovalHighlights
+
+  // Search matches are filled yellow, the current one amber with a border.
+  // Every mark shape is a canvas object of its own, so only the matches around
+  // the visible area are drawn; scrolling draws the next ones.
+  const renderSearchHighlights = useCallback(() => {
+    const layer = searchMarkLayerRef.current
+    if (!layer) return
+    const { hits, current } = searchHighlightRef.current
+    let visible: { startRow: number; endRow: number; startColumn: number; endColumn: number } | null = null
+    try {
+      visible = univerApiRef.current?.univerAPI.getActiveWorkbook?.()?.getActiveSheet?.()?.getVisibleRange?.() ?? null
+    } catch {
+      visible = null
+    }
+    const shapes: MarkShape[] = []
+    hits.forEach((hit, position) => {
+      const active = position === current
+      if (!active && (!visible ||
+        hit.row < visible.startRow - 20 || hit.row > visible.endRow + 20 ||
+        hit.column < visible.startColumn - 4 || hit.column > visible.endColumn + 4)) return
+      if (!active && shapes.length >= 400) return
+      shapes.push({
+        range: { startRow: hit.row, endRow: hit.row, startColumn: hit.column, endColumn: hit.column },
+        style: active
+          ? { stroke: '#d97706', strokeWidth: 2, fill: 'rgba(245, 158, 11, 0.35)' }
+          : { stroke: 'rgba(0,0,0,0)', strokeWidth: 0, fill: 'rgba(250, 204, 21, 0.28)' },
+      })
+    })
+    layer.replace(shapes)
+    if (process.env.NODE_ENV !== 'production') {
+      (window as unknown as { __yaerpSearchHighlights?: number }).__yaerpSearchHighlights = shapes.length
+    }
+  }, [])
+  const searchHighlightRendererRef = useRef(renderSearchHighlights)
+  searchHighlightRendererRef.current = renderSearchHighlights
 
   const clearProtectionHighlights = useCallback(() => {
     protectionHighlightRenderGenerationRef.current += 1
@@ -4205,6 +4247,9 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         const editorRepaintFilter = skipEditorTextRepaints(univerResult.univer, workbookApi.getId())
         protectionMarkLayerRef.current = createMarkLayer(univerResult.univer)
         approvalMarkLayerRef.current = createMarkLayer(univerResult.univer)
+        searchMarkLayerRef.current = createMarkLayer(univerResult.univer)
+        // A reload keeps the open search; draw its matches on the new sheet.
+        window.requestAnimationFrame(() => { if (!disposed) searchHighlightRendererRef.current() })
         // Univer drops every highlight when a cell editor opens or closes and on
         // copy/cut: draw ours again right after.
         let overlayRedrawFrame: number | null = null
@@ -4215,6 +4260,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             if (disposed) return
             if (showProtectionHighlightsRef.current) protectionHighlightRendererRef.current()
             approvalHighlightRendererRef.current()
+            searchHighlightRendererRef.current()
             setPresenceRedrawToken((token) => token + 1)
           })
         })
@@ -4628,6 +4674,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
 
         const disposable = workbookApi.onCommandExecuted((command) => {
           if (command.type === CommandType.MUTATION) {
+            if (searchDataTimerRef.current) clearTimeout(searchDataTimerRef.current)
+            searchDataTimerRef.current = setTimeout(() => {
+              searchDataTimerRef.current = null
+              setSearchDataVersion((version) => version + 1)
+            }, 800)
             const structureOp = structureOpFromMutation(command.id, command.params)
             if (structureOp) {
               pendingStructureOpsRef.current.push(structureOp)
@@ -4741,6 +4792,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
             overlayRefreshTimerRef.current = null
             if (showProtectionHighlightsRef.current) protectionHighlightRendererRef.current()
             approvalHighlightRendererRef.current()
+            if (searchHighlightRef.current.hits.length) searchHighlightRendererRef.current()
           }, 150)
         })
 
@@ -4894,8 +4946,12 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           if (overlayRefreshTimerRef.current) { clearTimeout(overlayRefreshTimerRef.current); overlayRefreshTimerRef.current = null }
           protectionMarkLayerRef.current?.clear()
           approvalMarkLayerRef.current?.clear()
+          searchMarkLayerRef.current?.clear()
           protectionMarkLayerRef.current = null
           approvalMarkLayerRef.current = null
+          searchMarkLayerRef.current = null
+          searchReadGenerationRef.current += 1
+          if (searchDataTimerRef.current) { clearTimeout(searchDataTimerRef.current); searchDataTimerRef.current = null }
           pasteNotifier?.dispose?.()
           plainTextConvertMenu?.dispose?.()
           selectionPresenceDisposable.dispose()
@@ -5641,8 +5697,13 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         editable={!editLocked}
         selectionEditable={Boolean(selectionState && selectionState.rowIndex >= 0 && !editLocked && !selectedCellCannotEdit && !selectedCellMasked && !selectedCellFormulaHidden)}
         selectionLabel={selectionState?.rangeLabel || ''}
-        changeToken={`${saveStatus}:${reloadToken || ''}:${searchAccessToken}`}
+        changeToken={`${searchDataVersion}:${reloadToken || ''}:${searchAccessToken}`}
+        highlightHits={(hits, current) => {
+          searchHighlightRef.current = { hits, current }
+          searchHighlightRendererRef.current()
+        }}
         readCells={async (commitEditor) => {
+          const generation = ++searchReadGenerationRef.current
           if (commitEditor) {
             if (imeComposingRef.current) throw new Error('请先完成正在输入的文字')
             commitActiveCellEditor()
@@ -5650,31 +5711,46 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           // Background index refreshes must not commit a half-typed cell.
           await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
           const workbook = univerApiRef.current?.univerAPI.getActiveWorkbook()
-          const worksheet = workbook?.getActiveSheet()
-          if (!workbook || !worksheet) return []
-          const snapshot = workbook.save().sheets[worksheet.getSheetId()]
+          const fWorksheet = workbook?.getActiveSheet()
+          if (!workbook || !fWorksheet) return []
+          // Read the live model instead of saving a snapshot: no copy of the
+          // whole sheet and no range object per cell.
+          const model = fWorksheet.getSheet()
+          const matrix = model.getCellMatrix().getMatrix() as Record<string, Record<string, ICellData | null | undefined> | undefined>
           const result: SheetSearchCell[] = []
           const rules = protectionSnapshotRef.current
           const hiddenRows = new Set(rules.rows.filter((rule) => rule.masked_for_current_user).map((rule) => rule.row_index))
           const hiddenColumns = new Set(rules.columns.filter((rule) => rule.masked_for_current_user).map((rule) => rule.column_key))
           const hiddenCells = new Set(rules.cells.filter((rule) => rule.masked_for_current_user).map((rule) => `${rule.row_index}:${rule.column_key}`))
-          let visited = 0
-          const maxRows = worksheet.getMaxRows()
-          const maxColumns = worksheet.getMaxColumns()
-          for (const [rowKey, rowData] of Object.entries(snapshot?.cellData || {})) {
+          const columns = latestSheetRef.current.columns || []
+          const currentPermissions = permissions
+          if (!currentPermissions?.sheet.canView) return []
+          const maxRows = fWorksheet.getMaxRows()
+          const maxColumns = fWorksheet.getMaxColumns()
+          let sliceStart = performance.now()
+          for (const rowKey of Object.keys(matrix)) {
             const row = Number(rowKey)
-            if (!Number.isInteger(row) || row < 1 || row >= maxRows) continue
-            for (const [columnKey, cell] of Object.entries((rowData || {}) as Record<string, ICellData | null>)) {
+            const rowData = matrix[rowKey]
+            if (!Number.isInteger(row) || row < 1 || row >= maxRows || !rowData || hiddenRows.has(row - 1)) continue
+            for (const columnKey of Object.keys(rowData)) {
               const column = Number(columnKey)
-              if (!Number.isInteger(column) || !cell || column >= maxColumns) continue
-              const definition = latestSheetRef.current.columns?.[column]
-              if (!definition || !permissions?.sheet.canView || resolveCellPermission(permissions, definition.key, row - 1) === 'none' || hiddenRows.has(row - 1) || hiddenColumns.has(definition.key) || hiddenCells.has(`${row - 1}:${definition.key}`)) continue
-              const displayed = worksheet.getRange(row, column, 1, 1).getDisplayValue()
-              const raw = cell.v ?? cell.p?.body?.dataStream ?? ''
-              if (displayed === '••••' || raw === '••••') continue
-              const text = [displayed, raw].filter((part) => part !== null && part !== undefined && part !== '').map(String).join('\n')
-              if (text) result.push({ row, column, text })
-              if (++visited % 500 === 0) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+              const raw = rowData[columnKey]
+              if (!Number.isInteger(column) || !raw || column >= maxColumns) continue
+              const definition = columns[column]
+              if (!definition || hiddenColumns.has(definition.key) || hiddenCells.has(`${row - 1}:${definition.key}`) || resolveCellPermission(currentPermissions, definition.key, row - 1) === 'none') continue
+              const displayed = getDisplayValueFromCell(model.getCell(row, column))
+              const value = raw.v ?? raw.p?.body?.dataStream ?? ''
+              if (displayed === '••••' || value === '••••') continue
+              const shown = displayed === null || displayed === undefined ? '' : String(displayed).replace(/\r?\n$/, '')
+              const stored = value === null || value === undefined ? '' : String(value).replace(/\r?\n$/, '')
+              const text = shown && stored && shown !== stored ? `${shown}\n${stored}` : shown || stored
+              if (text) result.push({ row, column, text, lower: text.toLocaleLowerCase() })
+            }
+            // Give the browser a frame every ~12ms so the page stays responsive.
+            if (performance.now() - sliceStart > 12) {
+              await new Promise<void>((resolve) => setTimeout(resolve, 0))
+              if (generation !== searchReadGenerationRef.current) return []
+              sliceStart = performance.now()
             }
           }
           return result.sort((a, b) => a.row - b.row || a.column - b.column)

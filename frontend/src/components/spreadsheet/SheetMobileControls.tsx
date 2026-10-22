@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronDown, ChevronUp, ClipboardPaste, Eraser, List, Move, Pencil, Redo2, Scaling, Search, Undo2, X } from 'lucide-react'
 import { columnIndexToLetter } from '@/lib/spreadsheet'
 
-export interface SheetSearchCell { row: number; column: number; text: string }
+export interface SheetSearchCell { row: number; column: number; text: string; /** text lowercased once when indexed */ lower: string }
 export interface SheetEditCell { row: number; column: number; value: string }
 
 export function mobileCellValue(value: string, type: string): string | number | boolean {
@@ -29,6 +29,8 @@ interface Props {
   changeToken: string
   readCells: (commitEditor?: boolean) => Promise<SheetSearchCell[]>
   focusCell: (row: number, column: number) => void
+  /** Draws the matches on the sheet; current is the index of the selected one. */
+  highlightHits?: (hits: SheetSearchCell[], current: number) => void
   moveCell: (rowDelta: number, columnDelta: number) => Promise<void>
   undo: () => Promise<void>
   redo: () => Promise<void>
@@ -67,6 +69,7 @@ function writeSearchMemory(sheetId: number, memory: SearchMemory) {
 }
 
 const firstLine = (text: string) => text.split('\n')[0]
+const NO_HITS: SheetSearchCell[] = []
 
 function highlightMatch(text: string, query: string): ReactNode {
   const at = text.toLocaleLowerCase().indexOf(query.toLocaleLowerCase())
@@ -193,7 +196,7 @@ export default function SheetMobileControls(props: Props) {
     if (!searchOpen) return
     const timer = window.setTimeout(() => {
       const needle = query.trim().toLocaleLowerCase()
-      const result = needle ? cells.filter((cell) => cell.text.toLocaleLowerCase().includes(needle)) : []
+      const result = needle ? cells.filter((cell) => cell.lower.includes(needle)) : []
       const jump = jumpToFirstRef.current
       if (cells.length) jumpToFirstRef.current = false
       const anchor = anchorRef.current
@@ -216,6 +219,12 @@ export default function SheetMobileControls(props: Props) {
     }, 180)
     return () => window.clearTimeout(timer)
   }, [query, cells, searchOpen])
+
+  const highlighted = searchOpen && query.trim() ? hits : NO_HITS
+  useEffect(() => {
+    latest.current.highlightHits?.(highlighted, highlighted.length ? index : -1)
+  }, [highlighted, index])
+  useEffect(() => () => latest.current.highlightHits?.(NO_HITS, -1), [])
 
   const goToHit = (next: number) => {
     if (!hits[next]) return
@@ -325,10 +334,10 @@ export default function SheetMobileControls(props: Props) {
           <input ref={inputRef} type="search" value={query} onChange={(event) => { jumpToFirstRef.current = true; setListOpen(true); setQuery(event.target.value); remember(true, event.target.value) }} placeholder="搜索当前表（仅你可见的数据）" className="h-10 w-full min-w-0 rounded-lg bg-slate-50 pl-8 pr-2 text-base text-slate-800 outline-none focus:bg-white focus:ring-2 focus:ring-sky-200 md:h-8 md:text-sm [&::-webkit-search-cancel-button]:hidden" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } if (event.key === 'Escape') closeSearch() }} />
         </label>
         <span className={`shrink-0 px-1 text-xs tabular-nums ${query.trim() && !searching && !hits.length ? 'text-rose-500' : 'text-slate-500'}`} aria-live="polite">
-          {searching ? '读取中…' : !query.trim() ? '' : hits.length ? `${index + 1}/${hits.length}` : '无结果'}
+          {searching && !cells.length ? '读取中…' : !query.trim() ? '' : hits.length ? `${index + 1}/${hits.length}` : '无结果'}
         </span>
-        <button type="button" className={searchButtonClass} disabled={!hits.length || searching} aria-label="上一个搜索结果" title="上一个（Shift+Enter）" onClick={() => navigate(-1)}><ChevronUp className="h-4 w-4" /></button>
-        <button type="button" className={searchButtonClass} disabled={!hits.length || searching} aria-label="下一个搜索结果" title="下一个（Enter）" onClick={() => navigate(1)}><ChevronDown className="h-4 w-4" /></button>
+        <button type="button" className={searchButtonClass} disabled={!hits.length} aria-label="上一个搜索结果" title="上一个（Shift+Enter）" onClick={() => navigate(-1)}><ChevronUp className="h-4 w-4" /></button>
+        <button type="button" className={searchButtonClass} disabled={!hits.length} aria-label="下一个搜索结果" title="下一个（Enter）" onClick={() => navigate(1)}><ChevronDown className="h-4 w-4" /></button>
         {!listOpen && hits.length > 0 && <button type="button" className={searchButtonClass} aria-label="展开搜索结果列表" title="展开结果列表" onClick={() => setListOpen(true)}><List className="h-4 w-4" /></button>}
         <button type="button" className={searchButtonClass} aria-label="关闭搜索" title="关闭（Esc）" onClick={closeSearch}><X className="h-4 w-4" /></button>
       </div>
