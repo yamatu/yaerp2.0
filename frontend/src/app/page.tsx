@@ -392,7 +392,7 @@ export default function HomePage() {
     refresh: refreshFolder,
     createFolder,
     renameFolder,
-  } = useFileManager();
+  } = useFileManager({ syncUrl: true });
   const isMobile = useIsMobileLayout();
   const coarsePointer = useCoarsePointer();
   const touchUi = isMobile || coarsePointer;

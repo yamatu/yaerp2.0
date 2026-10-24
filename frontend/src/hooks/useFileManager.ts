@@ -1,11 +1,22 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import api from '@/lib/api'
 import { subscribeDataChanged } from '@/lib/dataEvents'
+import { setReturnTarget } from '@/lib/returnNavigation'
 import type { Folder, FolderContents } from '@/types'
 
-export function useFileManager() {
+function folderFromUrl(): number | null {
+  if (typeof window === 'undefined') return null
+  const value = Number(new URLSearchParams(window.location.search).get('folder'))
+  return Number.isInteger(value) && value > 0 ? value : null
+}
+
+/**
+ * syncUrl keeps the open folder in the page address (?folder=) and as the
+ * return target, so leaving a workbook or pressing back lands in that folder.
+ */
+export function useFileManager({ syncUrl = false }: { syncUrl?: boolean } = {}) {
   const [currentFolderId, setCurrentFolderId] = useState<number | null>(null)
   const [contents, setContents] = useState<FolderContents>({ folders: [], workbooks: [] })
   const [breadcrumb, setBreadcrumb] = useState<Folder[]>([])
@@ -28,34 +39,50 @@ export function useFileManager() {
     }
   }, [])
 
+  // Resolves to false when the folder does not exist or is not visible.
   const loadBreadcrumb = useCallback(async (folderId: number | null) => {
     if (folderId === null) {
       setBreadcrumb([])
-      return
+      return true
     }
     try {
       const res = await api.get<Folder[]>(`/folders/${folderId}/breadcrumb`)
       setBreadcrumb(res.data ?? [])
+      return res.code === 0
     } catch {
       setBreadcrumb([])
+      return true
     }
   }, [])
 
   const navigateTo = useCallback(
     async (folderId: number | null) => {
       setCurrentFolderId(folderId)
-      await Promise.all([loadContents(folderId), loadBreadcrumb(folderId)])
+      if (syncUrl) {
+        const url = new URL(window.location.href)
+        if (folderId === null) url.searchParams.delete('folder')
+        else url.searchParams.set('folder', String(folderId))
+        const target = url.pathname + url.search
+        window.history.replaceState(window.history.state, '', target + url.hash)
+        setReturnTarget(target)
+      }
+      const [, opened] = await Promise.all([loadContents(folderId), loadBreadcrumb(folderId)])
+      // A remembered folder that was deleted or is no longer shared.
+      if (!opened && syncUrl && folderId !== null) await navigateToRef.current(null)
     },
-    [loadContents, loadBreadcrumb]
+    [loadContents, loadBreadcrumb, syncUrl]
   )
+
+  const navigateToRef = useRef(navigateTo)
+  navigateToRef.current = navigateTo
 
   const refresh = useCallback(() => {
     return navigateTo(currentFolderId)
   }, [currentFolderId, navigateTo])
 
   useEffect(() => {
-    navigateTo(null)
-  }, [navigateTo])
+    void navigateTo(syncUrl ? folderFromUrl() : null)
+  }, [navigateTo, syncUrl])
 
   useEffect(() => subscribeDataChanged((detail) => {
     if (!detail.resourcesChanged) return
