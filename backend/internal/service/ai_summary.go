@@ -115,7 +115,10 @@ func (s *AIService) generateAISummaryContent(assistant *activeAIAssistant, title
 	return &generated, nil
 }
 
-func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs []int64) (*summaryBuildResult, error) {
+// buildAISummaryData reads the visible data of the workbooks. With a scope only
+// the scoped sheets are read, each clipped to its range.
+func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs []int64, scope *agentReadScope) (*summaryBuildResult, error) {
+	scopeArgs := map[string]any{agentReadScopeArg: scope}
 	result := &summaryBuildResult{
 		Content: model.AISummaryContent{
 			Headline: title,
@@ -141,6 +144,14 @@ func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs [
 			if result.VisibleSheets >= 48 {
 				break
 			}
+			sheetRange := (*agentSheetRange)(nil)
+			if scope != nil {
+				scoped, ok := scope.sheets[sheet.ID]
+				if !ok {
+					continue
+				}
+				sheetRange = scoped
+			}
 			if err := s.ensureSheetViewAccess(userID, sheet.ID); err != nil {
 				continue
 			}
@@ -150,6 +161,9 @@ func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs [
 			}
 			columns, err := parseSheetColumns(sheet.Columns)
 			if err != nil {
+				return nil, err
+			}
+			if columns, rows, err = scopeAgentRead(scopeArgs, &sheet, columns, rows); err != nil {
 				return nil, err
 			}
 			visibleRows, err := s.buildVisiblePreviewRows(userID, &sheet, columns, rows)
@@ -176,11 +190,19 @@ func (s *AIService) buildAISummaryData(userID int64, title string, workbookIDs [
 			result.VisibleRows += visibleRowCount
 			result.VisibleSheets++
 			source.SheetNames = append(source.SheetNames, sheet.Name)
-			sectionBullets = append(sectionBullets, fmt.Sprintf("%s：%d 条可见数据，%d 个字段", sheet.Name, visibleRowCount, len(columns)))
+			sourceSheet := model.AISummarySourceSheet{SheetID: sheet.ID, SheetName: sheet.Name}
+			sheetLabel := sheet.Name
+			if sheetRange != nil {
+				sourceSheet.Range = sheetRange.A1
+				sheetLabel = fmt.Sprintf("%s（%s）", sheet.Name, sheetRange.A1)
+			}
+			source.Sheets = append(source.Sheets, sourceSheet)
+			sectionBullets = append(sectionBullets, fmt.Sprintf("%s：%d 条可见数据，%d 个字段", sheetLabel, visibleRowCount, len(columns)))
 			result.NumericMetrics = append(result.NumericMetrics, collectSummaryNumericMetrics(workbook.Name, sheet.Name, columns, visibleRows)...)
 			sheetPayloads = append(sheetPayloads, map[string]any{
 				"sheet_id":   sheet.ID,
 				"sheet_name": sheet.Name,
+				"range":      sourceSheet.Range,
 				"columns":    columns,
 				"row_count":  visibleRowCount,
 				"rows":       filteredRows,

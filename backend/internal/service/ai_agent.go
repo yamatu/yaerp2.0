@@ -1368,6 +1368,9 @@ func (s *AIService) toolQuerySheet(userID int64, args map[string]any) (*toolExec
 	if err != nil {
 		return nil, err
 	}
+	if columns, rows, err = scopeAgentRead(args, sheet, columns, rows); err != nil {
+		return nil, err
+	}
 	for _, reference := range columnKeys {
 		key, _ := resolveColumnReference(reference, columns)
 		if key == "" {
@@ -1632,6 +1635,9 @@ func (s *AIService) toolLookupSheetRecords(userID int64, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
+	if columns, rows, err = scopeAgentRead(args, sheet, columns, rows); err != nil {
+		return nil, err
+	}
 	previewRows := buildAIPreviewRows(sheet, columns, rows)
 	candidates := make([]aiPreviewRow, 0, len(previewRows))
 	for _, row := range previewRows {
@@ -1713,6 +1719,9 @@ func (s *AIService) toolCalculateSheetMetrics(userID int64, args map[string]any)
 	}
 	columns, err := parseSheetColumns(sheet.Columns)
 	if err != nil {
+		return nil, err
+	}
+	if columns, rows, err = scopeAgentRead(args, sheet, columns, rows); err != nil {
 		return nil, err
 	}
 	previewRows, err := s.buildVisiblePreviewRows(userID, sheet, columns, rows)

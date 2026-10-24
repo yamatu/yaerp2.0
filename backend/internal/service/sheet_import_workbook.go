@@ -598,6 +598,15 @@ func workbookImportStyleRef(file *excelize.File, styleID int, styles map[string]
 		return "", fmt.Errorf("读取样式 %d 失败: %w", styleID, err)
 	}
 	univerStyle := convertExcelStyleToUniverStyle(excelStyle)
+	// Theme font colors and every fill of a file without a theme part are
+	// missing from GetStyle; read those colors from styles.xml directly.
+	fillColor, fontColor := rawExcelStyleColors(file, styleID)
+	if univerStyle.Bg == nil && fillColor != "" {
+		univerStyle.Bg = &univerColorStyle{RGB: stringPtr(fillColor)}
+	}
+	if univerStyle.Cl == nil && fontColor != "" {
+		univerStyle.Cl = &univerColorStyle{RGB: stringPtr(fontColor)}
+	}
 	if !isMeaningfulUniverStyle(&univerStyle) {
 		styleIDs[styleID] = ""
 		return "", nil

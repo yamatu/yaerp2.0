@@ -49,6 +49,11 @@ const (
 // buildAgentSheetPreview renders the permission-filtered data rows of one
 // sheet as a compact TSV block. complete reports whether every data row fit.
 func (s *AIService) buildAgentSheetPreview(userID, sheetID int64) (text string, complete bool, err error) {
+	return s.buildScopedAgentSheetPreview(userID, sheetID, nil)
+}
+
+// buildScopedAgentSheetPreview previews a sheet clipped to its range in scope.
+func (s *AIService) buildScopedAgentSheetPreview(userID, sheetID int64, scope *agentReadScope) (text string, complete bool, err error) {
 	if err := s.ensureSheetViewAccess(userID, sheetID); err != nil {
 		return "", false, err
 	}
@@ -58,6 +63,9 @@ func (s *AIService) buildAgentSheetPreview(userID, sheetID int64) (text string, 
 	}
 	columns, err := parseSheetColumns(sheet.Columns)
 	if err != nil {
+		return "", false, err
+	}
+	if columns, rows, err = scopeAgentRead(map[string]any{agentReadScopeArg: scope}, sheet, columns, rows); err != nil {
 		return "", false, err
 	}
 	if len(columns) == 0 {
@@ -100,7 +108,11 @@ func (s *AIService) buildAgentSheetPreview(userID, sheetID int64) (text string, 
 	complete = shown == len(dataRows)
 
 	var out strings.Builder
-	fmt.Fprintf(&out, "工作表「%s」(sheet_id=%d) 共 %d 条非空数据行", sheet.Name, sheet.ID, len(dataRows))
+	fmt.Fprintf(&out, "工作表「%s」(sheet_id=%d)", sheet.Name, sheet.ID)
+	if scope != nil && scope.sheets[sheet.ID] != nil {
+		fmt.Fprintf(&out, "所选区域 %s", scope.sheets[sheet.ID].A1)
+	}
+	fmt.Fprintf(&out, " 共 %d 条非空数据行", len(dataRows))
 	switch {
 	case len(dataRows) == 0:
 		out.WriteString("，目前只有表头。")

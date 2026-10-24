@@ -44,6 +44,8 @@ type agentRunState struct {
 	// openContext carries the workbook/sheet the employee has open in the UI so
 	// every tool call can search the visible table before anything else.
 	openContext *openSheetContext
+	// readScope, when set, limits every tool call to these sheets and ranges.
+	readScope *agentReadScope
 }
 
 func newAgentRunState(userID int64, assistant *activeAIAssistant, conversation []map[string]any, toolDefs []openAIToolDefinition) *agentRunState {
@@ -119,6 +121,7 @@ type PreparedAgentStream struct {
 	conversation []map[string]any
 	toolDefs     []openAIToolDefinition
 	openContext  *openSheetContext
+	readScope    *agentReadScope
 }
 
 // PrepareStream validates a streaming request without contacting the model.
@@ -181,6 +184,7 @@ func (s *AIService) runAgentStream(
 	assistant := prepared.assistant
 	state := newAgentRunState(prepared.userID, assistant, prepared.conversation, prepared.toolDefs)
 	state.openContext = prepared.openContext
+	state.readScope = prepared.readScope
 
 	if err := emit(AgentEvent{Type: AgentEventStart}); err != nil {
 		return nil, err
@@ -448,6 +452,14 @@ func (s *AIService) prepareToolCall(state *agentRunState, call openAIToolCall) p
 	}
 	args["_assistant_id"] = state.assistant.ID
 	state.openContext.inject(args)
+	delete(args, agentReadScopeArg)
+	if state.readScope != nil {
+		args[agentReadScopeArg] = state.readScope
+		if err := checkAgentReadScope(args); err != nil {
+			prepared.invalid = err
+			return prepared
+		}
+	}
 	prepared.args = args
 	return prepared
 }

@@ -21,6 +21,7 @@ import {
   PencilLine,
   Plus,
   Search,
+  Sparkles,
   Trash2,
   Unlock,
   X,
@@ -70,6 +71,8 @@ interface Props {
   onColor: (sheets: Sheet[], color: string) => void;
   onState: (sheets: Sheet[], action: SheetStateAction) => void;
   onShare: (sheet: Sheet) => void;
+  /** Opens the AI summary generator on this sheet. */
+  onAnalyze?: (sheet: Sheet) => void;
 }
 
 interface MenuState {
@@ -407,6 +410,10 @@ export default function SheetTabBar(props: Props) {
         );
       }
       items.push(divider("d-share"));
+      if (props.onAnalyze) {
+        const analyze = props.onAnalyze;
+        items.push(menuItem("analyze", <Sparkles className="h-4 w-4" />, "AI 分析此工作表", () => runMenu(() => analyze(single))));
+      }
       items.push(
         menuItem("share", <MessageCircle className="h-4 w-4" />, "分享工作表（WhatsApp）", () => runMenu(() => props.onShare(single))),
       );
