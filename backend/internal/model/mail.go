@@ -114,6 +114,9 @@ type MailAttachment struct {
 	Size        int64  `json:"size"`
 	Inline      bool   `json:"inline"`
 	ContentID   string `json:"content_id,omitempty"`
+	// URL is a signed, expiring link that serves the part without the API
+	// session (previews, <img> in the mail frame, native downloads).
+	URL string `json:"url,omitempty"`
 }
 
 type MailMessageSummary struct {

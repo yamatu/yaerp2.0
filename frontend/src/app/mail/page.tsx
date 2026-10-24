@@ -68,7 +68,7 @@ import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
 import PullToRefresh from "@/components/mail/PullToRefresh";
 import SwipeableRow from "@/components/mail/SwipeableRow";
 import { FilePreviewModal, type FilePreviewItem } from "@/components/ui/FilePreviewModal";
-import api from "@/lib/api";
+import api, { resolveApiPath, resolveMailPartLinks } from "@/lib/api";
 import {
   buildMailQuote,
   buildOutgoingMail,
@@ -154,6 +154,8 @@ interface MailAttachment {
   size: number;
   inline: boolean;
   content_id?: string;
+  /** Signed link serving the part (inline view; add &download=1 to save). */
+  url?: string;
 }
 interface MailMessageSummary {
   uid: number;
@@ -511,7 +513,7 @@ function htmlToText(value: string) {
 }
 
 function iframeDocument(html: string) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="referrer" content="no-referrer"><base target="_blank"><style>img{cursor:zoom-in}html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;-webkit-text-size-adjust:100%}html{overflow-x:hidden}#${MAIL_FRAME_ROOT_ID}{display:flow-root}table{overflow-wrap:break-word;word-break:normal}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body><div id="${MAIL_FRAME_ROOT_ID}">${html}</div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="referrer" content="no-referrer"><base target="_blank"><style>img{cursor:zoom-in}html,body{margin:0;padding:0;background:#fff;color:#1e293b;font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;-webkit-text-size-adjust:100%}html{overflow-x:hidden}#${MAIL_FRAME_ROOT_ID}{display:flow-root}table{overflow-wrap:break-word;word-break:normal}img{display:inline-block;max-width:100%!important;max-height:640px!important;height:auto!important;object-fit:contain;vertical-align:middle}pre{white-space:pre-wrap}a{color:#0369a1}.yaerp-translation-pair{margin:0 0 14px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}.yaerp-translation-source{white-space:pre-wrap;color:#334155}.yaerp-translation-result{margin-top:5px;padding:7px 10px;border-left:3px solid #10b981;border-radius:0 6px 6px 0;background:#ecfdf5;color:#065f46;white-space:pre-wrap}</style></head><body><div id="${MAIL_FRAME_ROOT_ID}">${resolveMailPartLinks(html)}</div></body></html>`;
 }
 
 const mailFrameSandbox = "allow-popups allow-popups-to-escape-sandbox";
@@ -1954,6 +1956,15 @@ export default function MailPage() {
       (item) => item.part_id === attachmentPreviewKey,
     );
     if (!attachment) return;
+    // The message lists a signed link for every part: the viewer loads it
+    // directly, with range requests and without copying it into the page.
+    if (attachment.url) {
+      setAttachmentPreviewLinks((current) => ({
+        ...current,
+        [attachmentPreviewKey]: resolveApiPath(attachment.url!),
+      }));
+      return;
+    }
     let cancelled = false;
     setAttachmentPreviewLoading(true);
     void (async () => {
@@ -2026,6 +2037,16 @@ export default function MailPage() {
 
   const downloadAttachment = async (attachment: MailAttachment) => {
     if (!selected) return;
+    if (attachment.url) {
+      // A native download: progress, resume, no copy of the file in the page.
+      const anchor = document.createElement("a");
+      anchor.href = `${resolveApiPath(attachment.url)}&download=1`;
+      anchor.download = attachment.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      return;
+    }
     // Prefer the stored URL: the browser downloads it with native progress and
     // resume support instead of buffering the file in the page.
     const link = attachmentPreviewLinks[attachment.part_id];
@@ -3695,7 +3716,7 @@ export default function MailPage() {
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-50 text-sm font-semibold text-sky-700">
                       {selected.sender_avatar ? (
                         <img
-                          src={selected.sender_avatar}
+                          src={resolveApiPath(selected.sender_avatar)}
                           alt={`${mailAddressLabel(selected.from)} 的头像`}
                           className="h-full w-full object-cover"
                         />
@@ -3730,7 +3751,7 @@ export default function MailPage() {
                             <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-50 text-sm font-semibold text-sky-700">
                               {selected.sender_avatar ? (
                                 <img
-                                  src={selected.sender_avatar}
+                                  src={resolveApiPath(selected.sender_avatar)}
                                   alt="发件人头像"
                                   className="h-full w-full object-cover"
                                 />

@@ -310,6 +310,8 @@ func main() {
 	r.GET("/api/files/:id/content", uploadHandler.ServeFile)
 	r.GET("/api/files/:id/thumbnail", uploadHandler.ServeThumbnail)
 	r.GET("/api/whatsapp/avatar/:userId/:chatId", whatsAppHandler.ServeAvatar)
+	// Signed, expiring mail part links; the token carries the access check.
+	r.GET("/api/mail/file", mailHandler.ServeMailPart)
 	r.POST("/api/internal/whatsapp/events", whatsAppHandler.Webhook)
 
 	// Protected routes

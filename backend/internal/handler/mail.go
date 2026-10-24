@@ -298,11 +298,12 @@ func (h *MailHandler) DownloadAttachment(c *gin.Context) {
 		contentType = "application/octet-stream"
 	}
 	disposition := "attachment"
-	if c.Query("inline") == "1" || c.Query("inline") == "true" || c.Query("disposition") == "inline" {
+	if (c.Query("inline") == "1" || c.Query("inline") == "true" || c.Query("disposition") == "inline") && service.MailInlineServable(contentType) {
 		disposition = "inline"
 	}
 	c.Header("Content-Type", contentType)
 	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
+	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Cache-Control", "private, no-store")
 	// ServeContent handles HEAD, range requests and Content-Length; the bytes are
 	// already in memory (and memoized in the mail service), so a PDF viewer can
@@ -670,4 +671,32 @@ func handleMailError(c *gin.Context, err error) {
 		}
 		response.BadRequest(c, message)
 	}
+}
+
+// ServeMailPart serves an attachment or body image from a signed link (no
+// session needed, so <img> tags, PDF tabs and native downloads work). Types
+// that could run script on this origin are always sent as downloads.
+func (h *MailHandler) ServeMailPart(c *gin.Context) {
+	filename, contentType, data, err := h.service.OpenMailPartLink(c.Query("t"))
+	if err != nil {
+		if errors.Is(err, service.ErrMailPartLinkInvalid) {
+			response.Forbidden(c, err.Error())
+			return
+		}
+		handleMailError(c, err)
+		return
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	disposition := "attachment"
+	if c.Query("download") != "1" && service.MailInlineServable(contentType) {
+		disposition = "inline"
+	}
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": filename}))
+	c.Header("X-Content-Type-Options", "nosniff")
+	// A link always names the same bytes, so the frame can redraw from cache.
+	c.Header("Cache-Control", "private, max-age=3600")
+	http.ServeContent(c.Writer, c.Request, filename, time.Time{}, bytes.NewReader(data))
 }

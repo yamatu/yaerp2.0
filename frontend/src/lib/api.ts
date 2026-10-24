@@ -3,6 +3,18 @@ import { getRealtimeClientId } from './realtimeClient'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || '/api'
 
+/** Maps a server path such as /api/mail/file?t=… onto the configured API base. */
+export function resolveApiPath(path: string) {
+  if (!path.startsWith('/api/') || API_BASE === '/api') return path
+  return API_BASE.replace(/\/$/, '') + path.slice(4)
+}
+
+/** Rewrites signed mail part links inside a message body for the API base. */
+export function resolveMailPartLinks(html: string) {
+  if (API_BASE === '/api' || !html.includes('/api/mail/file?')) return html
+  return html.split('"/api/mail/file?').join('"' + resolveApiPath('/api/mail/file?'))
+}
+
 class ApiClient {
   private getToken(): string | null {
     if (typeof window === 'undefined') return null
