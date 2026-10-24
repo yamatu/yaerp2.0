@@ -325,13 +325,22 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 	if _, err := conn.Select(folder, false); err != nil {
 		return nil, err
 	}
-	message, raw, err := fetchRawMail(conn, uid)
+	message, raw, pruned, err := fetchMailForDisplay(conn, uid)
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := s.parseMailData(raw)
+	accountID := account.ID
+	partURL := func(partID string) string { return s.mailPartURL(userID, accountID, folder, uid, partID) }
+	parsed, err := s.parseMailDataWithOptions(raw, mailParseOptions{partURL: partURL, pruned: pruned})
 	if err != nil {
 		return nil, err
+	}
+	// The parts are already in memory: keep them so the previews, body images
+	// and downloads that follow do not fetch the whole message again.
+	for _, attachment := range parsed.Attachments {
+		key := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: attachment.PartID}
+		s.mailPartIndex().put(key, attachment.Filename, attachment.ContentType)
+		s.mailAttachmentCache().put(key, mailAttachmentCacheEntry{filename: attachment.Filename, contentType: attachment.ContentType, data: attachment.Data})
 	}
 	summary := summarizeIMAPMessage(folder, message)
 	if parsed.Subject != "" {
@@ -358,7 +367,9 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 		Attachments: make([]model.MailAttachment, 0, len(parsed.Attachments)),
 	}
 	for _, attachment := range parsed.Attachments {
-		detail.Attachments = append(detail.Attachments, attachment.MailAttachment)
+		item := attachment.MailAttachment
+		item.URL = partURL(item.PartID)
+		detail.Attachments = append(detail.Attachments, item)
 	}
 	if !summary.Read {
 		seqset := new(imap.SeqSet)
@@ -444,6 +455,11 @@ func (s *MailService) downloadAttachmentUncached(userID int64, folder string, ui
 	if _, err := conn.Select(folder, true); err != nil {
 		return "", "", nil, err
 	}
+	// Fetch just this part when possible; a 20MB attachment of a 60MB message
+	// then costs 20MB instead of the whole message every time.
+	if filename, contentType, data, ok := s.fetchMailAttachmentPart(conn, mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: partID}); ok {
+		return filename, contentType, data, nil
+	}
 	_, raw, err := fetchRawMail(conn, uid)
 	if err != nil {
 		return "", "", nil, err
@@ -487,7 +503,25 @@ func fetchRawMail(conn *imapclient.Client, uid uint32) (*imap.Message, []byte, e
 	return message, raw, nil
 }
 
+// mailInlineDataURIMax is the largest body image embedded as a data: URI when
+// the caller can serve parts through links; larger images become links, so a
+// message with photos is not a response of many megabytes of base64.
+const mailInlineDataURIMax = 48 << 10
+
+type mailParseOptions struct {
+	// partURL returns the link of a part. Without it every body image up to
+	// mailInlineImageMaxSize is embedded (used when forwarding server-side).
+	partURL func(partID string) string
+	// pruned is set for a message rebuilt by fetchMailForDisplay: parts marked
+	// with mailOmittedSizeHeader have no body here and load through links.
+	pruned bool
+}
+
 func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
+	return s.parseMailDataWithOptions(raw, mailParseOptions{})
+}
+
+func (s *MailService) parseMailDataWithOptions(raw []byte, options mailParseOptions) (*parsedMailData, error) {
 	reader, err := gomail.CreateReader(strings.NewReader(string(raw)))
 	if reader == nil {
 		return nil, err
@@ -525,16 +559,9 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 		if readErr != nil {
 			return nil, readErr
 		}
-		contentType, params := parseMailMediaType(part.Header.Get("Content-Type"))
-		disposition, dispositionParams := parseMailMediaType(part.Header.Get("Content-Disposition"))
-		filename := dispositionParams["filename"]
-		if filename == "" {
-			filename = params["name"]
-		}
-		filename = sanitizeMailFilename(decodeMailHeaderValue(filename))
-		isText := strings.HasPrefix(contentType, "text/") && !strings.EqualFold(disposition, "attachment")
-		if isText {
-			switch strings.ToLower(contentType) {
+		info := describeMailPart(part.Header.Get)
+		if info.bodyText {
+			switch info.contentType {
 			case "text/html":
 				if result.HTMLBody != "" {
 					result.HTMLBody += "<hr>"
@@ -549,21 +576,31 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 			continue
 		}
 		attachmentIndex++
-		contentID := strings.Trim(strings.TrimSpace(part.Header.Get("Content-ID")), "<>")
-		isInline := strings.EqualFold(disposition, "inline") || (contentID != "" && mailInlineImageType(contentType, content) != "")
-		if filename == "" {
-			filename = fmt.Sprintf("attachment-%d%s", attachmentIndex, mailExtensionForType(contentType))
+		imageType := info.finish(attachmentIndex, content)
+		contentID := info.contentID
+		size := int64(len(content))
+		omitted := false
+		if options.pruned {
+			if declared, err := strconv.ParseInt(strings.TrimSpace(part.Header.Get(mailOmittedSizeHeader)), 10, 64); err == nil {
+				size, omitted = declared, true
+			}
 		}
 		attachment := parsedMailAttachment{
 			MailAttachment: model.MailAttachment{
-				PartID: strconv.Itoa(attachmentIndex), Filename: filename, ContentType: contentType,
-				Size: int64(len(content)), Inline: isInline, ContentID: contentID,
+				PartID: strconv.Itoa(attachmentIndex), Filename: info.filename, ContentType: info.contentType,
+				Size: size, ContentID: contentID,
 			},
 			Data: content,
 		}
 		result.Attachments = append(result.Attachments, attachment)
-		if imageType := mailInlineImageType(contentType, content); contentID != "" && imageType != "" && len(content) <= mailInlineImageMaxSize {
-			inlineData[normalizeMailContentID(contentID)] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(content)
+		if contentID != "" && imageType != "" {
+			key := normalizeMailContentID(contentID)
+			switch {
+			case options.partURL != nil && (omitted || size > mailInlineDataURIMax):
+				inlineData[key] = options.partURL(attachment.PartID)
+			case !omitted && len(content) <= mailInlineImageMaxSize:
+				inlineData[key] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(content)
+			}
 		}
 	}
 	senderName := ""
@@ -583,6 +620,16 @@ func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
 			filtered = append(filtered, attachment)
 		}
 		result.Attachments = filtered
+	}
+	// A part is inline (shown in the body, not in the attachment list) only when
+	// the body really shows it. Apple Mail and others mark ordinary attachments
+	// "inline" without referencing them; those must stay downloadable.
+	referenced := referencedMailContentIDs(result.HTMLBody)
+	for index := range result.Attachments {
+		attachment := &result.Attachments[index]
+		key := normalizeMailContentID(attachment.ContentID)
+		_, shown := inlineData[key]
+		attachment.Inline = attachment.ContentID != "" && referenced[key] && shown
 	}
 	result.HTMLBody = replaceMailCIDImages(result.HTMLBody, inlineData)
 	result.HTMLBody = forceMailExternalLinksNewTab(s.htmlPolicy.Sanitize(inlineMailStyleSheets(result.HTMLBody)))

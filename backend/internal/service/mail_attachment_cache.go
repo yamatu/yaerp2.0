@@ -11,9 +11,11 @@ import (
 // The cache below keeps recently read parts in memory for a short time so the
 // preview, the download button and repeated range requests stay instant.
 const (
-	mailAttachmentCacheTTL      = 10 * time.Minute
-	mailAttachmentCacheMaxBytes = 64 << 20
-	mailAttachmentCacheMaxEntry = 32 << 20
+	mailAttachmentCacheTTL = 10 * time.Minute
+	// One opened message (up to mailMaxRawMessageSize) must fit, or every range
+	// request of a large attachment would fetch the whole message again.
+	mailAttachmentCacheMaxBytes = 192 << 20
+	mailAttachmentCacheMaxEntry = 64 << 20
 )
 
 type mailAttachmentCacheKey struct {
@@ -96,6 +98,18 @@ func (cache *mailAttachmentCache) put(key mailAttachmentCacheKey, entry mailAtta
 	}
 }
 
+// invalidateUser drops every cached part of a user, used when the active mail
+// account changes: message UIDs are only unique within one account.
+func (cache *mailAttachmentCache) invalidateUser(userID int64) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	for key, element := range cache.entries {
+		if key.userID == userID {
+			cache.removeElement(element)
+		}
+	}
+}
+
 // invalidate drops every part of one message, used after a move or delete so a
 // stale body cannot be served from memory.
 func (cache *mailAttachmentCache) invalidate(userID int64, folder string, uid uint32) {
@@ -137,4 +151,18 @@ func (s *MailService) mailAttachmentCache() *mailAttachmentCache {
 		s.attachmentCache = newMailAttachmentCache()
 	})
 	return s.attachmentCache
+}
+
+func (s *MailService) mailPartIndex() *mailPartIndex {
+	s.partIndexOnce.Do(func() {
+		s.partIndex = &mailPartIndex{entries: make(map[mailAttachmentCacheKey]mailPartIndexEntry)}
+	})
+	return s.partIndex
+}
+
+// invalidateMailUserParts forgets the cached parts of a user whose active
+// account changed: message UIDs are only unique within one account.
+func (s *MailService) invalidateMailUserParts(userID int64) {
+	s.mailAttachmentCache().invalidateUser(userID)
+	s.mailPartIndex().invalidateUser(userID)
 }

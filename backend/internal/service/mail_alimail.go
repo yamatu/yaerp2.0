@@ -1007,11 +1007,12 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 	if err != nil {
 		return nil, err
 	}
+	bodyHTML := s.aliMailEmbedInlineImages(account, folder, uid, response.Message.Body.HTML, attachments)
 	detail := &model.MailMessageDetail{
 		MailMessageSummary: summary,
 		CC:                 aliMailAddresses(response.Message.CC), BCC: aliMailAddresses(response.Message.BCC),
 		ReplyTo: aliMailAddresses(response.Message.ReplyTo), TextBody: response.Message.Body.Text,
-		HTMLBody: s.htmlPolicy.Sanitize(inlineMailStyleSheets(s.aliMailEmbedInlineImages(account, uid, response.Message.Body.HTML, attachments))), Attachments: attachments,
+		HTMLBody: s.htmlPolicy.Sanitize(inlineMailStyleSheets(bodyHTML)), Attachments: attachments,
 		InReplyTo:  aliMailHeaderValue(response.Message.InternetMessageHeaders, "In-Reply-To"),
 		References: parseAliMailReferences(aliMailHeaderValue(response.Message.InternetMessageHeaders, "References")),
 	}
@@ -1027,26 +1028,37 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 	return detail, nil
 }
 
-// aliMailEmbedInlineImages replaces the cid: images of an AliMail body with the
-// attachment bytes. The API returns the body with cid: references only, which
-// a browser cannot load.
-func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, uid uint32, htmlValue string, attachments []model.MailAttachment) string {
+// aliMailEmbedInlineImages resolves the cid: images of an AliMail body (the
+// API returns cid: references only, which a browser cannot load): small images
+// are embedded, larger ones point to signed part links. It also sets every
+// attachment's link, and marks as inline exactly the images the body shows.
+func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, folder string, uid uint32, htmlValue string, attachments []model.MailAttachment) string {
 	referenced := referencedMailContentIDs(htmlValue)
-	if len(referenced) == 0 {
-		return htmlValue
-	}
 	inlineData := map[string]string{}
-	for _, attachment := range attachments {
+	for index := range attachments {
+		attachment := &attachments[index]
+		attachment.URL = s.mailPartURL(account.UserID, account.ID, folder, uid, attachment.PartID)
 		contentID := normalizeMailContentID(attachment.ContentID)
-		if contentID == "" || !referenced[contentID] || attachment.Size > mailInlineImageMaxSize {
+		attachment.Inline = false
+		if contentID == "" || !referenced[contentID] {
+			continue
+		}
+		looksLikeImage := strings.HasPrefix(strings.ToLower(attachment.ContentType), "image/") ||
+			strings.HasPrefix(mime.TypeByExtension(filepath.Ext(attachment.Filename)), "image/")
+		if attachment.Size > mailInlineDataURIMax {
+			if looksLikeImage {
+				inlineData[contentID] = attachment.URL
+				attachment.Inline = true
+			}
 			continue
 		}
 		_, contentType, data, err := s.aliMailDownloadAttachment(account, uid, attachment.PartID)
-		if err != nil || len(data) == 0 || len(data) > mailInlineImageMaxSize {
+		if err != nil || len(data) == 0 {
 			continue
 		}
 		if imageType := mailInlineImageType(firstNonEmptyMail(attachment.ContentType, contentType), data); imageType != "" {
 			inlineData[contentID] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(data)
+			attachment.Inline = true
 		}
 	}
 	return replaceMailCIDImages(htmlValue, inlineData)

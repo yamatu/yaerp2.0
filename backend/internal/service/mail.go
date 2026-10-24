@@ -88,6 +88,8 @@ type MailService struct {
 
 	attachmentCacheOnce sync.Once
 	attachmentCache     *mailAttachmentCache
+	partIndexOnce       sync.Once
+	partIndex           *mailPartIndex
 
 	attachmentStore MailAttachmentStore
 }
@@ -293,6 +295,7 @@ func (s *MailService) UpdateOwnAccount(userID, accountID int64, input *model.Mai
 }
 
 func (s *MailService) saveOwnAccount(userID, accountID int64, input *model.MailAccountInput) (*model.MailAccount, error) {
+	defer s.invalidateMailUserParts(userID)
 	account, secret, err := s.accountFromInput(userID, accountID, input)
 	if err != nil {
 		return nil, err
@@ -402,6 +405,7 @@ func mailAccountInputIsEmpty(input *model.MailAccountInput) bool {
 }
 
 func (s *MailService) DeleteOwnAccount(userID int64) error {
+	defer s.invalidateMailUserParts(userID)
 	account, _ := s.repo.GetAccount(userID)
 	err := s.repo.DeleteAccount(userID, 0)
 	if account != nil {
@@ -419,6 +423,7 @@ func (s *MailService) DeleteOwnAccountByID(userID, accountID int64) error {
 	}
 	err := s.repo.DeleteAccount(userID, accountID)
 	s.invalidateAliMailToken(accountID)
+	s.invalidateMailUserParts(userID)
 	if repo.IsMailAccountMissing(err) {
 		return nil
 	}
@@ -426,6 +431,7 @@ func (s *MailService) DeleteOwnAccountByID(userID, accountID int64) error {
 }
 
 func (s *MailService) ActivateOwnAccount(userID, accountID int64) (*model.MailAccount, error) {
+	defer s.invalidateMailUserParts(userID)
 	if err := s.repo.SetDefaultAccount(userID, accountID); err != nil {
 		if repo.IsMailAccountMissing(err) {
 			return nil, fmt.Errorf("邮箱账号不存在或已停用")
@@ -736,6 +742,7 @@ func (s *MailService) SendMessage(userID int64, input *model.MailSendInput, atta
 	if err != nil {
 		return nil, err
 	}
+	input.HTMLBody = s.embedMailPartLinks(userID, input.HTMLBody)
 	return s.sendMessageForAccount(account, input, attachments)
 }
 
