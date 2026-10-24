@@ -65,6 +65,14 @@ type AISummarySource struct {
 	WorkbookID   int64    `json:"workbook_id"`
 	WorkbookName string   `json:"workbook_name"`
 	SheetNames   []string `json:"sheet_names"`
+	// Sheets lists the sheets read, with the range when only part was read.
+	Sheets []AISummarySourceSheet `json:"sheets,omitempty"`
+}
+
+type AISummarySourceSheet struct {
+	SheetID   int64  `json:"sheet_id"`
+	SheetName string `json:"sheet_name"`
+	Range     string `json:"range,omitempty"`
 }
 
 type AISummaryContent struct {
@@ -92,9 +100,19 @@ type AISummaryGenerateRequest struct {
 	Title       string  `json:"title" binding:"required"`
 	WorkbookIDs []int64 `json:"workbook_ids"`
 	// FolderIDs adds every workbook the user can open inside these folders.
-	FolderIDs   []int64 `json:"folder_ids"`
-	AssistantID *int64  `json:"assistant_id"`
-	Prompt      string  `json:"prompt"`
+	FolderIDs []int64 `json:"folder_ids"`
+	// Sheets limits the analysis to single sheets, optionally to a range of
+	// each; with only sheets selected, the rest of their workbooks is not read.
+	Sheets      []AISummarySheetTarget `json:"sheets"`
+	AssistantID *int64                 `json:"assistant_id"`
+	Prompt      string                 `json:"prompt"`
+}
+
+// AISummarySheetTarget is one sheet of a summary. Range is an A1 range such
+// as "A1:F200", "B:D" or "2:50"; empty means the whole sheet.
+type AISummarySheetTarget struct {
+	SheetID int64  `json:"sheet_id"`
+	Range   string `json:"range"`
 }
 
 type AISummaryUpdateRequest struct {

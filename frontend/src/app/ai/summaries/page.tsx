@@ -21,7 +21,7 @@ import {
   X,
 } from 'lucide-react'
 import { AuthGuard } from '@/components/auth/AuthGuard'
-import WorkbookScopePicker, { type ScopeItem } from '@/components/ai/WorkbookScopePicker'
+import WorkbookScopePicker, { isValidSheetRange, type ScopeSelection } from '@/components/ai/WorkbookScopePicker'
 import { MOBILE_QUERY, useHistoryLayer, useMediaQuery } from '@/hooks/useMobileGestures'
 import api from '@/lib/api'
 import { getAccessToken, getStoredUser, isAdmin } from '@/lib/auth'
@@ -75,8 +75,9 @@ export default function AISummariesPage() {
   const [generatePrompt, setGeneratePrompt] = useState('总结关键指标、异常、趋势和下一步建议，并标明信息来源。')
   const [progress, setProgress] = useState<ProgressStep[]>([])
   const [generateAssistantId, setGenerateAssistantId] = useState<number | null>(null)
-  const [scope, setScope] = useState<{ workbooks: ScopeItem[]; folders: ScopeItem[] }>({ workbooks: [], folders: [] })
-  const scopeEmpty = scope.workbooks.length === 0 && scope.folders.length === 0
+  const [scope, setScope] = useState<ScopeSelection>({ workbooks: [], folders: [], sheets: [] })
+  const scopeEmpty = scope.workbooks.length === 0 && scope.folders.length === 0 && scope.sheets.length === 0
+  const invalidRange = scope.sheets.find((sheet) => !isValidSheetRange(sheet.range))
   const [loading, setLoading] = useState(true)
   const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
@@ -139,6 +140,28 @@ export default function AISummariesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // The sheet editor links here with ?workbook=&sheet=&range= to analyse one
+  // sheet or a selected range: open the generator with it preselected.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const workbookId = Number(params.get('workbook'))
+    const sheetId = Number(params.get('sheet'))
+    if (!workbookId || !sheetId) return
+    const range = (params.get('range') || '').toUpperCase()
+    void api.get<Workbook>(`/workbooks/${workbookId}?summary=1`).then((res) => {
+      const sheet = res.code === 0 ? res.data?.sheets?.find((item) => item.id === sheetId) : undefined
+      if (!res.data || !sheet) {
+        setError('要分析的工作表不存在或没有查看权限')
+        return
+      }
+      setScope({ workbooks: [], folders: [], sheets: [{ id: sheet.id, name: sheet.name, workbookId, workbookName: res.data.name, range }] })
+      setGenerateTitle(range ? `${sheet.name} ${range} 数据分析` : `${sheet.name} 数据分析`)
+      setProgress([])
+      setGeneratorOpen(true)
+      window.history.replaceState(null, '', '/ai/summaries')
+    }).catch(() => setError('读取要分析的工作表失败'))
+  }, [])
+
   useEffect(() => {
     if (!selectedPage || editing) return
     setDraftTitle(selectedPage.title)
@@ -156,7 +179,11 @@ export default function AISummariesPage() {
 
   const generateSummary = async () => {
     if (!generateTitle.trim() || scopeEmpty) {
-      setError('请输入标题并至少选择一个工作簿或文件夹')
+      setError('请输入标题并至少选择一个工作簿、工作表或文件夹')
+      return
+    }
+    if (invalidRange) {
+      setError(`「${invalidRange.name}」的区域 ${invalidRange.range} 格式不正确，示例：A1:F200、B:D、2:50`)
       return
     }
     setWorking(true)
@@ -168,6 +195,7 @@ export default function AISummariesPage() {
         title: generateTitle.trim(),
         workbook_ids: scope.workbooks.map((item) => item.id),
         folder_ids: scope.folders.map((item) => item.id),
+        sheets: scope.sheets.map((item) => ({ sheet_id: item.id, range: item.range.replace(/s+/g, '') })),
         assistant_id: generateAssistantId ?? 0,
         prompt: generatePrompt.trim(),
       }, (raw) => {
@@ -192,7 +220,7 @@ export default function AISummariesPage() {
       const page = created as AISummaryPage | null
       if (!page) throw new Error('生成汇总失败')
       setGeneratorOpen(false)
-      setScope({ workbooks: [], folders: [] })
+      setScope({ workbooks: [], folders: [], sheets: [] })
       setProgress([])
       await loadData(page.id)
       window.history.replaceState(null, '', `/ai/summaries?selected=${page.id}`)
@@ -456,7 +484,9 @@ export default function AISummariesPage() {
                       <div className="mt-3 flex flex-wrap gap-2">
                         {draftContent.sources.map((source) => (
                           <span key={source.workbook_id} className="max-w-full break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                            <strong className="font-semibold text-slate-800">{source.workbook_name}</strong> · {source.sheet_names.length} 张工作表
+                            <strong className="font-semibold text-slate-800">{source.workbook_name}</strong> · {source.sheets?.length
+                              ? source.sheets.map((sheet) => (sheet.range ? `${sheet.sheet_name}（${sheet.range}）` : sheet.sheet_name)).join('、')
+                              : `${source.sheet_names.length} 张工作表`}
                           </span>
                         ))}
                       </div>
@@ -500,7 +530,7 @@ export default function AISummariesPage() {
                   </div>
                   <p className="text-xs leading-5 text-slate-400">AI 会读取所选范围内你有权限查看的全部数据，按要求筛选、分组汇总后生成报告，数字由服务器精确计算。</p>
                 </div>
-                <WorkbookScopePicker workbooks={workbooks} selectedWorkbooks={scope.workbooks} selectedFolders={scope.folders} onChange={setScope} />
+                <WorkbookScopePicker workbooks={workbooks} value={scope} onChange={setScope} />
                 {progress.length > 0 && (
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3" aria-live="polite">
                     <div className="mb-2 text-xs font-semibold text-slate-600">分析进度</div>
@@ -515,7 +545,7 @@ export default function AISummariesPage() {
                   </div>
                 )}
               </div>
-              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setGeneratorOpen(false)} disabled={working} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void generateSummary()} disabled={working || scopeEmpty} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{working ? '正在分析…' : '生成报告'}</button></div>
+              <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3"><button type="button" onClick={() => setGeneratorOpen(false)} disabled={working} className="h-10 sm:h-9 rounded-lg border border-slate-200 px-4 text-sm text-slate-600">取消</button><button type="button" onClick={() => void generateSummary()} disabled={working || scopeEmpty || Boolean(invalidRange)} className="inline-flex h-10 sm:h-9 items-center gap-2 rounded-lg bg-slate-900 px-4 text-sm font-semibold text-white disabled:opacity-50">{working ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{working ? '正在分析…' : '生成报告'}</button></div>
             </div>
           </div>
         )}

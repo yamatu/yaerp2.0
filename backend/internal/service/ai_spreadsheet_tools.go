@@ -540,6 +540,9 @@ func (s *AIService) toolFilterSheetRows(userID int64, args map[string]any) (*too
 	if err != nil {
 		return nil, err
 	}
+	if columns, rows, err = scopeAgentRead(args, sheet, columns, rows); err != nil {
+		return nil, err
+	}
 	visible, err := s.readSheetRowValues(userID, sheet, columns, rows)
 	if err != nil {
 		return nil, err
@@ -547,6 +550,9 @@ func (s *AIService) toolFilterSheetRows(userID int64, args map[string]any) (*too
 	keys := make([]string, 0, len(conditions))
 	for _, condition := range conditions {
 		keys = append(keys, condition.ColumnKey)
+	}
+	if err := ensureColumnsInScope(args, columns, keys); err != nil {
+		return nil, err
 	}
 	if err := ensureReadColumnsVisible(buildAIPreviewRows(sheet, columns, rows), visible, keys); err != nil {
 		return nil, err
@@ -981,6 +987,9 @@ func (s *AIService) toolInspectSheetRange(userID int64, args map[string]any) (*t
 	}
 	rows, err := s.loadAgentRows(sheet)
 	if err != nil {
+		return nil, err
+	}
+	if columns, rows, err = scopeAgentRead(args, sheet, columns, rows); err != nil {
 		return nil, err
 	}
 	visible, err := s.readSheetRowValues(userID, sheet, columns, rows)

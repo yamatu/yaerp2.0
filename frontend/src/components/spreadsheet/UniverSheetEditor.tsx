@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Sigma, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, BadgeCheck, Bot, Building2, Check, CheckSquare2, ChevronDown, ChevronUp, ClipboardCheck, Columns3, Download, Eye, EyeOff, FileOutput, FileSpreadsheet, Files, Filter, FilterX, Hash, ImagePlus, ListChecks, LocateFixed, Lock, Plus, Printer, RemoveFormatting, Rows3, Save, Search, Shield, Sigma, Sparkles, Square, Trash2, Unlock, UserRoundCheck, Users, Wrench, X } from 'lucide-react'
 import { RANGE_TYPE, CommandType, VerticalAlign, getDisplayValueFromCell, type ICellData, type ILanguagePack, type IWorkbookData, type IWorksheetData } from '@univerjs/core'
 import { createUniver, defaultTheme, LocaleType } from '@univerjs/presets'
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core'
@@ -5329,6 +5329,24 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
     }
   }, [effectiveCanExportSheet, originalWorkbookXlsxAvailable, originalWorkbookXlsxFilename, workbookId])
 
+  // Opens the AI summary generator on this sheet, limited to the selected
+  // range; a single selected cell means the whole sheet.
+  const openAISummaryForSelection = useCallback(() => {
+    let range = ''
+    try {
+      const active = univerApiRef.current?.univerAPI.getActiveWorkbook()?.getActiveSheet()?.getActiveRange()
+      const bounds = active?.getRange()
+      if (active && bounds && (bounds.endRow > bounds.startRow || bounds.endColumn > bounds.startColumn)) {
+        range = active.getA1Notation()
+      }
+    } catch {
+      range = ''
+    }
+    const params = new URLSearchParams({ workbook: String(workbookId), sheet: String(sheet.id) })
+    if (range) params.set('range', range)
+    window.location.assign(`/ai/summaries?${params.toString()}`)
+  }, [sheet.id, workbookId])
+
   const openPdfExportPanel = useCallback(() => {
     const validIDs = new Set(workbookSheetOptions.map((item) => item.id))
     const nextSelected = selectedPdfSheetIds.filter((id) => validIDs.has(id))
@@ -6139,6 +6157,16 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   aria-label="PDF 导出与预览"
                 >
                   <FileOutput className="h-4 w-4" />
+                </button>
+              </FloatingToolHint>
+              <FloatingToolHint label="AI 分析所选区域（只选一个单元格时分析整张表）">
+                <button
+                  type="button"
+                  onClick={openAISummaryForSelection}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-violet-200 bg-violet-50 text-violet-700 shadow-lg transition hover:bg-violet-100"
+                  aria-label="AI 分析所选区域"
+                >
+                  <Sparkles className="h-4 w-4" />
                 </button>
               </FloatingToolHint>
               <ImportXlsxButton

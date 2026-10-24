@@ -116,6 +116,9 @@ func (s *AIService) toolAggregateSheetRows(userID int64, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
+	if columns, rows, err = scopeAgentRead(args, sheet, columns, rows); err != nil {
+		return nil, err
+	}
 	visible, err := s.readSheetRowValues(userID, sheet, columns, rows)
 	if err != nil {
 		return nil, err
@@ -128,6 +131,9 @@ func (s *AIService) toolAggregateSheetRows(userID int64, args map[string]any) (*
 	}
 	for _, condition := range conditions {
 		readKeys = append(readKeys, condition.ColumnKey)
+	}
+	if err := ensureColumnsInScope(args, columns, readKeys); err != nil {
+		return nil, err
 	}
 	// A hidden value must not silently count as blank in a total.
 	if err := ensureReadColumnsVisible(buildAIPreviewRows(sheet, columns, rows), visible, readKeys); err != nil {

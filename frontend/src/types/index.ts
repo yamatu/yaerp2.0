@@ -874,6 +874,8 @@ export interface AISummarySource {
   workbook_id: number;
   workbook_name: string;
   sheet_names: string[];
+  /** Sheets read, with the range when only part of a sheet was read. */
+  sheets?: { sheet_id: number; sheet_name: string; range?: string }[];
 }
 
 export interface AISummaryContent {

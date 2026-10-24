@@ -934,6 +934,7 @@ export default function WorkbookEditorShell({
                 defaultContent: `工作表：${workbook.name} / ${sheet.name}`,
               })
             }
+            onAnalyze={(sheet) => router.push(`/ai/summaries?workbook=${workbookId}&sheet=${sheet.id}`)}
           />
         </main>
 

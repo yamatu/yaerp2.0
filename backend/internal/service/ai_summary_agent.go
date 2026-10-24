@@ -15,6 +15,9 @@ const (
 	summaryMaxTableRows     = 30
 	summaryMaxTableColumns  = 8
 	summaryAgentMaxSections = 8
+	summaryMaxSheetTargets  = 30
+	// Scoped runs preview every selected sheet, up to this many.
+	summaryScopedPreviewSheets = 6
 )
 
 // summaryAgentTools are the read-only tools a summary run may use. A summary
@@ -44,7 +47,7 @@ const summaryAgentPrompt = `你是 YaERP 经营数据分析师，要根据用户
 // assistant it runs a read-only agent that can filter and aggregate every
 // visible row, reporting each step through emit; otherwise it falls back to a
 // single model call over a data sample, and to local statistics without a
-// model.
+// model. Selected sheets (optionally ranges) limit every read of the run.
 func (s *AIService) GenerateAISummaryPageWithProgress(ctx context.Context, userID int64, req *model.AISummaryGenerateRequest, emit AgentEventSink) (*model.AISummaryPage, error) {
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
@@ -73,11 +76,17 @@ func (s *AIService) GenerateAISummaryPageWithProgress(ctx context.Context, userI
 			add(id)
 		}
 	}
+	wholeWorkbookIDs := append([]int64{}, workbookIDs...)
+
+	scope, err := s.buildSummaryReadScope(userID, req.Sheets, wholeWorkbookIDs, add)
+	if err != nil {
+		return nil, err
+	}
 	if len(workbookIDs) == 0 {
-		return nil, fmt.Errorf("请至少选择一个工作簿或文件夹")
+		return nil, fmt.Errorf("请至少选择一个工作簿、工作表或文件夹")
 	}
 
-	build, err := s.buildAISummaryData(userID, title, workbookIDs)
+	build, err := s.buildAISummaryData(userID, title, workbookIDs, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +109,7 @@ func (s *AIService) GenerateAISummaryPageWithProgress(ctx context.Context, userI
 	if assistant != nil {
 		var generated *model.AISummaryContent
 		if assistant.SupportsTools {
-			generated, err = s.runSummaryAgent(ctx, userID, assistant, title, req.Prompt, workbookIDs, emit)
+			generated, err = s.runSummaryAgent(ctx, userID, assistant, title, req.Prompt, workbookIDs, scope, emit)
 		}
 		if generated == nil {
 			if err != nil {
@@ -128,26 +137,100 @@ func (s *AIService) GenerateAISummaryPageWithProgress(ctx context.Context, userI
 	return s.saveAISummaryPage(userID, title, assistant, workbookIDs, build.Content)
 }
 
-func (s *AIService) runSummaryAgent(ctx context.Context, userID int64, assistant *activeAIAssistant, title, prompt string, workbookIDs []int64, emit AgentEventSink) (*model.AISummaryContent, error) {
-	pinned, err := s.buildPinnedWorkbooksContext(userID, &ChatContext{WorkbookIDs: workbookIDs})
-	if err != nil {
-		return nil, err
+// buildSummaryReadScope turns selected sheets into a read scope. Without
+// selected sheets there is no scope: whole workbooks are read as before. With
+// some, whole selected workbooks stay readable and only the selected sheets
+// (clipped to their ranges) of the other workbooks are.
+func (s *AIService) buildSummaryReadScope(userID int64, targets []model.AISummarySheetTarget, wholeWorkbookIDs []int64, addWorkbook func(int64)) (*agentReadScope, error) {
+	if len(targets) == 0 {
+		return nil, nil
 	}
-	previews := make([]string, 0, summaryPreviewSheets)
-	scope := s.permService.NewAccessScope()
-	for _, workbookID := range workbookIDs {
-		if len(previews) >= summaryPreviewSheets {
-			break
+	if len(targets) > summaryMaxSheetTargets {
+		return nil, fmt.Errorf("一次最多选择 %d 张工作表", summaryMaxSheetTargets)
+	}
+	scope := newAgentReadScope()
+	access := s.permService.NewAccessScope()
+	workbookNames := map[int64]string{}
+	for _, target := range targets {
+		if target.SheetID <= 0 {
+			continue
 		}
-		workbook, err := s.getSearchWorkbook(userID, workbookID, scope)
+		if err := s.ensureSheetViewAccess(userID, target.SheetID); err != nil {
+			return nil, fmt.Errorf("工作表 %d 不可访问: %w", target.SheetID, err)
+		}
+		sheet, err := s.sheetRepo.GetSheet(target.SheetID)
+		if err != nil {
+			return nil, fmt.Errorf("工作表 %d 不存在", target.SheetID)
+		}
+		sheetRange, err := parseAgentA1Range(target.Range)
+		if err != nil {
+			return nil, fmt.Errorf("工作表「%s」的%w", sheet.Name, err)
+		}
+		if _, known := workbookNames[sheet.WorkbookID]; !known {
+			workbook, err := s.getSearchWorkbook(userID, sheet.WorkbookID, access)
+			if err != nil {
+				return nil, fmt.Errorf("工作表「%s」所在的工作簿不可访问", sheet.Name)
+			}
+			workbookNames[sheet.WorkbookID] = workbook.Name
+		}
+		addWorkbook(sheet.WorkbookID)
+		scope.add(sheet.ID, fmt.Sprintf("「%s / %s」", workbookNames[sheet.WorkbookID], sheet.Name), sheetRange)
+	}
+	for _, workbookID := range wholeWorkbookIDs {
+		workbook, err := s.getSearchWorkbook(userID, workbookID, access)
 		if err != nil {
 			continue
 		}
 		for _, sheet := range workbook.Sheets {
-			if len(previews) >= summaryPreviewSheets {
+			scope.sheets[sheet.ID] = nil
+			scope.labels[sheet.ID] = fmt.Sprintf("「%s / %s」", workbook.Name, sheet.Name)
+		}
+	}
+	if len(scope.sheets) == 0 {
+		return nil, fmt.Errorf("请至少选择一张可访问的工作表")
+	}
+	return scope, nil
+}
+
+func (s *AIService) runSummaryAgent(ctx context.Context, userID int64, assistant *activeAIAssistant, title, prompt string, workbookIDs []int64, readScope *agentReadScope, emit AgentEventSink) (*model.AISummaryContent, error) {
+	var contextMessages []string
+	if readScope == nil {
+		pinned, err := s.buildPinnedWorkbooksContext(userID, &ChatContext{WorkbookIDs: workbookIDs})
+		if err != nil {
+			return nil, err
+		}
+		if pinned != "" {
+			contextMessages = append(contextMessages, strings.Replace(pinned, "用户把以下工作簿拖进了对话", "本次分析的工作簿范围如下", 1))
+		}
+	} else {
+		contextMessages = append(contextMessages, "本次分析只针对以下工作表（括号内为所选区域，未写区域即整张表）："+readScope.describe()+
+			"。所有工具调用只能传这些 sheet_id，工具读到的数据已经限定在所选区域内；不要分析范围以外的数据，也不要声称看过其它工作表。")
+	}
+
+	previews := make([]string, 0, summaryPreviewSheets)
+	access := s.permService.NewAccessScope()
+	maxPreviews := summaryPreviewSheets
+	if readScope != nil {
+		maxPreviews = summaryScopedPreviewSheets
+	}
+	for _, workbookID := range workbookIDs {
+		if len(previews) >= maxPreviews {
+			break
+		}
+		workbook, err := s.getSearchWorkbook(userID, workbookID, access)
+		if err != nil {
+			continue
+		}
+		for _, sheet := range workbook.Sheets {
+			if len(previews) >= maxPreviews {
 				break
 			}
-			if preview, _, err := s.buildAgentSheetPreview(userID, sheet.ID); err == nil && preview != "" {
+			if readScope != nil {
+				if _, ok := readScope.sheets[sheet.ID]; !ok {
+					continue
+				}
+			}
+			if preview, _, err := s.buildScopedAgentSheetPreview(userID, sheet.ID, readScope); err == nil && preview != "" {
 				previews = append(previews, fmt.Sprintf("工作簿「%s」的%s", workbook.Name, preview))
 			}
 		}
@@ -158,8 +241,8 @@ func (s *AIService) runSummaryAgent(ctx context.Context, userID int64, assistant
 		systemPrompt += "\n\n该助手的补充要求（不得覆盖以上规则）：\n" + custom
 	}
 	conversation := []map[string]any{{"role": "system", "content": systemPrompt}}
-	if pinned != "" {
-		conversation = append(conversation, map[string]any{"role": "system", "content": strings.Replace(pinned, "用户把以下工作簿拖进了对话", "本次分析的工作簿范围如下", 1)})
+	for _, message := range contextMessages {
+		conversation = append(conversation, map[string]any{"role": "system", "content": message})
 	}
 	if len(previews) > 0 {
 		conversation = append(conversation, map[string]any{"role": "system", "content": "部分工作表的数据预览（TSV，第一列 row 为 0-based 数据行号；预览不完整时用工具读取全部数据）：\n\n" + strings.Join(previews, "\n\n")})
@@ -170,14 +253,33 @@ func (s *AIService) runSummaryAgent(ctx context.Context, userID int64, assistant
 	}
 	conversation = append(conversation, map[string]any{"role": "user", "content": fmt.Sprintf("报告标题：%s\n分析要求：%s", title, request)})
 
-	toolDefs := make([]openAIToolDefinition, 0, len(summaryAgentTools))
-	for _, definition := range s.buildToolDefinitions() {
-		if summaryAgentTools[definition.Function.Name] {
-			toolDefs = append(toolDefs, definition)
+	scopedRanges := false
+	if readScope != nil {
+		for _, sheetRange := range readScope.sheets {
+			if sheetRange != nil {
+				scopedRanges = true
+				break
+			}
 		}
 	}
+	toolDefs := make([]openAIToolDefinition, 0, len(summaryAgentTools))
+	for _, definition := range s.buildToolDefinitions() {
+		name := definition.Function.Name
+		if !summaryAgentTools[name] {
+			continue
+		}
+		// Full-text search reads across a workbook and cannot be clipped to a
+		// range; filter_sheet_rows covers keyword conditions inside the range.
+		if readScope != nil && name == "search_sheet_content" {
+			continue
+		}
+		if scopedRanges && name == "search_sheet_rows" {
+			continue
+		}
+		toolDefs = append(toolDefs, definition)
+	}
 	result, err := s.runAgentStream(ctx, &PreparedAgentStream{
-		userID: userID, assistant: assistant, conversation: conversation, toolDefs: toolDefs,
+		userID: userID, assistant: assistant, conversation: conversation, toolDefs: toolDefs, readScope: readScope,
 	}, emit)
 	if err != nil {
 		return nil, err
