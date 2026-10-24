@@ -152,17 +152,23 @@ func (s *MailService) fetchMailAttachmentPart(conn *imapclient.Client, key mailA
 	}
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(key.uid)
-	structure, err := fetchMailBodyStructure(conn, seqset)
-	if err != nil || len(structure.Parts) == 0 {
-		return "", "", nil, false
+	listed, known := s.mailPartIndex().get(key)
+	var leaves []*mailStructureLeaf
+	if known && listed.leaf != nil {
+		// Checked against the parsed message when it was opened.
+		leaves = []*mailStructureLeaf{listed.leaf}
+	} else {
+		structure, err := fetchMailBodyStructure(conn, seqset)
+		if err != nil || len(structure.Parts) == 0 {
+			return "", "", nil, false
+		}
+		leaves = mailStructureLeaves(structure)
 	}
-	for _, leaf := range mailStructureLeaves(structure) {
+	for _, leaf := range leaves {
 		if leaf.attachment != target {
 			continue
 		}
-		// Compare what the headers say: the bytes refine type and default name
-		// only after the fetch, and a large message is listed without them.
-		if listed, known := s.mailPartIndex().get(key); known && (listed.filename != leaf.info.filename || listed.contentType != leaf.info.contentType) {
+		if known && !listed.matches(leaf) {
 			return "", "", nil, false
 		}
 		section := &imap.BodySectionName{BodyPartName: imap.BodyPartName{Path: leaf.path}, Peek: true}
@@ -203,7 +209,16 @@ func (s *MailService) fetchMailAttachmentPart(conn *imapclient.Client, key mailA
 type mailPartIndexEntry struct {
 	filename    string
 	contentType string
-	listedAt    time.Time
+	// leaf is the structure part with the same number, kept when it describes
+	// the same file; the part can then be fetched without BODYSTRUCTURE.
+	leaf     *mailStructureLeaf
+	listedAt time.Time
+}
+
+// matches compares what the headers say: the bytes refine type and default
+// name only after the fetch, and a large message is listed without them.
+func (entry mailPartIndexEntry) matches(leaf *mailStructureLeaf) bool {
+	return entry.filename == leaf.info.filename && entry.contentType == leaf.info.contentType
 }
 
 // mailPartIndex remembers, per opened message, which file each attachment
@@ -218,7 +233,11 @@ const (
 	mailPartIndexMax = 20000
 )
 
-func (index *mailPartIndex) put(key mailAttachmentCacheKey, filename, contentType string) {
+func (index *mailPartIndex) put(key mailAttachmentCacheKey, filename, contentType string, leaf *mailStructureLeaf) {
+	entry := mailPartIndexEntry{filename: filename, contentType: contentType}
+	if leaf != nil && entry.matches(leaf) {
+		entry.leaf = leaf
+	}
 	index.mu.Lock()
 	defer index.mu.Unlock()
 	now := time.Now()
@@ -229,7 +248,8 @@ func (index *mailPartIndex) put(key mailAttachmentCacheKey, filename, contentTyp
 			}
 		}
 	}
-	index.entries[key] = mailPartIndexEntry{filename: filename, contentType: contentType, listedAt: now}
+	entry.listedAt = now
+	index.entries[key] = entry
 }
 
 func (index *mailPartIndex) get(key mailAttachmentCacheKey) (mailPartIndexEntry, bool) {
@@ -271,6 +291,12 @@ func fetchOneMessage(conn *imapclient.Client, seqset *imap.SeqSet, items []imap.
 	for item := range messages {
 		if message == nil {
 			message = item
+			continue
+		}
+		// Servers may report the flags a non-peek fetch changed in a separate
+		// FETCH response.
+		if _, ok := item.Items[imap.FetchFlags]; ok {
+			message.Flags = item.Flags
 		}
 	}
 	if err := <-done; err != nil {
@@ -283,20 +309,56 @@ func fetchOneMessage(conn *imapclient.Client, seqset *imap.SeqSet, items []imap.
 }
 
 const (
-	// Messages above this size are opened without their large parts.
-	mailDisplayFullFetchMax = 6 << 20
+	// Messages above this size are opened without their large parts. It is
+	// small on purpose: the rebuilt message costs the same round trips as a
+	// full fetch, so attachments are never downloaded just to show the text.
+	mailDisplayFullFetchMax = 256 << 10
 	// Parts up to this encoded size are always fetched with the message.
 	mailDisplaySmallPartMax = 96 << 10
+	// Body images (parts with a Content-ID) are fetched with the message up to
+	// this total encoded size, so ordinary pictures show with the text.
+	mailDisplayInlineBudget = 1536 << 10
 	// mailOmittedSizeHeader marks a part whose body was left out when
 	// opening a large message; it carries the part's decoded size estimate.
 	mailOmittedSizeHeader = "X-Yaerp-Omitted-Size"
 )
 
-// fetchMailForDisplay returns the message to show. Large messages are
-// rebuilt from their structure with only the text parts and small parts
-// included, so opening a mail with big attachments or photos transfers little
+type mailDisplayFetch struct {
+	message *imap.Message
+	raw     []byte
+	// pruned is set when raw was rebuilt without the large parts.
+	pruned bool
+	// leaves is the message structure, nil for a single part message.
+	leaves []*mailStructureLeaf
+}
+
+// selectMailFolder selects folder unless the connection already has it open
+// with enough access, which saves a round trip per request on a pooled
+// connection. UID commands do not depend on a fresh SELECT.
+func selectMailFolder(conn *imapclient.Client, folder string, readOnly bool) error {
+	if mailbox := conn.Mailbox(); mailbox != nil && conn.State() == imap.SelectedState && mailbox.Name == folder && (readOnly || !mailbox.ReadOnly) {
+		return nil
+	}
+	_, err := conn.Select(folder, readOnly)
+	return err
+}
+
+func hasMailFlag(flags []string, flag string) bool {
+	for _, value := range flags {
+		if strings.EqualFold(value, flag) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchMailForDisplay returns the message to show. Messages that are not tiny
+// are rebuilt from their structure with only the text parts, small parts and
+// body images included, so opening a mail with attachments transfers little
 // data; the omitted parts load on demand through fetchMailAttachmentPart.
-func fetchMailForDisplay(conn *imapclient.Client, uid uint32) (*imap.Message, []byte, bool, error) {
+// An unread message is marked read by the body fetch itself (no separate
+// STORE), which requires folder to be selected read-write.
+func fetchMailForDisplay(conn *imapclient.Client, uid uint32) (*mailDisplayFetch, error) {
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uid)
 	topHeader := &imap.BodySectionName{BodyPartName: imap.BodyPartName{Specifier: imap.HeaderSpecifier}, Peek: true}
@@ -304,14 +366,40 @@ func fetchMailForDisplay(conn *imapclient.Client, uid uint32) (*imap.Message, []
 		imap.FetchUid, imap.FetchEnvelope, imap.FetchFlags, imap.FetchRFC822Size, imap.FetchBodyStructure, imap.FetchInternalDate, topHeader.FetchItem(),
 	})
 	if err != nil {
-		return nil, nil, false, err
+		return nil, err
 	}
-	fullFetch := func() (*imap.Message, []byte, bool, error) {
-		full, raw, err := fetchRawMail(conn, uid)
-		return full, raw, false, err
+	peek := hasMailFlag(message.Flags, imap.SeenFlag)
+	noteSeen := func(bodies *imap.Message) {
+		if !peek && hasMailFlag(bodies.Flags, imap.SeenFlag) {
+			message.Flags = append(message.Flags, imap.SeenFlag)
+		}
 	}
 	structure := message.BodyStructure
-	if message.Size <= mailDisplayFullFetchMax || structure == nil || len(structure.Parts) == 0 {
+	var leaves []*mailStructureLeaf
+	if structure != nil && len(structure.Parts) > 0 {
+		leaves = mailStructureLeaves(structure)
+	}
+	fullFetch := func() (*mailDisplayFetch, error) {
+		section := &imap.BodySectionName{Peek: peek}
+		full, err := fetchOneMessage(conn, seqset, []imap.FetchItem{imap.FetchFlags, section.FetchItem()})
+		if err != nil {
+			return nil, err
+		}
+		body := full.GetBody(section)
+		if body == nil {
+			return nil, fmt.Errorf("邮件正文读取失败")
+		}
+		raw, err := io.ReadAll(io.LimitReader(body, mailMaxRawMessageSize+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) > mailMaxRawMessageSize {
+			return nil, fmt.Errorf("邮件内容超过 64MB，无法在线打开")
+		}
+		noteSeen(full)
+		return &mailDisplayFetch{message: message, raw: raw, leaves: leaves}, nil
+	}
+	if message.Size <= mailDisplayFullFetchMax || leaves == nil {
 		return fullFetch()
 	}
 	headerLiteral := message.GetBody(topHeader)
@@ -320,27 +408,33 @@ func fetchMailForDisplay(conn *imapclient.Client, uid uint32) (*imap.Message, []
 	}
 	header, err := io.ReadAll(headerLiteral)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, err
 	}
 
-	leaves := mailStructureLeaves(structure)
 	byPath := make(map[string]*mailStructureLeaf, len(leaves))
 	sections := map[string]*imap.BodySectionName{}
-	items := make([]imap.FetchItem, 0, len(leaves))
+	items := []imap.FetchItem{imap.FetchFlags}
+	inlineBudget := int64(mailDisplayInlineBudget)
 	for _, leaf := range leaves {
 		key := fmt.Sprint(leaf.path)
 		byPath[key] = leaf
-		if leaf.info.bodyText || leaf.structure.Size <= mailDisplaySmallPartMax {
-			section := &imap.BodySectionName{BodyPartName: imap.BodyPartName{Path: leaf.path}, Peek: true}
+		size := int64(leaf.structure.Size)
+		include := leaf.info.bodyText || size <= mailDisplaySmallPartMax
+		if !include && leaf.info.contentID != "" && !strings.EqualFold(leaf.structure.Disposition, "attachment") && size <= inlineBudget {
+			inlineBudget -= size
+			include = true
+		}
+		if include {
+			section := &imap.BodySectionName{BodyPartName: imap.BodyPartName{Path: leaf.path}, Peek: peek}
 			sections[key] = section
 			items = append(items, section.FetchItem())
 		}
 	}
 	contents := map[string][]byte{}
-	if len(items) > 0 {
+	if len(sections) > 0 {
 		bodies, err := fetchOneMessage(conn, seqset, items)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, err
 		}
 		for key, section := range sections {
 			literal := bodies.GetBody(section)
@@ -348,9 +442,10 @@ func fetchMailForDisplay(conn *imapclient.Client, uid uint32) (*imap.Message, []
 				return fullFetch()
 			}
 			if contents[key], err = io.ReadAll(literal); err != nil {
-				return nil, nil, false, err
+				return nil, err
 			}
 		}
+		noteSeen(bodies)
 	}
 
 	var out bytes.Buffer
@@ -400,5 +495,5 @@ func fetchMailForDisplay(conn *imapclient.Client, uid uint32) (*imap.Message, []
 	if !writeChildren(nil, structure) {
 		return fullFetch()
 	}
-	return message, out.Bytes(), true, nil
+	return &mailDisplayFetch{message: message, raw: out.Bytes(), pruned: true, leaves: leaves}, nil
 }

@@ -328,25 +328,35 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 		return nil, err
 	}
 	defer func() { releaseIMAP(err) }()
-	if _, err := conn.Select(folder, false); err != nil {
+	if err = selectMailFolder(conn, folder, false); err != nil {
 		return nil, err
 	}
-	message, raw, pruned, err := fetchMailForDisplay(conn, uid)
+	fetched, err := fetchMailForDisplay(conn, uid)
 	if err != nil {
 		return nil, err
 	}
+	message := fetched.message
 	accountID := account.ID
 	partURL := func(partID string) string { return s.mailPartURL(userID, accountID, folder, uid, partID) }
-	parsed, err := s.parseMailDataWithOptions(raw, mailParseOptions{partURL: partURL, pruned: pruned})
+	parsed, err := s.parseMailDataWithOptions(fetched.raw, mailParseOptions{partURL: partURL, pruned: fetched.pruned})
 	if err != nil {
 		return nil, err
 	}
-	// The parts are already in memory: keep them so the previews, body images
-	// and downloads that follow do not fetch the whole message again.
+	leafByAttachment := map[int]*mailStructureLeaf{}
+	for _, leaf := range fetched.leaves {
+		if leaf.attachment > 0 {
+			leafByAttachment[leaf.attachment] = leaf
+		}
+	}
+	// The fetched parts are kept so the previews, body images and downloads
+	// that follow do not fetch them again; omitted parts are cached on demand.
 	for _, attachment := range parsed.Attachments {
 		key := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: attachment.PartID}
-		s.mailPartIndex().put(key, attachment.header.filename, attachment.header.contentType)
-		s.mailAttachmentCache().put(key, mailAttachmentCacheEntry{filename: attachment.Filename, contentType: attachment.ContentType, data: attachment.Data})
+		number, _ := strconv.Atoi(attachment.PartID)
+		s.mailPartIndex().put(key, attachment.header.filename, attachment.header.contentType, leafByAttachment[number])
+		if !attachment.omitted {
+			s.mailAttachmentCache().put(key, mailAttachmentCacheEntry{filename: attachment.Filename, contentType: attachment.ContentType, data: attachment.Data})
+		}
 	}
 	summary := summarizeIMAPMessage(folder, message)
 	if parsed.Subject != "" {
@@ -458,7 +468,7 @@ func (s *MailService) downloadAttachmentUncached(userID int64, folder string, ui
 		return "", "", nil, err
 	}
 	defer func() { releaseIMAP(err) }()
-	if _, err := conn.Select(folder, true); err != nil {
+	if err = selectMailFolder(conn, folder, true); err != nil {
 		return "", "", nil, err
 	}
 	// Fetch just this part when possible; a 20MB attachment of a 60MB message

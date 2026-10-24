@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/microcosm-cc/bluemonday"
@@ -992,7 +993,18 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 	}
 	endpoint := "/v2/users/" + url.PathEscape(account.EmailAddress) + "/messages/" + url.PathEscape(remoteID)
 	query := url.Values{"$select": {aliMailListSelect + ",bccRecipients,replyTo,body,internetMessageHeaders,isReadReceiptRequested"}}
+	var attachments []model.MailAttachment
+	attachmentsDone := make(chan error, 1)
+	go func() {
+		var listErr error
+		attachments, listErr = s.aliMailAttachments(account, remoteID)
+		attachmentsDone <- listErr
+	}()
 	if err := s.aliMailDo(account, http.MethodGet, endpoint, query, nil, &response); err != nil {
+		<-attachmentsDone
+		return nil, err
+	}
+	if err := <-attachmentsDone; err != nil {
 		return nil, err
 	}
 	response.Message.ID = remoteID
@@ -1003,11 +1015,7 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 	if err != nil {
 		return nil, err
 	}
-	attachments, err := s.aliMailAttachments(account, remoteID)
-	if err != nil {
-		return nil, err
-	}
-	bodyHTML := s.aliMailEmbedInlineImages(account, folder, uid, response.Message.Body.HTML, attachments)
+	bodyHTML := s.aliMailEmbedInlineImages(account, folder, uid, remoteID, response.Message.Body.HTML, attachments)
 	detail := &model.MailMessageDetail{
 		MailMessageSummary: summary,
 		CC:                 aliMailAddresses(response.Message.CC), BCC: aliMailAddresses(response.Message.BCC),
@@ -1032,9 +1040,12 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 // API returns cid: references only, which a browser cannot load): small images
 // are embedded, larger ones point to signed part links. It also sets every
 // attachment's link, and marks as inline exactly the images the body shows.
-func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, folder string, uid uint32, htmlValue string, attachments []model.MailAttachment) string {
+func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, folder string, uid uint32, remoteID, htmlValue string, attachments []model.MailAttachment) string {
 	referenced := referencedMailContentIDs(htmlValue)
 	inlineData := map[string]string{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 4)
 	for index := range attachments {
 		attachment := &attachments[index]
 		attachment.URL = s.mailPartURL(account.UserID, account.ID, folder, uid, attachment.PartID)
@@ -1047,18 +1058,29 @@ func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, folde
 		// small ones are embedded, the others load through their link (served
 		// with the image type sniffed from the bytes).
 		attachment.Inline = true
+		mu.Lock()
 		inlineData[contentID] = attachment.URL
+		mu.Unlock()
 		if attachment.Size > mailInlineDataURIMax {
 			continue
 		}
-		_, contentType, data, err := s.aliMailDownloadAttachment(account, uid, attachment.PartID)
-		if err != nil || len(data) == 0 {
-			continue
-		}
-		if imageType := mailInlineImageType(firstNonEmptyMail(attachment.ContentType, contentType), data); imageType != "" {
-			inlineData[contentID] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(data)
-		}
+		wg.Add(1)
+		go func(item model.MailAttachment, contentID string) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			_, contentType, data, err := s.aliMailFetchAttachment(account, remoteID, item.PartID, item.Filename, item.ContentType)
+			if err != nil || len(data) == 0 {
+				return
+			}
+			if imageType := mailInlineImageType(firstNonEmptyMail(item.ContentType, contentType), data); imageType != "" {
+				mu.Lock()
+				inlineData[contentID] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(data)
+				mu.Unlock()
+			}
+		}(*attachment, contentID)
 	}
+	wg.Wait()
 	return replaceMailCIDImages(htmlValue, inlineData)
 }
 
@@ -1114,6 +1136,10 @@ func (s *MailService) aliMailDownloadAttachment(account *model.MailAccount, uid 
 			break
 		}
 	}
+	return s.aliMailFetchAttachment(account, remoteID, attachmentID, filename, contentType)
+}
+
+func (s *MailService) aliMailFetchAttachment(account *model.MailAccount, remoteID, attachmentID, filename, contentType string) (string, string, []byte, error) {
 	token, err := s.aliMailAccessToken(account)
 	if err != nil {
 		return "", "", nil, err
@@ -1124,10 +1150,12 @@ func (s *MailService) aliMailDownloadAttachment(account *model.MailAccount, uid 
 		return "", "", nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
-	client, err := s.aliMailHTTPClient(account)
+	shared, err := s.aliMailHTTPClient(account)
 	if err != nil {
 		return "", "", nil, err
 	}
+	// A copy: the shared client is used concurrently.
+	client := *shared
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	response, err := client.Do(request)
 	if err != nil {

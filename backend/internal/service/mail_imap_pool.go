@@ -18,6 +18,7 @@ const (
 	imapPoolMaxAge        = 10 * time.Minute
 	imapPoolMaxPerAcct    = 3
 	imapPoolVerifyTTL     = 3 * time.Second
+	imapPoolTrustRecent   = 10 * time.Second
 	imapPoolSweepInterval = 30 * time.Second
 )
 
@@ -48,7 +49,7 @@ func (s *MailService) acquireIMAP(session *mailSession) (*imapclient.Client, fun
 		if conn == nil {
 			break
 		}
-		if s.imapConnAlive(conn.client) {
+		if s.imapConnUsable(conn) {
 			conn.lastUsedAt = time.Now()
 			return conn.client, func(opErr error) { s.releaseIMAP(conn, opErr != nil) }, nil
 		}
@@ -141,6 +142,15 @@ func terminatePooledIMAP(conn *pooledIMAPConn) {
 	if conn != nil && conn.client != nil {
 		_ = conn.client.Terminate()
 	}
+}
+
+// imapConnUsable does not probe a connection that completed a command moments
+// ago; the NOOP would add a full round trip to every click.
+func (s *MailService) imapConnUsable(conn *pooledIMAPConn) bool {
+	if time.Since(conn.lastUsedAt) <= imapPoolTrustRecent && conn.client != nil && conn.client.State()&imap.AuthenticatedState != 0 {
+		return true
+	}
+	return s.imapConnAlive(conn.client)
 }
 
 // imapConnAlive probes an idle connection before reuse. NOOP is the cheapest
