@@ -90,6 +90,8 @@ type MailService struct {
 	attachmentCache     *mailAttachmentCache
 	partIndexOnce       sync.Once
 	partIndex           *mailPartIndex
+	messageLocksMu      sync.Mutex
+	messageLocks        map[mailAttachmentCacheKey]*mailMessageLock
 
 	attachmentStore MailAttachmentStore
 }

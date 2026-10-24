@@ -160,6 +160,11 @@ func (s *MailService) fetchMailAttachmentPart(conn *imapclient.Client, key mailA
 		if leaf.attachment != target {
 			continue
 		}
+		// Compare what the headers say: the bytes refine type and default name
+		// only after the fetch, and a large message is listed without them.
+		if listed, known := s.mailPartIndex().get(key); known && (listed.filename != leaf.info.filename || listed.contentType != leaf.info.contentType) {
+			return "", "", nil, false
+		}
 		section := &imap.BodySectionName{BodyPartName: imap.BodyPartName{Path: leaf.path}, Peek: true}
 		message, err := fetchOneMessage(conn, seqset, []imap.FetchItem{section.FetchItem()})
 		if err != nil {
@@ -189,9 +194,6 @@ func (s *MailService) fetchMailAttachmentPart(conn *imapclient.Client, key mailA
 		}
 		info := leaf.info
 		info.finish(target, content)
-		if listed, known := s.mailPartIndex().get(key); known && (listed.filename != info.filename || listed.contentType != info.contentType) {
-			return "", "", nil, false
-		}
 		return info.filename, info.contentType, content, true
 	}
 	return "", "", nil, false

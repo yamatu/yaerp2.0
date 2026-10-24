@@ -1043,13 +1043,12 @@ func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, folde
 		if contentID == "" || !referenced[contentID] {
 			continue
 		}
-		looksLikeImage := strings.HasPrefix(strings.ToLower(attachment.ContentType), "image/") ||
-			strings.HasPrefix(mime.TypeByExtension(filepath.Ext(attachment.Filename)), "image/")
+		// The body shows this part as an image, whatever type it declares:
+		// small ones are embedded, the others load through their link (served
+		// with the image type sniffed from the bytes).
+		attachment.Inline = true
+		inlineData[contentID] = attachment.URL
 		if attachment.Size > mailInlineDataURIMax {
-			if looksLikeImage {
-				inlineData[contentID] = attachment.URL
-				attachment.Inline = true
-			}
 			continue
 		}
 		_, contentType, data, err := s.aliMailDownloadAttachment(account, uid, attachment.PartID)
@@ -1058,7 +1057,6 @@ func (s *MailService) aliMailEmbedInlineImages(account *model.MailAccount, folde
 		}
 		if imageType := mailInlineImageType(firstNonEmptyMail(attachment.ContentType, contentType), data); imageType != "" {
 			inlineData[contentID] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(data)
-			attachment.Inline = true
 		}
 	}
 	return replaceMailCIDImages(htmlValue, inlineData)
