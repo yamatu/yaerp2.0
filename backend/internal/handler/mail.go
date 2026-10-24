@@ -686,6 +686,7 @@ func (h *MailHandler) ServeMailPart(c *gin.Context) {
 		handleMailError(c, err)
 		return
 	}
+	contentType = service.MailServedContentType(contentType, data)
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}

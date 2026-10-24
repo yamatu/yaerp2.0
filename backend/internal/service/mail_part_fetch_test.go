@@ -150,3 +150,46 @@ func TestMailInlineServable(t *testing.T) {
 		}
 	}
 }
+
+// A large message is opened without its big parts. An image the body shows
+// that is declared application/octet-stream has no bytes to recognise it by;
+// it must still be shown through its link.
+func TestOmittedOctetStreamImageBecomesLink(t *testing.T) {
+	raw := strings.Join([]string{
+		"From: a@example.com", "Subject: t", "MIME-Version: 1.0", `Content-Type: multipart/related; boundary="rel"`, "",
+		"--rel", "Content-Type: text/html; charset=utf-8", "", `<p><img id="photo" src="cid:photo@x"></p>`,
+		"--rel", "Content-Type: application/octet-stream", "Content-ID: <photo@x>", "Content-Transfer-Encoding: base64",
+		mailOmittedSizeHeader + ": 2400000", "", "",
+		"--rel--", "",
+	}, "\r\n")
+	service := NewMailService(nil, nil, "test-secret")
+	parsed, err := service.parseMailDataWithOptions([]byte(raw), mailParseOptions{
+		partURL: func(partID string) string { return "/api/mail/file?t=part-" + partID },
+		pruned:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(parsed.HTMLBody, `src="/api/mail/file?t=part-1"`) {
+		t.Fatalf("the omitted image must be a link: %s", parsed.HTMLBody)
+	}
+	attachment := parsed.Attachments[0]
+	if !attachment.Inline || attachment.Size != 2400000 {
+		t.Fatalf("omitted image must be inline with its declared size: %+v", attachment.MailAttachment)
+	}
+	// The index records what the headers say, which a part fetched alone
+	// reproduces before its bytes refine type and name.
+	if attachment.header.contentType != "application/octet-stream" || attachment.header.filename != "" {
+		t.Fatalf("header-level description changed: %+v", attachment.header)
+	}
+}
+
+func TestServedTypeSniffsImages(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n0000IHDR")
+	if got := MailServedContentType("application/octet-stream", png); got != "image/png" {
+		t.Fatalf("octet-stream PNG served as %q", got)
+	}
+	if got := MailServedContentType("application/zip", []byte("PK\x03\x04")); got != "application/zip" {
+		t.Fatalf("a zip must keep its type, got %q", got)
+	}
+}

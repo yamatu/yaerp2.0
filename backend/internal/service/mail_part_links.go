@@ -164,3 +164,12 @@ func (s *MailService) embedMailPartLinks(userID int64, htmlBody string) string {
 		return parts[1] + uri + parts[3]
 	})
 }
+
+// MailServedContentType is the type a part is served with: images declared as
+// application/octet-stream (or without a type) get their real image type.
+func MailServedContentType(contentType string, data []byte) string {
+	if imageType := mailInlineImageType(contentType, data); imageType != "" {
+		return imageType
+	}
+	return contentType
+}

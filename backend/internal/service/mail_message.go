@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -26,6 +27,11 @@ import (
 type parsedMailAttachment struct {
 	model.MailAttachment
 	Data []byte
+	// header is the part as its headers describe it, before the bytes refine
+	// the type and default name; a part fetched alone is checked against it.
+	header    mailPartInfo
+	imageType string
+	omitted   bool
 }
 
 type parsedMailData struct {
@@ -322,25 +328,35 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 		return nil, err
 	}
 	defer func() { releaseIMAP(err) }()
-	if _, err := conn.Select(folder, false); err != nil {
+	if err = selectMailFolder(conn, folder, false); err != nil {
 		return nil, err
 	}
-	message, raw, pruned, err := fetchMailForDisplay(conn, uid)
+	fetched, err := fetchMailForDisplay(conn, uid)
 	if err != nil {
 		return nil, err
 	}
+	message := fetched.message
 	accountID := account.ID
 	partURL := func(partID string) string { return s.mailPartURL(userID, accountID, folder, uid, partID) }
-	parsed, err := s.parseMailDataWithOptions(raw, mailParseOptions{partURL: partURL, pruned: pruned})
+	parsed, err := s.parseMailDataWithOptions(fetched.raw, mailParseOptions{partURL: partURL, pruned: fetched.pruned})
 	if err != nil {
 		return nil, err
 	}
-	// The parts are already in memory: keep them so the previews, body images
-	// and downloads that follow do not fetch the whole message again.
+	leafByAttachment := map[int]*mailStructureLeaf{}
+	for _, leaf := range fetched.leaves {
+		if leaf.attachment > 0 {
+			leafByAttachment[leaf.attachment] = leaf
+		}
+	}
+	// The fetched parts are kept so the previews, body images and downloads
+	// that follow do not fetch them again; omitted parts are cached on demand.
 	for _, attachment := range parsed.Attachments {
 		key := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: attachment.PartID}
-		s.mailPartIndex().put(key, attachment.Filename, attachment.ContentType)
-		s.mailAttachmentCache().put(key, mailAttachmentCacheEntry{filename: attachment.Filename, contentType: attachment.ContentType, data: attachment.Data})
+		number, _ := strconv.Atoi(attachment.PartID)
+		s.mailPartIndex().put(key, attachment.header.filename, attachment.header.contentType, leafByAttachment[number])
+		if !attachment.omitted {
+			s.mailAttachmentCache().put(key, mailAttachmentCacheEntry{filename: attachment.Filename, contentType: attachment.ContentType, data: attachment.Data})
+		}
 	}
 	summary := summarizeIMAPMessage(folder, message)
 	if parsed.Subject != "" {
@@ -452,13 +468,22 @@ func (s *MailService) downloadAttachmentUncached(userID int64, folder string, ui
 		return "", "", nil, err
 	}
 	defer func() { releaseIMAP(err) }()
-	if _, err := conn.Select(folder, true); err != nil {
+	if err = selectMailFolder(conn, folder, true); err != nil {
 		return "", "", nil, err
 	}
 	// Fetch just this part when possible; a 20MB attachment of a 60MB message
 	// then costs 20MB instead of the whole message every time.
 	if filename, contentType, data, ok := s.fetchMailAttachmentPart(conn, mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: partID}); ok {
 		return filename, contentType, data, nil
+	}
+	// The whole message is needed. Several body images of one message are
+	// requested at once: one request downloads it and caches every part, the
+	// others wait for it and are answered from the cache.
+	unlock := s.lockMailMessage(userID, folder, uid)
+	defer unlock()
+	cacheKey := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: partID}
+	if entry, ok := s.mailAttachmentCache().get(cacheKey); ok {
+		return entry.filename, entry.contentType, entry.data, nil
 	}
 	_, raw, err := fetchRawMail(conn, uid)
 	if err != nil {
@@ -468,12 +493,51 @@ func (s *MailService) downloadAttachmentUncached(userID int64, folder string, ui
 	if err != nil {
 		return "", "", nil, err
 	}
-	for _, attachment := range parsed.Attachments {
+	var found *parsedMailAttachment
+	for index := range parsed.Attachments {
+		attachment := &parsed.Attachments[index]
+		key := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid, partID: attachment.PartID}
+		s.mailAttachmentCache().put(key, mailAttachmentCacheEntry{filename: attachment.Filename, contentType: attachment.ContentType, data: attachment.Data})
 		if attachment.PartID == partID {
-			return attachment.Filename, attachment.ContentType, attachment.Data, nil
+			found = attachment
 		}
 	}
-	return "", "", nil, ErrMailMessageNotFound
+	if found == nil {
+		return "", "", nil, ErrMailMessageNotFound
+	}
+	return found.Filename, found.ContentType, found.Data, nil
+}
+
+// lockMailMessage serializes whole-message downloads of one message; the
+// returned function releases the lock.
+func (s *MailService) lockMailMessage(userID int64, folder string, uid uint32) func() {
+	key := mailAttachmentCacheKey{userID: userID, folder: folder, uid: uid}
+	s.messageLocksMu.Lock()
+	if s.messageLocks == nil {
+		s.messageLocks = map[mailAttachmentCacheKey]*mailMessageLock{}
+	}
+	lock := s.messageLocks[key]
+	if lock == nil {
+		lock = &mailMessageLock{}
+		s.messageLocks[key] = lock
+	}
+	lock.waiters++
+	s.messageLocksMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.messageLocksMu.Lock()
+		lock.waiters--
+		if lock.waiters == 0 {
+			delete(s.messageLocks, key)
+		}
+		s.messageLocksMu.Unlock()
+	}
+}
+
+type mailMessageLock struct {
+	mu      sync.Mutex
+	waiters int
 }
 
 func fetchRawMail(conn *imapclient.Client, uid uint32) (*imap.Message, []byte, error) {
@@ -576,6 +640,7 @@ func (s *MailService) parseMailDataWithOptions(raw []byte, options mailParseOpti
 			continue
 		}
 		attachmentIndex++
+		header := info
 		imageType := info.finish(attachmentIndex, content)
 		contentID := info.contentID
 		size := int64(len(content))
@@ -590,17 +655,24 @@ func (s *MailService) parseMailDataWithOptions(raw []byte, options mailParseOpti
 				PartID: strconv.Itoa(attachmentIndex), Filename: info.filename, ContentType: info.contentType,
 				Size: size, ContentID: contentID,
 			},
-			Data: content,
+			Data: content, header: header, imageType: imageType, omitted: omitted,
 		}
 		result.Attachments = append(result.Attachments, attachment)
-		if contentID != "" && imageType != "" {
-			key := normalizeMailContentID(contentID)
-			switch {
-			case options.partURL != nil && (omitted || size > mailInlineDataURIMax):
-				inlineData[key] = options.partURL(attachment.PartID)
-			case !omitted && len(content) <= mailInlineImageMaxSize:
-				inlineData[key] = "data:" + imageType + ";base64," + base64.StdEncoding.EncodeToString(content)
-			}
+	}
+	// Body images: small ones are embedded, others are links. A part the body
+	// references by cid: is shown through its link whatever type it declares;
+	// an omitted part has no bytes to tell, and the browser decides anyway.
+	bodyReferences := referencedMailContentIDs(result.HTMLBody)
+	for _, attachment := range result.Attachments {
+		if attachment.ContentID == "" {
+			continue
+		}
+		key := normalizeMailContentID(attachment.ContentID)
+		switch {
+		case !attachment.omitted && attachment.imageType != "" && (options.partURL == nil || attachment.Size <= mailInlineDataURIMax) && attachment.Size <= mailInlineImageMaxSize:
+			inlineData[key] = "data:" + attachment.imageType + ";base64," + base64.StdEncoding.EncodeToString(attachment.Data)
+		case options.partURL != nil && (attachment.imageType != "" || bodyReferences[key]):
+			inlineData[key] = options.partURL(attachment.PartID)
 		}
 	}
 	senderName := ""
