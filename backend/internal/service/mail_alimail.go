@@ -1270,6 +1270,13 @@ func (s *MailService) aliMailSendMessage(account *model.MailAccount, input *mode
 	if textBody == "" && htmlBody != "" {
 		textBody = bluemonday.StrictPolicy().Sanitize(htmlBody)
 	}
+	// Images in the body go as inline attachments referenced by cid:; many
+	// clients (Gmail among them) refuse data: images.
+	domain := "localhost"
+	if at := strings.LastIndex(account.EmailAddress, "@"); at >= 0 {
+		domain = account.EmailAddress[at+1:]
+	}
+	htmlBody, inlineImages := extractMailInlineImages(s.htmlPolicy.Sanitize(htmlBody), domain)
 	headers := map[string]string{}
 	if value := strings.TrimSpace(input.InReplyTo); value != "" {
 		headers["In-Reply-To"] = "<" + trimMessageID(value) + ">"
@@ -1291,7 +1298,7 @@ func (s *MailService) aliMailSendMessage(account *model.MailAccount, input *mode
 		Subject: strings.TrimSpace(input.Subject), Priority: priority,
 		ReadReceiptRequested: input.RequestReadReceipt,
 		From:                 aliMailRecipient{Email: account.EmailAddress, Name: account.DisplayName},
-		To:                   to, CC: cc, BCC: bcc, Body: aliMailBody{Text: textBody, HTML: s.htmlPolicy.Sanitize(htmlBody)},
+		To:                   to, CC: cc, BCC: bcc, Body: aliMailBody{Text: textBody, HTML: htmlBody},
 		InternetMessageHeaders: headers,
 	}
 	var created struct {
@@ -1305,8 +1312,17 @@ func (s *MailService) aliMailSendMessage(account *model.MailAccount, input *mode
 	if created.Message.ID == "" {
 		return nil, fmt.Errorf("阿里邮箱未返回草稿邮件标识")
 	}
+	for index, image := range inlineImages {
+		inline := MailOutgoingAttachment{
+			Filename:    fmt.Sprintf("image-%d%s", index+1, mailInlineImageExtensions[image.ContentType]),
+			ContentType: image.ContentType, Data: image.Data,
+		}
+		if err := s.aliMailUploadAttachment(account, created.Message.ID, inline, image.ContentID); err != nil {
+			return nil, fmt.Errorf("正文图片上传失败: %w", err)
+		}
+	}
 	for _, attachment := range attachments {
-		if err := s.aliMailUploadAttachment(account, created.Message.ID, attachment); err != nil {
+		if err := s.aliMailUploadAttachment(account, created.Message.ID, attachment, ""); err != nil {
 			return nil, fmt.Errorf("附件 %s 上传失败: %w", attachment.Filename, err)
 		}
 	}
@@ -1339,7 +1355,9 @@ func aliMailRecipients(values []string) ([]aliMailRecipient, error) {
 	return result, nil
 }
 
-func (s *MailService) aliMailUploadAttachment(account *model.MailAccount, messageID string, attachment MailOutgoingAttachment) error {
+// aliMailUploadAttachment adds a file to a draft; with a contentID it is an
+// inline image the body references as cid:contentID.
+func (s *MailService) aliMailUploadAttachment(account *model.MailAccount, messageID string, attachment MailOutgoingAttachment, contentID string) error {
 	filename := sanitizeMailFilename(attachment.Filename)
 	if filename == "" {
 		filename = "attachment"
@@ -1348,7 +1366,11 @@ func (s *MailService) aliMailUploadAttachment(account *model.MailAccount, messag
 	var session struct {
 		UploadURL string `json:"uploadUrl"`
 	}
-	payload := map[string]any{"attachment": map[string]any{"name": filename, "isInline": false}}
+	meta := map[string]any{"name": filename, "isInline": contentID != ""}
+	if contentID != "" {
+		meta["contentId"] = contentID
+	}
+	payload := map[string]any{"attachment": meta}
 	if err := s.aliMailDo(account, http.MethodPost, endpoint, nil, payload, &session); err != nil {
 		return err
 	}

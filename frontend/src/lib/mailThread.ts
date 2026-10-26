@@ -125,9 +125,11 @@ export function buildOutgoingMail(options: {
   htmlBody: string;
   quote: MailQuote | null;
   signatureHTML: string;
+  /** Text part when it is known better than derived from htmlBody. */
+  plainText?: string;
 }): OutgoingMailBody {
   const { format, textBody, htmlBody, quote, signatureHTML } = options;
-  const ownText = format === "html" ? htmlToPlainText(htmlBody) : textBody;
+  const ownText = options.plainText ?? (format === "html" ? htmlToPlainText(htmlBody) : textBody);
   if (!quote?.include) {
     return { html: format === "html" ? htmlBody : "", text: ownText, signatureHTML };
   }

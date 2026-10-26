@@ -21,6 +21,7 @@ import {
   Folder,
   FolderPlus,
   Forward,
+  ImagePlus,
   Inbox,
   Languages,
   Loader2,
@@ -64,6 +65,9 @@ import MailBodyFrame, {
   MAIL_FRAME_ROOT_ID,
   type MailFrameImage,
 } from "@/components/mail/MailBodyFrame";
+import MailComposeEditor, {
+  type MailComposeEditorHandle,
+} from "@/components/mail/MailComposeEditor";
 import MailSignatureEditor from "@/components/mail/MailSignatureEditor";
 import PullToRefresh from "@/components/mail/PullToRefresh";
 import SwipeableRow from "@/components/mail/SwipeableRow";
@@ -77,6 +81,12 @@ import {
   htmlToPlainText,
   type MailQuote,
 } from "@/lib/mailThread";
+import {
+  clearComposeImages,
+  composeEditorMailHTML,
+  hasComposeImages,
+  textToComposeHTML,
+} from "@/lib/mailComposeImages";
 import { getStoredUser, isAdmin } from "@/lib/auth";
 import type { AuthUser } from "@/types";
 
@@ -276,6 +286,8 @@ interface ComposeState {
   bcc: string;
   subject: string;
   textBody: string;
+  /** Content of the body editor (text mode): textBody plus inline images. */
+  textHTML: string;
   htmlBody: string;
   format: "text" | "html";
   inReplyTo: string;
@@ -330,6 +342,7 @@ const emptyCompose: ComposeState = {
   bcc: "",
   subject: "",
   textBody: "",
+  textHTML: "",
   htmlBody: "",
   format: "text",
   inReplyTo: "",
@@ -508,6 +521,23 @@ function textToHTML(value: string) {
   return `<div style="white-space:pre-wrap">${escapeHTML(value)}</div>`;
 }
 
+/** What the body is sent as: text with images in it becomes an HTML mail. */
+function composeBodyParts(compose: ComposeState) {
+  if (compose.format === "text" && hasComposeImages(compose.textHTML)) {
+    return {
+      format: "html" as const,
+      textBody: compose.textBody,
+      htmlBody: composeEditorMailHTML(compose.textHTML),
+      plainText: compose.textBody,
+    };
+  }
+  return {
+    format: compose.format,
+    textBody: compose.textBody,
+    htmlBody: compose.htmlBody,
+  };
+}
+
 function htmlToText(value: string) {
   return htmlToPlainText(value);
 }
@@ -620,7 +650,8 @@ export default function MailPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [compose, setCompose] = useState<ComposeState | null>(null);
   const [composeView, setComposeView] = useState<"edit" | "preview">("edit");
-  const composeBodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const composeBodyRef = useRef<MailComposeEditorHandle | null>(null);
+  const composeImageInputRef = useRef<HTMLInputElement | null>(null);
   // Set when a reply / forward opens, so the caret lands at the top of the
   // empty body ready for typing.
   const focusComposeBodyRef = useRef(false);
@@ -789,28 +820,21 @@ export default function MailPage() {
     compose?.signatureID === "none"
       ? ""
       : activeSignature?.html_content || account?.signature_html || "";
-  const composeOutgoing = useMemo(
-    () =>
-      compose
-        ? buildOutgoingMail({
-            format: compose.format,
-            textBody: compose.textBody,
-            htmlBody: compose.htmlBody,
-            quote: compose.quote,
-            signatureHTML: activeSignatureHTML,
-          })
-        : null,
-    [activeSignatureHTML, compose],
-  );
+  // Only built for the preview: with photos in the body it carries their data.
   const composePreview = useMemo(() => {
-    if (!compose || !composeOutgoing) return "";
-    if (compose.quote?.include) return composeOutgoing.html;
+    if (!compose || composeView !== "preview") return "";
+    const parts = composeBodyParts(compose);
+    if (compose.quote?.include) {
+      return buildOutgoingMail({
+        ...parts,
+        quote: compose.quote,
+        signatureHTML: activeSignatureHTML,
+      }).html;
+    }
     const body =
-      compose.format === "html"
-        ? compose.htmlBody
-        : textToHTML(compose.textBody);
+      parts.format === "html" ? parts.htmlBody : textToHTML(parts.textBody);
     return `${body}${activeSignatureHTML ? `<br><br>${activeSignatureHTML}` : ""}`;
-  }, [activeSignatureHTML, compose, composeOutgoing]);
+  }, [activeSignatureHTML, compose, composeView]);
   const composeQuoteDisplay = useMemo(
     () =>
       compose?.quote ? iframeDocument(decorateMailThread(compose.quote.html)) : "",
@@ -1165,11 +1189,7 @@ export default function MailPage() {
     focusComposeBodyRef.current = false;
     setQuoteExpanded(true);
     const timer = window.setTimeout(() => {
-      const body = composeBodyRef.current;
-      if (!body) return;
-      body.focus();
-      body.setSelectionRange(0, 0);
-      body.scrollTop = 0;
+      composeBodyRef.current?.focusStart();
     }, 60);
     return () => window.clearTimeout(timer);
   }, [compose]);
@@ -1239,6 +1259,9 @@ export default function MailPage() {
   const modalOpen =
     settingsOpen || signaturesOpen || contactsOpen || bulkJobsOpen;
   const composeOpen = Boolean(compose);
+  useEffect(() => {
+    if (!composeOpen) clearComposeImages();
+  }, [composeOpen]);
   const composeDirty =
     Boolean(compose) && JSON.stringify(compose) !== composeSnapshotRef.current;
   const pendingBackRef = useRef<MailHistoryState | null>(null);
@@ -1789,6 +1812,7 @@ export default function MailPage() {
         cc: sentByMe ? addressValues(detail.cc || []) : "",
         subject: detail.subject,
         textBody: detail.text_body,
+        textHTML: textToComposeHTML(detail.text_body),
         htmlBody: detail.html_body || textToHTML(detail.text_body),
         format: detail.html_body ? "html" : "text",
       });
@@ -1863,9 +1887,7 @@ export default function MailPage() {
     try {
       const form = new FormData();
       const outgoing = buildOutgoingMail({
-        format: compose.format,
-        textBody: compose.textBody,
-        htmlBody: compose.htmlBody,
+        ...composeBodyParts(compose),
         quote: compose.quote,
         signatureHTML: activeSignatureHTML,
       });
@@ -5330,7 +5352,7 @@ export default function MailPage() {
                     className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs ${compose.format === "text" ? "bg-slate-900 text-white" : "text-slate-500"}`}
                   >
                     <Type className="h-3.5 w-3.5" />
-                    纯文本
+                    正文
                   </button>
                   <button
                     type="button"
@@ -5342,7 +5364,9 @@ export default function MailPage() {
                               format: "html",
                               htmlBody:
                                 current.htmlBody ||
-                                textToHTML(current.textBody),
+                                (hasComposeImages(current.textHTML)
+                                  ? composeEditorMailHTML(current.textHTML)
+                                  : textToHTML(current.textBody)),
                             }
                           : current,
                       );
@@ -5449,24 +5473,26 @@ export default function MailPage() {
                   className="mt-3 min-h-[40vh] w-full sm:min-h-[42dvh] resize-y rounded-lg border border-slate-200 p-3 font-mono text-sm leading-6 outline-none focus:border-sky-400"
                 />
               ) : (
-                <textarea
+                <MailComposeEditor
                   ref={composeBodyRef}
-                  value={compose.textBody}
-                  onChange={(event) =>
+                  html={compose.textHTML}
+                  onChange={(textHTML, textBody) =>
                     setCompose((current) =>
-                      current
-                        ? { ...current, textBody: event.target.value }
-                        : current,
+                      current ? { ...current, textHTML, textBody } : current,
                     )
                   }
+                  onAttach={(files) =>
+                    setComposeFiles((current) => [...current, ...files])
+                  }
+                  onNotice={setNotice}
                   placeholder={
                     compose.quote
                       ? compose.context === "forward"
                         ? "在这里输入转发说明…"
                         : "在这里输入回复内容…"
-                      : "邮件正文"
+                      : "邮件正文（可直接粘贴截图或拖入图片）"
                   }
-                  className={`mt-3 w-full resize-y rounded-lg border border-slate-200 p-3 text-sm leading-7 outline-none focus:border-sky-400 ${compose.quote ? "min-h-[22vh] sm:min-h-[200px]" : "min-h-[40vh] sm:min-h-[42dvh]"}`}
+                  className={`mt-3 w-full resize-y ${compose.quote ? "min-h-[22vh] sm:min-h-[200px]" : "min-h-[40vh] sm:min-h-[42dvh]"}`}
                 />
               )}
               {compose.quote && composeView === "edit" && (
@@ -5582,6 +5608,30 @@ export default function MailPage() {
                   const files = Array.from(event.target.files || []);
                   setComposeFiles((current) => [...current, ...files]);
                   event.target.value = "";
+                }}
+              />
+              {compose.format === "text" && composeView === "edit" && (
+                <button
+                  type="button"
+                  onClick={() => composeImageInputRef.current?.click()}
+                  className="flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 text-slate-500 hover:bg-slate-100 sm:h-9 sm:w-9 sm:px-0"
+                  title="在正文中插入图片（也可直接粘贴截图）"
+                  aria-label="插入图片"
+                >
+                  <ImagePlus className="h-5 w-5 sm:h-4 sm:w-4" />
+                  <span className="text-xs sm:hidden">图片</span>
+                </button>
+              )}
+              <input
+                ref={composeImageInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={(event) => {
+                  const files = Array.from(event.target.files || []);
+                  event.target.value = "";
+                  void composeBodyRef.current?.insertImages(files);
                 }}
               />
               <span className="min-w-0 flex-1 truncate text-xs text-slate-400">

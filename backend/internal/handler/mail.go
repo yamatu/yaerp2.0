@@ -605,7 +605,9 @@ func (h *MailHandler) CancelBulkJob(c *gin.Context) {
 
 func readMailSendRequest(c *gin.Context) ([]byte, []service.MailOutgoingAttachment, error) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMailSendRequestBytes)
-	if err := c.Request.ParseMultipartForm(8 << 20); err != nil {
+	// Non-file fields may use this plus 10MB; the payload carries the photos
+	// placed in the body as data: URIs.
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		return nil, nil, fmt.Errorf("邮件或附件过大")
 	}
 	if c.Request.MultipartForm != nil {
