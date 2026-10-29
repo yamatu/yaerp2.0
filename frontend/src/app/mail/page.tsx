@@ -29,6 +29,8 @@ import {
   ListFilter,
   Mail,
   MailOpen,
+  Maximize2,
+  Minus,
   Paperclip,
   Pencil,
   Plus,
@@ -521,6 +523,46 @@ function textToHTML(value: string) {
   return `<div style="white-space:pre-wrap">${escapeHTML(value)}</div>`;
 }
 
+const composeDraftKey = () => `yaerp-mail-draft:${getStoredUser()?.id ?? "me"}`;
+
+/**
+ * Keeps the mail being written in localStorage, so a reload or a closed tab
+ * does not lose it. Body images and attachments are files and are not kept.
+ */
+function saveComposeDraft(compose: ComposeState | null) {
+  try {
+    if (!compose) {
+      localStorage.removeItem(composeDraftKey());
+      return;
+    }
+    const draft = {
+      ...compose,
+      textHTML: compose.textHTML.replace(/<img[^>]*data-mail-img="[^"]*"[^>]*>/g, ""),
+    };
+    try {
+      localStorage.setItem(composeDraftKey(), JSON.stringify(draft));
+    } catch {
+      // Over the storage quota (a large quoted mail): keep the own text.
+      localStorage.setItem(composeDraftKey(), JSON.stringify({ ...draft, quote: null }));
+    }
+  } catch {
+    // Storage unavailable (private mode): the draft lives in memory only.
+  }
+}
+
+function loadComposeDraft(): ComposeState | null {
+  try {
+    const raw = localStorage.getItem(composeDraftKey());
+    if (!raw) return null;
+    const draft = { ...emptyCompose, ...(JSON.parse(raw) as Partial<ComposeState>) };
+    const hasContent = [draft.to, draft.cc, draft.bcc, draft.subject, draft.textBody, draft.format === "html" ? draft.htmlBody : ""]
+      .some((value) => value.trim() !== "");
+    return hasContent ? draft : null;
+  } catch {
+    return null;
+  }
+}
+
 /** What the body is sent as: text with images in it becomes an HTML mail. */
 function composeBodyParts(compose: ComposeState) {
   if (compose.format === "text" && hasComposeImages(compose.textHTML)) {
@@ -649,6 +691,9 @@ export default function MailPage() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [compose, setCompose] = useState<ComposeState | null>(null);
+  const [composeMinimized, setComposeMinimized] = useState(false);
+  const composeMinimizedRef = useRef(false);
+  composeMinimizedRef.current = composeMinimized;
   const [composeView, setComposeView] = useState<"edit" | "preview">("edit");
   const composeBodyRef = useRef<MailComposeEditorHandle | null>(null);
   const composeImageInputRef = useRef<HTMLInputElement | null>(null);
@@ -1259,6 +1304,7 @@ export default function MailPage() {
   const modalOpen =
     settingsOpen || signaturesOpen || contactsOpen || bulkJobsOpen;
   const composeOpen = Boolean(compose);
+  const composeVisible = composeOpen && !composeMinimized;
   useEffect(() => {
     if (!composeOpen) clearComposeImages();
   }, [composeOpen]);
@@ -1314,15 +1360,9 @@ export default function MailPage() {
         return;
       }
       if (!next.compose && composeRef.current) {
-        const dirty =
-          JSON.stringify(composeRef.current) !== composeSnapshotRef.current;
-        if (dirty && !window.confirm("放弃这封未发送的邮件？")) {
-          writeMailHistory({ ...next, compose: true }, "push");
-          return;
-        }
-        setCompose(null);
-        setComposeFiles([]);
-      } else if (next.compose && !composeRef.current) {
+        // Back leaves the mail being written in the minimized bar.
+        setComposeMinimized(true);
+      } else if (next.compose && (!composeRef.current || composeMinimizedRef.current)) {
         writeMailHistory({ ...next, compose: false }, "replace");
       }
       if (!next.modal && modalOpenRef.current) closeAllModals();
@@ -1367,7 +1407,7 @@ export default function MailPage() {
   useEffect(() => {
     if (!isMobileViewport()) return;
     const current = readMailHistory();
-    const desired = { ...current, compose: composeOpen, modal: modalOpen };
+    const desired = { ...current, compose: composeVisible, modal: modalOpen };
     if (desired.compose === current.compose && desired.modal === current.modal)
       return;
     const depth = (value: MailHistoryState) =>
@@ -1383,11 +1423,10 @@ export default function MailPage() {
     } else {
       writeMailHistory(desired, "replace");
     }
-  }, [composeOpen, modalOpen]);
+  }, [composeVisible, modalOpen]);
 
   useEffect(() => {
     if (composeOpen) {
-      composeSnapshotRef.current = JSON.stringify(composeRef.current);
       setComposeCcOpen(
         Boolean(composeRef.current?.cc || composeRef.current?.bcc),
       );
@@ -1426,10 +1465,47 @@ export default function MailPage() {
     if (composeDirty && !window.confirm("放弃这封未发送的邮件？")) return;
     setCompose(null);
     setComposeFiles([]);
+    setComposeMinimized(false);
   };
 
+  /** Asks before a new mail replaces one that is being written. */
+  const confirmReplaceCompose = () => {
+    const current = composeRef.current;
+    if (!current || JSON.stringify(current) === composeSnapshotRef.current) return true;
+    if (window.confirm("还有一封未发送的邮件，继续会替换它。要继续吗？")) return true;
+    setComposeMinimized(false);
+    return false;
+  };
+
+  const beginCompose = (next: ComposeState) => {
+    if (composeRef.current) clearComposeImages();
+    composeSnapshotRef.current = JSON.stringify(next);
+    setCompose(next);
+    setComposeMinimized(false);
+  };
+
+  // A draft left by a reload or a closed tab comes back minimized.
+  const draftRestoredRef = useRef(false);
+  useEffect(() => {
+    if (!account || draftRestoredRef.current) return;
+    draftRestoredRef.current = true;
+    if (composeRef.current) return;
+    const draft = loadComposeDraft();
+    if (!draft) return;
+    composeSnapshotRef.current = JSON.stringify(emptyCompose);
+    setCompose(draft);
+    setComposeView("edit");
+    setComposeMinimized(true);
+  }, [account]);
+  useEffect(() => {
+    if (!draftRestoredRef.current) return;
+    const timer = window.setTimeout(() => saveComposeDraft(compose), compose ? 400 : 0);
+    return () => window.clearTimeout(timer);
+  }, [compose]);
+
   const startNewCompose = (bulk = false) => {
-    setCompose({ ...emptyCompose, bulk });
+    if (!confirmReplaceCompose()) return;
+    beginCompose({ ...emptyCompose, bulk });
     setComposeFiles([]);
     setComposeView("edit");
   };
@@ -1781,6 +1857,7 @@ export default function MailPage() {
     detail: MailMessageDetail,
     mode: "reply" | "replyAll" | "forward" | "edit",
   ) => {
+    if (!confirmReplaceCompose()) return;
     const ownAddress = account?.email_address.toLowerCase();
     const baseSubject = detail.subject.replace(/^(re|fwd):\s*/i, "");
     const phone = isMobileViewport();
@@ -1790,7 +1867,7 @@ export default function MailPage() {
     const quote = buildMailQuote(detail);
     if (mode === "forward") {
       focusComposeBodyRef.current = true;
-      setCompose({
+      beginCompose({
         ...emptyCompose,
         context: "forward",
         subject: `Fwd: ${baseSubject}`,
@@ -1805,7 +1882,7 @@ export default function MailPage() {
       const sentByMe = detail.from.some(
         (item) => item.address.toLowerCase() === ownAddress,
       );
-      setCompose({
+      beginCompose({
         ...emptyCompose,
         context: "new",
         to: addressValues(sentByMe ? detail.to : detail.from),
@@ -1833,7 +1910,7 @@ export default function MailPage() {
             )
           : [];
       focusComposeBodyRef.current = true;
-      setCompose({
+      beginCompose({
         ...emptyCompose,
         context: "reply",
         to: addressValues(replyTargets),
@@ -1922,6 +1999,7 @@ export default function MailPage() {
       const wasBulk = compose.bulk;
       setCompose(null);
       setComposeFiles([]);
+      setComposeMinimized(false);
       setNotice(wasBulk ? "群发任务已进入发送队列。" : "邮件已发送。");
       if (wasBulk) {
         setBulkJobsOpen(true);
@@ -2209,7 +2287,8 @@ export default function MailPage() {
           : next;
       });
     } else {
-      setCompose({
+      if (!confirmReplaceCompose()) return;
+      beginCompose({
         ...emptyCompose,
         bulk: selectedContacts.length > 1,
         to: selectedContacts
@@ -2259,7 +2338,8 @@ export default function MailPage() {
   };
 
   const writeToContact = (contact: MailContact) => {
-    setCompose({
+    if (!confirmReplaceCompose()) return;
+    beginCompose({
       ...emptyCompose,
       to: contact.name ? `${contact.name} <${contact.email}>` : contact.email,
     });
@@ -2270,8 +2350,9 @@ export default function MailPage() {
   };
 
   const writeToAddress = (address: MailAddress) => {
+    if (!confirmReplaceCompose()) return;
     const contact = contactsByEmail.get(address.address.toLowerCase());
-    setCompose({
+    beginCompose({
       ...emptyCompose,
       to: contact?.name
         ? `${contact.name} <${address.address}>`
@@ -2586,7 +2667,8 @@ export default function MailPage() {
             <button
               type="button"
               onClick={() => {
-                setCompose({ ...emptyCompose, bulk: true });
+                if (!confirmReplaceCompose()) return;
+                beginCompose({ ...emptyCompose, bulk: true });
                 setComposeFiles([]);
                 setComposeView("edit");
               }}
@@ -5136,14 +5218,71 @@ export default function MailPage() {
         </ModalShell>
       )}
 
+      {compose && composeMinimized && (
+        <div
+          role="region"
+          aria-label="已最小化的邮件"
+          className={`fixed inset-x-2 z-[90] flex items-center gap-1 rounded-lg bg-slate-900 py-1 pl-3 pr-1 text-white shadow-2xl sm:inset-x-auto sm:bottom-0 sm:right-20 sm:w-80 sm:rounded-b-none ${
+            // Above the action bar of an open mail or of a selection on phones.
+            isMobile && (mobilePane === "detail" || mobileSelecting)
+              ? "bottom-[calc(env(safe-area-inset-bottom)+4rem)]"
+              : "bottom-[calc(var(--mobile-tabbar-offset)+0.5rem)]"
+          }`}
+        >
+          <button
+            type="button"
+            onClick={() => setComposeMinimized(false)}
+            className="flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left"
+            title="展开继续编辑"
+          >
+            {compose.bulk ? (
+              <Users className="h-4 w-4 shrink-0 text-sky-300" />
+            ) : (
+              <Pencil className="h-4 w-4 shrink-0 text-sky-300" />
+            )}
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-semibold">
+                {compose.subject.trim() ||
+                  (compose.bulk ? "群发邮件" : "新邮件")}
+              </span>
+              {compose.to.trim() && (
+                <span className="block truncate text-[11px] text-slate-400">
+                  {compose.to}
+                </span>
+              )}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setComposeMinimized(false)}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:h-8 sm:w-8"
+            title="展开"
+            aria-label="展开写邮件"
+          >
+            <Maximize2 className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={closeCompose}
+            disabled={sending}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:h-8 sm:w-8"
+            title="关闭写邮件"
+            aria-label="关闭写邮件"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {compose && (
         <div
           role="dialog"
           aria-modal="true"
           aria-label={compose.bulk ? "群发邮件" : "写邮件"}
-          className="fixed inset-x-0 top-[var(--vv-top)] z-[90] flex h-[var(--vv-height)] items-end justify-center bg-slate-950/40 p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-4"
+          className={`fixed inset-x-0 top-[var(--vv-top)] z-[90] h-[var(--vv-height)] items-end justify-center bg-slate-950/40 p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-4 ${composeMinimized ? "hidden" : "flex"}`}
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) closeCompose();
+            // Clicking beside the window keeps the mail: it is minimized.
+            if (event.target === event.currentTarget) setComposeMinimized(true);
           }}
         >
           <div className="flex h-full w-full max-w-4xl flex-col overflow-hidden bg-white shadow-2xl sm:h-auto sm:max-h-[94dvh] sm:rounded-lg">
@@ -5157,7 +5296,15 @@ export default function MailPage() {
               >
                 <X className="h-5 w-5" />
               </button>
-              <div className="flex items-center gap-2 text-sm font-semibold">
+              <button
+                type="button"
+                onClick={() => setComposeMinimized(true)}
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:hidden"
+                aria-label="最小化写邮件"
+              >
+                <Minus className="h-5 w-5" />
+              </button>
+              <div className="flex flex-1 items-center gap-2 text-sm font-semibold sm:flex-none">
                 {compose.bulk ? (
                   <Users className="h-4 w-4" />
                 ) : (
@@ -5190,10 +5337,20 @@ export default function MailPage() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => setComposeMinimized(true)}
+                  className="hidden h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:flex"
+                  title="最小化（内容会保留，可先去查看、复制其他邮件）"
+                  aria-label="最小化写邮件"
+                >
+                  <Minus className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
                   onClick={closeCompose}
                   disabled={sending}
                   className="hidden h-8 w-8 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:flex"
                   title="关闭写邮件"
+                  aria-label="关闭写邮件"
                 >
                   <X className="h-4 w-4" />
                 </button>
