@@ -881,6 +881,12 @@ func (s *SheetService) UpdateSheetForUserWithSource(userID int64, existing, shee
 	if err := s.sheetRepo.UpdateSheet(sheet); err != nil {
 		return nil, err
 	}
+	if source == "web" && s.history != nil && history != nil {
+		// The editor saves every few seconds and needs no history details in
+		// its answer: record the version after replying.
+		s.history.completeMutationLater(history)
+		return outcome, nil
+	}
 	return outcome, s.finishHistory(history)
 }
 
@@ -1194,6 +1200,16 @@ func (s *SheetService) ValidateCellChangesForUser(userID, sheetID int64, changes
 	if err := applySheetLifecycleState(sheet); err != nil {
 		return err
 	}
+	return s.ValidateCellChangesForSheet(userID, sheet, changes)
+}
+
+// ValidateCellChangesForSheet is ValidateCellChangesForUser for a caller that
+// already loaded the sheet (with its lifecycle state applied).
+func (s *SheetService) ValidateCellChangesForSheet(userID int64, sheet *model.Sheet, changes []model.CellUpdate) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	sheetID := sheet.ID
 	if err := s.ensureSheetModificationAllowed(sheet, userID); err != nil {
 		return err
 	}
@@ -1610,11 +1626,16 @@ func mergeConcurrentCellValues(existingConfig, nextConfig, columns json.RawMessa
 			if _, changed := localChanges[rowKey+":"+columnKey]; changed {
 				continue
 			}
+			nextCellRaw, hasNextCell := nextRow[columnKey]
+			// Nearly every cell comes back unchanged; settle those without
+			// decoding either side.
+			if hasNextCell && sameJSONText(existingCellRaw, nextCellRaw) {
+				continue
+			}
 			existingFields, ok := decodeCellValueFields(existingCellRaw)
 			if !ok {
 				continue
 			}
-			nextCellRaw, hasNextCell := nextRow[columnKey]
 			if !hasNextCell {
 				// The client dropped the cell even though it never edited it.
 				// Restore the server value so concurrent edits are not erased.
@@ -2921,6 +2942,38 @@ func univerSheetDimensions(config json.RawMessage) (int, int) {
 	if len(config) == 0 {
 		return 0, 0
 	}
+	// Only the sizes and the cell positions are needed: cells stay undecoded.
+	var payload struct {
+		Sheet *struct {
+			RowCount    json.Number                           `json:"rowCount"`
+			ColumnCount json.Number                           `json:"columnCount"`
+			CellData    map[string]map[string]json.RawMessage `json:"cellData"`
+		} `json:"univerSheetData"`
+	}
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return univerSheetDimensionsLoose(config)
+	}
+	if payload.Sheet == nil {
+		return 0, 0
+	}
+	rowCount := numericDimension(payload.Sheet.RowCount)
+	columnCount := numericDimension(payload.Sheet.ColumnCount)
+	for rowKey, row := range payload.Sheet.CellData {
+		if rowIndex, err := strconv.Atoi(rowKey); err == nil && rowIndex+1 > rowCount {
+			rowCount = rowIndex + 1
+		}
+		for columnKey := range row {
+			if columnIndex, err := strconv.Atoi(columnKey); err == nil && columnIndex+1 > columnCount {
+				columnCount = columnIndex + 1
+			}
+		}
+	}
+	return rowCount, columnCount
+}
+
+// univerSheetDimensionsLoose reads snapshots whose cell rows are not all
+// objects, which the typed decode above rejects.
+func univerSheetDimensionsLoose(config json.RawMessage) (int, int) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(config, &payload); err != nil {
 		return 0, 0
@@ -2955,8 +3008,11 @@ func numericDimension(value interface{}) int {
 	case int:
 		return typed
 	case json.Number:
-		parsed, _ := strconv.Atoi(typed.String())
-		return parsed
+		parsed, err := typed.Float64()
+		if err != nil {
+			return 0
+		}
+		return int(parsed)
 	default:
 		return 0
 	}
@@ -2986,8 +3042,7 @@ func (s *SheetService) ensureCellMutationsAuthorized(userID int64, existing, nex
 		return nil
 	}
 
-	currentCells := extractUniverCellData(existing.Config)
-	nextCells := extractUniverCellData(next.Config)
+	currentCells, nextCells := changedUniverCells(existing.Config, next.Config)
 	if len(currentCells) == 0 && len(nextCells) == 0 {
 		return nil
 	}
@@ -3087,6 +3142,102 @@ func (s *SheetService) checkProtectionByWorksheetRow(config json.RawMessage, wor
 	}
 
 	return false, "", nil
+}
+
+// changedUniverCells returns, keyed "row:column", the cells that differ
+// between two snapshots (canonical JSON of each side; "" where a side has no
+// cell). Unchanged cells are settled on their raw text, so a save of a large
+// sheet does not decode every cell of both snapshots.
+func changedUniverCells(currentConfig, nextConfig json.RawMessage) (map[string]string, map[string]string) {
+	current, currentOK := rawUniverCells(currentConfig)
+	next, nextOK := rawUniverCells(nextConfig)
+	if !currentOK || !nextOK {
+		return changedCellsOnly(extractUniverCellData(currentConfig), extractUniverCellData(nextConfig))
+	}
+	canonical := func(raw json.RawMessage) string {
+		var value any
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return string(raw)
+		}
+		encoded, _ := json.Marshal(value)
+		return string(encoded)
+	}
+	currentChanged := map[string]string{}
+	nextChanged := map[string]string{}
+	visit := func(rowKey, columnKey string) {
+		key := rowKey + ":" + columnKey
+		if _, done := currentChanged[key]; done {
+			return
+		}
+		if _, done := nextChanged[key]; done {
+			return
+		}
+		currentRaw, inCurrent := current[rowKey][columnKey]
+		nextRaw, inNext := next[rowKey][columnKey]
+		if inCurrent && inNext && sameJSONText(currentRaw, nextRaw) {
+			return
+		}
+		currentValue, nextValue := "", ""
+		if inCurrent {
+			currentValue = canonical(currentRaw)
+		}
+		if inNext {
+			nextValue = canonical(nextRaw)
+		}
+		if currentValue != nextValue {
+			currentChanged[key] = currentValue
+			nextChanged[key] = nextValue
+		}
+	}
+	for rowKey, row := range current {
+		for columnKey := range row {
+			visit(rowKey, columnKey)
+		}
+	}
+	for rowKey, row := range next {
+		for columnKey := range row {
+			visit(rowKey, columnKey)
+		}
+	}
+	return currentChanged, nextChanged
+}
+
+// rawUniverCells decodes the cell map of a snapshot without decoding cells.
+// ok is false when the snapshot has a shape the typed decode cannot read.
+func rawUniverCells(config json.RawMessage) (map[string]map[string]json.RawMessage, bool) {
+	if len(config) == 0 {
+		return nil, true
+	}
+	var payload struct {
+		Sheet *struct {
+			CellData map[string]map[string]json.RawMessage `json:"cellData"`
+		} `json:"univerSheetData"`
+	}
+	if err := json.Unmarshal(config, &payload); err != nil {
+		return nil, false
+	}
+	if payload.Sheet == nil {
+		return nil, true
+	}
+	return payload.Sheet.CellData, true
+}
+
+func changedCellsOnly(current, next map[string]string) (map[string]string, map[string]string) {
+	currentChanged := map[string]string{}
+	nextChanged := map[string]string{}
+	for key, value := range current {
+		if next[key] != value {
+			currentChanged[key] = value
+			nextChanged[key] = next[key]
+		}
+	}
+	for key, value := range next {
+		if _, seen := current[key]; !seen {
+			currentChanged[key] = ""
+			nextChanged[key] = value
+		}
+	}
+	return currentChanged, nextChanged
 }
 
 func extractUniverCellData(config json.RawMessage) map[string]string {

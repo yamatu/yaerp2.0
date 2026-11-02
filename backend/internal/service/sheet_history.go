@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,42 @@ type SheetHistoryService struct {
 	sheetRepo   *repo.SheetRepo
 	permService *PermissionService
 	normalized  normalizedSnapshotCache
+
+	// pending serialises deferred history recording per sheet, so a mutation
+	// only starts once the previous one of the same sheet has been recorded.
+	pendingMu sync.Mutex
+	pending   map[int64]*sync.Mutex
+}
+
+func (s *SheetHistoryService) sheetLock(sheetID int64) *sync.Mutex {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.pending == nil {
+		s.pending = make(map[int64]*sync.Mutex)
+	}
+	lock := s.pending[sheetID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.pending[sheetID] = lock
+	}
+	return lock
+}
+
+// completeMutationLater records the mutation after the caller has answered.
+// The sheet's lock is taken before returning, so a following prepareMutation
+// waits until this one is recorded and versions stay in order.
+func (s *SheetHistoryService) completeMutationLater(history *sheetMutationHistory) {
+	if s == nil || history == nil || s.historyRepo == nil {
+		return
+	}
+	lock := s.sheetLock(history.SheetID)
+	lock.Lock()
+	go func() {
+		defer lock.Unlock()
+		if err := s.completeMutation(history); err != nil {
+			log.Printf("record history of sheet %d: %v", history.SheetID, err)
+		}
+	}()
 }
 
 // normalizedSheetSnapshot is a sheet snapshot decoded and canonicalised once.
@@ -41,6 +78,20 @@ type normalizedSheetSnapshot struct {
 	Normalized json.RawMessage
 	Snapshot   *model.SheetVersionSnapshot
 	Checksum   string
+
+	// The parts the history diff compares, derived once: the state after one
+	// save is the state before the next, so it is diffed twice.
+	diffOnce      sync.Once
+	diffRows      map[int]json.RawMessage
+	diffConfigRaw json.RawMessage
+}
+
+func (n *normalizedSheetSnapshot) diffParts() (map[int]json.RawMessage, json.RawMessage) {
+	n.diffOnce.Do(func() {
+		n.diffRows = versionRowsForDiff(n.Snapshot)
+		n.diffConfigRaw = configWithoutCells(n.Snapshot.Sheet.Config)
+	})
+	return n.diffRows, n.diffConfigRaw
 }
 
 func normalizeSheetSnapshot(raw json.RawMessage) (*normalizedSheetSnapshot, error) {
@@ -116,6 +167,10 @@ func (s *SheetHistoryService) prepareMutation(userID, sheetID int64, source, act
 	if s == nil || s.historyRepo == nil {
 		return nil, nil
 	}
+	// Wait for a deferred recording of the previous mutation of this sheet.
+	lock := s.sheetLock(sheetID)
+	lock.Lock()
+	lock.Unlock() //nolint:staticcheck // only waits
 	raw, err := s.historyRepo.LoadSheetSnapshot(sheetID)
 	if err != nil {
 		return nil, err
@@ -166,7 +221,9 @@ func (s *SheetHistoryService) completeMutation(history *sheetMutationHistory) er
 	}
 
 	metadata := metadataMap(history.Metadata)
-	diff := buildSheetVersionDiff(history.Before.Snapshot, after.Snapshot, 100)
+	beforeRows, beforeConfig := history.Before.diffParts()
+	afterRows, afterConfig := after.diffParts()
+	diff := diffSheetVersionParts(history.Before.Snapshot, after.Snapshot, beforeRows, afterRows, beforeConfig, afterConfig, 100)
 	metadata["changed_cells"] = diff.ChangedCells
 	metadata["added_rows"] = diff.AddedRows
 	metadata["removed_rows"] = diff.RemovedRows
@@ -606,6 +663,13 @@ func canonicalJSON(raw json.RawMessage) (json.RawMessage, any, error) {
 }
 
 func buildSheetVersionDiff(version, current *model.SheetVersionSnapshot, limit int) *model.SheetVersionDiff {
+	return diffSheetVersionParts(version, current, versionRowsForDiff(version), versionRowsForDiff(current),
+		configWithoutCells(version.Sheet.Config), configWithoutCells(current.Sheet.Config), limit)
+}
+
+// diffSheetVersionParts is buildSheetVersionDiff with the rows and cell-free
+// configs of both versions already derived.
+func diffSheetVersionParts(version, current *model.SheetVersionSnapshot, oldRows, newRows map[int]json.RawMessage, oldConfig, newConfig json.RawMessage, limit int) *model.SheetVersionDiff {
 	diff := &model.SheetVersionDiff{FieldChanges: make([]model.SheetVersionFieldChange, 0), CellChanges: make([]model.SheetVersionCellChange, 0)}
 	fields := []struct {
 		name string
@@ -616,7 +680,7 @@ func buildSheetVersionDiff(version, current *model.SheetVersionSnapshot, limit i
 		{name: "sort_order", old: version.Sheet.SortOrder, new: current.Sheet.SortOrder},
 		{name: "columns", old: version.Sheet.Columns, new: current.Sheet.Columns},
 		{name: "frozen", old: version.Sheet.Frozen, new: current.Sheet.Frozen},
-		{name: "config", old: configWithoutCells(version.Sheet.Config), new: configWithoutCells(current.Sheet.Config)},
+		{name: "config", old: oldConfig, new: newConfig},
 	}
 	for _, field := range fields {
 		oldValue, _ := json.Marshal(field.old)
@@ -630,8 +694,6 @@ func buildSheetVersionDiff(version, current *model.SheetVersionSnapshot, limit i
 		diff.FieldChanges = append(diff.FieldChanges, model.SheetVersionFieldChange{Field: field.name, OldValue: oldValue, NewValue: newValue})
 	}
 
-	oldRows := versionRowsForDiff(version)
-	newRows := versionRowsForDiff(current)
 	rowIndexes := make([]int, 0, len(oldRows)+len(newRows))
 	seen := make(map[int]struct{})
 	for row := range oldRows {
@@ -780,10 +842,15 @@ func compactFieldChanges(changes []model.SheetVersionFieldChange, limit int) []m
 }
 
 func jsonValuesEqual(left, right json.RawMessage) bool {
+	// Rows of normalised snapshots are canonical JSON, so equal rows are
+	// byte-identical and almost every row of a save is decided here.
+	if bytes.Equal(left, right) {
+		return true
+	}
 	var leftValue any
 	var rightValue any
 	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
-		return bytes.Equal(left, right)
+		return false
 	}
 	return valuesEqual(leftValue, rightValue)
 }

@@ -15,6 +15,22 @@ export function resolveMailPartLinks(html: string) {
   return html.split('"/api/mail/file?').join('"' + resolveApiPath('/api/mail/file?'))
 }
 
+// JSON bodies above this size are sent gzip-compressed. A sheet save carries
+// the whole worksheet (hundreds of KB), which compresses about tenfold.
+const GZIP_REQUEST_MIN_BYTES = 32 * 1024
+
+let gzipRequestsSupported =
+  typeof CompressionStream !== 'undefined' && typeof Blob !== 'undefined' && typeof Response !== 'undefined'
+
+async function gzipText(text: string): Promise<ArrayBuffer | null> {
+  try {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))
+    return await new Response(stream).arrayBuffer()
+  } catch {
+    return null
+  }
+}
+
 class ApiClient {
   private getToken(): string | null {
     if (typeof window === 'undefined') return null
@@ -80,6 +96,31 @@ class ApiClient {
     return res.json()
   }
 
+  /** Sends a JSON body, compressed when it is large and the browser can. */
+  private async requestJSON<T>(endpoint: string, method: string, body?: unknown): Promise<ApiResponse<T>> {
+    const text = body ? JSON.stringify(body) : undefined
+    if (text && text.length >= GZIP_REQUEST_MIN_BYTES && gzipRequestsSupported) {
+      const compressed = await gzipText(text)
+      if (compressed) {
+        const res = await this.requestRaw(endpoint, {
+          method,
+          body: compressed,
+          headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+        })
+        // A server without gzip support cannot parse the body ("invalid
+        // request body"): send it as is, and keep doing so if that works.
+        // Other refusals (validation messages) are answers, not retried.
+        if (res.status !== 400 && res.status !== 415) return res.json()
+        const answer = (await res.clone().json().catch(() => null)) as { message?: string } | null
+        if (res.status === 400 && answer && !/invalid|gzip/i.test(answer.message || '')) return answer as ApiResponse<T>
+        const plain = await this.requestRaw(endpoint, { method, body: text })
+        if (plain.status !== 400 && plain.status !== 415) gzipRequestsSupported = false
+        return plain.json()
+      }
+    }
+    return this.request<T>(endpoint, { method, body: text })
+  }
+
   private async refreshToken(): Promise<boolean> {
     const refreshToken = typeof window !== 'undefined'
       ? localStorage.getItem('refresh_token')
@@ -119,17 +160,11 @@ class ApiClient {
   }
 
   post<T>(endpoint: string, body?: unknown) {
-    return this.request<T>(endpoint, {
-      method: 'POST',
-      body: body ? JSON.stringify(body) : undefined,
-    })
+    return this.requestJSON<T>(endpoint, 'POST', body)
   }
 
   put<T>(endpoint: string, body?: unknown) {
-    return this.request<T>(endpoint, {
-      method: 'PUT',
-      body: body ? JSON.stringify(body) : undefined,
-    })
+    return this.requestJSON<T>(endpoint, 'PUT', body)
   }
 
   delete<T>(endpoint: string) {

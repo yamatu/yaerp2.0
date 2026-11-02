@@ -295,6 +295,7 @@ func main() {
 	// Middleware
 	r.Use(middleware.CORSMiddleware(cfg.Server.AllowedOrigins))
 	r.Use(middleware.RequestBodyLimit(cfg.Debug.MaxRequestBytes))
+	r.Use(middleware.DecompressRequestBody(cfg.Debug.MaxRequestBytes))
 	r.Use(middleware.RateLimitMiddleware(100))
 	diagnostics.Register(r, cfg.Debug.PprofEnabled, cfg.Debug.PprofToken, db.Stats, hub.ClientCount, hub.DroppedBroadcastCount, hub.SlowClientCount)
 

@@ -580,6 +580,28 @@ function composeBodyParts(compose: ComposeState) {
   };
 }
 
+/** Copies text; falls back to execCommand where the Clipboard API is missing (plain http). */
+async function copyToClipboard(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Permission denied: try the fallback below.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  return copied;
+}
+
 function htmlToText(value: string) {
   return htmlToPlainText(value);
 }
@@ -740,6 +762,18 @@ export default function MailPage() {
   const [correspondenceContact, setCorrespondenceContact] =
     useState<MailContact | null>(null);
   const [senderCardOpen, setSenderCardOpen] = useState(false);
+  const [copiedAddress, setCopiedAddress] = useState("");
+  const copyAddress = async (address: string) => {
+    if (await copyToClipboard(address)) {
+      setCopiedAddress(address);
+      window.setTimeout(
+        () => setCopiedAddress((current) => (current === address ? "" : current)),
+        1800,
+      );
+    } else {
+      setError("复制失败，请手动选择邮箱地址复制。");
+    }
+  };
   const [contextMenu, setContextMenu] = useState<MessageContextMenu | null>(
     null,
   );
@@ -3869,18 +3903,36 @@ export default function MailPage() {
                               <div className="truncate text-sm font-semibold text-slate-900">
                                 {mailAddressLabel([selectedSenderAddress])}
                               </div>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void navigator.clipboard.writeText(
-                                    selectedSenderAddress.address,
-                                  )
-                                }
-                                className="mt-1 break-all text-left text-xs text-sky-700 hover:underline"
-                                title="复制邮箱地址"
-                              >
-                                {selectedSenderAddress.address}
-                              </button>
+                              <div className="mt-1 flex items-start gap-1.5">
+                                <span className="min-w-0 select-all break-all pt-0.5 text-xs text-sky-700">
+                                  {selectedSenderAddress.address}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void copyAddress(selectedSenderAddress.address)
+                                  }
+                                  className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-md border px-1.5 text-[11px] font-medium transition ${
+                                    copiedAddress === selectedSenderAddress.address
+                                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                      : "border-slate-200 text-slate-500 hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700"
+                                  }`}
+                                  title="复制邮箱地址"
+                                  aria-label="复制邮箱地址"
+                                >
+                                  {copiedAddress === selectedSenderAddress.address ? (
+                                    <>
+                                      <Check className="h-3 w-3" />
+                                      已复制
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy className="h-3 w-3" />
+                                      复制
+                                    </>
+                                  )}
+                                </button>
+                              </div>
                               {selectedSenderContact?.company && (
                                 <div className="mt-1 truncate text-xs text-slate-400">
                                   {selectedSenderContact.company}

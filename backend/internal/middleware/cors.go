@@ -17,6 +17,7 @@ func CORSMiddleware(allowedOrigins []string) gin.HandlerFunc {
 			"Origin",
 			"Content-Type",
 			"Content-Length",
+			"Content-Encoding",
 			"Accept",
 			"Accept-Encoding",
 			"Authorization",
