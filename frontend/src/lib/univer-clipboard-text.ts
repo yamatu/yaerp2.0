@@ -183,7 +183,7 @@ export interface DisposableLike {
 }
 
 interface ClipboardInterfaceLike {
-  write?: (text: string, html: string) => Promise<void> | void
+  write?: (text: string, html: string, customData?: Record<string, string>) => Promise<void> | void
 }
 
 /**
@@ -233,31 +233,48 @@ function legacyCopy(text: string, html: string): boolean {
  * that paste an image by default. The image is optional: when the range is too
  * large or the browser refuses image flavours, text and HTML are written alone.
  */
-export async function writeSheetClipboard(text: string, html: string): Promise<void> {
+export async function writeSheetClipboard(text: string, html: string, customData?: Record<string, string>): Promise<void> {
   const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined
   const ItemConstructor = typeof ClipboardItem !== 'undefined' ? ClipboardItem : undefined
   if (!clipboard || typeof clipboard.write !== 'function' || !ItemConstructor) {
     if (!legacyCopy(text, html)) throw new Error('Clipboard is not available')
     return
   }
+  const supports = (ItemConstructor as unknown as { supports?: (type: string) => boolean }).supports
+  const isSupported = (type: string) => typeof supports === 'function' && supports.call(ItemConstructor, type)
+  // Univer's own flavours (formulas for pasting into another sheet) are
+  // custom "web " types. Current browsers accept them (Safari ignores them),
+  // older Safari - recognisable by the missing ClipboardItem.supports - fails
+  // the whole write, so they are left out there.
+  const customItems = typeof supports === 'function'
+    ? Object.fromEntries(Object.entries(customData ?? {}).map(([type, value]) => [type, new Blob([value], { type })]))
+    : {}
   const textItems = {
     'text/plain': new Blob([text], { type: 'text/plain' }),
     'text/html': new Blob([html], { type: 'text/html' }),
+    ...customItems,
   }
-  const supports = (ItemConstructor as unknown as { supports?: (type: string) => boolean }).supports
-  const imageSupported = typeof supports !== 'function' || supports.call(ItemConstructor, 'image/png')
+  const imageSupported = typeof supports !== 'function' || isSupported('image/png')
+  // Decided before the first write: Safari only accepts a clipboard write
+  // made directly from the key press or click, so a second write after a
+  // failed one is refused there. A range too large for a picture is written
+  // as text and HTML straight away instead of failing first.
+  let image: Promise<Blob> | null = null
   if (imageSupported) {
+    try {
+      image = renderClipboardTableImage(html)
+    } catch {
+      image = null
+    }
+  }
+  if (image) {
     try {
       // Handed over as a promise so the write starts inside the user gesture
       // while the bitmap is still being encoded.
-      const image = renderClipboardTableImage(html).then((blob) => {
-        if (!blob) throw new Error('No clipboard image for this range')
-        return blob
-      })
       await clipboard.write([new ItemConstructor({ ...textItems, 'image/png': image })])
       return
     } catch {
-      // Too large, unsupported or rejected: fall back to text and HTML only.
+      // The image flavour was rejected (Chrome allows the retry below).
     }
   }
   await clipboard.write([new ItemConstructor(textItems)])
@@ -555,19 +572,28 @@ export function registerQuotedClipboardFixes(
     const clipboardInterface = injector.get<ClipboardInterfaceLike | null | undefined>(IClipboardInterfaceService)
     if (clipboardInterface && typeof clipboardInterface.write === 'function') {
       const originalWrite = clipboardInterface.write
-      const patchedWrite = function patchedWrite(this: ClipboardInterfaceLike, text: string, html: string) {
+      const patchedWrite = function patchedWrite(this: ClipboardInterfaceLike, text: string, html: string, customData?: Record<string, string>) {
         const copy = lastSheetCopy
         lastSheetCopy = null
-        if (!copy || copy.html !== html) return originalWrite.call(this, text, html)
-        return writeSheetClipboard(text, html).catch((error) => {
+        // Univer writes the copied table wrapped in an Excel HTML envelope.
+        const copiedTable = copy?.html.match(/<table[\s\S]*<\/table>/)?.[0] ?? copy?.html
+        if (!copy || !copiedTable || (html !== copy.html && !html.includes(copiedTable))) {
+          return originalWrite.call(this, text, html, customData)
+        }
+        return writeSheetClipboard(text, html, customData).catch((error) => {
           console.warn('Failed to write the sheet clipboard, using the default copy:', error)
-          return originalWrite.call(this, text, html)
+          return originalWrite.call(this, text, html, customData)
         })
       }
-      clipboardInterface.write = patchedWrite
+      // The service is a lazy DI proxy: a plain assignment is forwarded to the
+      // hidden instance while reads keep returning the method the proxy cached,
+      // so the override has to be defined on the proxy itself.
+      const setWrite = (write: ClipboardInterfaceLike['write']) =>
+        Object.defineProperty(clipboardInterface, 'write', { value: write, writable: true, configurable: true })
+      setWrite(patchedWrite)
       disposables.push({
         dispose: () => {
-          if (clipboardInterface.write === patchedWrite) clipboardInterface.write = originalWrite
+          if (clipboardInterface.write === patchedWrite) setWrite(originalWrite)
         },
       })
     }
