@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -45,8 +46,28 @@ func parseSheetLifecycleState(config json.RawMessage) (map[string]interface{}, s
 	return payload, state, nil
 }
 
+// readSheetLifecycleState decodes only the sheetState field. The config also
+// holds the whole worksheet, which this skips instead of building it in memory.
+func readSheetLifecycleState(config json.RawMessage) (sheetLifecycleState, error) {
+	var payload struct {
+		State json.RawMessage `json:"sheetState"`
+	}
+	if len(config) > 0 {
+		if err := json.Unmarshal(config, &payload); err != nil {
+			return sheetLifecycleState{}, fmt.Errorf("parse sheet state config: %w", err)
+		}
+	}
+	state := sheetLifecycleState{}
+	if len(payload.State) > 0 && !bytes.Equal(bytes.TrimSpace(payload.State), []byte("null")) {
+		if err := json.Unmarshal(payload.State, &state); err != nil {
+			return sheetLifecycleState{}, fmt.Errorf("parse sheet lifecycle state: %w", err)
+		}
+	}
+	return state, nil
+}
+
 func applySheetLifecycleState(sheet *model.Sheet) error {
-	_, state, err := parseSheetLifecycleState(sheet.Config)
+	state, err := readSheetLifecycleState(sheet.Config)
 	if err != nil {
 		return err
 	}

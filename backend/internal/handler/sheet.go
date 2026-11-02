@@ -558,7 +558,7 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		}
 		response.Forbidden(c, message)
 	}
-	if err := h.sheetService.ValidateCellChangesForUser(userID, id, req.CellChanges); err != nil {
+	if err := h.sheetService.ValidateCellChangesForSheet(userID, existing, req.CellChanges); err != nil {
 		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
 			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
 			forbidSave(err.Error())
@@ -596,7 +596,10 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		return
 	}
 	cellResult.AppliedChanges = req.CellChanges
-	if !sheetChanged(existing, sheet) {
+	// The editor only saves when something changed. Comparing the whole stored
+	// snapshot with the new one cost more than the save itself, so it only
+	// guards saves that list no cell edits.
+	if len(req.CellChanges) == 0 && !req.StructureChanged && !sheetChanged(existing, sheet) {
 		response.OK(c, cellResult)
 		return
 	}
