@@ -549,10 +549,19 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	if req.Config != nil {
 		sheet.Config = *req.Config
 	}
+	// A refused layout change cannot be retried: the client reloads the saved
+	// sheet instead of keeping rows that will never save.
+	forbidSave := func(message string) {
+		if req.StructureChanged {
+			response.ErrorCode(c, http.StatusForbidden, "sheet_structure_denied", message)
+			return
+		}
+		response.Forbidden(c, message)
+	}
 	if err := h.sheetService.ValidateCellChangesForUser(userID, id, req.CellChanges); err != nil {
 		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
 			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
-			response.Forbidden(c, err.Error())
+			forbidSave(err.Error())
 			return
 		}
 		response.ServerError(c, err.Error())
@@ -571,7 +580,7 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 		}
 		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
 			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) || errors.Is(err, service.ErrSheetStateDenied) {
-			response.Forbidden(c, err.Error())
+			forbidSave(err.Error())
 			return
 		}
 		if errors.Is(err, service.ErrAutomationInvalid) {
@@ -593,16 +602,9 @@ func (h *SheetHandler) UpdateSheet(c *gin.Context) {
 	}
 	outcome, err := h.sheetService.UpdateSheetForUserWithOps(userID, existing, sheet, req.StructureOps)
 	if err != nil {
-		if errors.Is(err, service.ErrProtectionDenied) {
-			response.Forbidden(c, err.Error())
-			return
-		}
-		if errors.Is(err, service.ErrSheetPermissionDenied) {
-			response.Forbidden(c, err.Error())
-			return
-		}
-		if errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
-			response.Forbidden(c, err.Error())
+		if errors.Is(err, service.ErrProtectionDenied) || errors.Is(err, service.ErrSheetPermissionDenied) ||
+			errors.Is(err, service.ErrSheetLocked) || errors.Is(err, service.ErrSheetArchived) {
+			forbidSave(err.Error())
 			return
 		}
 		response.ServerError(c, err.Error())
