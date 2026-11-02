@@ -32,6 +32,7 @@ import { installCellEditorAlignmentRecalculation, registerEditorComposedStyleInt
 import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
 import { registerPasteNotifier, registerPlainTextPaste, registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
 import { skipEditorTextRepaints } from '@/lib/univer-render-dirty'
+import { registerUniverInputRecovery } from '@/lib/univer-input-recovery'
 import { describeFormulaError, registerFormulaErrorHint, type FormulaErrorHint } from '@/lib/univer-formula-error-hint'
 import FormulaErrorTooltip from '@/components/spreadsheet/FormulaErrorTooltip'
 import FormulaConsistencyBanner from '@/components/spreadsheet/FormulaConsistencyBanner'
@@ -4246,6 +4247,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         // editor services are only instantiated while the first unit is
         // created, so wire up the alignment fixes once the workbook exists.
         const editorRepaintFilter = skipEditorTextRepaints(univerResult.univer, workbookApi.getId())
+        const inputRecovery = containerRef.current
+          ? registerUniverInputRecovery(univerResult.univer, workbookApi.getId(), containerRef.current, (what) => {
+            console.info(`[sheet-input] recovered ${what === 'composition' ? 'an unfinished input method composition' : 'keyboard shortcuts after a lost mouse release'}`)
+          })
+          : null
         protectionMarkLayerRef.current = createMarkLayer(univerResult.univer)
         approvalMarkLayerRef.current = createMarkLayer(univerResult.univer)
         searchMarkLayerRef.current = createMarkLayer(univerResult.univer)
@@ -4942,6 +4948,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           setFormulaErrorHint(null)
           quotedClipboardFix?.dispose()
           editorRepaintFilter?.dispose()
+          inputRecovery?.dispose()
           stopWatchingMarkWipes?.()
           if (overlayRedrawFrame !== null) window.cancelAnimationFrame(overlayRedrawFrame)
           if (overlayRefreshTimerRef.current) { clearTimeout(overlayRefreshTimerRef.current); overlayRefreshTimerRef.current = null }

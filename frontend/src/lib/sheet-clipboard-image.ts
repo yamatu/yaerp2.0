@@ -105,8 +105,13 @@ function drawBorder(
   context.restore()
 }
 
-/** Returns a PNG of the copied table, or `null` when it is too large or unsupported. */
-export async function renderClipboardTableImage(html: string): Promise<Blob | null> {
+/**
+ * Draws the copied table and returns its PNG encoding, or `null` when the
+ * table is too large or unsupported. The drawing happens synchronously, so a
+ * caller can decide whether to offer an image before it starts writing to the
+ * clipboard; only the PNG encoding is asynchronous.
+ */
+export function renderClipboardTableImage(html: string): Promise<Blob> | null {
   if (typeof document === 'undefined' || typeof DOMParser === 'undefined' || !html) return null
   const parsed = new DOMParser().parseFromString(html, 'text/html')
   const table = parsed.querySelector('table')
@@ -205,11 +210,11 @@ export async function renderClipboardTableImage(html: string): Promise<Blob | nu
     drawBorder(context, style.borderRightWidth, style.borderRightStyle, style.borderRightColor, [x + width, y], [x + width, y + height])
   })
 
-  return new Promise<Blob | null>((resolve) => {
+  return new Promise<Blob>((resolve, reject) => {
     try {
-      canvas.toBlob((blob) => resolve(blob), 'image/png')
-    } catch {
-      resolve(null)
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('The clipboard image could not be encoded'))), 'image/png')
+    } catch (error) {
+      reject(error)
     }
   })
 }
