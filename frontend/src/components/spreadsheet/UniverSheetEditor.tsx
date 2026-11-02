@@ -699,6 +699,7 @@ const FORMULA_SCAN_COMMAND_PATTERN = /insert|remove|delete|move|auto-fill|refill
 // index based merging on the server is only valid while the layout is stable.
 const STRUCTURAL_COMMAND_PATTERN = /(insert|remove)-(multi-)?(row|col)|(insert|delete)-range|move-(rows|cols|range)|reorder-range|sort-range/
 const STRUCTURE_CONFLICT_ERROR_CODE = 'sheet_structure_conflict'
+const STRUCTURE_DENIED_ERROR_CODE = 'sheet_structure_denied'
 
 function readStructureRevision(config: unknown): number {
   const revision = Number((parseSheetConfig(config) as { structureRevision?: unknown }).structureRevision)
@@ -4556,11 +4557,11 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
                   setLocalReloadNonce(localReloadNonceRef.current)
                   return
                 }
-                if (structureChanged && res.code === 403) {
-                  // The server refused the new layout (protected rows): go back
-                  // to the saved one instead of keeping a sheet that cannot save.
+                if ((res as { error_code?: string }).error_code === STRUCTURE_DENIED_ERROR_CODE) {
+                  // The server refused the new layout: go back to the saved one
+                  // instead of keeping a sheet that can no longer save anything.
                   persistQueuedRef.current = false
-                  setActionError(res.message || '本次行列调整涉及受保护区域，已恢复为保存前的内容。')
+                  setActionError('这次行列调整涉及你无权修改的内容，未能保存，已恢复为调整前的表格。')
                   localReloadNonceRef.current += 1
                   setLocalReloadNonce(localReloadNonceRef.current)
                   return
