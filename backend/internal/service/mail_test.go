@@ -182,6 +182,40 @@ func TestAliMailProviderHelpers(t *testing.T) {
 	}
 }
 
+func TestMailRecipientsWithQuotedDisplayNames(t *testing.T) {
+	values := []string{
+		`"Zhang, San" <zs@example.com>`,
+		`"lisi@example.com" <lisi@example.com>`,
+		`"[ACME] Bob" <bob@example.com>`,
+		`张三 <z3@example.com>`,
+		`a@example.com, b@example.com`,
+	}
+	want := []string{"zs@example.com", "lisi@example.com", "bob@example.com", "z3@example.com", "a@example.com", "b@example.com"}
+
+	_, envelope, err := parseMailAddresses(values)
+	if err != nil {
+		t.Fatalf("parseMailAddresses: %v", err)
+	}
+	if strings.Join(envelope, ",") != strings.Join(want, ",") {
+		t.Fatalf("SMTP envelope = %v, want %v", envelope, want)
+	}
+
+	recipients, err := aliMailRecipients(values)
+	if err != nil {
+		t.Fatalf("aliMailRecipients: %v", err)
+	}
+	got := make([]string, 0, len(recipients))
+	for _, recipient := range recipients {
+		got = append(got, recipient.Email)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("AliMail recipients = %v, want %v", got, want)
+	}
+	if recipients[0].Name != "Zhang, San" {
+		t.Fatalf("quoted display name = %q, want %q", recipients[0].Name, "Zhang, San")
+	}
+}
+
 func TestAliMailSearchQuery(t *testing.T) {
 	if got := aliMailSearchQuery("inbox-id", MailMessageListOptions{}); got != "" {
 		t.Fatalf("folder-only query should use the list API, got %q", got)

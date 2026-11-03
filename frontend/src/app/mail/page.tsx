@@ -376,19 +376,49 @@ const translationLanguages = [
   ["ar", "阿拉伯语"],
 ];
 
+// Display names with characters such as , @ [ ] ( ) must be quoted, otherwise
+// the server's RFC 5322 parser rejects or mangles the whole address.
+function formatAddress(name: string | undefined, address: string) {
+  const display = (name || "").trim();
+  if (!display || display.toLowerCase() === address.toLowerCase()) {
+    return address;
+  }
+  if (/^[\p{L}\p{N} !#$%&'*+\-/=?^_`{|}~]+$/u.test(display)) {
+    return `${display} <${address}>`;
+  }
+  return `"${display.replace(/["\\]/g, "\\$&")}" <${address}>`;
+}
+
 function addressValues(addresses: MailAddress[]) {
   return addresses
-    .map((item) =>
-      item.name ? `${item.name} <${item.address}>` : item.address,
-    )
+    .map((item) => formatAddress(item.name, item.address))
     .join("; ");
 }
 
 function splitAddresses(value: string) {
-  return value
-    .split(/[;\n]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const parts: string[] = [];
+  let current = "";
+  let quoted = false;
+  let angle = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (quoted && char === "\\" && i + 1 < value.length) {
+      current += char + value[i + 1];
+      i += 1;
+      continue;
+    }
+    if (char === '"') quoted = !quoted;
+    else if (!quoted && char === "<") angle = true;
+    else if (!quoted && char === ">") angle = false;
+    else if (!quoted && !angle && /[;,；，\r\n]/.test(char)) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current);
+  return parts.map((item) => item.trim()).filter(Boolean);
 }
 
 function bulkJobStatusLabel(status: MailBulkJob["status"]) {
@@ -411,9 +441,7 @@ function bulkJobStatusClass(status: MailBulkJob["status"]) {
 }
 
 function appendAddress(value: string, contact: MailContact) {
-  const formatted = contact.name
-    ? `${contact.name} <${contact.email}>`
-    : contact.email;
+  const formatted = formatAddress(contact.name, contact.email);
   const current = splitAddresses(value);
   if (
     current.some((item) =>
@@ -2326,11 +2354,7 @@ export default function MailPage() {
         ...emptyCompose,
         bulk: selectedContacts.length > 1,
         to: selectedContacts
-          .map((contact) =>
-            contact.name
-              ? `${contact.name} <${contact.email}>`
-              : contact.email,
-          )
+          .map((contact) => formatAddress(contact.name, contact.email))
           .join("; "),
       });
       setComposeFiles([]);
@@ -2375,7 +2399,7 @@ export default function MailPage() {
     if (!confirmReplaceCompose()) return;
     beginCompose({
       ...emptyCompose,
-      to: contact.name ? `${contact.name} <${contact.email}>` : contact.email,
+      to: formatAddress(contact.name, contact.email),
     });
     setComposeFiles([]);
     setComposeView("edit");
@@ -2388,11 +2412,7 @@ export default function MailPage() {
     const contact = contactsByEmail.get(address.address.toLowerCase());
     beginCompose({
       ...emptyCompose,
-      to: contact?.name
-        ? `${contact.name} <${address.address}>`
-        : address.name
-          ? `${address.name} <${address.address}>`
-          : address.address,
+      to: formatAddress(contact?.name || address.name, address.address),
     });
     setComposeFiles([]);
     setComposeView("edit");
@@ -5443,11 +5463,7 @@ export default function MailPage() {
                 {contacts.map((contact) => (
                   <option
                     key={`${contact.source}-${contact.id}-${contact.email}`}
-                    value={
-                      contact.name
-                        ? `${contact.name} <${contact.email}>`
-                        : contact.email
-                    }
+                    value={formatAddress(contact.name, contact.email)}
                   >
                     {contact.company}
                   </option>

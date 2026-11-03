@@ -1341,13 +1341,17 @@ func htmlEscape(value string) string {
 func aliMailRecipients(values []string) ([]aliMailRecipient, error) {
 	result := make([]aliMailRecipient, 0, len(values))
 	for _, raw := range values {
-		for _, part := range strings.Split(raw, ",") {
-			if strings.TrimSpace(part) == "" {
-				continue
-			}
-			address, err := stdmail.ParseAddress(strings.TrimSpace(part))
-			if err != nil || !strings.Contains(address.Address, "@") {
-				return nil, fmt.Errorf("邮箱地址 %q 无效", part)
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		addresses, err := stdmail.ParseAddressList(raw)
+		if err != nil {
+			return nil, fmt.Errorf("邮箱地址 %q 无效", raw)
+		}
+		for _, address := range addresses {
+			if !strings.Contains(address.Address, "@") {
+				return nil, fmt.Errorf("邮箱地址 %q 无效", raw)
 			}
 			result = append(result, aliMailRecipient{Email: strings.ToLower(address.Address), Name: address.Name})
 		}
