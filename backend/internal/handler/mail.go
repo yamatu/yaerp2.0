@@ -243,14 +243,17 @@ func (h *MailHandler) ListMessages(c *gin.Context) {
 		response.BadRequest(c, "结束日期不能早于开始日期")
 		return
 	}
-	result, err := h.service.ListMessages(
-		c.GetInt64("user_id"), c.DefaultQuery("folder", "INBOX"), page, pageSize,
-		service.MailMessageListOptions{
-			Query: c.Query("query"), UnreadOnly: unread, Participant: c.Query("participant"),
-			Filter: c.DefaultQuery("filter", "all"), StartDate: startDate, EndDate: endDate,
-			SortBy: c.DefaultQuery("sort_by", "date"), SortOrder: c.DefaultQuery("sort_order", "desc"),
-		},
-	)
+	options := service.MailMessageListOptions{
+		Query: c.Query("query"), UnreadOnly: unread, Participant: c.Query("participant"),
+		Filter: c.DefaultQuery("filter", "all"), StartDate: startDate, EndDate: endDate,
+		SortBy: c.DefaultQuery("sort_by", "date"), SortOrder: c.DefaultQuery("sort_order", "desc"),
+	}
+	var result *model.MailMessagePage
+	if c.Query("scope") == "all" && strings.TrimSpace(options.Query) != "" {
+		result, err = h.service.SearchAllMessages(c.GetInt64("user_id"), page, pageSize, options)
+	} else {
+		result, err = h.service.ListMessages(c.GetInt64("user_id"), c.DefaultQuery("folder", "INBOX"), page, pageSize, options)
+	}
 	if err != nil {
 		handleMailError(c, err)
 		return

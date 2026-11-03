@@ -274,18 +274,10 @@ func (s *MailService) mailSignatureFromInput(userID, signatureID int64, input *m
 // page view into an unbounded number of upstream calls.
 const correspondenceScanLimit = 1000
 
-func (s *MailService) ListCorrespondence(userID int64, email string, page, pageSize int) (*model.MailMessagePage, error) {	parsed, err := stdmail.ParseAddress(strings.TrimSpace(email))
+func (s *MailService) ListCorrespondence(userID int64, email string, page, pageSize int) (*model.MailMessagePage, error) {
+	parsed, err := stdmail.ParseAddress(strings.TrimSpace(email))
 	if err != nil || !strings.Contains(parsed.Address, "@") {
 		return nil, fmt.Errorf("请选择有效的客户邮箱")
-	}
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 30
-	}
-	if pageSize > 100 {
-		pageSize = 100
 	}
 	folders, err := s.ListFolders(userID)
 	if err != nil {
@@ -295,24 +287,100 @@ func (s *MailService) ListCorrespondence(userID int64, email string, page, pageS
 	if sent := folderForRole(folders, "sent"); sent != "" && !strings.EqualFold(sent, targets[0]) {
 		targets = append(targets, sent)
 	}
-	// The mail provider does not expose a filtered total for "messages with this
-	// participant", so pages are drained from the source and sliced locally. One
-	// page more than the requested one is drained so a merged
-	// inbox + sent timeline can still be ordered correctly across the boundary.
+	return s.listAcrossFolders(userID, "CORRESPONDENCE", targets, page, pageSize, MailMessageListOptions{Participant: parsed.Address}, false)
+}
+
+// SearchAllMessages runs a keyword search over every mailbox folder except
+// trash and junk, so sent mail, drafts and custom folders are found together
+// with the inbox.
+func (s *MailService) SearchAllMessages(userID int64, page, pageSize int, options MailMessageListOptions) (*model.MailMessagePage, error) {
+	options.Query = strings.TrimSpace(options.Query)
+	if options.Query == "" {
+		return nil, fmt.Errorf("请输入搜索关键词")
+	}
+	folders, err := s.ListFolders(userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.listAcrossFolders(userID, "SEARCH", mailSearchFolders(folders), page, pageSize, options, true)
+}
+
+func mailSearchFolders(folders []model.MailFolder) []string {
+	rank := map[string]int{"inbox": 0, "sent": 1, "drafts": 2}
+	candidates := make([]model.MailFolder, 0, len(folders))
+	seen := make(map[string]struct{}, len(folders))
+	for _, folder := range folders {
+		if !folder.Selectable || folder.Role == "trash" || folder.Role == "junk" {
+			continue
+		}
+		key := strings.ToLower(folder.Name)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, folder)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, ok := rank[candidates[i].Role]
+		if !ok {
+			left = len(rank)
+		}
+		right, ok := rank[candidates[j].Role]
+		if !ok {
+			right = len(rank)
+		}
+		return left < right
+	})
+	result := make([]string, 0, len(candidates))
+	for _, folder := range candidates {
+		result = append(result, folder.Name)
+	}
+	return result
+}
+
+// listAcrossFolders merges one filtered view of several folders into a single
+// timeline. Providers do not expose a filtered total across folders, so pages
+// are drained from each source and sliced locally; one extra page is drained
+// so ordering stays correct across the page boundary. With skipFailing, a
+// folder the server refuses to search is skipped unless every folder fails.
+func (s *MailService) listAcrossFolders(userID int64, label string, targets []string, page, pageSize int, options MailMessageListOptions, skipFailing bool) (*model.MailMessagePage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 30
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	sortBy := "date"
+	if strings.EqualFold(options.SortBy, "size") {
+		sortBy = "size"
+	}
+	sortOrder := "desc"
+	if strings.EqualFold(options.SortOrder, "asc") {
+		sortOrder = "asc"
+	}
+	options.SortBy, options.SortOrder = sortBy, sortOrder
 	needed := (page + 1) * pageSize
 	if needed > correspondenceScanLimit {
 		needed = correspondenceScanLimit
 	}
 	all := make([]model.MailMessageSummary, 0, needed)
-	// True when at least one source folder did not run out of messages, which
-	// means more matches may exist beyond the drained window.
 	sourceHasMore := false
+	var lastErr error
+	succeeded := 0
 	for _, folder := range targets {
 		fetched := 0
+		failed := false
 		for sourcePage := 1; fetched < needed; sourcePage++ {
-			result, listErr := s.ListMessages(userID, folder, sourcePage, 100, MailMessageListOptions{Participant: parsed.Address})
+			result, listErr := s.ListMessages(userID, folder, sourcePage, 100, options)
 			if listErr != nil {
-				return nil, listErr
+				if !skipFailing {
+					return nil, listErr
+				}
+				lastErr, failed = listErr, true
+				break
 			}
 			all = append(all, result.Messages...)
 			fetched += len(result.Messages)
@@ -321,8 +389,14 @@ func (s *MailService) ListCorrespondence(userID int64, email string, page, pageS
 			}
 			sourceHasMore = true
 		}
+		if !failed {
+			succeeded++
+		}
 	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].Date.After(all[j].Date) })
+	if succeeded == 0 && lastErr != nil {
+		return nil, lastErr
+	}
+	sortMailSummaries(all, sortBy, sortOrder)
 	hasMore := len(all) > needed || (sourceHasMore && len(all) >= needed)
 	if len(all) > needed {
 		all = all[:needed]
@@ -336,7 +410,7 @@ func (s *MailService) ListCorrespondence(userID int64, email string, page, pageS
 		end = len(all)
 	}
 	return &model.MailMessagePage{
-		Folder: "CORRESPONDENCE", Messages: all[offset:end], Page: page,
+		Folder: label, Messages: all[offset:end], Page: page,
 		PageSize: pageSize, Total: len(all), HasMore: hasMore,
 	}, nil
 }

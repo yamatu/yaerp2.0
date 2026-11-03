@@ -54,6 +54,7 @@ import {
   FormEvent,
   KeyboardEvent,
   MouseEvent,
+  PointerEvent as ReactPointerEvent,
   ReactNode,
   useCallback,
   useEffect,
@@ -376,19 +377,49 @@ const translationLanguages = [
   ["ar", "阿拉伯语"],
 ];
 
+// Display names with characters such as , @ [ ] ( ) must be quoted, otherwise
+// the server's RFC 5322 parser rejects or mangles the whole address.
+function formatAddress(name: string | undefined, address: string) {
+  const display = (name || "").trim();
+  if (!display || display.toLowerCase() === address.toLowerCase()) {
+    return address;
+  }
+  if (/^[\p{L}\p{N} !#$%&'*+\-/=?^_`{|}~]+$/u.test(display)) {
+    return `${display} <${address}>`;
+  }
+  return `"${display.replace(/["\\]/g, "\\$&")}" <${address}>`;
+}
+
 function addressValues(addresses: MailAddress[]) {
   return addresses
-    .map((item) =>
-      item.name ? `${item.name} <${item.address}>` : item.address,
-    )
+    .map((item) => formatAddress(item.name, item.address))
     .join("; ");
 }
 
 function splitAddresses(value: string) {
-  return value
-    .split(/[;\n]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const parts: string[] = [];
+  let current = "";
+  let quoted = false;
+  let angle = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (quoted && char === "\\" && i + 1 < value.length) {
+      current += char + value[i + 1];
+      i += 1;
+      continue;
+    }
+    if (char === '"') quoted = !quoted;
+    else if (!quoted && char === "<") angle = true;
+    else if (!quoted && char === ">") angle = false;
+    else if (!quoted && !angle && /[;,；，\r\n]/.test(char)) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current);
+  return parts.map((item) => item.trim()).filter(Boolean);
 }
 
 function bulkJobStatusLabel(status: MailBulkJob["status"]) {
@@ -411,13 +442,14 @@ function bulkJobStatusClass(status: MailBulkJob["status"]) {
 }
 
 function appendAddress(value: string, contact: MailContact) {
-  const formatted = contact.name
-    ? `${contact.name} <${contact.email}>`
-    : contact.email;
+  const formatted = formatAddress(contact.name, contact.email);
   const current = splitAddresses(value);
+  const email = contact.email.trim().toLowerCase();
   if (
-    current.some((item) =>
-      item.toLowerCase().includes(contact.email.toLowerCase()),
+    current.some(
+      (item) =>
+        (item.match(/<([^<>]+)>\s*$/)?.[1] || item).trim().toLowerCase() ===
+        email,
     )
   )
     return value;
@@ -702,6 +734,7 @@ export default function MailPage() {
   const [page, setPage] = useState(1);
   const [searchDraft, setSearchDraft] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchScope, setSearchScope] = useState<"all" | "folder">("all");
   const [filterMode, setFilterMode] = useState<MailFilterMode>("all");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [startDate, setStartDate] = useState("");
@@ -759,6 +792,14 @@ export default function MailPage() {
     useState<MailContactInput>(emptyContact);
   const [editingContactID, setEditingContactID] = useState<number | null>(null);
   const [savingContact, setSavingContact] = useState(false);
+  const [contactFormFocus, setContactFormFocus] = useState(0);
+  const contactNameRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const input = contactNameRef.current;
+    if (!contactFormFocus || !input) return;
+    input.scrollIntoView({ block: "center", behavior: "smooth" });
+    input.focus({ preventScroll: true });
+  }, [contactFormFocus]);
   const [correspondenceContact, setCorrespondenceContact] =
     useState<MailContact | null>(null);
   const [senderCardOpen, setSenderCardOpen] = useState(false);
@@ -803,6 +844,13 @@ export default function MailPage() {
     () => folders.find((folder) => folder.name === selectedFolder),
     [folders, selectedFolder],
   );
+  const foldersByName = useMemo(
+    () => new Map(folders.map((folder) => [folder.name, folder])),
+    [folders],
+  );
+  const globalSearch =
+    Boolean(searchQuery) && searchScope === "all" && !correspondenceContact;
+  const crossFolderList = globalSearch || Boolean(correspondenceContact);
   const filteredContacts = useMemo(() => {
     const query = contactQuery.trim().toLowerCase();
     return contacts
@@ -1083,7 +1131,10 @@ export default function MailPage() {
           sort_by: sortBy,
           sort_order: sortOrder,
         });
-        if (searchQuery) params.set("query", searchQuery);
+        if (searchQuery) {
+          params.set("query", searchQuery);
+          if (searchScope === "all") params.set("scope", "all");
+        }
         if (startDate) params.set("start_date", startDate);
         if (endDate) params.set("end_date", endDate);
         endpoint = `/mail/messages?${params.toString()}`;
@@ -1111,6 +1162,7 @@ export default function MailPage() {
     filterMode,
     page,
     searchQuery,
+    searchScope,
     selectedFolder,
     sortBy,
     sortOrder,
@@ -1236,6 +1288,8 @@ export default function MailPage() {
 
   useEffect(() => {
     setCurrentUser(getStoredUser());
+    if (localStorage.getItem("yaerp:mail:search-scope") === "folder")
+      setSearchScope("folder");
   }, []);
   useEffect(() => {
     void loadAccount();
@@ -1567,6 +1621,10 @@ export default function MailPage() {
   const selectFolder = (folder: MailFolder) => {
     if (!folder.selectable) return;
     setCorrespondenceContact(null);
+    if (globalSearch) {
+      setSearchDraft("");
+      setSearchQuery("");
+    }
     setSelectedFolder(folder.name);
     setSelected(null);
     setTranslation(null);
@@ -2230,6 +2288,7 @@ export default function MailPage() {
     });
     setSenderCardOpen(false);
     setContactsOpen(true);
+    setContactFormFocus((current) => current + 1);
   };
 
   const saveContact = async () => {
@@ -2277,9 +2336,10 @@ export default function MailPage() {
       phone: contact.phone || "",
       notes: contact.notes || "",
     });
+    setContactFormFocus((current) => current + 1);
   };
 
-  const toggleContact = (contact: MailContact) => {
+  const toggleContact =(contact: MailContact) => {
     const key = contactKey(contact);
     setSelectedContactKeys((current) => {
       const next = new Set(current);
@@ -2326,11 +2386,7 @@ export default function MailPage() {
         ...emptyCompose,
         bulk: selectedContacts.length > 1,
         to: selectedContacts
-          .map((contact) =>
-            contact.name
-              ? `${contact.name} <${contact.email}>`
-              : contact.email,
-          )
+          .map((contact) => formatAddress(contact.name, contact.email))
           .join("; "),
       });
       setComposeFiles([]);
@@ -2375,7 +2431,7 @@ export default function MailPage() {
     if (!confirmReplaceCompose()) return;
     beginCompose({
       ...emptyCompose,
-      to: contact.name ? `${contact.name} <${contact.email}>` : contact.email,
+      to: formatAddress(contact.name, contact.email),
     });
     setComposeFiles([]);
     setComposeView("edit");
@@ -2388,11 +2444,7 @@ export default function MailPage() {
     const contact = contactsByEmail.get(address.address.toLowerCase());
     beginCompose({
       ...emptyCompose,
-      to: contact?.name
-        ? `${contact.name} <${address.address}>`
-        : address.name
-          ? `${address.name} <${address.address}>`
-          : address.address,
+      to: formatAddress(contact?.name || address.name, address.address),
     });
     setComposeFiles([]);
     setComposeView("edit");
@@ -3063,11 +3115,15 @@ export default function MailPage() {
                   <h2 className="truncate text-base font-semibold text-slate-900 md:text-sm">
                     {correspondenceContact
                       ? `与 ${correspondenceContact.name || correspondenceContact.email} 的往来`
-                      : selectedFolderMeta?.display_name || selectedFolder}
+                      : globalSearch
+                        ? `搜索“${searchQuery}”`
+                        : selectedFolderMeta?.display_name || selectedFolder}
                   </h2>
                   <div className="mt-0.5 truncate text-xs text-slate-400">
-                    {pageData.total} 封邮件
-                    {selectedFolderMeta?.unread && !correspondenceContact
+                    {globalSearch
+                      ? `${pageData.total}${pageData.has_more ? "+" : ""} 封匹配邮件 · 全部文件夹`
+                      : `${pageData.total} 封邮件`}
+                    {selectedFolderMeta?.unread && !crossFolderList
                       ? ` · ${selectedFolderMeta.unread} 封未读`
                       : ""}
                     <span className="md:hidden"> · {account.email_address}</span>
@@ -3264,7 +3320,11 @@ export default function MailPage() {
                       autoFocus={isMobile && mobileSearchOpen && !searchQuery}
                       value={searchDraft}
                       onChange={(event) => setSearchDraft(event.target.value)}
-                      placeholder="搜索发件人、主题或正文"
+                      placeholder={
+                        searchScope === "all"
+                          ? "在全部邮件中搜索发件人、主题或正文"
+                          : "在当前文件夹中搜索"
+                      }
                       className="min-w-0 flex-1 bg-transparent text-sm outline-none [&::-webkit-search-cancel-button]:hidden"
                     />
                     {searchDraft && (
@@ -3282,6 +3342,21 @@ export default function MailPage() {
                       </button>
                     )}
                   </label>
+                  <select
+                    value={searchScope}
+                    onChange={(event) => {
+                      const next = event.target.value as "all" | "folder";
+                      setSearchScope(next);
+                      localStorage.setItem("yaerp:mail:search-scope", next);
+                      setPage(1);
+                    }}
+                    className="h-10 w-[5.5rem] shrink-0 rounded-lg border border-slate-200 bg-white px-1.5 text-xs text-slate-600 outline-none focus:border-sky-400 md:h-9"
+                    aria-label="搜索范围"
+                    title="搜索范围：全部邮件包括收件箱、已发送、草稿和自定义文件夹"
+                  >
+                    <option value="all">全部</option>
+                    <option value="folder">本文件夹</option>
+                  </select>
                   <button
                     type="submit"
                     className="h-10 shrink-0 rounded-lg bg-slate-900 px-3 text-xs font-medium text-white md:h-9"
@@ -3400,8 +3475,11 @@ export default function MailPage() {
                   const key = messageKey(message);
                   const checked = selectedKeys.has(key);
                   const showCheckbox = !isMobile || mobileSelecting;
+                  const messageFolder = crossFolderList
+                    ? foldersByName.get(message.folder)
+                    : selectedFolderMeta;
                   const counterpart =
-                    selectedFolderMeta?.role === "sent"
+                    messageFolder?.role === "sent"
                       ? mailAddressLabel(message.to, "未知收件人")
                       : mailAddressLabel(message.from);
                   return (
@@ -3519,8 +3597,10 @@ export default function MailPage() {
                           </>
                         )}
                         <span>{formatBytes(message.size)}</span>
-                        {correspondenceContact && (
-                          <span className="truncate">· {message.folder}</span>
+                        {crossFolderList && (
+                          <span className="truncate rounded bg-slate-100 px-1.5 py-0.5 text-slate-500">
+                            {messageFolder?.display_name || message.folder}
+                          </span>
                         )}
                       </div>
                     </div>
@@ -4680,7 +4760,7 @@ export default function MailPage() {
           }}
           maxWidth="max-w-6xl"
         >
-          <div className="app-scroll grid min-h-0 flex-1 grid-rows-[auto_minmax(320px,1fr)_auto] overflow-y-auto lg:grid-cols-[180px_minmax(0,1fr)_320px] lg:grid-rows-1 lg:overflow-visible">
+          <div className="app-scroll grid min-h-0 flex-1 grid-rows-[auto_minmax(320px,1fr)_auto] overflow-y-auto lg:grid-cols-[180px_minmax(0,1fr)_320px] lg:grid-rows-1 lg:overflow-hidden">
             <aside className="flex gap-2 overflow-x-auto border-b border-slate-200 bg-slate-50 p-3 lg:flex-col lg:overflow-visible lg:border-b-0 lg:border-r">
               <div className="hidden px-2 pb-1 pt-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400 lg:block">
                 联系人来源
@@ -4818,6 +4898,7 @@ export default function MailPage() {
                     onClick={() => {
                       setEditingContactID(null);
                       setContactDraft(emptyContact);
+                      setContactFormFocus((current) => current + 1);
                     }}
                     className="ml-auto inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-600"
                   >
@@ -5037,7 +5118,7 @@ export default function MailPage() {
               </div>
             </section>
 
-            <aside className="max-h-[46dvh] overflow-y-auto bg-slate-50 p-4 lg:max-h-none">
+            <aside className="app-scroll max-h-[46dvh] overflow-y-auto bg-slate-50 p-4 lg:max-h-none lg:min-h-0">
               <div className="mb-1 flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-slate-800">
                   {editingContactID ? "编辑个人联系人" : "新建个人联系人"}
@@ -5057,6 +5138,7 @@ export default function MailPage() {
                     姓名
                   </span>
                   <input
+                    ref={contactNameRef}
                     value={contactDraft.name}
                     onChange={(event) =>
                       setContactDraft((current) => ({
@@ -5443,11 +5525,7 @@ export default function MailPage() {
                 {contacts.map((contact) => (
                   <option
                     key={`${contact.source}-${contact.id}-${contact.email}`}
-                    value={
-                      contact.name
-                        ? `${contact.name} <${contact.email}>`
-                        : contact.email
-                    }
+                    value={formatAddress(contact.name, contact.email)}
                   >
                     {contact.company}
                   </option>
@@ -5962,37 +6040,135 @@ function ModalShell({
   maxWidth: string;
   children: ReactNode;
 }) {
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [minimized, setMinimized] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // Once dragged the window floats: the dimmed backdrop goes away and the page
+  // underneath stays clickable, so the user can read the mail behind it.
+  const floating = offset.x !== 0 || offset.y !== 0;
+
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || event.pointerType === "touch") return;
+    if ((event.target as HTMLElement).closest("button, input, select, a")) return;
+    const panel = panelRef.current;
+    if (!panel || !window.matchMedia("(min-width: 640px)").matches) return;
+    event.preventDefault();
+    const rect = panel.getBoundingClientRect();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const base = offset;
+    const move = (moveEvent: PointerEvent) => {
+      const dx = Math.min(
+        Math.max(moveEvent.clientX - startX, 120 - rect.right),
+        window.innerWidth - 120 - rect.left,
+      );
+      const dy = Math.min(
+        Math.max(moveEvent.clientY - startY, -rect.top),
+        window.innerHeight - 56 - rect.top,
+      );
+      setOffset({ x: base.x + dx, y: base.y + dy });
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+  };
+
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-      className="fixed inset-x-0 top-[var(--vv-top)] z-[110] flex h-[var(--vv-height)] items-end justify-center bg-slate-950/45 p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-3"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <div
-        className={`flex max-h-[calc(100%-env(safe-area-inset-top)-0.5rem)] min-h-0 w-full ${maxWidth} flex-col overflow-hidden rounded-t-2xl bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:max-h-[92dvh] sm:rounded-lg sm:pb-0`}
-      >
-        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
-          <div className="min-w-0">
-            <h2 className="font-semibold text-slate-950">{title}</h2>
-            <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>
-          </div>
+    <>
+      {minimized && (
+        <div
+          role="region"
+          aria-label={`已最小化的${title}`}
+          className="fixed inset-x-2 bottom-[calc(var(--mobile-tabbar-offset)+4rem)] z-[110] flex items-center gap-1 rounded-lg bg-slate-900 py-1 pl-3 pr-1 text-white shadow-2xl sm:inset-x-auto sm:bottom-0 sm:left-4 sm:w-72 sm:rounded-b-none"
+        >
+          <button
+            type="button"
+            onClick={() => setMinimized(false)}
+            className="flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left"
+            title="还原窗口"
+          >
+            <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+              {title}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMinimized(false)}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:h-8 sm:w-8"
+            title="还原"
+            aria-label={`还原${title}`}
+          >
+            <Maximize2 className="h-4 w-4" />
+          </button>
           <button
             type="button"
             onClick={onClose}
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 sm:h-8 sm:w-8"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-300 hover:bg-white/10 sm:h-8 sm:w-8"
             title="关闭"
-            aria-label="关闭"
+            aria-label={`关闭${title}`}
           >
             <X className="h-4 w-4" />
           </button>
         </div>
-        {children}
+      )}
+      <div
+        role="dialog"
+        aria-modal={!floating}
+        aria-label={title}
+        className={`fixed inset-x-0 top-[var(--vv-top)] z-[110] h-[var(--vv-height)] items-end justify-center p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-3 ${minimized ? "hidden" : "flex"} ${floating ? "pointer-events-none" : "bg-slate-950/45"}`}
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) onClose();
+        }}
+      >
+        <div
+          ref={panelRef}
+          style={
+            floating
+              ? { transform: `translate(${offset.x}px, ${offset.y}px)` }
+              : undefined
+          }
+          className={`pointer-events-auto flex max-h-[calc(100%-env(safe-area-inset-top)-0.5rem)] min-h-0 w-full ${maxWidth} flex-col overflow-hidden rounded-t-2xl bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:max-h-[92dvh] sm:rounded-lg sm:pb-0 ${floating ? "ring-1 ring-slate-300" : ""}`}
+        >
+          <div
+            onPointerDown={startDrag}
+            onDoubleClick={() => setOffset({ x: 0, y: 0 })}
+            className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 sm:cursor-move sm:select-none sm:px-5 sm:py-4"
+            title="拖动标题栏移动窗口，双击还原位置"
+          >
+            <div className="min-w-0">
+              <h2 className="font-semibold text-slate-950">{title}</h2>
+              <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setMinimized(true)}
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 sm:h-8 sm:w-8"
+                title="最小化"
+                aria-label="最小化"
+              >
+                <Minus className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 sm:h-8 sm:w-8"
+                title="关闭"
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          {children}
+        </div>
       </div>
-    </div>
+    </>
   );
 }
 
