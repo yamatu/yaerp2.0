@@ -1,10 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -338,7 +344,9 @@ func (s *MailService) GetMessage(userID int64, folder string, uid uint32) (*mode
 	message := fetched.message
 	accountID := account.ID
 	partURL := func(partID string) string { return s.mailPartURL(userID, accountID, folder, uid, partID) }
-	parsed, err := s.parseMailDataWithOptions(fetched.raw, mailParseOptions{partURL: partURL, pruned: fetched.pruned})
+	parsed, err := s.parseMailDataWithOptions(fetched.raw, mailParseOptions{
+		partURL: partURL, pruned: fetched.pruned, extractAvatar: true, ownAddress: account.EmailAddress,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -579,6 +587,10 @@ type mailParseOptions struct {
 	// pruned is set for a message rebuilt by fetchMailForDisplay: parts marked
 	// with mailOmittedSizeHeader have no body here and load through links.
 	pruned bool
+	// extractAvatar moves a sender avatar found in the body into SenderAvatar.
+	extractAvatar bool
+	// ownAddress is the mailbox's own address; its mail is never searched for an avatar.
+	ownAddress string
 }
 
 func (s *MailService) parseMailData(raw []byte) (*parsedMailData, error) {
@@ -682,7 +694,13 @@ func (s *MailService) parseMailDataWithOptions(raw []byte, options mailParseOpti
 		senderEmail = result.From[0].Address
 	}
 	var avatarContentID string
-	result.HTMLBody, result.SenderAvatar, avatarContentID = extractMailSenderAvatar(result.HTMLBody, senderName, senderEmail, inlineData)
+	// Only the reading view lifts an avatar out of the body. Downloads and
+	// server-side forwards must keep every part, and the account's own mail
+	// shows the user's profile picture instead of a guessed body image.
+	ownMail := options.ownAddress != "" && strings.EqualFold(strings.TrimSpace(senderEmail), strings.TrimSpace(options.ownAddress))
+	if options.extractAvatar && !ownMail {
+		result.HTMLBody, result.SenderAvatar, avatarContentID = extractMailSenderAvatar(result.HTMLBody, senderName, senderEmail, inlineData)
+	}
 	if avatarContentID != "" {
 		filtered := result.Attachments[:0]
 		for _, attachment := range result.Attachments {
@@ -704,7 +722,7 @@ func (s *MailService) parseMailDataWithOptions(raw []byte, options mailParseOpti
 		attachment.Inline = attachment.ContentID != "" && referenced[key] && shown
 	}
 	result.HTMLBody = replaceMailCIDImages(result.HTMLBody, inlineData)
-	result.HTMLBody = forceMailExternalLinksNewTab(s.htmlPolicy.Sanitize(inlineMailStyleSheets(result.HTMLBody)))
+	result.HTMLBody = forceMailExternalLinksNewTab(s.htmlPolicy.Sanitize(normalizeMailImageSources(inlineMailStyleSheets(result.HTMLBody))))
 	if result.TextBody == "" && result.HTMLBody != "" {
 		result.TextBody = bluemondayText(result.HTMLBody)
 	}
@@ -842,6 +860,9 @@ func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineDa
 	trackingImages := make([]*htmlparser.Node, 0)
 	avatarURL := ""
 	avatarContentID := ""
+	// Everything after the start of a quoted message belongs to someone else
+	// (often the reader: "To: me@..."), so no avatar is taken from there.
+	afterQuote := false
 	var walk func(*htmlparser.Node)
 	walk = func(node *htmlparser.Node) {
 		if node == nil {
@@ -850,6 +871,12 @@ func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineDa
 		if node.Type == htmlparser.TextNode {
 			visibleText.WriteString(" ")
 			visibleText.WriteString(node.Data)
+			if mailQuoteTextMarker.MatchString(node.Data) {
+				afterQuote = true
+			}
+		}
+		if node.Type == htmlparser.ElementNode && mailHTMLStartsQuote(node) {
+			afterQuote = true
 		}
 		if node.Type == htmlparser.ElementNode && strings.EqualFold(node.Data, "img") {
 			source := mailHTMLAttribute(node, "src")
@@ -859,16 +886,13 @@ func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineDa
 					trackingImages = append(trackingImages, node)
 					return
 				}
-				text := visibleText.String()
-				if len(text) > 600 {
-					text = text[len(text)-600:]
+				if afterQuote {
+					return
 				}
 				attributes := strings.ToLower(strings.Join([]string{
 					mailHTMLAttribute(node, "class"), mailHTMLAttribute(node, "id"),
 					mailHTMLAttribute(node, "alt"), mailHTMLAttribute(node, "title"), source,
 				}, " "))
-				nearSender := needle != "" && strings.Contains(strings.ToLower(text), needle)
-				insideSenderSignature := needle != "" && mailHTMLAncestorContainsText(node, context, needle)
 				// The chosen image is removed from the body, so only clear signs
 				// count: words in the image's own labels, or an avatar URL. Loose
 				// URL substrings ("qpic", "head", "face") also matched every
@@ -883,11 +907,16 @@ func extractMailSenderAvatar(htmlValue, senderName, senderEmail string, inlineDa
 				brandHint := strings.Contains(attributes, "logo") || strings.Contains(attributes, "brand") ||
 					mailImageMatchesSender(attributes, senderImageHints)
 				nearMessageStart := len([]rune(strings.TrimSpace(visibleText.String()))) <= 1200
+				// A picture next to the sender's name and address is only an
+				// avatar when it is avatar-sized; a photo pasted into a short
+				// mail above the signature is content and must stay.
+				inSenderSignature := needle != "" && mailImageLooksLikeAvatar(node, resolvedURL) &&
+					mailHTMLSenderIdentityNode(node, context, needle) != nil
 				score := 0
 				switch {
-				case explicitAvatarHint:
+				case explicitAvatarHint && !mailImageIsLarge(node, resolvedURL):
 					score = 100
-				case nearSender || insideSenderSignature:
+				case inSenderSignature:
 					score = 90
 				case nearMessageStart && brandHint && mailHTMLImageIsSmallSquare(node):
 					score = 80
@@ -1007,6 +1036,66 @@ func mailHTMLImageIsSmallSquare(node *htmlparser.Node) bool {
 	return ratio >= 0.6 && ratio <= 1.67
 }
 
+var mailQuoteTextMarker = regexp.MustCompile(`(?i)^\s*(?:(?:from|发件人|寄件人|寄件者|发信人)\s*[:：]|-{2,}\s*(?:original message|forwarded message|原始邮件|转发邮件|邮件原文)|on\s.{4,240}\swrote\s*:?\s*$|.{0,200}写道\s*[:：]?\s*$)`)
+
+// mailHTMLStartsQuote recognises the containers mail clients put a quoted
+// message in (Gmail, Outlook, Thunderbird, Yahoo, Apple Mail).
+func mailHTMLStartsQuote(node *htmlparser.Node) bool {
+	if strings.EqualFold(node.Data, "blockquote") {
+		return true
+	}
+	class := strings.ToLower(mailHTMLAttribute(node, "class"))
+	id := strings.ToLower(mailHTMLAttribute(node, "id"))
+	return strings.Contains(class, "quote") || strings.Contains(class, "moz-cite-prefix") ||
+		id == "divrplyfwdmsg" || id == "appendonsend" || strings.Contains(id, "quote")
+}
+
+// mailImageLooksLikeAvatar accepts small, roughly square pictures. Without
+// width/height attributes the size is read from an embedded image; anything
+// else (a remote picture, a large part served by link) is not assumed to be one.
+func mailImageLooksLikeAvatar(node *htmlparser.Node, resolvedURL string) bool {
+	if _, widthOK := mailHTMLImageDimension(node, "width"); widthOK {
+		return mailHTMLImageIsSmallSquare(node)
+	}
+	if _, heightOK := mailHTMLImageDimension(node, "height"); heightOK {
+		return false
+	}
+	width, height, ok := mailDataImageSize(resolvedURL)
+	if !ok || width < 16 || height < 16 || width > 256 || height > 256 {
+		return false
+	}
+	ratio := float64(width) / float64(height)
+	return ratio >= 0.6 && ratio <= 1.67
+}
+
+func mailImageIsLarge(node *htmlparser.Node, resolvedURL string) bool {
+	width, widthOK := mailHTMLImageDimension(node, "width")
+	height, heightOK := mailHTMLImageDimension(node, "height")
+	if widthOK || heightOK {
+		return width > 400 || height > 400
+	}
+	if pixelWidth, pixelHeight, ok := mailDataImageSize(resolvedURL); ok {
+		return pixelWidth > 640 || pixelHeight > 640
+	}
+	return false
+}
+
+func mailDataImageSize(value string) (int, int, bool) {
+	header, payload, found := strings.Cut(value, ",")
+	if !found || !strings.HasPrefix(strings.ToLower(header), "data:image/") || !strings.HasSuffix(strings.ToLower(header), ";base64") {
+		return 0, 0, false
+	}
+	data, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return 0, 0, false
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, false
+	}
+	return config.Width, config.Height, true
+}
+
 func mailHTMLImageDimension(node *htmlparser.Node, key string) (float64, bool) {
 	value := strings.ToLower(strings.TrimSpace(mailHTMLAttribute(node, key)))
 	value = strings.TrimSpace(strings.TrimSuffix(value, "px"))
@@ -1047,6 +1136,93 @@ func forceMailExternalLinksNewTab(htmlValue string) string {
 	}
 	walk(context)
 	return renderMailHTMLChildren(context, htmlValue)
+}
+
+var (
+	mailLazyImageAttributes = []string{"data-src", "data-original", "data-lazy-src", "data-actualsrc", "data-url"}
+	mailPlaceholderImage    = regexp.MustCompile(`(?i)(?:blank|placeholder|spacer|loading|lazy|pixel|transparent)[^/]*\.(?:gif|png|svg)(?:[?#]|$)`)
+	mailSourceWhitespace    = regexp.MustCompile(`\s`)
+)
+
+// normalizeMailImageSources repairs image sources the sanitizer would drop or
+// that never load on their own: URLs containing spaces (the sanitizer removes
+// the whole <img>), lazy-loaded newsletter images whose real address is in
+// data-src, and images that only carry a srcset.
+func normalizeMailImageSources(htmlValue string) string {
+	if !strings.Contains(strings.ToLower(htmlValue), "<img") {
+		return htmlValue
+	}
+	context := &htmlparser.Node{Type: htmlparser.ElementNode, Data: "div", DataAtom: atom.Div}
+	nodes, err := htmlparser.ParseFragment(strings.NewReader(htmlValue), context)
+	if err != nil {
+		return htmlValue
+	}
+	for _, node := range nodes {
+		context.AppendChild(node)
+	}
+	changed := false
+	var walk func(*htmlparser.Node)
+	walk = func(node *htmlparser.Node) {
+		if node.Type == htmlparser.ElementNode && strings.EqualFold(node.Data, "img") {
+			source := mailHTMLAttribute(node, "src")
+			original := source
+			if mailImageSourceIsPlaceholder(source) {
+				replacement := ""
+				for _, key := range mailLazyImageAttributes {
+					if candidate := mailHTMLAttribute(node, key); mailImageSourceIsRemote(candidate) {
+						replacement = candidate
+						break
+					}
+				}
+				if replacement == "" && source == "" {
+					replacement = firstMailSrcsetURL(mailHTMLAttribute(node, "srcset"))
+				}
+				if replacement != "" {
+					source = replacement
+				}
+			}
+			if mailImageSourceIsRemote(source) && mailSourceWhitespace.MatchString(source) {
+				source = mailSourceWhitespace.ReplaceAllString(source, "%20")
+			}
+			if source != original {
+				setMailHTMLAttribute(node, "src", source)
+				changed = true
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(context)
+	if !changed {
+		return htmlValue
+	}
+	return renderMailHTMLChildren(context, htmlValue)
+}
+
+func mailImageSourceIsRemote(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "//")
+}
+
+func mailImageSourceIsPlaceholder(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "#" || strings.EqualFold(value, "about:blank") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(value), "data:") {
+		return len(value) < 200
+	}
+	return mailPlaceholderImage.MatchString(value)
+}
+
+func firstMailSrcsetURL(srcset string) string {
+	first := strings.TrimSpace(strings.SplitN(srcset, ",", 2)[0])
+	candidate := strings.Fields(first)
+	if len(candidate) == 0 || !mailImageSourceIsRemote(candidate[0]) {
+		return ""
+	}
+	return candidate[0]
 }
 
 func setMailHTMLAttribute(node *htmlparser.Node, key, value string) {
@@ -1182,21 +1358,6 @@ func mailHTMLNodeHasVisibleContent(node *htmlparser.Node) bool {
 	}
 	walk(node)
 	return visible
-}
-
-func mailHTMLAncestorContainsText(node, root *htmlparser.Node, needle string) bool {
-	needle = strings.ToLower(strings.TrimSpace(needle))
-	if needle == "" {
-		return false
-	}
-	depth := 0
-	for parent := node.Parent; parent != nil && parent != root && depth < 6; parent = parent.Parent {
-		if strings.Contains(strings.ToLower(mailHTMLNodeText(parent, 2400)), needle) {
-			return true
-		}
-		depth++
-	}
-	return false
 }
 
 func mailHTMLNodeText(node *htmlparser.Node, limit int) string {
