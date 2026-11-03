@@ -216,6 +216,22 @@ func TestMailRecipientsWithQuotedDisplayNames(t *testing.T) {
 	}
 }
 
+func TestMailSearchFoldersCoverEverythingButTrashAndJunk(t *testing.T) {
+	folders := []model.MailFolder{
+		{Name: "客户项目", Role: "folder", Selectable: true},
+		{Name: "Trash", Role: "trash", Selectable: true},
+		{Name: "Sent Messages", Role: "sent", Selectable: true},
+		{Name: "[Gmail]", Role: "folder", Selectable: false},
+		{Name: "Junk", Role: "junk", Selectable: true},
+		{Name: "Drafts", Role: "drafts", Selectable: true},
+		{Name: "INBOX", Role: "inbox", Selectable: true},
+	}
+	got := strings.Join(mailSearchFolders(folders), ",")
+	if want := "INBOX,Sent Messages,Drafts,客户项目"; got != want {
+		t.Fatalf("mailSearchFolders = %q, want %q", got, want)
+	}
+}
+
 func TestAliMailSearchQuery(t *testing.T) {
 	if got := aliMailSearchQuery("inbox-id", MailMessageListOptions{}); got != "" {
 		t.Fatalf("folder-only query should use the list API, got %q", got)
