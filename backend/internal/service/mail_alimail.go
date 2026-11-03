@@ -1020,7 +1020,7 @@ func (s *MailService) aliMailGetMessage(account *model.MailAccount, folder strin
 		MailMessageSummary: summary,
 		CC:                 aliMailAddresses(response.Message.CC), BCC: aliMailAddresses(response.Message.BCC),
 		ReplyTo: aliMailAddresses(response.Message.ReplyTo), TextBody: response.Message.Body.Text,
-		HTMLBody: s.htmlPolicy.Sanitize(inlineMailStyleSheets(bodyHTML)), Attachments: attachments,
+		HTMLBody: s.htmlPolicy.Sanitize(normalizeMailImageSources(inlineMailStyleSheets(bodyHTML))), Attachments: attachments,
 		InReplyTo:  aliMailHeaderValue(response.Message.InternetMessageHeaders, "In-Reply-To"),
 		References: parseAliMailReferences(aliMailHeaderValue(response.Message.InternetMessageHeaders, "References")),
 	}

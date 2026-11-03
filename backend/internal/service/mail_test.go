@@ -519,7 +519,7 @@ func TestExtractMailSenderAvatar(t *testing.T) {
 
 	tableSignature := `<table><tr><td><img src="cid:table-avatar"></td><td><a>Yamatu</a><br><a>yamatu@qq.com</a></td></tr></table><p>正文</p>`
 	cleaned, avatar, contentID = extractMailSenderAvatar(tableSignature, "Yamatu", "yamatu@qq.com", map[string]string{
-		"table-avatar": "data:image/png;base64,dGFibGU=",
+		"table-avatar": testPNGDataURI(t, 96, 96),
 	})
 	if avatar == "" || contentID != "table-avatar" || strings.Contains(cleaned, "table-avatar") || strings.Contains(cleaned, "yamatu@qq.com") {
 		t.Fatalf("table signature avatar was not extracted: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)
@@ -527,7 +527,7 @@ func TestExtractMailSenderAvatar(t *testing.T) {
 
 	inlineSignature := `<p>正文保留</p><div class="signature"><img src="cid:inline-avatar"><a>Yamatu</a><a>yamatu@qq.com</a></div>`
 	cleaned, avatar, contentID = extractMailSenderAvatar(inlineSignature, "Yamatu", "yamatu@qq.com", map[string]string{
-		"inline-avatar": "data:image/png;base64,aW5saW5l",
+		"inline-avatar": testPNGDataURI(t, 64, 64),
 	})
 	if avatar == "" || contentID != "inline-avatar" || strings.Contains(cleaned, "yamatu@qq.com") || !strings.Contains(cleaned, "正文保留") {
 		t.Fatalf("inline signature was not removed: avatar=%q contentID=%q html=%q", avatar, contentID, cleaned)

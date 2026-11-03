@@ -76,6 +76,7 @@ type MailService struct {
 	imapPoolMu    sync.Mutex
 	imapPool      map[int64][]*pooledIMAPConn
 	imapPoolGen   map[int64]uint64
+	imapLeases    map[int64]chan struct{}
 	aliHTTPMu     sync.Mutex
 	aliHTTPClient map[string]*http.Client
 	aliRateMu     sync.Mutex

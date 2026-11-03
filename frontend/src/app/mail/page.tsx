@@ -90,7 +90,7 @@ import {
   hasComposeImages,
   textToComposeHTML,
 } from "@/lib/mailComposeImages";
-import { getStoredUser, isAdmin } from "@/lib/auth";
+import { getStoredUser, isAdmin, saveCurrentUser } from "@/lib/auth";
 import type { AuthUser } from "@/types";
 
 type MailProxyMode = "global" | "on" | "off";
@@ -880,6 +880,44 @@ export default function MailPage() {
     [contacts],
   );
   const selectedSenderAddress = selected?.from[0] || null;
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const uploadOwnAvatar = async (file: File | undefined) => {
+    if (!file || uploadingAvatar) return;
+    if (!file.type.startsWith("image/")) {
+      setError("头像必须使用图片文件。");
+      return;
+    }
+    setUploadingAvatar(true);
+    setError("");
+    try {
+      const uploaded = await api.upload(file);
+      if (uploaded.code !== 0 || !uploaded.data?.id)
+        throw new Error(uploaded.message || "上传头像失败");
+      const profile = await api.put<AuthUser>("/auth/avatar", {
+        attachment_id: uploaded.data.id,
+      });
+      if (profile.code !== 0 || !profile.data)
+        throw new Error(profile.message || "保存头像失败");
+      saveCurrentUser(profile.data);
+      setCurrentUser(profile.data);
+      setNotice("头像已更新。");
+    } catch (uploadError) {
+      setError(
+        uploadError instanceof Error ? uploadError.message : "上传头像失败",
+      );
+    } finally {
+      setUploadingAvatar(false);
+    }
+  };
+  const selectedIsOwnMail = Boolean(
+    selectedSenderAddress &&
+      account &&
+      selectedSenderAddress.address.toLowerCase() ===
+        account.email_address.toLowerCase(),
+  );
+  const selectedSenderAvatar = selectedIsOwnMail
+    ? currentUser?.avatar
+    : selected?.sender_avatar;
   const selectedSenderContact = selectedSenderAddress
     ? contactsByEmail.get(selectedSenderAddress.address.toLowerCase()) || null
     : null;
@@ -3931,17 +3969,11 @@ export default function MailPage() {
                     {selected.subject}
                   </h2>
                   <div className="mt-4 flex items-start gap-3 border-b border-slate-100 pb-4">
-                    <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-50 text-sm font-semibold text-sky-700">
-                      {selected.sender_avatar ? (
-                        <img
-                          src={resolveApiPath(selected.sender_avatar)}
-                          alt={`${mailAddressLabel(selected.from)} 的头像`}
-                          className="h-full w-full object-cover"
-                        />
-                      ) : (
-                        mailAddressLabel(selected.from).slice(0, 2).toUpperCase()
-                      )}
-                    </div>
+                    <MailAvatar
+                      src={selectedSenderAvatar}
+                      label={mailAddressLabel(selected.from)}
+                      className="h-10 w-10"
+                    />
                     <div className="relative min-w-0 flex-1">
                       <button
                         type="button"
@@ -3966,19 +3998,11 @@ export default function MailPage() {
                           onClick={(event) => event.stopPropagation()}
                         >
                           <div className="flex items-start gap-3 border-b border-slate-100 p-4">
-                            <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-50 text-sm font-semibold text-sky-700">
-                              {selected.sender_avatar ? (
-                                <img
-                                  src={resolveApiPath(selected.sender_avatar)}
-                                  alt="发件人头像"
-                                  className="h-full w-full object-cover"
-                                />
-                              ) : (
-                                mailAddressLabel([selectedSenderAddress])
-                                  .slice(0, 2)
-                                  .toUpperCase()
-                              )}
-                            </div>
+                            <MailAvatar
+                              src={selectedSenderAvatar}
+                              label={mailAddressLabel([selectedSenderAddress])}
+                              className="h-11 w-11"
+                            />
                             <div className="min-w-0 flex-1">
                               <div className="truncate text-sm font-semibold text-slate-900">
                                 {mailAddressLabel([selectedSenderAddress])}
@@ -4423,6 +4447,39 @@ export default function MailPage() {
           maxWidth="max-w-3xl"
         >
           <div className="min-h-0 overflow-y-auto">
+            <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-3 sm:px-6">
+              <MailAvatar
+                src={currentUser?.avatar}
+                label={currentUser?.username || account?.email_address || "我"}
+                className="h-12 w-12"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold text-slate-800">我的头像</div>
+                <div className="mt-0.5 text-xs leading-5 text-slate-400">
+                  显示在你发出的邮件上，与个人设置中的头像相同。对方邮箱里的头像由对方的邮件服务商决定。
+                </div>
+              </div>
+              <label
+                className={`inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-600 hover:bg-slate-50 ${uploadingAvatar ? "pointer-events-none opacity-50" : ""}`}
+              >
+                {uploadingAvatar ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ImagePlus className="h-3.5 w-3.5" />
+                )}
+                {currentUser?.avatar ? "更换头像" : "设置头像"}
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  className="sr-only"
+                  aria-label="上传头像"
+                  onChange={(event) => {
+                    void uploadOwnAvatar(event.target.files?.[0]);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+            </div>
             {accounts.length > 0 && (
               <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3 sm:px-6">
                 {accounts.map((item) => (
@@ -6024,6 +6081,38 @@ function ContextButton({
       <Icon className="h-4 w-4" />
       {label}
     </button>
+  );
+}
+
+// Remote avatars (QQ, CDNs) refuse hotlinked requests carrying our Referer;
+// a picture that still fails falls back to the initials.
+function MailAvatar({
+  src,
+  label,
+  className,
+}: {
+  src?: string;
+  label: string;
+  className: string;
+}) {
+  const [failedSrc, setFailedSrc] = useState("");
+  const showImage = Boolean(src) && failedSrc !== src;
+  return (
+    <div
+      className={`flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-sky-50 text-sm font-semibold text-sky-700 ${className}`}
+    >
+      {showImage ? (
+        <img
+          src={resolveApiPath(src || "")}
+          alt={`${label} 的头像`}
+          referrerPolicy="no-referrer"
+          onError={() => setFailedSrc(src || "")}
+          className="h-full w-full object-cover"
+        />
+      ) : (
+        label.slice(0, 2).toUpperCase()
+      )}
+    </div>
   );
 }
 

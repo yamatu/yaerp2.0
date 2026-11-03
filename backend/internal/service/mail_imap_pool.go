@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -20,7 +21,29 @@ const (
 	imapPoolVerifyTTL     = 3 * time.Second
 	imapPoolTrustRecent   = 10 * time.Second
 	imapPoolSweepInterval = 30 * time.Second
+	// Providers refuse logins beyond a few simultaneous sessions per mailbox
+	// (QQ, 163, AliMail). Opening a mail with many large images used to dial one
+	// connection per image and the refused ones showed as broken pictures, so
+	// leases above this wait for a connection to come back instead.
+	imapMaxLeasedPerAcct = 3
+	imapLeaseWait        = 60 * time.Second
 )
+
+var errIMAPBusy = errors.New("邮箱服务器连接繁忙，请稍后重试")
+
+func (s *MailService) imapLeaseSlots(accountID int64) chan struct{} {
+	s.imapPoolMu.Lock()
+	defer s.imapPoolMu.Unlock()
+	if s.imapLeases == nil {
+		s.imapLeases = make(map[int64]chan struct{})
+	}
+	slots := s.imapLeases[accountID]
+	if slots == nil {
+		slots = make(chan struct{}, imapMaxLeasedPerAcct)
+		s.imapLeases[accountID] = slots
+	}
+	return slots
+}
 
 type pooledIMAPConn struct {
 	client    *imapclient.Client
@@ -44,6 +67,23 @@ func (s *MailService) acquireIMAP(session *mailSession) (*imapclient.Client, fun
 	}
 	routeKey := route.key()
 	accountID := session.account.ID
+	slots := s.imapLeaseSlots(accountID)
+	timer := time.NewTimer(imapLeaseWait)
+	select {
+	case slots <- struct{}{}:
+		timer.Stop()
+	case <-timer.C:
+		return nil, nil, errIMAPBusy
+	}
+	lease := func(conn *pooledIMAPConn) func(error) {
+		var once sync.Once
+		return func(opErr error) {
+			once.Do(func() {
+				s.releaseIMAP(conn, opErr != nil)
+				<-slots
+			})
+		}
+	}
 	for {
 		conn := s.takePooledIMAP(accountID, routeKey)
 		if conn == nil {
@@ -51,7 +91,7 @@ func (s *MailService) acquireIMAP(session *mailSession) (*imapclient.Client, fun
 		}
 		if s.imapConnUsable(conn) {
 			conn.lastUsedAt = time.Now()
-			return conn.client, func(opErr error) { s.releaseIMAP(conn, opErr != nil) }, nil
+			return conn.client, lease(conn), nil
 		}
 		go closePooledIMAP(conn)
 	}
@@ -61,6 +101,7 @@ func (s *MailService) acquireIMAP(session *mailSession) (*imapclient.Client, fun
 	s.imapPoolMu.Unlock()
 	client, err := s.dialIMAP(session)
 	if err != nil {
+		<-slots
 		return nil, nil, err
 	}
 	now := time.Now()
@@ -68,7 +109,7 @@ func (s *MailService) acquireIMAP(session *mailSession) (*imapclient.Client, fun
 		client: client, accountID: accountID, routeKey: routeKey,
 		generation: generation, createdAt: now, lastUsedAt: now,
 	}
-	return client, func(opErr error) { s.releaseIMAP(conn, opErr != nil) }, nil
+	return client, lease(conn), nil
 }
 
 // takePooledIMAP removes and returns one reusable idle connection, closing
