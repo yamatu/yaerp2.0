@@ -33,6 +33,8 @@ import { registerCellShiftFormulaRepair } from '@/lib/univer-formula-alignment'
 import { registerPasteNotifier, registerPlainTextPaste, registerQuotedClipboardFixes } from '@/lib/univer-clipboard-text'
 import { skipEditorTextRepaints } from '@/lib/univer-render-dirty'
 import { registerUniverInputRecovery } from '@/lib/univer-input-recovery'
+import { registerEditorCaretCollapse } from '@/lib/univer-editor-caret'
+import { registerFormatPainterRowHeightGuard } from '@/lib/univer-format-painter-row-height'
 import { describeFormulaError, registerFormulaErrorHint, type FormulaErrorHint } from '@/lib/univer-formula-error-hint'
 import FormulaErrorTooltip from '@/components/spreadsheet/FormulaErrorTooltip'
 import FormulaConsistencyBanner from '@/components/spreadsheet/FormulaConsistencyBanner'
@@ -4274,6 +4276,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         registerEditorComposedStyleInterceptor(univerResult.univer)
         installCellEditorAlignmentRecalculation(univerResult.univer)
         registerSharedFormulaEditorInterceptor(univerResult.univer)
+        const editorCaretCollapse = registerEditorCaretCollapse(univerResult.univer)
+        const formatPainterRowHeightGuard = registerFormatPainterRowHeightGuard(univerResult.univer)
         const resolveSharedFormula = createSharedFormulaResolver(univerResult.univer)
         sharedFormulaResolverRef.current = resolveSharedFormula
         // `下移` / `右移` move selected cells only; for uniform formula columns the
@@ -4949,6 +4953,8 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           quotedClipboardFix?.dispose()
           editorRepaintFilter?.dispose()
           inputRecovery?.dispose()
+          editorCaretCollapse?.dispose()
+          formatPainterRowHeightGuard?.dispose()
           stopWatchingMarkWipes?.()
           if (overlayRedrawFrame !== null) window.cancelAnimationFrame(overlayRedrawFrame)
           if (overlayRefreshTimerRef.current) { clearTimeout(overlayRefreshTimerRef.current); overlayRefreshTimerRef.current = null }

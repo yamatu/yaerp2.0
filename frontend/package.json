@@ -9,6 +9,8 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@univerjs/docs": "^1.1.0",
+    "@univerjs/docs-ui": "^1.1.0",
     "@univerjs/preset-sheets-conditional-formatting": "^1.1.0",
     "@univerjs/preset-sheets-core": "^1.1.0",
     "@univerjs/preset-sheets-data-validation": "^1.1.0",
