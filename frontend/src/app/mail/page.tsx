@@ -87,6 +87,7 @@ import {
 import {
   clearComposeImages,
   composeEditorMailHTML,
+  hasComposeFormatting,
   hasComposeImages,
   textToComposeHTML,
 } from "@/lib/mailComposeImages";
@@ -595,9 +596,12 @@ function loadComposeDraft(): ComposeState | null {
   }
 }
 
-/** What the body is sent as: text with images in it becomes an HTML mail. */
+/** What the body is sent as: text with images or formatting becomes an HTML mail. */
 function composeBodyParts(compose: ComposeState) {
-  if (compose.format === "text" && hasComposeImages(compose.textHTML)) {
+  if (
+    compose.format === "text" &&
+    (hasComposeImages(compose.textHTML) || hasComposeFormatting(compose.textHTML))
+  ) {
     return {
       format: "html" as const,
       textBody: compose.textBody,
@@ -5713,7 +5717,8 @@ export default function MailPage() {
                               format: "html",
                               htmlBody:
                                 current.htmlBody ||
-                                (hasComposeImages(current.textHTML)
+                                (hasComposeImages(current.textHTML) ||
+                                hasComposeFormatting(current.textHTML)
                                   ? composeEditorMailHTML(current.textHTML)
                                   : textToHTML(current.textBody)),
                             }
@@ -5841,7 +5846,7 @@ export default function MailPage() {
                         : "在这里输入回复内容…"
                       : "邮件正文（可直接粘贴截图或拖入图片）"
                   }
-                  className={`mt-3 w-full resize-y ${compose.quote ? "min-h-[22vh] sm:min-h-[200px]" : "min-h-[40vh] sm:min-h-[42dvh]"}`}
+                  className={`w-full resize-y ${compose.quote ? "min-h-[22vh] sm:min-h-[200px]" : "min-h-[40vh] sm:min-h-[42dvh]"}`}
                 />
               )}
               {compose.quote && composeView === "edit" && (
