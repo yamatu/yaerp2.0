@@ -3240,7 +3240,7 @@ export default function ChannelsPage() {
         )}
 
         {notificationSettingsOpen && (
-          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setNotificationSettingsOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setNotificationSettingsOpen(false) }}>
             <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg border border-slate-200 bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3284,7 +3284,7 @@ export default function ChannelsPage() {
         )}
 
         {isAssistantPickerOpen && (
-          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsAssistantPickerOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsAssistantPickerOpen(false) }}>
             <div className="flex max-h-[92dvh] sm:max-h-[78vh] w-full max-w-lg flex-col overflow-hidden rounded-t-2xl sm:rounded-lg border border-slate-200 bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3325,7 +3325,7 @@ export default function ChannelsPage() {
         )}
 
         {isCreateOpen && (
-          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsCreateOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsCreateOpen(false) }}>
             <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3353,7 +3353,7 @@ export default function ChannelsPage() {
         )}
 
         {isTablePickerOpen && (
-          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTablePickerOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTablePickerOpen(false) }}>
             <div className="flex max-h-[92dvh] sm:max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3474,7 +3474,7 @@ export default function ChannelsPage() {
         )}
 
         {isGalleryPickerOpen && (
-          <div className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsGalleryPickerOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsGalleryPickerOpen(false) }}>
             <div className="flex max-h-[92dvh] sm:max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3537,7 +3537,7 @@ export default function ChannelsPage() {
         )}
 
         {renamingGalleryImage && (
-          <div className="fixed inset-0 z-[85] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { event.stopPropagation(); if (event.target === event.currentTarget) setRenamingGalleryImage(null) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[85] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { event.stopPropagation(); if (event.target === event.currentTarget) setRenamingGalleryImage(null) }}>
             <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3563,7 +3563,7 @@ export default function ChannelsPage() {
         )}
 
         {forwardingMessage && (
-          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setForwardingMessage(null) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setForwardingMessage(null) }}>
             <div className="flex max-h-[92dvh] sm:max-h-[72vh] w-full max-w-md flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>
@@ -3601,7 +3601,7 @@ export default function ChannelsPage() {
         )}
 
         {isManageOpen && activeChannel && (
-          <div className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsManageOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[65] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsManageOpen(false) }}>
             <div className="flex max-h-[92dvh] sm:max-h-[84vh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>

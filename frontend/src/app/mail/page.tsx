@@ -5468,15 +5468,20 @@ export default function MailPage() {
       {compose && (
         <div
           role="dialog"
-          aria-modal="true"
+          aria-modal={isMobile}
           aria-label={compose.bulk ? "群发邮件" : "写邮件"}
+          // On desktop the window floats over the mailbox from the start, so
+          // the mail behind it can be read, selected and copied while writing.
+          data-movable-dialog
+          data-floating={isMobile ? undefined : "true"}
+          data-floating-default={isMobile ? undefined : "true"}
           className={`fixed inset-x-0 top-[var(--vv-top)] z-[90] h-[var(--vv-height)] items-end justify-center bg-slate-950/40 p-0 sm:inset-0 sm:h-auto sm:items-center sm:p-4 ${composeMinimized ? "hidden" : "flex"}`}
           onMouseDown={(event) => {
             // Clicking beside the window keeps the mail: it is minimized.
             if (event.target === event.currentTarget) setComposeMinimized(true);
           }}
         >
-          <div className="flex h-full w-full max-w-4xl flex-col overflow-hidden bg-white shadow-2xl sm:h-auto sm:max-h-[94dvh] sm:rounded-lg">
+          <div className="flex h-full w-full max-w-4xl flex-col overflow-hidden bg-white shadow-2xl sm:h-auto sm:max-h-[calc(100dvh-1rem)] sm:min-h-[360px] sm:min-w-[520px] sm:max-w-[calc(100vw-1rem)] sm:resize sm:rounded-lg sm:[width:min(56rem,calc(100vw-2rem))]">
             <div className="flex shrink-0 items-center justify-between bg-slate-900 px-2 pb-1 pt-[calc(env(safe-area-inset-top)+0.25rem)] text-white sm:h-14 sm:px-4 sm:py-0">
               <button
                 type="button"

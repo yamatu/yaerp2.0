@@ -93,6 +93,7 @@ export function ResponsiveDialog({
 
   return createPortal(
     <div
+      data-movable-dialog
       className="fixed inset-0 z-[85] flex items-end justify-center md:items-center md:p-4"
       role="dialog"
       aria-modal="true"
@@ -134,7 +135,7 @@ export function ResponsiveDialog({
         >
           <span className="h-1 w-10 rounded-full bg-slate-300" />
         </div>
-        <div className="flex items-start gap-3 border-b border-slate-200 px-4 pb-3 pt-1 md:pt-3">
+        <div data-dialog-handle className="flex items-start gap-3 border-b border-slate-200 px-4 pb-3 pt-1 md:pt-3">
           {icon && (
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-600">
               {icon}

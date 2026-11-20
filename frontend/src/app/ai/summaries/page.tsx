@@ -499,7 +499,7 @@ export default function AISummariesPage() {
         </div>
 
         {shareOpen && selectedPage && (
-          <div className="fixed inset-0 z-[85] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setShareOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[85] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setShareOpen(false) }}>
             <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg border border-slate-200 bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3"><div><div className="text-sm font-semibold text-slate-900">发送 AI 总结到频道</div><div className="mt-0.5 text-xs text-slate-500">频道成员可以直接打开“{selectedPage.title}”</div></div><button type="button" onClick={() => setShareOpen(false)} className="inline-flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button></div>
               <div className="p-4"><label className="block space-y-1.5"><span className="text-sm font-medium text-slate-700">目标频道</span><select value={shareChannelId} onChange={(event) => setShareChannelId(event.target.value)} className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-base outline-none focus:border-violet-300 sm:h-10 sm:text-sm"><option value="">请选择频道</option>{channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></label>{channels.length === 0 && <div className="mt-3 text-xs text-amber-700">当前账号还没有可用频道。</div>}</div>
@@ -509,7 +509,7 @@ export default function AISummariesPage() {
         )}
 
         {generatorOpen && (
-          <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setGeneratorOpen(false) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !working) setGeneratorOpen(false) }}>
             <div className="flex max-h-[92dvh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl border border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl sm:rounded-lg sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div className="flex items-center gap-3"><span className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-white"><Bot className="h-4 w-4" /></span><div><div className="text-sm font-semibold text-slate-900">生成跨工作簿总结</div><div className="text-xs text-slate-500">仅会读取当前账号有权查看的单元格</div></div></div>

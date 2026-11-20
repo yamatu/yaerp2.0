@@ -254,7 +254,7 @@ export function SupplierQuoteBatchModal({
   const canSave = !saving && (filledCount > 0 || availabilityChanges.length > 0);
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4">
+    <div data-movable-dialog className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4">
       <div className="flex max-h-[94vh] w-full max-w-7xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
           <div>

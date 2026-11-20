@@ -99,7 +99,7 @@ export function WhatsAppSendDialog({ open, resource, onClose, onSent }: WhatsApp
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <div data-movable-dialog className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
       <div className="flex max-h-[92dvh] sm:max-h-[86vh] w-full max-w-lg flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
           <div className="min-w-0">

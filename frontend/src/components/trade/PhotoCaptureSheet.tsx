@@ -106,7 +106,7 @@ export function PhotoCaptureSheet({
 
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
+      data-movable-dialog className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget && !uploading) onClose();
       }}
