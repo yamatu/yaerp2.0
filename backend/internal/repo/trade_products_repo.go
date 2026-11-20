@@ -166,3 +166,37 @@ func firstPositiveTrade(values ...float64) float64 {
 	}
 	return 0
 }
+
+func (r *TradeRepo) InspectionPhotoUploader(orderID, photoID int64) (int64, error) {
+	var uploadedBy int64
+	err := r.db.QueryRow(
+		`SELECT uploaded_by FROM trade_inspection_photos WHERE id=$1 AND order_id=$2`, photoID, orderID,
+	).Scan(&uploadedBy)
+	return uploadedBy, err
+}
+
+func (r *TradeRepo) DeleteInspectionPhoto(orderID, photoID int64) error {
+	result, err := r.db.Exec(`DELETE FROM trade_inspection_photos WHERE id=$1 AND order_id=$2`, photoID, orderID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// TradeImageSource tells whether an attachment is a product picture
+// ("inquiry") or an inspection photo of the order, and who added it.
+func (r *TradeRepo) TradeImageSource(orderID, attachmentID int64) (string, int64, error) {
+	var source string
+	var uploadedBy int64
+	err := r.db.QueryRow(
+		`SELECT source, uploaded_by FROM (
+		   SELECT 'inquiry' AS source, COALESCE(uploaded_by,0) AS uploaded_by FROM trade_item_images WHERE order_id=$1 AND attachment_id=$2
+		   UNION ALL
+		   SELECT 'inspection', COALESCE(uploaded_by,0) FROM trade_inspection_photos WHERE order_id=$1 AND attachment_id=$2
+		 ) images LIMIT 1`, orderID, attachmentID,
+	).Scan(&source, &uploadedBy)
+	return source, uploadedBy, err
+}

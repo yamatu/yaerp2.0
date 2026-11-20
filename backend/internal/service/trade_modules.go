@@ -11,48 +11,80 @@ import (
 
 const tradeModulesCacheTTL = 30 * time.Second
 
+// tradeModulesCache keeps the workflow switches every order listing needs.
 type tradeModulesCache struct {
-	mu       sync.Mutex
-	modules  model.TradeModules
-	loadedAt time.Time
+	mu         sync.Mutex
+	modules    model.TradeModules
+	visibility model.TradeOwnerVisibility
+	loadedAt   time.Time
 }
 
-// Modules returns the enabled workflow modules, read through a short cache
-// because every order listing needs them.
-func (s *TradeService) Modules() model.TradeModules {
+func (s *TradeService) cachedSwitches() (model.TradeModules, model.TradeOwnerVisibility) {
 	cache := &s.modulesCache
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if !cache.loadedAt.IsZero() && time.Since(cache.loadedAt) < tradeModulesCacheTTL {
-		return cache.modules
+		return cache.modules, cache.visibility
 	}
 	settings, err := s.repo.GetSettings()
 	if err != nil {
 		log.Printf("load trade modules: %v", err)
 		if cache.loadedAt.IsZero() {
-			return model.DefaultTradeModules()
+			return model.DefaultTradeModules(), model.DefaultTradeOwnerVisibility()
 		}
-		return cache.modules
+		return cache.modules, cache.visibility
 	}
 	cache.modules = settings.Modules
+	cache.visibility = settings.OwnerVisibility
 	cache.loadedAt = time.Now()
-	return cache.modules
+	return cache.modules, cache.visibility
+}
+
+// Modules returns the enabled workflow modules.
+func (s *TradeService) Modules() model.TradeModules {
+	modules, _ := s.cachedSwitches()
+	return modules
+}
+
+// OwnerVisibility returns what an order's salesperson may see of later stages.
+func (s *TradeService) OwnerVisibility() model.TradeOwnerVisibility {
+	_, visibility := s.cachedSwitches()
+	return visibility
+}
+
+func (s *TradeService) requireTradeAdmin(userID int64, message string) error {
+	admin, err := s.isAdmin(userID)
+	if err != nil {
+		return err
+	}
+	if !admin {
+		return fmt.Errorf("%s", message)
+	}
+	return nil
 }
 
 func (s *TradeService) UpdateModules(userID int64, modules model.TradeModules) (*model.TradeSettings, error) {
-	admin, err := s.isAdmin(userID)
-	if err != nil {
+	if err := s.requireTradeAdmin(userID, "只有管理员可以开关外贸业务功能模块"); err != nil {
 		return nil, err
-	}
-	if !admin {
-		return nil, fmt.Errorf("只有管理员可以开关外贸业务功能模块")
 	}
 	if err := s.repo.UpdateModules(userID, modules); err != nil {
 		return nil, err
 	}
 	s.modulesCache.mu.Lock()
-	s.modulesCache.modules = modules
-	s.modulesCache.loadedAt = time.Now()
+	s.modulesCache.loadedAt = time.Time{}
+	s.modulesCache.mu.Unlock()
+	return s.GetSettings(userID)
+}
+
+func (s *TradeService) UpdateOwnerVisibility(userID int64, visibility model.TradeOwnerVisibility) (*model.TradeSettings, error) {
+	if err := s.requireTradeAdmin(userID, "只有管理员可以修改业务员的查看权限"); err != nil {
+		return nil, err
+	}
+	if err := s.repo.UpdateOwnerVisibility(userID, visibility); err != nil {
+		return nil, err
+	}
+	s.modulesCache.mu.Lock()
+	s.modulesCache.loadedAt = time.Time{}
 	s.modulesCache.mu.Unlock()
 	return s.GetSettings(userID)
 }

@@ -859,6 +859,82 @@ func (h *TradeHandler) UpdateModules(c *gin.Context) {
 	response.OK(c, settings)
 }
 
+func (h *TradeHandler) DeleteInspectionPhoto(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	photoID, err := parseIDParam(c, "photoId")
+	if err != nil {
+		response.BadRequest(c, "无效的照片编号")
+		return
+	}
+	userID := c.GetInt64("user_id")
+	if err := h.service.DeleteInspectionPhoto(userID, orderID, photoID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "质检照片不存在")
+			return
+		}
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.GetOrder(userID, orderID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) ReplaceTradeImage(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	attachmentID, err := parseIDParam(c, "attachmentId")
+	if err != nil {
+		response.BadRequest(c, "无效的图片编号")
+		return
+	}
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "请上传图片")
+		return
+	}
+	defer file.Close()
+	userID := c.GetInt64("user_id")
+	if err := h.service.ReplaceTradeImage(userID, orderID, attachmentID, file, header); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "业务单不存在或无权访问")
+			return
+		}
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.GetOrder(userID, orderID)
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) UpdateOwnerVisibility(c *gin.Context) {
+	var request model.TradeOwnerVisibility
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	settings, err := h.service.UpdateOwnerVisibility(c.GetInt64("user_id"), request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, settings)
+}
+
 func (h *TradeHandler) UpdateOrderPricing(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {

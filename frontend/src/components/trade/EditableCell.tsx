@@ -74,6 +74,9 @@ export function EditableCell({
       <button
         type="button"
         onClick={() => {
+          // A select closed with Esc never reaches commit, so the flag would
+          // otherwise swallow the next change.
+          cancelledRef.current = false;
           setDraft(value);
           setEditing(true);
         }}

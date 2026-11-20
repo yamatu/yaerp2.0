@@ -399,6 +399,19 @@ type TradeSettings struct {
 	PaymentRecordPermissions []TradePaymentRecordPermission `json:"payment_record_permissions"`
 	PIProfile                TradePIProfile                 `json:"pi_profile"`
 	Modules                  TradeModules                   `json:"modules"`
+	OwnerVisibility          TradeOwnerVisibility           `json:"owner_visibility"`
+}
+
+// TradeOwnerVisibility lets the salesperson who owns an order see the data
+// later stages record, even without the warehouse/quality/packing position.
+type TradeOwnerVisibility struct {
+	Receiving  bool `json:"receiving"`
+	Inspection bool `json:"inspection"`
+	Packing    bool `json:"packing"`
+}
+
+func DefaultTradeOwnerVisibility() TradeOwnerVisibility {
+	return TradeOwnerVisibility{Receiving: true, Inspection: true, Packing: true}
 }
 
 // TradeModules switches optional parts of the order workflow on or off. A
@@ -515,6 +528,8 @@ type TradeOrderAccess struct {
 	CanViewPI                bool   `json:"can_view_pi"`
 	CanGeneratePI            bool   `json:"can_generate_pi"`
 	CanManageItemImages      bool   `json:"can_manage_item_images"`
+	// Delete, rotate or flip inspection photos (their uploader may as well).
+	CanManageInspectionPhotos bool `json:"can_manage_inspection_photos"`
 }
 
 type TradeOrder struct {

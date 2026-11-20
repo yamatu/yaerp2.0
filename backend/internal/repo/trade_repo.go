@@ -2041,9 +2041,10 @@ func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 			AccountName:  "YAERP Trading Co., Ltd.",
 			DefaultNotes: "All banking charges outside the beneficiary bank are for the buyer's account.",
 		},
-		Modules: model.DefaultTradeModules(),
+		Modules:         model.DefaultTradeModules(),
+		OwnerVisibility: model.DefaultTradeOwnerVisibility(),
 	}
-	rows, err := r.db.Query(`SELECT setting_key,value FROM trade_settings WHERE setting_key IN ('payment_methods','payment_record_permissions','pi_profile','modules')`)
+	rows, err := r.db.Query(`SELECT setting_key,value FROM trade_settings WHERE setting_key IN ('payment_methods','payment_record_permissions','pi_profile','modules','owner_visibility')`)
 	if err != nil {
 		return nil, err
 	}
@@ -2071,6 +2072,10 @@ func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 			if err := json.Unmarshal(value, &settings.Modules); err != nil {
 				return nil, err
 			}
+		case "owner_visibility":
+			if err := json.Unmarshal(value, &settings.OwnerVisibility); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -2080,14 +2085,22 @@ func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 }
 
 func (r *TradeRepo) UpdateModules(userID int64, modules model.TradeModules) error {
-	value, err := json.Marshal(modules)
+	return r.saveSetting(userID, "modules", modules)
+}
+
+func (r *TradeRepo) UpdateOwnerVisibility(userID int64, visibility model.TradeOwnerVisibility) error {
+	return r.saveSetting(userID, "owner_visibility", visibility)
+}
+
+func (r *TradeRepo) saveSetting(userID int64, key string, setting any) error {
+	value, err := json.Marshal(setting)
 	if err != nil {
 		return err
 	}
 	_, err = r.db.Exec(
-		`INSERT INTO trade_settings(setting_key,value,updated_by,updated_at) VALUES('modules',$1,$2,NOW())
+		`INSERT INTO trade_settings(setting_key,value,updated_by,updated_at) VALUES($1,$2,$3,NOW())
 		 ON CONFLICT(setting_key) DO UPDATE SET value=EXCLUDED.value,updated_by=EXCLUDED.updated_by,updated_at=NOW()`,
-		value, userID,
+		key, value, userID,
 	)
 	return err
 }

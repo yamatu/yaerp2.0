@@ -78,7 +78,7 @@ func TestApplyTradeItemPricing(t *testing.T) {
 	if item.QuotedPrice != 100 || item.FreightAmount != 12 || item.PurchasePrice != 60 || item.PurchaseCurrency != "CNY" || item.SupplierName != "工厂A" {
 		t.Fatalf("pricing not applied: %#v", item)
 	}
-	if item.Status != "已下单" || tradeWorkflowString(item, "purchase_status") != "已下单" {
+	if item.Status != "已采购" || tradeWorkflowString(item, "purchase_status") != "已采购" {
 		t.Fatalf("a line with supplier and cost should count as ordered: %#v", item)
 	}
 
@@ -134,5 +134,65 @@ func TestPurchaseNeedsOnlyCostWithoutQuoting(t *testing.T) {
 	}
 	if blockers := tradeOrderAdvanceBlockersWith(order, model.AllTradeModules()); len(blockers) != 1 {
 		t.Fatalf("with quoting the adopted supplier is still required, got %#v", blockers)
+	}
+}
+
+func TestPurchaseStatusesAndNotBought(t *testing.T) {
+	for status, want := range map[string]string{"": "待采购", "询价中": "待采购", "已下单": "已采购", "生产中": "已采购", "已采购": "已采购", "没买到": "没买到"} {
+		if got := normalizeTradePurchaseStatus(status); got != want {
+			t.Fatalf("normalize(%q) = %q, want %q", status, got, want)
+		}
+	}
+	items := []model.TradeOrderItem{
+		{ID: 1, LineNo: 1, SKU: "A", Quantity: 2, QuotedPrice: 10},
+		{ID: 2, LineNo: 2, SKU: "B", Quantity: 1, QuotedPrice: 50, PurchasePrice: 30},
+	}
+	set := func(index int, status string) {
+		if err := applyTradeStageItemUpdate(model.TradeStagePurchase, &items[index], &model.UpdateTradeStageItemRequest{
+			PurchasePrice: items[index].PurchasePrice, WorkflowData: map[string]any{"purchase_status": status},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	order := &model.TradeOrder{ID: 1, Stage: model.TradeStagePurchase, Currency: "CNY", Items: items}
+	set(0, "待采购")
+	set(1, "已采购")
+	if blockers := tradeOrderAdvanceBlockersWith(order, model.DefaultTradeModules()); len(blockers) != 1 {
+		t.Fatalf("a 待采购 line blocks, got %#v", blockers)
+	}
+	set(0, "没买到")
+	if !tradeItemExcluded(&items[0]) {
+		t.Fatalf("没买到 must leave the order: %#v", items[0].WorkflowData)
+	}
+	if blockers := tradeOrderAdvanceBlockersWith(order, model.DefaultTradeModules()); len(blockers) != 0 {
+		t.Fatalf("没买到 and 已采购 may move on, got %#v", blockers)
+	}
+	if summary := buildTradeProfitSummary(order, items); !near(summary.GoodsRevenue, 50) {
+		t.Fatalf("没买到 must not count in revenue, got %v", summary.GoodsRevenue)
+	}
+	set(0, "已采购")
+	if tradeItemExcluded(&items[0]) {
+		t.Fatal("changing 没买到 back must bring the line back")
+	}
+}
+
+func TestReceivingAndInspectionStatusFillQuantities(t *testing.T) {
+	item := model.TradeOrderItem{ID: 1, LineNo: 1, SKU: "A", Quantity: 5}
+	_ = applyTradeStageItemUpdate(model.TradeStageReceiving, &item, &model.UpdateTradeStageItemRequest{WorkflowData: map[string]any{"receipt_status": "全部到货"}})
+	if item.ReceivedQuantity != 5 {
+		t.Fatalf("全部到货 should fill the received quantity, got %v", item.ReceivedQuantity)
+	}
+	other := model.TradeOrderItem{ID: 2, LineNo: 2, SKU: "B", Quantity: 4}
+	_ = applyTradeStageItemUpdate(model.TradeStageReceiving, &other, &model.UpdateTradeStageItemRequest{ReceivedQuantity: 4, WorkflowData: map[string]any{"receipt_status": "待到货"}})
+	if tradeWorkflowString(&other, "receipt_status") != "全部到货" {
+		t.Fatalf("a full quantity should mark 全部到货, got %q", tradeWorkflowString(&other, "receipt_status"))
+	}
+	order := &model.TradeOrder{ID: 1, Stage: model.TradeStageReceiving, Items: []model.TradeOrderItem{item, other}}
+	if blockers := tradeOrderAdvanceBlockersWith(order, model.DefaultTradeModules()); len(blockers) != 0 {
+		t.Fatalf("all received should move on, got %#v", blockers)
+	}
+	_ = applyTradeStageItemUpdate(model.TradeStageInspection, &item, &model.UpdateTradeStageItemRequest{WorkflowData: map[string]any{"inspection_result": "合格"}})
+	if item.AcceptedQuantity != 5 {
+		t.Fatalf("合格 should fill the accepted quantity, got %v", item.AcceptedQuantity)
 	}
 }

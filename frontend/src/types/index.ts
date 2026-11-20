@@ -1595,6 +1595,14 @@ export interface TradeSettings {
   payment_record_permissions: TradePaymentRecordPermission[];
   pi_profile: TradePIProfile;
   modules?: TradeModules;
+  owner_visibility?: TradeOwnerVisibility;
+}
+
+/** What the salesperson who owns an order may see of later stages. */
+export interface TradeOwnerVisibility {
+  receiving: boolean;
+  inspection: boolean;
+  packing: boolean;
 }
 
 export interface TradeModules {
@@ -1670,6 +1678,7 @@ export interface TradeOrderAccess {
   can_view_pi: boolean;
   can_generate_pi: boolean;
   can_manage_item_images: boolean;
+  can_manage_inspection_photos?: boolean;
 }
 
 export interface TradeProfitLine {

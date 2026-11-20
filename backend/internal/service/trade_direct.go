@@ -48,9 +48,9 @@ func applyTradeItemPricing(item *model.TradeOrderItem, input model.TradeOrderPri
 		item.PurchaseCurrency = "CNY"
 	}
 	if item.PurchasePrice > 0 && tradeWorkflowString(item, "purchase_status") == "" {
-		setTradeWorkflowValue(item, "purchase_status", "已下单")
+		setTradeWorkflowValue(item, "purchase_status", tradePurchaseBought)
 		if !tradeStageAtOrAfter(orderStage, model.TradeStageReceiving) {
-			item.Status = "已下单"
+			item.Status = tradePurchaseBought
 		}
 	}
 }
@@ -126,6 +126,11 @@ func (s *TradeService) UpdateOrderPricing(userID, orderID int64, request *model.
 		}
 		if order.OwnerID != userID || !orderAccess.CanViewCustomerPricing {
 			return nil, fmt.Errorf("只有订单负责人、业务负责人或管理员可以修改售价")
+		}
+		// From receiving on the products are fixed for staff; returning the
+		// order to purchasing unlocks them again.
+		if tradeStageAtOrAfter(order.Stage, model.TradeStageReceiving) {
+			return nil, fmt.Errorf("订单已进入%s环节，产品和价格不能再修改；如需修改请先退回采购环节", tradeStageLabel(order.Stage))
 		}
 	}
 	if order.Stage == model.TradeStageCancelled {
