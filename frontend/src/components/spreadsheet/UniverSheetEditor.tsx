@@ -5724,6 +5724,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         selectionEditable={Boolean(selectionState && selectionState.rowIndex >= 0 && !editLocked && !selectedCellCannotEdit && !selectedCellMasked && !selectedCellFormulaHidden)}
         selectionLabel={selectionState?.rangeLabel || ''}
         changeToken={`${searchDataVersion}:${reloadToken || ''}:${searchAccessToken}`}
+        isCellEditing={() => Boolean(getVisibleUniverCellEditor(containerRef.current))}
         highlightHits={(hits, current) => {
           searchHighlightRef.current = { hits, current }
           searchHighlightRendererRef.current()
