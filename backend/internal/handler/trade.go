@@ -859,6 +859,25 @@ func (h *TradeHandler) UpdateModules(c *gin.Context) {
 	response.OK(c, settings)
 }
 
+func (h *TradeHandler) UpdateParcels(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.UpdateTradeParcelsRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdateParcels(c.GetInt64("user_id"), orderID, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) DeleteInspectionPhoto(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {

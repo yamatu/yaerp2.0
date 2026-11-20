@@ -516,7 +516,7 @@ func TestTradeOrderAdvanceBlockers(t *testing.T) {
 	}
 
 	order.Stage = model.TradeStageShipment
-	order.Shipment = &model.TradeShipment{OrderID: order.ID, Carrier: "物流公司", BookingNo: "BK-001", ShippingStatus: "未发货"}
+	order.Shipment = &model.TradeShipment{OrderID: order.ID, BookingNo: "BK-001", ShippingStatus: "未发货"}
 	if blockers := tradeOrderAdvanceBlockers(order); len(blockers) != 3 {
 		t.Fatalf("incomplete shipment should require carrier, arrival and payment proof, got %#v", blockers)
 	}

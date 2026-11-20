@@ -1573,6 +1573,28 @@ export interface TradePackingGroup {
   updated_at: string;
 }
 
+export interface TradeParcelBox {
+  group_no: number;
+  copies: number;
+}
+
+/** One consignment of an order: a carrier and tracking number with some boxes. */
+export interface TradeParcel {
+  id: number;
+  order_id: number;
+  parcel_no: number;
+  carrier: string;
+  tracking_no: string;
+  shipping_status: string;
+  ship_date?: string;
+  actual_freight_currency: string;
+  actual_freight_amount: number;
+  actual_freight_to_cny_rate: number;
+  boxes: TradeParcelBox[];
+  notes: string;
+  updated_at: string;
+}
+
 export interface TradePositionMember {
   user_id: number;
   username: string;
@@ -1887,6 +1909,7 @@ export interface TradeOrder {
   inspection_photos?: TradeInspectionPhoto[];
   packing_groups?: TradePackingGroup[];
   shipment?: TradeShipment;
+  parcels?: TradeParcel[];
   profit_summary?: TradeProfitSummary;
 }
 

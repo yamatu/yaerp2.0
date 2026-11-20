@@ -419,6 +419,7 @@ func main() {
 		api.POST("/trade/orders/:id/inspection-photos", tradeHandler.UploadInspectionPhoto)
 		api.POST("/trade/orders/:id/inspection-photos/link", tradeHandler.LinkInspectionPhotos)
 		api.DELETE("/trade/orders/:id/inspection-photos/:photoId", tradeHandler.DeleteInspectionPhoto)
+		api.PUT("/trade/orders/:id/parcels", tradeHandler.UpdateParcels)
 		api.PUT("/trade/orders/:id/images/:attachmentId/content", tradeHandler.ReplaceTradeImage)
 		api.PUT("/trade/orders/:id/packing-groups", tradeHandler.UpdatePackingGroups)
 		api.POST("/trade/orders/:id/return-to-purchase", tradeHandler.ReturnOrderToPurchase)

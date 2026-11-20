@@ -361,6 +361,49 @@ type TradePackingGroupItem struct {
 	Quantity    float64 `json:"quantity"`
 }
 
+// TradeParcel is one consignment of an order: a carrier and tracking number
+// carrying some of the packed boxes.
+type TradeParcel struct {
+	ID                     int64            `json:"id"`
+	OrderID                int64            `json:"order_id"`
+	ParcelNo               int              `json:"parcel_no"`
+	Carrier                string           `json:"carrier"`
+	TrackingNo             string           `json:"tracking_no"`
+	ShippingStatus         string           `json:"shipping_status"`
+	ShipDate               *time.Time       `json:"ship_date,omitempty"`
+	ActualFreightCurrency  string           `json:"actual_freight_currency"`
+	ActualFreightAmount    float64          `json:"actual_freight_amount"`
+	ActualFreightToCNYRate float64          `json:"actual_freight_to_cny_rate"`
+	Boxes                  []TradeParcelBox `json:"boxes"`
+	Notes                  string           `json:"notes"`
+	UpdatedAt              time.Time        `json:"updated_at"`
+}
+
+// TradeParcelBox puts copies of a packing group (boxes packed the same way)
+// into a parcel.
+type TradeParcelBox struct {
+	GroupNo int `json:"group_no"`
+	Copies  int `json:"copies"`
+}
+
+type TradeParcelInput struct {
+	// Existing parcel being edited; zero for a new one.
+	ID                     int64            `json:"id"`
+	Carrier                string           `json:"carrier"`
+	TrackingNo             string           `json:"tracking_no"`
+	ShippingStatus         string           `json:"shipping_status"`
+	ShipDate               string           `json:"ship_date"`
+	ActualFreightCurrency  string           `json:"actual_freight_currency"`
+	ActualFreightAmount    float64          `json:"actual_freight_amount"`
+	ActualFreightToCNYRate float64          `json:"actual_freight_to_cny_rate"`
+	Boxes                  []TradeParcelBox `json:"boxes"`
+	Notes                  string           `json:"notes"`
+}
+
+type UpdateTradeParcelsRequest struct {
+	Parcels []TradeParcelInput `json:"parcels"`
+}
+
 type TradePackingGroup struct {
 	ID                 int64                   `json:"id"`
 	OrderID            int64                   `json:"order_id"`
@@ -619,6 +662,7 @@ type TradeOrder struct {
 	InspectionPhotos             []TradeInspectionPhoto    `json:"inspection_photos,omitempty"`
 	PackingGroups                []TradePackingGroup       `json:"packing_groups,omitempty"`
 	Shipment                     *TradeShipment            `json:"shipment,omitempty"`
+	Parcels                      []TradeParcel             `json:"parcels,omitempty"`
 	ProfitSummary                *TradeProfitSummary       `json:"profit_summary,omitempty"`
 }
 

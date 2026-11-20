@@ -640,6 +640,12 @@ func (s *TradeService) GetOrder(userID, orderID int64) (*model.TradeOrder, error
 	order.Items = items
 	order.Events = events
 	order.Customer = customer
+	// Parcels decide whether recorded shipping counts as a cost.
+	parcels, err := s.repo.ListParcels(orderID)
+	if err != nil {
+		return nil, err
+	}
+	order.Parcels = parcels
 	order.ProfitSummary = buildTradeProfitSummary(order, items)
 	if quotes, quoteErr := s.repo.ListSupplierQuotes(orderID); quoteErr == nil {
 		order.SupplierQuotes = quotes
@@ -1293,7 +1299,9 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		summary.Revenue = order.TotalAmount
 	}
 	actualFreightCNY := 0.0
-	if freightMode == "quoted" {
+	// Shipping is a cost whenever we charge for it, and also when parcels we
+	// sent record what we paid. A customer forwarder costs us nothing.
+	if freightMode == "quoted" || lineFreight > 0 || (len(order.Parcels) > 0 && order.ActualFreightAmount > 0) {
 		actualCurrency := strings.ToUpper(firstNonEmptyTrade(order.ActualFreightCurrency, "CNY"))
 		actualRate := nonNegativeTradeValue(order.ActualFreightToCNYRate)
 		if strings.EqualFold(actualCurrency, "CNY") {
@@ -2928,6 +2936,20 @@ func (s *TradeService) loadTradeOrderAdvanceBlockers(order *model.TradeOrder) ([
 			}
 			order.Shipment = shipment
 		}
+		if order.Parcels == nil {
+			parcels, err := s.repo.ListParcels(order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.Parcels = parcels
+		}
+		if order.PackingGroups == nil {
+			groups, err := s.repo.ListPackingGroups(order.ID)
+			if err != nil {
+				return nil, err
+			}
+			order.PackingGroups = groups
+		}
 		if order.CustomerQuotes == nil {
 			quotes, err := s.repo.ListCustomerQuoteRounds(order.ID)
 			if err != nil {
@@ -3053,21 +3075,23 @@ func tradeOrderAdvanceBlockersWith(order *model.TradeOrder, modules model.TradeM
 			blockers = append(blockers, "尚未完成装箱数量或箱数："+labels)
 		}
 	case model.TradeStageShipment:
-		shipment := order.Shipment
-		if shipment == nil {
-			blockers = append(blockers, "尚未填写发货跟踪资料")
-			break
-		}
-		carrier := strings.ToUpper(strings.TrimSpace(shipment.Carrier))
-		if carrier != "DHL" && carrier != "FEDEX" {
-			blockers = append(blockers, "物流公司请选择 DHL 或 FedEx")
-		}
-		if strings.TrimSpace(shipment.BookingNo) == "" {
-			blockers = append(blockers, "请填写物流订单号")
-		}
-		status := normalizeTradeShippingStatus(shipment.ShippingStatus)
-		if status != "已发货" {
-			blockers = append(blockers, "物流状态更新为“已发货”后才能完成订单")
+		if len(order.Parcels) > 0 {
+			blockers = append(blockers, tradeParcelBlockers(order.Parcels, order.PackingGroups)...)
+		} else {
+			shipment := order.Shipment
+			if shipment == nil {
+				blockers = append(blockers, "请添加发货包裹，填写物流公司和单号")
+				break
+			}
+			if strings.TrimSpace(shipment.Carrier) == "" {
+				blockers = append(blockers, "请选择物流公司")
+			}
+			if strings.TrimSpace(shipment.BookingNo) == "" {
+				blockers = append(blockers, "请填写物流订单号")
+			}
+			if normalizeTradeShippingStatus(shipment.ShippingStatus) != "已发货" {
+				blockers = append(blockers, "物流状态更新为“已发货”后才能完成订单")
+			}
 		}
 		paymentProofFound := false
 		for _, quote := range order.CustomerQuotes {
@@ -3081,7 +3105,7 @@ func tradeOrderAdvanceBlockersWith(order *model.TradeOrder, modules model.TradeM
 		if !paymentProofFound && modules.Quotation {
 			blockers = append(blockers, "完成订单前必须上传客户付款凭证")
 		}
-		if order.FreightMode == "quoted" {
+		if shipment := order.Shipment; order.FreightMode == "quoted" && len(order.Parcels) == 0 && shipment != nil {
 			if shipment.ActualFreightAmount <= 0 {
 				blockers = append(blockers, "我方已向客户报价运费，请填写最终实际运费")
 			} else if !strings.EqualFold(shipment.ActualFreightCurrency, "CNY") && shipment.ActualFreightToCNYRate <= 0 {

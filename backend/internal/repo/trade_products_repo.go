@@ -200,3 +200,81 @@ func (r *TradeRepo) TradeImageSource(orderID, attachmentID int64) (string, int64
 	).Scan(&source, &uploadedBy)
 	return source, uploadedBy, err
 }
+
+func (r *TradeRepo) ListParcels(orderID int64) ([]model.TradeParcel, error) {
+	rows, err := r.db.Query(
+		`SELECT id,order_id,parcel_no,carrier,tracking_no,shipping_status,ship_date,actual_freight_currency,
+		 actual_freight_amount,actual_freight_to_cny_rate,boxes,notes,updated_at
+		 FROM trade_order_parcels WHERE order_id=$1 ORDER BY parcel_no,id`, orderID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list trade parcels: %w", err)
+	}
+	defer rows.Close()
+	parcels := make([]model.TradeParcel, 0)
+	for rows.Next() {
+		var parcel model.TradeParcel
+		var shipDate sql.NullTime
+		var boxesRaw []byte
+		if err := rows.Scan(&parcel.ID, &parcel.OrderID, &parcel.ParcelNo, &parcel.Carrier, &parcel.TrackingNo,
+			&parcel.ShippingStatus, &shipDate, &parcel.ActualFreightCurrency, &parcel.ActualFreightAmount,
+			&parcel.ActualFreightToCNYRate, &boxesRaw, &parcel.Notes, &parcel.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if shipDate.Valid {
+			parcel.ShipDate = &shipDate.Time
+		}
+		parcel.Boxes = []model.TradeParcelBox{}
+		if err := json.Unmarshal(boxesRaw, &parcel.Boxes); err != nil {
+			return nil, err
+		}
+		parcels = append(parcels, parcel)
+	}
+	return parcels, rows.Err()
+}
+
+// ReplaceParcels stores the parcels of an order and the order-level shipment
+// summary in one transaction.
+func (r *TradeRepo) ReplaceParcels(orderID int64, parcels []model.TradeParcel, summary *model.TradeShipment) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM trade_order_parcels WHERE order_id=$1`, orderID); err != nil {
+		return err
+	}
+	for _, parcel := range parcels {
+		boxes, err := json.Marshal(parcel.Boxes)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO trade_order_parcels(order_id,parcel_no,carrier,tracking_no,shipping_status,ship_date,
+			 actual_freight_currency,actual_freight_amount,actual_freight_to_cny_rate,boxes,notes,created_at,updated_at)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())`,
+			orderID, parcel.ParcelNo, parcel.Carrier, parcel.TrackingNo, parcel.ShippingStatus, parcel.ShipDate,
+			parcel.ActualFreightCurrency, parcel.ActualFreightAmount, parcel.ActualFreightToCNYRate, boxes, parcel.Notes,
+		); err != nil {
+			return fmt.Errorf("save parcel %d: %w", parcel.ParcelNo, err)
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO trade_order_shipments(order_id,booking_no,carrier,etd,shipping_status,
+		 actual_freight_currency,actual_freight_amount,actual_freight_to_cny_rate,actual_freight_notes,updated_at)
+		 VALUES($1,$2,$3,$4,$5,'CNY',$6,1,$7,NOW())
+		 ON CONFLICT(order_id) DO UPDATE SET booking_no=EXCLUDED.booking_no,carrier=EXCLUDED.carrier,
+		 etd=EXCLUDED.etd,shipping_status=EXCLUDED.shipping_status,actual_freight_currency='CNY',
+		 actual_freight_amount=EXCLUDED.actual_freight_amount,actual_freight_to_cny_rate=1,
+		 actual_freight_notes=EXCLUDED.actual_freight_notes,updated_at=NOW()`,
+		orderID, summary.BookingNo, summary.Carrier, summary.ETD, summary.ShippingStatus,
+		summary.ActualFreightAmount, summary.ActualFreightNotes,
+	); err != nil {
+		return fmt.Errorf("save shipment summary: %w", err)
+	}
+	_, err = tx.Exec(`UPDATE trade_orders SET updated_at=NOW() WHERE id=$1`, orderID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}

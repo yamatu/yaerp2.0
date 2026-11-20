@@ -361,6 +361,11 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 			order.Shipment.ActualFreightToCNYRate = 0
 			order.Shipment.ActualFreightNotes = ""
 		}
+		for index := range order.Parcels {
+			order.Parcels[index].ActualFreightCurrency = ""
+			order.Parcels[index].ActualFreightAmount = 0
+			order.Parcels[index].ActualFreightToCNYRate = 0
+		}
 	}
 	if !orderAccess.CanViewCustomerPricing {
 		order.TotalAmount = 0
@@ -399,6 +404,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	}
 	if !orderAccess.CanViewShipment {
 		order.Shipment = nil
+		order.Parcels = nil
 	}
 	if !orderAccess.CanViewPacking {
 		order.PackingGroups = nil
