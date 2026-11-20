@@ -80,6 +80,8 @@ import {
   OrderPricingModal,
 } from "@/components/trade/TradePricingEditor";
 import { ProfitWarnings } from "@/components/trade/ProfitWarnings";
+import { EditableCell } from "@/components/trade/EditableCell";
+import { amountValue, parseAmountText } from "@/lib/tradeNumbers";
 import {
   CustomerQuoteRoundModal,
   type CustomerQuoteRoundPayload,
@@ -676,6 +678,13 @@ const STAGE_DATA_FIELDS: Partial<Record<TradeStage, StageDataField[]>> = {
 };
 
 const SHIPMENT_STATUSES = ["未发货", "已发货"];
+
+const STATUS_FIELD_KEYS = [
+  "status",
+  "purchase_status",
+  "receipt_status",
+  "inspection_result",
+];
 
 function normalizeShipmentStatus(status?: string) {
   const value = status?.trim() || "";
@@ -1929,6 +1938,148 @@ export default function TradeWorkspacePage() {
     }
   };
 
+  const stageDraftForItem = (
+    stage: TradeStage,
+    item: TradeOrderItem,
+  ): Record<string, string> => {
+    const fields = STAGE_DATA_FIELDS[stage] || [];
+    return Object.fromEntries(
+      fields.map((field) => {
+        let value = stageItemValue(item, field);
+        if (!value && field.key === "sample_qty")
+          value = String(item.received_quantity || item.quantity || 0);
+        if (!value && field.key === "accepted_quantity")
+          value = String(item.received_quantity || item.quantity || 0);
+        if (!value && ["received_date", "inspection_date"].includes(field.key))
+          value = new Date().toISOString().slice(0, 10);
+        if (!value && field.key === "inspector") value = profile?.username || "";
+        if (
+          !value &&
+          ["purchase_status", "receipt_status", "inspection_result"].includes(
+            field.key,
+          )
+        ) {
+          value = stageItemStatus(stage, item);
+        }
+        if (
+          field.type === "select" &&
+          field.options?.length &&
+          !field.options.includes(value)
+        ) {
+          value = field.options[0];
+        }
+        return [field.key, value];
+      }),
+    );
+  };
+
+  const stagePayloadForItem = (
+    stage: TradeStage,
+    item: TradeOrderItem,
+    draft: Record<string, string>,
+  ) => {
+    const fields = STAGE_DATA_FIELDS[stage] || [];
+    const payload: Record<string, unknown> = {
+      order_item_id: item.id,
+      workflow_data: {},
+    };
+    const workflowData = payload.workflow_data as Record<string, unknown>;
+    fields.forEach((field) => {
+      const rawValue = draft[field.key] || "";
+      const value =
+        field.type === "number" ? amountValue(rawValue) : rawValue.trim();
+      if (field.source === "workflow") workflowData[field.key] = value;
+      else payload[field.key] = value;
+    });
+    if (typeof payload.sku === "string" && !itemExtraName(item)) {
+      payload.product_name = payload.sku;
+    }
+    return payload;
+  };
+
+  const applyEditedOrder = async (order: TradeOrder) => {
+    setDetailOrder(order);
+    await loadData(true);
+  };
+
+  // One field of one product in the current stage, saved like the modal does.
+  const saveStageCell = async (
+    item: TradeOrderItem,
+    key: string,
+    value: string,
+  ) => {
+    if (!detailOrder) return;
+    const draft = { ...stageDraftForItem(detailOrder.stage, item), [key]: value };
+    setError("");
+    const response = await api.put<TradeOrder>(
+      `/trade/orders/${detailOrder.id}/stage-data`,
+      { items: [stagePayloadForItem(detailOrder.stage, item, draft)] },
+    );
+    if (response.code !== 0 || !response.data) {
+      setError(response.message || "保存失败");
+      return;
+    }
+    await applyEditedOrder(response.data);
+  };
+
+  // Product, price, freight and cost of one line, through the pricing API.
+  const savePricingCell = async (
+    item: TradeOrderItem,
+    patch: Record<string, string | number>,
+  ) => {
+    if (!detailOrder) return;
+    setError("");
+    const response = await api.put<TradeOrder>(
+      `/trade/orders/${detailOrder.id}/pricing`,
+      {
+        items: [
+          {
+            order_item_id: item.id,
+            sku: item.sku || item.product_name,
+            product_name: item.product_name,
+            specification: item.specification,
+            quantity: item.quantity,
+            unit: item.unit,
+            sales_price: item.quoted_price,
+            freight_amount: item.freight_amount || 0,
+            supplier_name: item.supplier_name,
+            purchase_currency: item.purchase_currency || "CNY",
+            purchase_price: item.purchase_price,
+            ...patch,
+          },
+        ],
+      },
+    );
+    if (response.code !== 0 || !response.data) {
+      setError(response.message || "保存失败");
+      return;
+    }
+    await applyEditedOrder(response.data);
+  };
+
+  const renderStatusCell = (item: TradeOrderItem) => {
+    const statusField = editableStageFields.find((field) =>
+      STATUS_FIELD_KEYS.includes(field.key),
+    );
+    const status = stageItemStatus(detailViewStage, item);
+    const badge = (
+      <span className="rounded-md bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">
+        {status}
+      </span>
+    );
+    if (!statusField) return badge;
+    return (
+      <EditableCell
+        label={`第 ${item.line_no} 行${statusField.label}`}
+        type="select"
+        options={statusField.options || []}
+        value={status}
+        display={badge}
+        onSave={(value) => saveStageCell(item, statusField.key, value)}
+      />
+    );
+  };
+
   const openStageDataModal = () => {
     if (!detailOrder?.can_operate_stage) {
       setError("当前账号不是本环节负责人，不能修改环节数据。");
@@ -1948,40 +2099,7 @@ export default function TradeWorkspacePage() {
       Object.fromEntries(
         tradeActiveItems(detailOrder.items).map((item) => [
           item.id,
-          Object.fromEntries(
-            fields.map((field) => {
-              let value = stageItemValue(item, field);
-              if (!value && field.key === "sample_qty")
-                value = String(item.received_quantity || item.quantity || 0);
-              if (!value && field.key === "accepted_quantity")
-                value = String(item.received_quantity || item.quantity || 0);
-              if (
-                !value &&
-                ["received_date", "inspection_date"].includes(field.key)
-              )
-                value = new Date().toISOString().slice(0, 10);
-              if (!value && field.key === "inspector")
-                value = profile?.username || "";
-              if (
-                !value &&
-                [
-                  "purchase_status",
-                  "receipt_status",
-                  "inspection_result",
-                ].includes(field.key)
-              ) {
-                value = stageItemStatus(detailOrder.stage, item);
-              }
-              if (
-                field.type === "select" &&
-                field.options?.length &&
-                !field.options.includes(value)
-              ) {
-                value = field.options[0];
-              }
-              return [field.key, value];
-            }),
-          ),
+          stageDraftForItem(detailOrder.stage, item),
         ]),
       ),
     );
@@ -2000,39 +2118,22 @@ export default function TradeWorkspacePage() {
   const saveStageData = async () => {
     if (!detailOrder) return;
     const fields = STAGE_DATA_FIELDS[detailOrder.stage] || [];
-    const numericFields = new Set([
-      "quantity",
-      "target_price",
-      "purchase_price",
-      "cost_exchange_rate",
-      "received_quantity",
-      "accepted_quantity",
-      "packed_quantity",
-      "carton_count",
-      "gross_weight",
-      "net_weight",
-      "sample_qty",
-    ]);
-    const items = tradeActiveItems(detailOrder.items).map((item) => {
-      const draft = stageItemDrafts[item.id] || {};
-      const payload: Record<string, unknown> = {
-        order_item_id: item.id,
-        workflow_data: {},
-      };
-      const workflowData = payload.workflow_data as Record<string, unknown>;
-      fields.forEach((field) => {
-        const rawValue = draft[field.key] || "";
-        const value = numericFields.has(field.key)
-          ? Number(rawValue || 0)
-          : rawValue.trim();
-        if (field.source === "workflow") workflowData[field.key] = value;
-        else payload[field.key] = value;
-      });
-      if (typeof payload.sku === "string" && !itemExtraName(item)) {
-        payload.product_name = payload.sku;
-      }
-      return payload;
-    });
+    const invalid = tradeActiveItems(detailOrder.items).flatMap((item) =>
+      fields
+        .filter(
+          (field) =>
+            field.type === "number" &&
+            parseAmountText(stageItemDrafts[item.id]?.[field.key] || "") === null,
+        )
+        .map((field) => `第 ${item.line_no} 行${field.label}`),
+    );
+    if (invalid.length) {
+      setError(`${invalid.slice(0, 3).join("、")} 不是有效数字，请修改后再保存。`);
+      return;
+    }
+    const items = tradeActiveItems(detailOrder.items).map((item) =>
+      stagePayloadForItem(detailOrder.stage, item, stageItemDrafts[item.id] || {}),
+    );
     setSavingStageData(true);
     setError("");
     try {
@@ -3447,6 +3548,39 @@ export default function TradeWorkspacePage() {
     (stage) =>
       tradeStageEnabled(stage.key, modules) ||
       (dashboard?.stage_counts?.[stage.key] || 0) > 0,
+  );
+  // Admins/managers edit prices and cost; the order's salesperson edits the
+  // selling side only (the server ignores cost fields from them).
+  const canEditDetailPricing = Boolean(
+    detailOrder &&
+      detailOrder.stage !== "cancelled" &&
+      (detailOrder.access?.can_view_profit ||
+        (detailOrder.owner_id === profile?.id &&
+          detailOrder.access?.can_view_customer_pricing)),
+  );
+  const canEditCost = Boolean(
+    detailOrder?.access?.can_view_profit && detailOrder.stage !== "cancelled",
+  );
+  // Fields of the stage on screen that this user may change right now.
+  const editableStageFields =
+    detailOrder &&
+    detailViewStage === detailOrder.stage &&
+    detailOrder.can_operate_stage &&
+    detailOrder.stage !== "packing"
+      ? STAGE_DATA_FIELDS[detailOrder.stage] || []
+      : [];
+  const canEditPurchaseStage = editableStageFields.some(
+    (field) => field.key === "purchase_price",
+  );
+  const showSupplierColumns = Boolean(
+    detailOrder?.access?.can_view_supplier &&
+      (detailOrder.access.can_view_profit ||
+        ["supplier_quote", "purchase"].includes(detailViewStage)),
+  );
+  const showPurchaseColumn = Boolean(
+    detailOrder?.access?.can_view_supplier_pricing &&
+      (detailOrder.access.can_view_profit ||
+        ["supplier_quote", "purchase"].includes(detailViewStage)),
   );
   const detailStages = STAGES.filter(
     (stage) =>
@@ -4913,7 +5047,7 @@ export default function TradeWorkspacePage() {
 
         {customerDeleteApprovalsOpen && tradeAccess?.is_admin && (
           <div
-            className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget)
                 setCustomerDeleteApprovalsOpen(false);
@@ -5007,7 +5141,7 @@ export default function TradeWorkspacePage() {
 
         {customerDeleteTarget && (
           <div
-            className="fixed inset-0 z-[63] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[63] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !deletingCustomer)
                 setCustomerDeleteTarget(null);
@@ -5105,7 +5239,7 @@ export default function TradeWorkspacePage() {
 
         {aiImportOpen && (
           <div
-            className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (
                 event.target === event.currentTarget &&
@@ -5645,7 +5779,7 @@ export default function TradeWorkspacePage() {
 
         {orderModalOpen && (
           <div
-            className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[62] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingOrder)
                 setOrderModalOpen(false);
@@ -5823,7 +5957,7 @@ export default function TradeWorkspacePage() {
 
         {supplierModalOpen && (
           <div
-            className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingSupplier)
                 closeSupplierModal();
@@ -6078,7 +6212,7 @@ export default function TradeWorkspacePage() {
         )}
 
         {customerQuoteStatusDraft && detailOrder && (
-          <div className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
+          <div data-movable-dialog className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
             <div className="max-h-[94vh] w-full max-w-lg overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
@@ -6315,7 +6449,7 @@ export default function TradeWorkspacePage() {
         )}
 
         {paymentQuoteID && detailOrder && (
-          <div className="fixed inset-0 z-[105] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
+          <div data-movable-dialog className="fixed inset-0 z-[105] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
             <div className="max-h-[94vh] w-full max-w-md overflow-y-auto rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
@@ -6397,7 +6531,7 @@ export default function TradeWorkspacePage() {
         )}
 
         {itemModalOpen && detailOrder && (
-          <div className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
+          <div data-movable-dialog className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4">
             <div className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
@@ -6468,13 +6602,14 @@ export default function TradeWorkspacePage() {
             order={pricingOrder.order}
             suppliers={suppliers}
             convert={pricingOrder.convert}
+            showCost={Boolean(pricingOrder.order.access?.can_view_profit)}
             onClose={() => setPricingOrder(null)}
             onSaved={handlePricingSaved}
           />
         )}
 
         {settingsOpen && (
-          <div className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4">
+          <div data-movable-dialog className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4">
             <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
                 <div>
@@ -7183,7 +7318,7 @@ export default function TradeWorkspacePage() {
                             客户频道
                           </button>
                         )}
-                        {detailOrder.access?.can_view_profit &&
+                        {canEditDetailPricing &&
                           !modules.quotation &&
                           QUOTE_STAGES.includes(detailOrder.stage) && (
                             <button
@@ -7200,8 +7335,7 @@ export default function TradeWorkspacePage() {
                               转为成交订单
                             </button>
                           )}
-                        {detailOrder.access?.can_view_profit &&
-                          detailOrder.stage !== "cancelled" && (
+                        {canEditDetailPricing && (
                             <button
                               type="button"
                               onClick={() =>
@@ -7281,7 +7415,7 @@ export default function TradeWorkspacePage() {
                                   </span>
                                 </div>
                                 <p className="mt-0.5 text-xs text-slate-400">
-                                  商品利润与运费利润分开核算，并按本轮报价汇率折合人民币。
+                                  客户付款（产品 + 运费 + 手续费）按汇率折合人民币，减去采购成本即为利润。
                                 </p>
                               </div>
                               <button
@@ -7292,94 +7426,53 @@ export default function TradeWorkspacePage() {
                                 编辑成本
                               </button>
                             </div>
-                            <div className="grid grid-cols-2 gap-px bg-slate-200 sm:grid-cols-3 xl:grid-cols-5">
-                              {[
-                                [
-                                  "商品收入",
-                                  detailOrder.profit_summary.goods_revenue,
-                                ],
-                                [
-                                  "报价运费",
-                                  detailOrder.profit_summary.freight_revenue,
-                                ],
-                                [
-                                  "产品成本",
-                                  detailOrder.profit_summary.product_cost,
-                                ],
-                                [
-                                  "实际运费",
-                                  detailOrder.profit_summary
-                                    .actual_freight_cost,
-                                ],
-                                [
-                                  "运费利润",
-                                  detailOrder.profit_summary.freight_profit,
-                                ],
-                                [
-                                  "附加成本",
-                                  detailOrder.profit_summary.additional_cost,
-                                ],
-                                [
-                                  "订单总利润",
-                                  detailOrder.profit_summary.profit_amount,
-                                ],
-                              ].map(([label, value]) => (
-                                <div
-                                  key={String(label)}
-                                  className="bg-white px-4 py-3"
-                                >
-                                  <div className="text-xs text-slate-400">
-                                    {label}
-                                  </div>
-                                  <div
-                                    className={`mt-1 text-sm font-semibold tabular-nums ${(label === "订单总利润" || label === "运费利润") && Number(value) < 0 ? "text-rose-700" : label === "订单总利润" || label === "运费利润" ? "text-emerald-700" : "text-slate-900"}`}
-                                  >
-                                    {formatFinancialMoney(
-                                      detailOrder.profit_summary?.currency ||
-                                        detailOrder.currency,
-                                      Number(value),
-                                    )}
-                                  </div>
+                            {(() => {
+                              const summary = detailOrder.profit_summary!;
+                              const currency = summary.currency || detailOrder.currency;
+                              const rate = summary.exchange_rate_cny;
+                              const cny = (value: number) =>
+                                rate > 0 ? formatFinancialMoney("CNY", value * rate) : "汇率待补";
+                              const cells: Array<{ label: string; value: string; sub?: string; tone?: string }> = [
+                                { label: "产品金额", value: formatFinancialMoney(currency, summary.goods_revenue) },
+                                { label: "运费", value: formatFinancialMoney(currency, summary.freight_revenue) },
+                                { label: "手续费", value: formatFinancialMoney(currency, summary.fee_revenue || 0) },
+                                {
+                                  label: "客户付款合计",
+                                  value: formatFinancialMoney(currency, summary.revenue),
+                                  sub: currency === "CNY" ? undefined : `≈ ${cny(summary.revenue)}`,
+                                },
+                                { label: "采购成本（人民币）", value: cny(summary.product_cost) },
+                              ];
+                              if (summary.actual_freight_cost > 0)
+                                cells.push({ label: "实际运费（人民币）", value: formatFinancialMoney("CNY", summary.freight_cost_cny) });
+                              if (summary.additional_cost > 0)
+                                cells.push({ label: "附加成本（人民币）", value: cny(summary.additional_cost) });
+                              cells.push(
+                                {
+                                  label: "利润（人民币）",
+                                  value: summary.cny_complete ? formatFinancialMoney("CNY", summary.profit_amount_cny) : "汇率待补",
+                                  tone: summary.profit_amount_cny < 0 ? "text-rose-700" : "text-emerald-700",
+                                },
+                                { label: "利润率", value: formatPercent(summary.profit_margin) },
+                                {
+                                  label: "汇率",
+                                  value: currency === "CNY" ? "人民币订单" : rate > 0 ? `1 ${currency} = ${rate} CNY` : "汇率待补",
+                                },
+                              );
+                              return (
+                                <div className="grid grid-cols-2 gap-px bg-slate-200 sm:grid-cols-3 xl:grid-cols-5" data-order-profit>
+                                  {cells.map((cell) => (
+                                    <div key={cell.label} className="bg-white px-4 py-3">
+                                      <div className="text-xs text-slate-400">{cell.label}</div>
+                                      <div className={`mt-1 text-sm font-semibold tabular-nums ${cell.tone || "text-slate-900"}`}>
+                                        {cell.value}
+                                      </div>
+                                      {cell.sub && <div className="text-xs tabular-nums text-slate-400">{cell.sub}</div>}
+                                    </div>
+                                  ))}
                                 </div>
-                              ))}
-                              <div className="bg-white px-4 py-3">
-                                <div className="text-xs text-slate-400">
-                                  利润率
-                                </div>
-                                <div className="mt-1 text-sm font-semibold tabular-nums text-slate-900">
-                                  {formatPercent(
-                                    detailOrder.profit_summary.profit_margin,
-                                  )}
-                                </div>
-                              </div>
-                              <div className="bg-white px-4 py-3">
-                                <div className="text-xs text-slate-400">
-                                  报价兑人民币
-                                </div>
-                                <div className="mt-1 text-sm font-semibold tabular-nums text-slate-900">
-                                  {detailOrder.profit_summary
-                                    .exchange_rate_cny > 0
-                                    ? `1 ${detailOrder.currency} = ${detailOrder.profit_summary.exchange_rate_cny} CNY`
-                                    : "汇率待补"}
-                                </div>
-                              </div>
-                              <div className="bg-white px-4 py-3">
-                                <div className="text-xs text-slate-400">
-                                  人民币总利润
-                                </div>
-                                <div
-                                  className={`mt-1 text-sm font-semibold tabular-nums ${detailOrder.profit_summary.profit_amount_cny < 0 ? "text-rose-700" : "text-emerald-700"}`}
-                                >
-                                  {detailOrder.profit_summary.cny_complete
-                                    ? formatFinancialMoney(
-                                        "CNY",
-                                        detailOrder.profit_summary
-                                          .profit_amount_cny,
-                                      )
-                                    : "汇率待补"}
-                                </div>
-                              </div>
-                            </div>
+                              );
+                            })()}
                             {(detailOrder.profit_summary.warnings.length > 0 ||
                               detailOrder.profit_summary
                                 .additional_cost_notes) && (
@@ -7512,9 +7605,25 @@ export default function TradeWorkspacePage() {
                                   </div>
                                 )}
                                 <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
-                                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-medium text-slate-600">
-                                    {stageItemStatus(detailViewStage, item)}
-                                  </span>
+                                  <span className="min-w-24">{renderStatusCell(item)}</span>
+                                  {detailOrder.access?.can_view_customer_pricing && (
+                                    <span className="min-w-24 text-xs">
+                                      <EditableCell
+                                        label={`第 ${item.line_no} 行售价`}
+                                        type="number"
+                                        value={item.quoted_price ? String(item.quoted_price) : ""}
+                                        display={
+                                          item.quoted_price > 0
+                                            ? `售价 ${formatMoney(detailOrder.currency, item.quoted_price)}`
+                                            : <span className="text-amber-600">售价未填</span>
+                                        }
+                                        disabled={!canEditDetailPricing}
+                                        onSave={(value) =>
+                                          savePricingCell(item, { sales_price: Number(value) })
+                                        }
+                                      />
+                                    </span>
+                                  )}
                                   {extras.map((extra) => (
                                     <span key={extra} className="text-slate-500">
                                       {extra}
@@ -7538,24 +7647,21 @@ export default function TradeWorkspacePage() {
                                 {modules.quotation ? "询价数量" : "数量"}
                               </th>
                               <th className="px-3 py-2">当前环节状态</th>
-                              {detailViewStage === "quotation" &&
-                                detailOrder.access
-                                  ?.can_view_customer_pricing && (
-                                <th className="px-3 py-2 text-right">
-                                  当前对客报价
-                                </th>
+                              {detailOrder.access?.can_view_customer_pricing && (
+                                <>
+                                  <th className="px-3 py-2 text-right">
+                                    售价（{detailOrder.currency}）
+                                  </th>
+                                  <th className="px-3 py-2 text-right">
+                                    运费（{detailOrder.currency}）
+                                  </th>
+                                </>
                               )}
-                              {["supplier_quote", "purchase"].includes(
-                                detailViewStage,
-                              ) && detailOrder.access?.can_view_supplier && (
-                                <th className="px-3 py-2">采用供应商</th>
+                              {showSupplierColumns && (
+                                <th className="px-3 py-2">供应商</th>
                               )}
-                              {["supplier_quote", "purchase"].includes(
-                                detailViewStage,
-                              ) &&
-                                detailOrder.access
-                                  ?.can_view_supplier_pricing && (
-                                <th className="px-3 py-2 text-right">采购价</th>
+                              {showPurchaseColumn && (
+                                <th className="px-3 py-2 text-right">采购单价</th>
                               )}
                               {detailViewStage === "receiving" &&
                                 detailOrder.access?.can_view_receiving && (
@@ -7646,7 +7752,14 @@ export default function TradeWorkspacePage() {
                                 </td>
                                 <td className="px-3 py-2">
                                   <div className="font-medium">
-                                    {itemSKU(item)}
+                                    <EditableCell
+                                      label={`第 ${item.line_no} 行 SKU`}
+                                      value={itemSKU(item)}
+                                      disabled={!canEditDetailPricing}
+                                      onSave={(value) =>
+                                        savePricingCell(item, { sku: value })
+                                      }
+                                    />
                                     {tradeItemDeclined(item) && (
                                     <span className="ml-1.5 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">
                                       客户未采购
@@ -7668,56 +7781,130 @@ export default function TradeWorkspacePage() {
                                   )}
                                 </td>
                                 <td className="px-3 py-2 text-slate-500">
-                                  {item.specification || "-"}
+                                  <EditableCell
+                                    label={`第 ${item.line_no} 行规格`}
+                                    value={item.specification || ""}
+                                    disabled={!canEditDetailPricing}
+                                    onSave={(value) =>
+                                      savePricingCell(item, { specification: value })
+                                    }
+                                  />
                                 </td>
                                 <td className="px-3 py-2 text-right tabular-nums">
-                                  {item.quantity} {item.unit}
+                                  <EditableCell
+                                    label={`第 ${item.line_no} 行数量`}
+                                    type="number"
+                                    align="right"
+                                    value={String(item.quantity)}
+                                    display={`${item.quantity} ${item.unit}`}
+                                    disabled={!canEditDetailPricing}
+                                    onSave={(value) =>
+                                      savePricingCell(item, { quantity: Number(value) })
+                                    }
+                                  />
                                 </td>
                                 <td className="px-3 py-2">
-                                  <span className="rounded-md bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">
-                                    {stageItemStatus(detailViewStage, item)}
-                                  </span>
+                                  {renderStatusCell(item)}
                                 </td>
-                                {detailViewStage === "quotation" &&
-                                  detailOrder.access
-                                    ?.can_view_customer_pricing && (
-                                  <td className="px-3 py-2 text-right tabular-nums">
-                                    {formatMoney(
-                                      detailOrder.currency,
-                                      item.quoted_price,
-                                    )}
-                                  </td>
+                                {detailOrder.access?.can_view_customer_pricing && (
+                                  <>
+                                    <td className="px-3 py-2 text-right tabular-nums">
+                                      <EditableCell
+                                        label={`第 ${item.line_no} 行售价`}
+                                        type="number"
+                                        align="right"
+                                        value={item.quoted_price ? String(item.quoted_price) : ""}
+                                        display={
+                                          item.quoted_price > 0 ? (
+                                            formatMoney(detailOrder.currency, item.quoted_price)
+                                          ) : (
+                                            <span className="text-amber-600">未填</span>
+                                          )
+                                        }
+                                        disabled={!canEditDetailPricing}
+                                        onSave={(value) =>
+                                          savePricingCell(item, { sales_price: Number(value) })
+                                        }
+                                      />
+                                    </td>
+                                    <td className="px-3 py-2 text-right tabular-nums">
+                                      <EditableCell
+                                        label={`第 ${item.line_no} 行运费`}
+                                        type="number"
+                                        align="right"
+                                        value={item.freight_amount ? String(item.freight_amount) : ""}
+                                        display={
+                                          item.freight_amount
+                                            ? formatMoney(detailOrder.currency, item.freight_amount)
+                                            : "-"
+                                        }
+                                        disabled={!canEditDetailPricing}
+                                        onSave={(value) =>
+                                          savePricingCell(item, { freight_amount: Number(value) })
+                                        }
+                                      />
+                                    </td>
+                                  </>
                                 )}
-                                {["supplier_quote", "purchase"].includes(
-                                  detailViewStage,
-                                ) && detailOrder.access?.can_view_supplier && (
+                                {showSupplierColumns && (
                                   <td className="px-3 py-2">
-                                    {item.supplier_name || "-"}
+                                    <EditableCell
+                                      label={`第 ${item.line_no} 行供应商`}
+                                      value={item.supplier_name || ""}
+                                      disabled={!canEditCost && !canEditPurchaseStage}
+                                      onSave={(value) =>
+                                        canEditCost
+                                          ? savePricingCell(item, { supplier_name: value })
+                                          : saveStageCell(item, "supplier_name", value)
+                                      }
+                                    />
                                   </td>
                                 )}
-                                {["supplier_quote", "purchase"].includes(
-                                  detailViewStage,
-                                ) &&
-                                  detailOrder.access
-                                    ?.can_view_supplier_pricing && (
-                                  <td className="px-3 py-2 text-right">
-                                    {formatMoney(
-                                      item.purchase_currency ||
-                                        detailOrder.currency,
-                                      item.purchase_price,
-                                    )}
+                                {showPurchaseColumn && (
+                                  <td className="px-3 py-2 text-right tabular-nums">
+                                    <EditableCell
+                                      label={`第 ${item.line_no} 行采购单价`}
+                                      type="number"
+                                      align="right"
+                                      value={item.purchase_price ? String(item.purchase_price) : ""}
+                                      display={
+                                        item.purchase_price > 0
+                                          ? formatMoney(item.purchase_currency || "CNY", item.purchase_price)
+                                          : "-"
+                                      }
+                                      disabled={!canEditCost && !canEditPurchaseStage}
+                                      onSave={(value) =>
+                                        canEditCost
+                                          ? savePricingCell(item, { purchase_price: Number(value) })
+                                          : saveStageCell(item, "purchase_price", value)
+                                      }
+                                    />
                                   </td>
                                 )}
                                 {detailViewStage === "receiving" &&
                                   detailOrder.access?.can_view_receiving && (
-                                  <td className="px-3 py-2 text-right">
-                                    {item.received_quantity || 0}
+                                  <td className="px-3 py-2 text-right tabular-nums">
+                                    <EditableCell
+                                      label={`第 ${item.line_no} 行到货数量`}
+                                      type="number"
+                                      align="right"
+                                      value={String(item.received_quantity || 0)}
+                                      disabled={!editableStageFields.some((field) => field.key === "received_quantity")}
+                                      onSave={(value) => saveStageCell(item, "received_quantity", value)}
+                                    />
                                   </td>
                                 )}
                                 {detailViewStage === "inspection" &&
                                   detailOrder.access?.can_view_inspection && (
-                                  <td className="px-3 py-2 text-right">
-                                    {item.accepted_quantity || 0}
+                                  <td className="px-3 py-2 text-right tabular-nums">
+                                    <EditableCell
+                                      label={`第 ${item.line_no} 行合格数量`}
+                                      type="number"
+                                      align="right"
+                                      value={String(item.accepted_quantity || 0)}
+                                      disabled={!editableStageFields.some((field) => field.key === "accepted_quantity")}
+                                      onSave={(value) => saveStageCell(item, "accepted_quantity", value)}
+                                    />
                                   </td>
                                 )}
                                 {detailViewStage === "packing" &&
@@ -8721,7 +8908,7 @@ export default function TradeWorkspacePage() {
 
         {piModalOpen && detailOrder && piDraft && selectedPIQuote && (
           <div
-            className="fixed inset-0 z-[92] flex items-end justify-center bg-slate-950/55 p-0 lg:items-center lg:p-4"
+            data-movable-dialog className="fixed inset-0 z-[92] flex items-end justify-center bg-slate-950/55 p-0 lg:items-center lg:p-4"
             onMouseDown={(event) => {
               if (
                 event.target === event.currentTarget &&
@@ -9358,7 +9545,7 @@ export default function TradeWorkspacePage() {
 
         {profitSettingsOpen && detailOrder && profitSettingsDraft && (
           <div
-            className="fixed inset-0 z-[93] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[93] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingProfitSettings)
                 setProfitSettingsOpen(false);
@@ -9530,7 +9717,7 @@ export default function TradeWorkspacePage() {
 
         {deleteTarget && (
           <div
-            className="fixed inset-0 z-[94] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[94] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !deletingOrder)
                 setDeleteTarget(null);
@@ -9597,7 +9784,7 @@ export default function TradeWorkspacePage() {
 
         {stageDataModalOpen && detailOrder && (
           <div
-            className="fixed inset-0 z-[92] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[92] flex items-end justify-center bg-slate-950/45 p-0 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !savingStageData)
                 setStageDataModalOpen(false);
@@ -10015,7 +10202,7 @@ export default function TradeWorkspacePage() {
 
         {orderItemDeleteTarget && detailOrder && (
           <div
-            className="fixed inset-0 z-[120] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[120] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !deletingOrderItem)
                 setOrderItemDeleteTarget(null);
@@ -10098,7 +10285,7 @@ export default function TradeWorkspacePage() {
 
         {galleryPickerOpen && detailOrder && (
           <div
-            className="fixed inset-0 z-[98] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[98] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !linkingGalleryImages)
                 setGalleryPickerOpen(false);
@@ -10218,7 +10405,7 @@ export default function TradeWorkspacePage() {
 
         {returnToPurchaseOpen && detailOrder && (
           <div
-            className="fixed inset-0 z-[98] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[98] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !returningToPurchase)
                 setReturnToPurchaseOpen(false);

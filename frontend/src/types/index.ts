@@ -1344,6 +1344,7 @@ export interface TradeOrderItem {
   net_weight: number;
   status: string;
   workflow_data?: Record<string, unknown>;
+  freight_amount?: number;
   images?: TradeItemImage[];
   created_at: string;
   updated_at: string;
@@ -1693,6 +1694,7 @@ export interface TradeProfitSummary {
   revenue: number;
   goods_revenue: number;
   freight_revenue: number;
+  fee_revenue?: number;
   product_cost: number;
   actual_freight_cost: number;
   additional_cost: number;
@@ -1823,6 +1825,7 @@ export interface TradeOrder {
   actual_freight_notes: string;
   additional_cost_amount: number;
   additional_cost_notes: string;
+  payment_fee_amount?: number;
   channel_id?: number;
   notes: string;
   source: "manual" | "ai_import";

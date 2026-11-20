@@ -73,7 +73,7 @@ const tradeOrderItemSelect = `
 	SELECT id, order_id, line_no, sku, product_name, description, specification, quantity,
 	       unit, target_price, quoted_price, supplier_name, purchase_currency, purchase_price,
 	       received_quantity, accepted_quantity, packed_quantity, carton_count, hs_code,
-	       gross_weight, net_weight, status, workflow_data, created_at, updated_at
+	       gross_weight, net_weight, status, workflow_data, freight_amount, created_at, updated_at
 	FROM trade_order_items`
 
 func scanTradeOrderItem(scanner tradeRowScanner) (*model.TradeOrderItem, error) {
@@ -84,7 +84,7 @@ func scanTradeOrderItem(scanner tradeRowScanner) (*model.TradeOrderItem, error) 
 		&item.Specification, &item.Quantity, &item.Unit, &item.TargetPrice, &item.QuotedPrice,
 		&item.SupplierName, &item.PurchaseCurrency, &item.PurchasePrice, &item.ReceivedQuantity,
 		&item.AcceptedQuantity, &item.PackedQuantity, &item.CartonCount, &item.HSCode,
-		&item.GrossWeight, &item.NetWeight, &item.Status, &workflowRaw, &item.CreatedAt, &item.UpdatedAt,
+		&item.GrossWeight, &item.NetWeight, &item.Status, &workflowRaw, &item.FreightAmount, &item.CreatedAt, &item.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -615,7 +615,7 @@ func (r *TradeRepo) DeleteOrderItem(orderID, itemID int64) error {
 	if _, err := tx.Exec(
 		`UPDATE trade_orders SET
 		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0),
-		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0)+quoted_freight_amount,
+		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price+freight_amount) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0)+quoted_freight_amount+payment_fee_amount,
 		 updated_at=NOW()
 		 WHERE id=$1 AND deleted_at IS NULL`, orderID,
 	); err != nil {
@@ -696,7 +696,7 @@ const tradeOrderSelect = `
 	       COALESCE((SELECT sh.actual_freight_amount FROM trade_order_shipments sh WHERE sh.order_id=o.id),0),
 	       COALESCE((SELECT sh.actual_freight_to_cny_rate FROM trade_order_shipments sh WHERE sh.order_id=o.id),1),
 	       COALESCE((SELECT sh.actual_freight_notes FROM trade_order_shipments sh WHERE sh.order_id=o.id),''),
-	       o.additional_cost_amount, o.additional_cost_notes,
+	       o.additional_cost_amount, o.additional_cost_notes, o.payment_fee_amount,
 	       o.channel_id, o.notes, o.label_width_mm, o.label_height_mm,
 	       o.source, o.data_status, o.ai_import_id, o.ai_source_text, o.ai_missing_fields, o.ai_import_model,
 	       o.label_paper_size, o.label_paper_width_mm, o.label_paper_height_mm, o.label_orientation,
@@ -728,7 +728,7 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 		&order.PaymentMethod, &order.TotalAmount, &order.QuotedGoodsAmount, &order.QuoteExchangeRateCNY,
 		&order.FreightMode, &order.QuotedFreightAmount, &order.ActualFreightCurrency,
 		&order.ActualFreightAmount, &order.ActualFreightToCNYRate, &order.ActualFreightNotes,
-		&order.AdditionalCostAmount, &order.AdditionalCostNotes,
+		&order.AdditionalCostAmount, &order.AdditionalCostNotes, &order.PaymentFeeAmount,
 		&channelID, &order.Notes,
 		&order.LabelWidthMM, &order.LabelHeightMM, &order.Source, &order.DataStatus, &order.AIImportID,
 		&order.AISourceText, &aiMissingFieldsRaw, &order.AIImportModel, &order.LabelPaperSize, &order.LabelPaperWidthMM,
@@ -1038,8 +1038,8 @@ func (r *TradeRepo) SaveOrderItem(item *model.TradeOrderItem) error {
 		`INSERT INTO trade_order_items (
 			order_id,line_no,sku,product_name,description,specification,quantity,unit,target_price,
 			quoted_price,supplier_name,purchase_currency,purchase_price,received_quantity,accepted_quantity,packed_quantity,
-			carton_count,hs_code,gross_weight,net_weight,status,workflow_data,created_at,updated_at
-		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW())
+			carton_count,hs_code,gross_weight,net_weight,status,workflow_data,freight_amount,created_at,updated_at
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW(),NOW())
 		 ON CONFLICT(order_id,line_no) DO UPDATE SET
 			sku=EXCLUDED.sku,product_name=EXCLUDED.product_name,description=EXCLUDED.description,
 			specification=EXCLUDED.specification,quantity=EXCLUDED.quantity,unit=EXCLUDED.unit,
@@ -1048,11 +1048,11 @@ func (r *TradeRepo) SaveOrderItem(item *model.TradeOrderItem) error {
 			received_quantity=EXCLUDED.received_quantity,accepted_quantity=EXCLUDED.accepted_quantity,
 			packed_quantity=EXCLUDED.packed_quantity,carton_count=EXCLUDED.carton_count,
 			hs_code=EXCLUDED.hs_code,gross_weight=EXCLUDED.gross_weight,net_weight=EXCLUDED.net_weight,
-			status=EXCLUDED.status,workflow_data=EXCLUDED.workflow_data,updated_at=NOW()`,
+			status=EXCLUDED.status,workflow_data=EXCLUDED.workflow_data,freight_amount=EXCLUDED.freight_amount,updated_at=NOW()`,
 		item.OrderID, item.LineNo, item.SKU, item.ProductName, item.Description, item.Specification,
 		item.Quantity, item.Unit, item.TargetPrice, item.QuotedPrice, item.SupplierName, item.PurchaseCurrency,
 		item.PurchasePrice, item.ReceivedQuantity, item.AcceptedQuantity, item.PackedQuantity,
-		item.CartonCount, item.HSCode, item.GrossWeight, item.NetWeight, item.Status, workflowRaw,
+		item.CartonCount, item.HSCode, item.GrossWeight, item.NetWeight, item.Status, workflowRaw, item.FreightAmount,
 	)
 	return err
 }
@@ -1080,7 +1080,7 @@ func (r *TradeRepo) RecalculateOrderTotal(orderID int64) error {
 	_, err := r.db.Exec(
 		`UPDATE trade_orders SET
 		 quoted_goods_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0),
-		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0)+quoted_freight_amount,
+		 total_amount=COALESCE((SELECT SUM(quantity*quoted_price+freight_amount) FROM trade_order_items WHERE order_id=$1 AND `+tradeActiveItemSQL+`),0)+quoted_freight_amount+payment_fee_amount,
 		 updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`,
 		orderID,
 	)
@@ -2092,10 +2092,14 @@ func (r *TradeRepo) UpdateModules(userID int64, modules model.TradeModules) erro
 	return err
 }
 
-func (r *TradeRepo) UpdateOrderCurrencyRate(orderID int64, currency string, rateCNY float64) error {
+// UpdateOrderPricingHeader sets the selling currency, its CNY rate, the
+// payment fee charged to the customer and, when given, the payment method.
+func (r *TradeRepo) UpdateOrderPricingHeader(orderID int64, currency string, rateCNY, paymentFee float64, paymentMethod *string) error {
 	result, err := r.db.Exec(
-		`UPDATE trade_orders SET currency=$2,quote_exchange_rate_cny=$3,updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`,
-		orderID, currency, rateCNY,
+		`UPDATE trade_orders SET currency=$2,quote_exchange_rate_cny=$3,payment_fee_amount=$4,
+		 payment_method=COALESCE($5,payment_method),payment_terms=COALESCE($5,payment_terms),updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`,
+		orderID, currency, rateCNY, paymentFee, paymentMethod,
 	)
 	if err != nil {
 		return err

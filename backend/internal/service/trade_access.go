@@ -352,6 +352,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.QuotedGoodsAmount = 0
 		order.QuoteExchangeRateCNY = 0
 		order.QuotedFreightAmount = 0
+		order.PaymentFeeAmount = 0
 		order.QuoteDeadline = nil
 		order.PaymentMethod = ""
 		order.PaymentTerms = ""
@@ -402,6 +403,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		if !orderAccess.CanViewCustomerPricing {
 			item.TargetPrice = 0
 			item.QuotedPrice = 0
+			item.FreightAmount = 0
 		}
 		if !orderAccess.CanViewSupplier {
 			item.SupplierName = ""

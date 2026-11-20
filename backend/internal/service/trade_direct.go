@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,9 +14,12 @@ func validateConfirmedTradeOrder(request *model.CreateTradeOrderRequest) error {
 	if request.ExchangeRateCNY < 0 {
 		return fmt.Errorf("汇率不能小于零")
 	}
+	if request.PaymentFeeAmount < 0 {
+		return fmt.Errorf("手续费不能小于零")
+	}
 	for index, item := range request.Items {
-		if item.SalesPrice < 0 || item.PurchasePrice < 0 {
-			return fmt.Errorf("第 %d 行价格不能小于零", index+1)
+		if item.SalesPrice < 0 || item.PurchasePrice < 0 || item.FreightAmount < 0 {
+			return fmt.Errorf("第 %d 行金额不能小于零", index+1)
 		}
 	}
 	return nil
@@ -28,21 +32,22 @@ func normalizeTradeOrderRate(currency string, rate float64) float64 {
 	return nonNegativeTradeValue(rate)
 }
 
-// applyTradeItemPricing writes the selling price and, when withCost is set,
-// the purchase cost. Entering a supplier and cost marks the line as ordered
-// unless a purchase status was already recorded.
-func applyTradeItemPricing(item *model.TradeOrderItem, salesPrice float64, supplier, purchaseCurrency string, purchasePrice float64, withCost bool, orderStage string) {
-	item.QuotedPrice = nonNegativeTradeValue(salesPrice)
+// applyTradeItemPricing writes the selling side of a line and, when withCost
+// is set, its purchase cost. Entering a cost marks the line as ordered unless
+// a purchase status was already recorded; the supplier is optional.
+func applyTradeItemPricing(item *model.TradeOrderItem, input model.TradeOrderPricingItem, withCost bool, orderStage string) {
+	item.QuotedPrice = nonNegativeTradeValue(input.SalesPrice)
+	item.FreightAmount = nonNegativeTradeValue(input.FreightAmount)
 	if !withCost {
 		return
 	}
-	item.SupplierName = strings.TrimSpace(supplier)
-	item.PurchasePrice = nonNegativeTradeValue(purchasePrice)
-	item.PurchaseCurrency = strings.ToUpper(strings.TrimSpace(purchaseCurrency))
+	item.SupplierName = strings.TrimSpace(input.SupplierName)
+	item.PurchasePrice = nonNegativeTradeValue(input.PurchasePrice)
+	item.PurchaseCurrency = strings.ToUpper(strings.TrimSpace(input.PurchaseCurrency))
 	if item.PurchaseCurrency == "" {
 		item.PurchaseCurrency = "CNY"
 	}
-	if item.SupplierName != "" && item.PurchasePrice > 0 && tradeWorkflowString(item, "purchase_status") == "" {
+	if item.PurchasePrice > 0 && tradeWorkflowString(item, "purchase_status") == "" {
 		setTradeWorkflowValue(item, "purchase_status", "已下单")
 		if !tradeStageAtOrAfter(orderStage, model.TradeStageReceiving) {
 			item.Status = "已下单"
@@ -62,12 +67,16 @@ func (s *TradeService) finishConfirmedOrder(userID int64, order *model.TradeOrde
 		input := request.Items[index]
 		item := &items[index]
 		item.Status = "客户确认"
-		applyTradeItemPricing(item, input.SalesPrice, input.SupplierName, input.PurchaseCurrency, input.PurchasePrice, withCost, model.TradeStageInquiry)
+		applyTradeItemPricing(item, model.TradeOrderPricingItem{
+			SalesPrice: input.SalesPrice, FreightAmount: input.FreightAmount, SupplierName: input.SupplierName,
+			PurchaseCurrency: input.PurchaseCurrency, PurchasePrice: input.PurchasePrice,
+		}, withCost, model.TradeStageInquiry)
 		if err := s.repo.SaveOrderItem(item); err != nil {
 			return nil, err
 		}
 	}
-	if err := s.repo.UpdateOrderCurrencyRate(order.ID, order.Currency, normalizeTradeOrderRate(order.Currency, request.ExchangeRateCNY)); err != nil {
+	rate := normalizeTradeOrderRate(order.Currency, request.ExchangeRateCNY)
+	if err := s.repo.UpdateOrderPricingHeader(order.ID, order.Currency, rate, nonNegativeTradeValue(request.PaymentFeeAmount), nil); err != nil {
 		return nil, err
 	}
 	if err := s.repo.RecalculateOrderTotal(order.ID); err != nil {
@@ -91,8 +100,9 @@ func (s *TradeService) finishConfirmedOrder(userID int64, order *model.TradeOrde
 	return s.GetOrder(userID, order.ID)
 }
 
-// UpdateOrderPricing edits the products, selling prices, costs and exchange
-// rate of an order in one step, at any stage before it is cancelled.
+// UpdateOrderPricing edits products, selling prices, freight, the payment fee
+// and costs of an order. Admins and managers edit everything; the salesperson
+// who owns the order edits only the selling side.
 func (s *TradeService) UpdateOrderPricing(userID, orderID int64, request *model.UpdateTradeOrderPricingRequest) (*model.TradeOrder, error) {
 	if request == nil {
 		return nil, fmt.Errorf("售价与成本不能为空")
@@ -101,22 +111,48 @@ func (s *TradeService) UpdateOrderPricing(userID, orderID int64, request *model.
 	if err != nil {
 		return nil, err
 	}
-	if !access.profile.CanViewAllOrders {
-		return nil, fmt.Errorf("仅管理员或业务负责人可以维护售价与成本")
-	}
 	order, err := s.repo.GetOrder(orderID, userID, true)
 	if err != nil {
 		return nil, err
 	}
+	if !s.canViewTradeOrder(userID, order, access) {
+		return nil, sql.ErrNoRows
+	}
+	withCost := access.profile.CanViewAllOrders
+	if !withCost {
+		orderAccess, accessErr := s.orderAccessForUser(userID, order, access)
+		if accessErr != nil {
+			return nil, accessErr
+		}
+		if order.OwnerID != userID || !orderAccess.CanViewCustomerPricing {
+			return nil, fmt.Errorf("只有订单负责人、业务负责人或管理员可以修改售价")
+		}
+	}
 	if order.Stage == model.TradeStageCancelled {
 		return nil, fmt.Errorf("已取消的业务单不能修改售价与成本")
 	}
-	if request.ExchangeRateCNY < 0 {
+	if request.ExchangeRateCNY != nil && *request.ExchangeRateCNY < 0 {
 		return nil, fmt.Errorf("汇率不能小于零")
+	}
+	if request.PaymentFeeAmount != nil && *request.PaymentFeeAmount < 0 {
+		return nil, fmt.Errorf("手续费不能小于零")
 	}
 	currency := strings.ToUpper(strings.TrimSpace(request.Currency))
 	if currency == "" {
 		currency = strings.ToUpper(firstNonEmptyTrade(order.Currency, "USD"))
+	}
+	rate := order.QuoteExchangeRateCNY
+	if request.ExchangeRateCNY != nil {
+		rate = *request.ExchangeRateCNY
+	}
+	fee := order.PaymentFeeAmount
+	if request.PaymentFeeAmount != nil {
+		fee = *request.PaymentFeeAmount
+	}
+	var paymentMethod *string
+	if request.PaymentMethod != nil {
+		trimmed := strings.TrimSpace(*request.PaymentMethod)
+		paymentMethod = &trimmed
 	}
 
 	items, err := s.repo.ListOrderItems(orderID)
@@ -145,8 +181,8 @@ func (s *TradeService) UpdateOrderPricing(userID, orderID int64, request *model.
 		if input.Quantity <= 0 {
 			return nil, fmt.Errorf("第 %d 行数量必须大于零", index+1)
 		}
-		if input.SalesPrice < 0 || input.PurchasePrice < 0 {
-			return nil, fmt.Errorf("第 %d 行价格不能小于零", index+1)
+		if input.SalesPrice < 0 || input.PurchasePrice < 0 || input.FreightAmount < 0 {
+			return nil, fmt.Errorf("第 %d 行金额不能小于零", index+1)
 		}
 		if _, _, err := normalizeTradeItemIdentity(input.SKU, input.ProductName); err != nil {
 			return nil, fmt.Errorf("第 %d 行：%w", index+1, err)
@@ -205,12 +241,12 @@ func (s *TradeService) UpdateOrderPricing(userID, orderID int64, request *model.
 		if item.Status == "" || item.Status == "pending" {
 			item.Status = "客户确认"
 		}
-		applyTradeItemPricing(item, input.SalesPrice, input.SupplierName, input.PurchaseCurrency, input.PurchasePrice, true, order.Stage)
+		applyTradeItemPricing(item, input, withCost, order.Stage)
 		if err := s.repo.SaveOrderItem(item); err != nil {
 			return nil, err
 		}
 	}
-	if err := s.repo.UpdateOrderCurrencyRate(orderID, currency, normalizeTradeOrderRate(currency, request.ExchangeRateCNY)); err != nil {
+	if err := s.repo.UpdateOrderPricingHeader(orderID, currency, normalizeTradeOrderRate(currency, rate), nonNegativeTradeValue(fee), paymentMethod); err != nil {
 		return nil, err
 	}
 	if err := s.repo.RecalculateOrderTotal(orderID); err != nil {

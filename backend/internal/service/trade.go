@@ -1201,10 +1201,12 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		summary.CostComplete = false
 		addWarning("订单没有产品明细")
 	}
+	lineFreight := 0.0
 	for _, item := range items {
 		if tradeItemExcluded(&item) {
 			continue
 		}
+		lineFreight += nonNegativeTradeValue(item.FreightAmount)
 		lineComplete := true
 		quantity := nonNegativeTradeValue(item.Quantity)
 		revenue := quantity * nonNegativeTradeValue(item.QuotedPrice)
@@ -1248,6 +1250,7 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		summary.Lines = append(summary.Lines, model.TradeProfitLine{
 			OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU, ProductName: item.ProductName,
 			Quantity: quantity, SalesUnitPrice: item.QuotedPrice, Revenue: revenue,
+			FreightAmount: nonNegativeTradeValue(item.FreightAmount),
 			PurchaseCurrency: purchaseCurrency, PurchaseUnitPrice: item.PurchasePrice,
 			CostExchangeRate: rate, PurchaseCost: purchaseCost, ProfitAmount: lineProfit,
 			ProfitMargin: lineMargin, CostComplete: lineComplete,
@@ -1259,12 +1262,16 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 	freightMode := strings.ToLower(firstNonEmptyTrade(order.FreightMode, "customer_forwarder"))
 	if freightMode == "quoted" {
 		summary.FreightRevenue = nonNegativeTradeValue(order.QuotedFreightAmount)
-		if summary.FreightRevenue <= 0 {
+		if summary.FreightRevenue <= 0 && lineFreight <= 0 {
 			summary.CostComplete = false
 			addWarning("已选择我方报价运费，但尚未填写报价运费")
 		}
 	}
-	summary.Revenue = summary.GoodsRevenue + summary.FreightRevenue
+	// Freight charged per line and the payment fee are part of what the
+	// customer pays.
+	summary.FreightRevenue += lineFreight
+	summary.FeeRevenue = nonNegativeTradeValue(order.PaymentFeeAmount)
+	summary.Revenue = summary.GoodsRevenue + summary.FreightRevenue + summary.FeeRevenue
 	if order.TotalAmount > 0 {
 		summary.Revenue = order.TotalAmount
 	}
@@ -2991,8 +2998,9 @@ func tradeOrderAdvanceBlockersWith(order *model.TradeOrder, modules model.TradeM
 			blockers = append(blockers, "尚未有客户接受的对客报价；如客户砍价，请记录反馈并创建下一轮报价")
 		}
 	case model.TradeStagePurchase:
+		// Without quoting there are no supplier quotes; the supplier is optional.
 		if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
-			return strings.TrimSpace(item.SupplierName) == "" || item.PurchasePrice <= 0 || !tradePurchaseStatusReady(item.Status)
+			return (modules.Quotation && strings.TrimSpace(item.SupplierName) == "") || item.PurchasePrice <= 0 || !tradePurchaseStatusReady(item.Status)
 		}); labels != "" {
 			blockers = append(blockers, "尚未确认采购下单："+labels)
 		}
