@@ -375,13 +375,15 @@ function QuickNavWidget({ admin }: { admin: boolean }) {
       },
       {
         key: 'action:new-trade-order',
-        label: '新建询价',
-        description: '在外贸业务中心创建询价业务单',
+        label: '新建业务单',
+        description: '在外贸业务中心录入成交订单（开启询价模块时为新建询价）',
         href: '/trade',
         icon: ClipboardPlus,
         keywords: [
           '新建',
           '创建',
+          '成交',
+          '录入',
           '询价',
           '报价',
           '订单',

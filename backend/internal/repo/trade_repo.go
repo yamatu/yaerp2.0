@@ -2041,8 +2041,9 @@ func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 			AccountName:  "YAERP Trading Co., Ltd.",
 			DefaultNotes: "All banking charges outside the beneficiary bank are for the buyer's account.",
 		},
+		Modules: model.DefaultTradeModules(),
 	}
-	rows, err := r.db.Query(`SELECT setting_key,value FROM trade_settings WHERE setting_key IN ('payment_methods','payment_record_permissions','pi_profile')`)
+	rows, err := r.db.Query(`SELECT setting_key,value FROM trade_settings WHERE setting_key IN ('payment_methods','payment_record_permissions','pi_profile','modules')`)
 	if err != nil {
 		return nil, err
 	}
@@ -2066,12 +2067,43 @@ func (r *TradeRepo) GetSettings() (*model.TradeSettings, error) {
 			if err := json.Unmarshal(value, &settings.PIProfile); err != nil {
 				return nil, err
 			}
+		case "modules":
+			if err := json.Unmarshal(value, &settings.Modules); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return settings, nil
+}
+
+func (r *TradeRepo) UpdateModules(userID int64, modules model.TradeModules) error {
+	value, err := json.Marshal(modules)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(
+		`INSERT INTO trade_settings(setting_key,value,updated_by,updated_at) VALUES('modules',$1,$2,NOW())
+		 ON CONFLICT(setting_key) DO UPDATE SET value=EXCLUDED.value,updated_by=EXCLUDED.updated_by,updated_at=NOW()`,
+		value, userID,
+	)
+	return err
+}
+
+func (r *TradeRepo) UpdateOrderCurrencyRate(orderID int64, currency string, rateCNY float64) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_orders SET currency=$2,quote_exchange_rate_cny=$3,updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`,
+		orderID, currency, rateCNY,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *TradeRepo) UpdateSettings(userID int64, settings *model.TradeSettings) error {

@@ -665,15 +665,15 @@ func (s *AIService) prepareERPAdvanceOrder(userID int64, raw map[string]any) (*s
 	target := strings.ToLower(firstNonEmptyTrade(stringValue(raw["to_stage"]), stringValue(raw["target_stage"]), "next"))
 	switch target {
 	case "next", "下一步", "下一阶段":
-		target = nextTradeStage(order.Stage)
+		target = order.NextStage
 	case "previous", "prev", "上一步", "上一阶段":
-		target = prevTradeStage(order.Stage)
+		target = order.PrevStage
 	}
 	if target == "" || !validTradeStage(target) {
 		return nil, nil, fmt.Errorf("无法确定有效的目标流程阶段")
 	}
-	isForward := target == nextTradeStage(order.Stage)
-	isBackward := target == prevTradeStage(order.Stage)
+	isForward := target == order.NextStage
+	isBackward := target == order.PrevStage
 	if isForward {
 		if !order.CanAdvance {
 			return nil, nil, fmt.Errorf("当前账号不能推进业务单 %s", order.OrderNo)
@@ -940,7 +940,7 @@ func erpOrderNextStep(order *model.TradeOrder) string {
 	if len(order.AdvanceBlockers) > 0 {
 		return fmt.Sprintf("当前处于%s。进入下一步前仍需完成：%s。", tradeStageLabel(order.Stage), strings.Join(order.AdvanceBlockers, "；"))
 	}
-	next := nextTradeStage(order.Stage)
+	next := order.NextStage
 	if next == "" {
 		return fmt.Sprintf("当前处于%s，请核对当前环节数据。", tradeStageLabel(order.Stage))
 	}

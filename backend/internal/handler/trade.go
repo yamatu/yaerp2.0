@@ -845,6 +845,43 @@ func (h *TradeHandler) UpdateSettings(c *gin.Context) {
 	response.OK(c, settings)
 }
 
+func (h *TradeHandler) UpdateModules(c *gin.Context) {
+	var request model.TradeModules
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	settings, err := h.service.UpdateModules(c.GetInt64("user_id"), request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, settings)
+}
+
+func (h *TradeHandler) UpdateOrderPricing(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.UpdateTradeOrderPricingRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdateOrderPricing(c.GetInt64("user_id"), orderID, &request)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "业务单不存在")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
 func (h *TradeHandler) UploadInspectionPhoto(c *gin.Context) {
 	orderID, err := parseIDParam(c, "id")
 	if err != nil {
