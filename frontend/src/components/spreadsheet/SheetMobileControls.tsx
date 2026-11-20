@@ -42,6 +42,8 @@ interface Props {
   clearSelected?: () => Promise<void>
   /** Pastes the clipboard text as plain values. */
   pastePlain?: () => Promise<void>
+  /** Whether a cell is being edited, so Esc cancels that edit instead. */
+  isCellEditing?: () => boolean
 }
 
 interface SearchMemory { open: boolean; query: string; row?: number; column?: number }
@@ -139,9 +141,29 @@ export default function SheetMobileControls(props: Props) {
   const keyboardInset = useKeyboardInset(editing)
 
   // Ctrl/Cmd+F on a sheet page searches the sheet, not the browser page.
+  // Esc closes it even after a jump moved focus back to the sheet. Registered
+  // on mount, before Univer's own Esc handler ends a cell edit, so an Esc
+  // that cancels an edit can still be told apart.
   const openSearchRef = useRef<() => void>(() => undefined)
+  const closeSearchRef = useRef<() => void>(() => undefined)
+  const searchPanelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        const panel = searchPanelRef.current
+        // The editor dispatches synthetic Esc presses to dismiss Univer popups.
+        if (!panel || !event.isTrusted || event.isComposing) return
+        const target = event.target instanceof Element ? event.target : null
+        if (!target || !panel.contains(target)) {
+          if (latest.current.isCellEditing?.()) return
+          if (document.querySelector('[aria-modal="true"]')) return
+          if (target?.closest('input, textarea, select, [contenteditable="true"]') && !target.closest('[data-u-comp]')) return
+        }
+        // Stops a type="search" input from clearing the remembered query.
+        event.preventDefault()
+        closeSearchRef.current()
+        return
+      }
       if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 'f') return
       if (!latest.current.ready) return
       event.preventDefault()
@@ -247,6 +269,7 @@ export default function SheetMobileControls(props: Props) {
     props.focusCell(hits[next].row, hits[next].column)
   }
   const closeSearch = () => { setSearchOpen(false); remember(false, query) }
+  closeSearchRef.current = closeSearch
   openSearchRef.current = () => {
     // Univer keeps focus in its hidden cell editor so typing starts an edit.
     // Leave it before the search box is mounted, or the first keys of the
@@ -327,11 +350,11 @@ export default function SheetMobileControls(props: Props) {
         </div>
       </div>}
     </div>
-    {searchOpen && <div className="absolute left-2 right-2 top-2 z-[65] flex max-h-[45vh] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl md:left-auto md:right-4 md:top-[110px] md:max-h-[calc(100%-250px)] md:w-[360px]" role="search" aria-label="当前表内容搜索">
+    {searchOpen && <div ref={searchPanelRef} className="absolute left-2 right-2 top-2 z-[65] flex max-h-[45vh] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl md:left-auto md:right-4 md:top-[110px] md:max-h-[calc(100%-250px)] md:w-[360px]" role="search" aria-label="当前表内容搜索">
       <div className="flex shrink-0 items-center gap-1 border-b border-slate-100 p-1.5">
         <label className="relative flex min-w-0 flex-1 items-center">
           <Search className="pointer-events-none absolute left-2.5 h-4 w-4 text-slate-400" />
-          <input ref={inputRef} type="search" value={query} onChange={(event) => { jumpToFirstRef.current = true; setListOpen(true); setQuery(event.target.value); remember(true, event.target.value) }} placeholder="搜索当前表（仅你可见的数据）" className="h-10 w-full min-w-0 rounded-lg bg-slate-50 pl-8 pr-2 text-base text-slate-800 outline-none focus:bg-white focus:ring-2 focus:ring-sky-200 md:h-8 md:text-sm [&::-webkit-search-cancel-button]:hidden" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } if (event.key === 'Escape') closeSearch() }} />
+          <input ref={inputRef} type="search" value={query} onChange={(event) => { jumpToFirstRef.current = true; setListOpen(true); setQuery(event.target.value); remember(true, event.target.value) }} placeholder="搜索当前表（仅你可见的数据）" className="h-10 w-full min-w-0 rounded-lg bg-slate-50 pl-8 pr-2 text-base text-slate-800 outline-none focus:bg-white focus:ring-2 focus:ring-sky-200 md:h-8 md:text-sm [&::-webkit-search-cancel-button]:hidden" onKeyDown={(event) => { if (event.nativeEvent.isComposing) return; if (event.key === 'Enter') { event.preventDefault(); navigate(event.shiftKey ? -1 : 1) } }} />
         </label>
         <span className={`shrink-0 px-1 text-xs tabular-nums ${query.trim() && !searching && !hits.length ? 'text-rose-500' : 'text-slate-500'}`} aria-live="polite">
           {searching && !cells.length ? '读取中…' : !query.trim() ? '' : hits.length ? `${index + 1}/${hits.length}` : '无结果'}
