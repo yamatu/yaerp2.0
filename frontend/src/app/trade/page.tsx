@@ -79,6 +79,7 @@ import {
 } from "@/components/trade/TradePricingEditor";
 import { ProfitWarnings } from "@/components/trade/ProfitWarnings";
 import { EditableCell } from "@/components/trade/EditableCell";
+import { TradeParcelsPanel } from "@/components/trade/TradeParcelsPanel";
 import {
   TradeImageViewer,
   type TradeImageTarget,
@@ -193,21 +194,6 @@ interface ProfitSettingsDraft {
   additional_cost_amount: string;
   additional_cost_notes: string;
   item_rates: Record<number, string>;
-}
-
-interface StageShipmentDraft {
-  booking_no: string;
-  carrier: string;
-  vessel_flight: string;
-  etd: string;
-  eta: string;
-  bl_no: string;
-  shipping_status: string;
-  actual_freight_currency: string;
-  actual_freight_amount: string;
-  actual_freight_to_cny_rate: string;
-  actual_freight_notes: string;
-  notes: string;
 }
 
 interface TradePIDraft {
@@ -675,8 +661,6 @@ const STAGE_DATA_FIELDS: Partial<Record<TradeStage, StageDataField[]>> = {
   ],
 };
 
-const SHIPMENT_STATUSES = ["未发货", "已发货"];
-
 const STATUS_FIELD_KEYS = [
   "status",
   "purchase_status",
@@ -712,43 +696,6 @@ function stageColumnsFor(stage: TradeStage, order: TradeOrder): StageDataField[]
 function stageAtOrAfter(stage: TradeStage, target: TradeStage) {
   const index = STAGES.findIndex((item) => item.key === stage);
   return index >= 0 && index >= STAGES.findIndex((item) => item.key === target);
-}
-
-function normalizeShipmentStatus(status?: string) {
-  const value = status?.trim() || "";
-  if (
-    ["已发货", "到了", "已离港", "运输中", "已到港", "已签收"].includes(
-      value,
-    )
-  ) {
-    return "已发货";
-  }
-  return "未发货";
-}
-
-function emptyStageShipmentDraft(order?: TradeOrder): StageShipmentDraft {
-  return {
-    booking_no: order?.shipment?.booking_no || "",
-    carrier: order?.shipment?.carrier || "",
-    vessel_flight: order?.shipment?.vessel_flight || "",
-    etd: order?.shipment?.etd?.slice(0, 10) || "",
-    eta: order?.shipment?.eta?.slice(0, 10) || "",
-    bl_no: order?.shipment?.bl_no || "",
-    shipping_status: normalizeShipmentStatus(
-      order?.shipment?.shipping_status,
-    ),
-    actual_freight_currency: order?.shipment?.actual_freight_currency || "CNY",
-    actual_freight_amount:
-      (order?.shipment?.actual_freight_amount || 0) > 0
-        ? String(order?.shipment?.actual_freight_amount)
-        : "",
-    actual_freight_to_cny_rate:
-      (order?.shipment?.actual_freight_to_cny_rate || 0) > 0
-        ? String(order?.shipment?.actual_freight_to_cny_rate)
-        : "1",
-    actual_freight_notes: order?.shipment?.actual_freight_notes || "",
-    notes: order?.shipment?.notes || "",
-  };
 }
 
 function stageItemValue(item: TradeOrderItem, field: StageDataField) {
@@ -2152,28 +2099,6 @@ export default function TradeWorkspacePage() {
         onSave={(next) => saveStageCell(item, field.key, next)}
       />
     );
-  };
-
-  const saveShipmentField = async (key: keyof StageShipmentDraft, value: string) => {
-    if (!detailOrder) return;
-    const draft = { ...emptyStageShipmentDraft(detailOrder), [key]: value };
-    const cnyFreight = draft.actual_freight_currency.toUpperCase() === "CNY";
-    setError("");
-    const response = await api.put<TradeOrder>(
-      `/trade/orders/${detailOrder.id}/stage-data`,
-      {
-        shipment: {
-          ...draft,
-          actual_freight_amount: amountValue(draft.actual_freight_amount),
-          actual_freight_to_cny_rate: cnyFreight ? 1 : amountValue(draft.actual_freight_to_cny_rate),
-        },
-      },
-    );
-    if (response.code !== 0 || !response.data) {
-      setError(response.message || "保存发货资料失败");
-      return;
-    }
-    await applyEditedOrder(response.data);
   };
 
   // A product the purchaser could not buy is refunded to the customer and can
@@ -8006,55 +7931,20 @@ export default function TradeWorkspacePage() {
                         </table>
                       </div>
                       {detailViewStage === "shipment" &&
-                        detailOrder.access?.can_view_shipment && (() => {
-                          const shipment = emptyStageShipmentDraft(detailOrder);
-                          const fields: Array<{
-                            key: keyof StageShipmentDraft;
-                            label: string;
-                            type?: "number" | "select";
-                            options?: string[];
-                          }> = [
-                            { key: "carrier", label: "物流公司", type: "select", options: ["DHL", "FedEx"] },
-                            { key: "booking_no", label: "物流订单号" },
-                            { key: "shipping_status", label: "运输状态", type: "select", options: SHIPMENT_STATUSES },
-                          ];
-                          if (detailOrder.freight_mode === "quoted")
-                            fields.push(
-                              { key: "actual_freight_currency", label: "实际运费币种" },
-                              { key: "actual_freight_amount", label: "最终实际运费", type: "number" },
-                              { key: "actual_freight_to_cny_rate", label: "实际运费兑人民币", type: "number" },
-                              { key: "actual_freight_notes", label: "实际运费说明" },
-                            );
-                          return (
-                            <section className="mt-4 rounded-lg border border-blue-200 bg-blue-50/40 p-3" data-shipment-card>
-                              <h3 className="text-sm font-semibold text-blue-900">发货跟踪</h3>
-                              <div className="mt-2 grid gap-x-4 gap-y-2 sm:grid-cols-3">
-                                {fields.map((field) => (
-                                  <div key={field.key} className="min-w-0 text-sm">
-                                    <div className="text-xs text-slate-500">{field.label}</div>
-                                    <EditableCell
-                                      label={field.label}
-                                      type={field.type || "text"}
-                                      options={field.options}
-                                      value={String(shipment[field.key] || "")}
-                                      display={
-                                        shipment[field.key] ? (
-                                          String(shipment[field.key])
-                                        ) : shipmentEditable ? (
-                                          <span className="text-slate-300">点击填写</span>
-                                        ) : (
-                                          "-"
-                                        )
-                                      }
-                                      disabled={!shipmentEditable}
-                                      onSave={(value) => saveShipmentField(field.key, value)}
-                                    />
-                                  </div>
-                                ))}
-                              </div>
-                            </section>
-                          );
-                        })()}
+                        detailOrder.access?.can_view_shipment && (
+                          <TradeParcelsPanel
+                            order={detailOrder}
+                            editable={
+                              shipmentEditable ||
+                              Boolean(
+                                detailOrder.access?.can_view_profit &&
+                                  detailOrder.stage !== "cancelled" &&
+                                  stageAtOrAfter(detailOrder.stage, "packing"),
+                              )
+                            }
+                            onSaved={applyEditedOrder}
+                          />
+                        )}
                       {detailViewStage === "quotation" &&
                         detailOrder.access?.can_view_customer_pricing && (
                         <section className="mt-6">

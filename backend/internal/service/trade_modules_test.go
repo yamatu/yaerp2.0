@@ -118,7 +118,8 @@ func TestProfitCountsLineFreightAndPaymentFee(t *testing.T) {
 	if !near(summary.FreightRevenue, 80) || !near(summary.FeeRevenue, 20) || !near(summary.Revenue, 1100) {
 		t.Fatalf("revenue parts = goods %v freight %v fee %v total %v", summary.GoodsRevenue, summary.FreightRevenue, summary.FeeRevenue, summary.Revenue)
 	}
-	if !near(summary.ProfitAmountCNY, 1100*7-3900) || !summary.CostComplete {
+	// Freight is charged but its real cost is only known once parcels ship.
+	if !near(summary.ProfitAmountCNY, 1100*7-3900) || summary.CostComplete {
 		t.Fatalf("profit CNY = %v (complete %v, %v), want %v", summary.ProfitAmountCNY, summary.CostComplete, summary.Warnings, 1100*7-3900)
 	}
 }
@@ -194,5 +195,49 @@ func TestReceivingAndInspectionStatusFillQuantities(t *testing.T) {
 	_ = applyTradeStageItemUpdate(model.TradeStageInspection, &item, &model.UpdateTradeStageItemRequest{WorkflowData: map[string]any{"inspection_result": "合格"}})
 	if item.AcceptedQuantity != 5 {
 		t.Fatalf("合格 should fill the accepted quantity, got %v", item.AcceptedQuantity)
+	}
+}
+
+func TestParcelsSplitBoxesAcrossCarriers(t *testing.T) {
+	groups := []model.TradePackingGroup{{GroupNo: 1, Copies: 3}, {GroupNo: 2, Copies: 1}}
+	parcels, err := buildTradeParcels([]model.TradeParcelInput{
+		{Carrier: "DHL", TrackingNo: "D1", ShippingStatus: "已发货", ActualFreightAmount: 300, Boxes: []model.TradeParcelBox{{GroupNo: 1, Copies: 2}}},
+		{Carrier: "FedEx", TrackingNo: "F1", ActualFreightCurrency: "USD", ActualFreightAmount: 20, ActualFreightToCNYRate: 7, Boxes: []model.TradeParcelBox{{GroupNo: 1, Copies: 1}, {GroupNo: 2, Copies: 1}}},
+	}, groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := tradeParcelSummary(parcels)
+	if summary.Carrier != "DHL / FedEx" || summary.BookingNo != "D1、F1" || summary.ShippingStatus != "未发货" || !near(summary.ActualFreightAmount, 440) {
+		t.Fatalf("summary = %#v", summary)
+	}
+	blockers := tradeParcelBlockers(parcels, groups)
+	if len(blockers) != 1 || blockers[0] != "包裹 2 还没有标记为已发货" {
+		t.Fatalf("blockers = %#v", blockers)
+	}
+	parcels[1].ShippingStatus = "已发货"
+	if blockers := tradeParcelBlockers(parcels, groups); len(blockers) != 0 {
+		t.Fatalf("all shipped, all boxes placed: %#v", blockers)
+	}
+	if blockers := tradeParcelBlockers(parcels[:1], groups); len(blockers) != 1 || blockers[0] != "还有箱子没分到包裹：箱组 1 剩 1 箱、箱组 2 剩 1 箱" {
+		t.Fatalf("unplaced boxes = %#v", blockers)
+	}
+	if _, err := buildTradeParcels([]model.TradeParcelInput{{Boxes: []model.TradeParcelBox{{GroupNo: 1, Copies: 4}}}}, groups); err == nil {
+		t.Fatal("more boxes than packed must be refused")
+	}
+	if _, err := buildTradeParcels([]model.TradeParcelInput{{Boxes: []model.TradeParcelBox{{GroupNo: 9, Copies: 1}}}}, groups); err == nil {
+		t.Fatal("unknown box group must be refused")
+	}
+	if _, err := buildTradeParcels([]model.TradeParcelInput{{ActualFreightCurrency: "USD", ActualFreightAmount: 10}}, groups); err == nil {
+		t.Fatal("foreign freight needs a rate")
+	}
+}
+
+func TestParcelFreightCountsAsCost(t *testing.T) {
+	order := &model.TradeOrder{Currency: "USD", QuoteExchangeRateCNY: 7, TotalAmount: 100, FreightMode: "customer_forwarder",
+		ActualFreightCurrency: "CNY", ActualFreightAmount: 140, ActualFreightToCNYRate: 1, Parcels: []model.TradeParcel{{ParcelNo: 1}}}
+	items := []model.TradeOrderItem{{ID: 1, LineNo: 1, SKU: "A", Quantity: 1, QuotedPrice: 100, PurchaseCurrency: "CNY", PurchasePrice: 300}}
+	if summary := buildTradeProfitSummary(order, items); !near(summary.ProfitAmountCNY, 700-300-140) {
+		t.Fatalf("parcel freight must reduce profit, got %v", summary.ProfitAmountCNY)
 	}
 }
