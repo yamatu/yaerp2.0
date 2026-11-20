@@ -233,6 +233,24 @@ func (r *TradeRepo) ListParcels(orderID int64) ([]model.TradeParcel, error) {
 	return parcels, rows.Err()
 }
 
+// ListParcelOrderIDs returns the orders that ship as at least one parcel.
+func (r *TradeRepo) ListParcelOrderIDs() (map[int64]bool, error) {
+	rows, err := r.db.Query(`SELECT DISTINCT order_id FROM trade_order_parcels`)
+	if err != nil {
+		return nil, fmt.Errorf("list parcel order ids: %w", err)
+	}
+	defer rows.Close()
+	ids := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
 // ReplaceParcels stores the parcels of an order and the order-level shipment
 // summary in one transaction.
 func (r *TradeRepo) ReplaceParcels(orderID int64, parcels []model.TradeParcel, summary *model.TradeShipment) error {

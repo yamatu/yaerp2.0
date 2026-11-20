@@ -1789,40 +1789,73 @@ export interface TradeBossOrderSummary {
   cny_complete: boolean;
   finalized: boolean;
   warnings: string[];
+  completed_at: string;
   updated_at: string;
 }
 
-export interface TradeBossMonthlySummary {
-  month: string;
+export interface TradeBossPeriodSummary {
   completed_orders: number;
   finalized_orders: number;
   incomplete_orders: number;
+  profitable_orders: number;
+  loss_orders: number;
+  revenue_cny: number;
+  goods_revenue_cny: number;
+  freight_revenue_cny: number;
+  fee_revenue_cny: number;
+  product_cost_cny: number;
+  freight_cost_cny: number;
+  additional_cost_cny: number;
+  total_cost_cny: number;
+  profit_amount_cny: number;
+  profit_margin: number;
+  average_profit_cny: number;
+}
+
+export interface TradeBossTrendPoint {
+  key: string;
+  label: string;
+  completed_orders: number;
+  finalized_orders: number;
   revenue_cny: number;
   total_cost_cny: number;
   profit_amount_cny: number;
-  freight_profit_cny: number;
   profit_margin: number;
 }
 
-export interface TradeBossDashboard {
-  total_orders: number;
-  active_orders: number;
-  completed_orders: number;
-  profitable_orders: number;
-  loss_orders: number;
-  incomplete_cost_orders: number;
-  cny_complete_orders: number;
+export interface TradeBossBreakdown {
+  key: string;
+  label: string;
+  orders: number;
+  quantity?: number;
   revenue_cny: number;
-  total_cost_cny: number;
+  cost_cny: number;
   profit_amount_cny: number;
-  freight_revenue_cny: number;
-  freight_cost_cny: number;
-  freight_profit_cny: number;
+  profit_margin: number;
+}
+
+export type TradeBossPeriod = "month" | "year";
+
+export interface TradeBossReport {
+  period: TradeBossPeriod;
+  year: number;
+  month?: number;
+  label: string;
+  previous_label: string;
+  start_date: string;
+  end_date: string;
+  summary: TradeBossPeriodSummary;
+  previous: TradeBossPeriodSummary;
+  trend: TradeBossTrendPoint[];
+  customers: TradeBossBreakdown[];
+  owners: TradeBossBreakdown[];
+  products: TradeBossBreakdown[];
   currencies: TradeBossCurrencySummary[];
-  monthly: TradeBossMonthlySummary[];
-  recent_orders: TradeBossOrderSummary[];
-  top_profit_orders: TradeBossOrderSummary[];
-  loss_orders_list: TradeBossOrderSummary[];
+  orders: TradeBossOrderSummary[];
+  active_orders: number;
+  active_revenue_cny: number;
+  total_orders: number;
+  available_years: number[];
 }
 
 export interface TradeOrder {

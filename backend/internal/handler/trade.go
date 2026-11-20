@@ -40,13 +40,19 @@ func (h *TradeHandler) Dashboard(c *gin.Context) {
 	response.OK(c, dashboard)
 }
 
-func (h *TradeHandler) BossDashboard(c *gin.Context) {
-	dashboard, err := h.service.BossDashboard(c.GetInt64("user_id"))
-	if err != nil {
+func (h *TradeHandler) BossReport(c *gin.Context) {
+	year, _ := strconv.Atoi(c.Query("year"))
+	month, _ := strconv.Atoi(c.Query("month"))
+	report, err := h.service.BossReport(c.GetInt64("user_id"), c.Query("period"), year, month)
+	if errors.Is(err, service.ErrTradeBossDenied) {
 		response.Forbidden(c, err.Error())
 		return
 	}
-	response.OK(c, dashboard)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, report)
 }
 
 func (h *TradeHandler) GeneratePI(c *gin.Context) {

@@ -752,40 +752,77 @@ type TradeBossOrderSummary struct {
 	CNYComplete       bool      `json:"cny_complete"`
 	Finalized         bool      `json:"finalized"`
 	Warnings          []string  `json:"warnings"`
+	CompletedAt       time.Time `json:"completed_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
-type TradeBossMonthlySummary struct {
-	Month            string  `json:"month"`
-	CompletedOrders  int64   `json:"completed_orders"`
-	FinalizedOrders  int64   `json:"finalized_orders"`
-	IncompleteOrders int64   `json:"incomplete_orders"`
-	RevenueCNY       float64 `json:"revenue_cny"`
-	TotalCostCNY     float64 `json:"total_cost_cny"`
-	ProfitAmountCNY  float64 `json:"profit_amount_cny"`
-	FreightProfitCNY float64 `json:"freight_profit_cny"`
-	ProfitMargin     float64 `json:"profit_margin"`
+// TradeBossPeriodSummary adds up the completed orders of a period in CNY.
+// Only orders whose cost and exchange rate are complete count as finalized
+// and enter the amounts.
+type TradeBossPeriodSummary struct {
+	CompletedOrders   int64   `json:"completed_orders"`
+	FinalizedOrders   int64   `json:"finalized_orders"`
+	IncompleteOrders  int64   `json:"incomplete_orders"`
+	ProfitableOrders  int64   `json:"profitable_orders"`
+	LossOrders        int64   `json:"loss_orders"`
+	RevenueCNY        float64 `json:"revenue_cny"`
+	GoodsRevenueCNY   float64 `json:"goods_revenue_cny"`
+	FreightRevenueCNY float64 `json:"freight_revenue_cny"`
+	FeeRevenueCNY     float64 `json:"fee_revenue_cny"`
+	ProductCostCNY    float64 `json:"product_cost_cny"`
+	FreightCostCNY    float64 `json:"freight_cost_cny"`
+	AdditionalCostCNY float64 `json:"additional_cost_cny"`
+	TotalCostCNY      float64 `json:"total_cost_cny"`
+	ProfitAmountCNY   float64 `json:"profit_amount_cny"`
+	ProfitMargin      float64 `json:"profit_margin"`
+	AverageProfitCNY  float64 `json:"average_profit_cny"`
 }
 
-type TradeBossDashboard struct {
-	TotalOrders          int64                      `json:"total_orders"`
-	ActiveOrders         int64                      `json:"active_orders"`
-	CompletedOrders      int64                      `json:"completed_orders"`
-	ProfitableOrders     int64                      `json:"profitable_orders"`
-	LossOrders           int64                      `json:"loss_orders"`
-	IncompleteCostOrders int64                      `json:"incomplete_cost_orders"`
-	CNYCompleteOrders    int64                      `json:"cny_complete_orders"`
-	RevenueCNY           float64                    `json:"revenue_cny"`
-	TotalCostCNY         float64                    `json:"total_cost_cny"`
-	ProfitAmountCNY      float64                    `json:"profit_amount_cny"`
-	FreightRevenueCNY    float64                    `json:"freight_revenue_cny"`
-	FreightCostCNY       float64                    `json:"freight_cost_cny"`
-	FreightProfitCNY     float64                    `json:"freight_profit_cny"`
-	Currencies           []TradeBossCurrencySummary `json:"currencies"`
-	Monthly              []TradeBossMonthlySummary  `json:"monthly"`
-	RecentOrders         []TradeBossOrderSummary    `json:"recent_orders"`
-	TopProfitOrders      []TradeBossOrderSummary    `json:"top_profit_orders"`
-	LossOrderList        []TradeBossOrderSummary    `json:"loss_orders_list"`
+// TradeBossTrendPoint is one day of a monthly report or one month of a yearly one.
+type TradeBossTrendPoint struct {
+	Key             string  `json:"key"`
+	Label           string  `json:"label"`
+	CompletedOrders int64   `json:"completed_orders"`
+	FinalizedOrders int64   `json:"finalized_orders"`
+	RevenueCNY      float64 `json:"revenue_cny"`
+	TotalCostCNY    float64 `json:"total_cost_cny"`
+	ProfitAmountCNY float64 `json:"profit_amount_cny"`
+	ProfitMargin    float64 `json:"profit_margin"`
+}
+
+// TradeBossBreakdown is the profit of one customer, salesperson or product.
+type TradeBossBreakdown struct {
+	Key             string  `json:"key"`
+	Label           string  `json:"label"`
+	Orders          int64   `json:"orders"`
+	Quantity        float64 `json:"quantity,omitempty"`
+	RevenueCNY      float64 `json:"revenue_cny"`
+	CostCNY         float64 `json:"cost_cny"`
+	ProfitAmountCNY float64 `json:"profit_amount_cny"`
+	ProfitMargin    float64 `json:"profit_margin"`
+}
+
+// TradeBossReport is the boss panel for one month or one year.
+type TradeBossReport struct {
+	Period           string                     `json:"period"`
+	Year             int                        `json:"year"`
+	Month            int                        `json:"month,omitempty"`
+	Label            string                     `json:"label"`
+	PreviousLabel    string                     `json:"previous_label"`
+	StartDate        string                     `json:"start_date"`
+	EndDate          string                     `json:"end_date"`
+	Summary          TradeBossPeriodSummary     `json:"summary"`
+	Previous         TradeBossPeriodSummary     `json:"previous"`
+	Trend            []TradeBossTrendPoint      `json:"trend"`
+	Customers        []TradeBossBreakdown       `json:"customers"`
+	Owners           []TradeBossBreakdown       `json:"owners"`
+	Products         []TradeBossBreakdown       `json:"products"`
+	Currencies       []TradeBossCurrencySummary `json:"currencies"`
+	Orders           []TradeBossOrderSummary    `json:"orders"`
+	ActiveOrders     int64                      `json:"active_orders"`
+	ActiveRevenueCNY float64                    `json:"active_revenue_cny"`
+	TotalOrders      int64                      `json:"total_orders"`
+	AvailableYears   []int                      `json:"available_years"`
 }
 
 type TradeDashboard struct {
