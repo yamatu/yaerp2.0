@@ -1612,6 +1612,7 @@ export interface TradeModules {
   inspection: boolean;
   packing: boolean;
   shipment: boolean;
+  show_legacy_stages?: boolean;
 }
 
 export type TradePaymentRecordAccess = "none" | "own" | "all";

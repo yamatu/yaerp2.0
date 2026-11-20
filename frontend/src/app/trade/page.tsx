@@ -247,7 +247,7 @@ type SettingsTab =
   | "pi";
 
 const MODULE_OPTIONS: Array<{
-  key: keyof TradeModules;
+  key: Exclude<keyof TradeModules, "show_legacy_stages">;
   label: string;
   description: string;
 }> = [
@@ -3552,10 +3552,13 @@ export default function TradeWorkspacePage() {
       color: "text-emerald-700",
     },
   ].filter((metric) => metric.enabled !== false);
+  // Old orders left in a switched-off stage stay reachable under 全部; their
+  // stage chip only shows when the admin asks for it.
   const visibleStages = STAGES.filter(
     (stage) =>
       tradeStageEnabled(stage.key, modules) ||
-      (dashboard?.stage_counts?.[stage.key] || 0) > 0,
+      (modules.show_legacy_stages &&
+        (dashboard?.stage_counts?.[stage.key] || 0) > 0),
   );
   // Admins/managers edit prices and cost; the order's salesperson edits the
   // selling side only (the server ignores cost fields from them).
@@ -6719,6 +6722,30 @@ export default function TradeWorkspacePage() {
                         </label>
                       );
                     })}
+                    <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-dashed border-slate-300 px-4 py-3 hover:bg-slate-50">
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-slate-800">
+                          筛选栏显示已关闭环节的旧单
+                        </span>
+                        <span className="mt-0.5 block text-xs text-slate-500">
+                          关闭后，「供应商」「报价议价」等已关闭环节不再出现在订单筛选栏，旧单仍可在「全部」里找到和打开。
+                        </span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        aria-label="筛选栏显示已关闭环节的旧单"
+                        checked={Boolean(modules.show_legacy_stages)}
+                        disabled={savingModules}
+                        onChange={() =>
+                          void saveModules({
+                            ...modules,
+                            show_legacy_stages: !modules.show_legacy_stages,
+                          })
+                        }
+                        className="mt-1 h-5 w-5 shrink-0 accent-slate-900"
+                      />
+                    </label>
                     <div className="pt-4">
                       <h3 className="text-sm font-semibold text-slate-800">
                         业务员（订单负责人）可以查看

@@ -425,6 +425,8 @@ type TradeModules struct {
 	Inspection bool `json:"inspection"`
 	Packing    bool `json:"packing"`
 	Shipment   bool `json:"shipment"`
+	// Keep switched-off stages that still hold old orders in the stage filter.
+	ShowLegacyStages bool `json:"show_legacy_stages"`
 }
 
 func DefaultTradeModules() TradeModules {
