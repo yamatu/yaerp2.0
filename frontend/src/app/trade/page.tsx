@@ -75,6 +75,10 @@ import { PaymentProofPanel } from "@/components/trade/PaymentProofPanel";
 import { PhotoCaptureSheet } from "@/components/trade/PhotoCaptureSheet";
 import { QuoteHistoryView } from "@/components/trade/QuoteHistoryView";
 import { StageFlowActions } from "@/components/trade/StageFlowActions";
+import {
+  ConfirmedOrderModal,
+  OrderPricingModal,
+} from "@/components/trade/TradePricingEditor";
 import { ProfitWarnings } from "@/components/trade/ProfitWarnings";
 import {
   CustomerQuoteRoundModal,
@@ -116,6 +120,7 @@ import type {
   TradeDashboard,
   TradeInspectionPhoto,
   GalleryImage,
+  TradeModules,
   TradeOrder,
   TradeOrderItem,
   TradePaymentProof,
@@ -234,7 +239,50 @@ interface UploadedAttachment {
 }
 
 type TradeView = "orders" | "products" | "customers" | "suppliers" | "boss";
-type SettingsTab = "positions" | "payment_permissions" | "payments" | "pi";
+type SettingsTab =
+  | "modules"
+  | "positions"
+  | "payment_permissions"
+  | "payments"
+  | "pi";
+
+const MODULE_OPTIONS: Array<{
+  key: keyof TradeModules;
+  label: string;
+  description: string;
+}> = [
+  {
+    key: "quotation",
+    label: "询价与报价",
+    description:
+      "客户询价、供应商询价、对客报价轮次、PI 和产品报价库。关闭后直接「录入成交订单」。",
+  },
+  {
+    key: "purchase",
+    label: "采购跟踪",
+    description: "记录向哪个供应商采购、采购状态。",
+  },
+  {
+    key: "receiving",
+    label: "仓库到货",
+    description: "登记每个产品的到货数量和库位。",
+  },
+  {
+    key: "inspection",
+    label: "质量检验",
+    description: "合格数量和质检照片。",
+  },
+  {
+    key: "packing",
+    label: "装箱贴标",
+    description: "装箱分组、箱数和 SKU 标签打印。",
+  },
+  {
+    key: "shipment",
+    label: "物流发货",
+    description: "物流公司、运单号和实际运费（计入利润）。",
+  },
+];
 
 const TRADE_STATE_KEY = "yaerp:trade:workspace-state:v3";
 
@@ -715,16 +763,34 @@ function stageDefinition(stage: TradeStage) {
   return STAGES.find((item) => item.key === stage);
 }
 
-function nextStage(stage: TradeStage): TradeStage | null {
-  const index = STAGES.findIndex((item) => item.key === stage);
-  if (index < 0 || index + 1 >= STAGES.length) return null;
-  return STAGES[index + 1].key;
+// The server skips stages whose module is switched off.
+function nextStage(order: Pick<TradeOrder, "next_stage">): TradeStage | null {
+  return order.next_stage || null;
 }
 
-function previousStage(stage: TradeStage): TradeStage | null {
-  const index = STAGES.findIndex((item) => item.key === stage);
-  if (index <= 0) return null;
-  return STAGES[index - 1].key;
+function previousStage(order: Pick<TradeOrder, "prev_stage">): TradeStage | null {
+  return order.prev_stage || null;
+}
+
+const DEFAULT_TRADE_MODULES: TradeModules = {
+  quotation: false,
+  purchase: true,
+  receiving: true,
+  inspection: true,
+  packing: true,
+  shipment: true,
+};
+
+const QUOTE_STAGES: TradeStage[] = ["inquiry", "supplier_quote", "quotation"];
+
+function tradeStageEnabled(stage: TradeStage, modules: TradeModules) {
+  if (QUOTE_STAGES.includes(stage)) return modules.quotation;
+  if (stage === "purchase") return modules.purchase;
+  if (stage === "receiving") return modules.receiving;
+  if (stage === "inspection") return modules.inspection;
+  if (stage === "packing") return modules.packing;
+  if (stage === "shipment") return modules.shipment;
+  return true;
 }
 
 function formatDate(value?: string) {
@@ -828,6 +894,13 @@ export default function TradeWorkspacePage() {
     payment_record_permissions: [],
     pi_profile: defaultTradePIProfile(),
   });
+  const modules = settings.modules || DEFAULT_TRADE_MODULES;
+  const [confirmedOrderOpen, setConfirmedOrderOpen] = useState(false);
+  const [pricingOrder, setPricingOrder] = useState<{
+    order: TradeOrder;
+    convert: boolean;
+  } | null>(null);
+  const [savingModules, setSavingModules] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -930,7 +1003,7 @@ export default function TradeWorkspacePage() {
   const [deletingOrderItem, setDeletingOrderItem] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("positions");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("modules");
   const [positionsDraft, setPositionsDraft] = useState<
     Record<string, number[]>
   >({});
@@ -1250,7 +1323,9 @@ export default function TradeWorkspacePage() {
       setActiveView("orders");
     if (activeView === "boss" && !tradeAccess.can_view_all_orders)
       setActiveView("orders");
-  }, [activeView, tradeAccess]);
+    if (activeView === "products" && settings.modules && !settings.modules.quotation)
+      setActiveView("orders");
+  }, [activeView, tradeAccess, settings.modules]);
 
   useEffect(() => {
     if (loading || !restoredRef.current) return;
@@ -1674,10 +1749,11 @@ export default function TradeWorkspacePage() {
   // Quick action from the palette: open the modal once access is confirmed.
   useEffect(() => {
     if (!pendingOrderRef.current) return;
-    if (!tradeAccess?.can_create_orders) return;
+    if (!tradeAccess?.can_create_orders || !settings.modules) return;
     pendingOrderRef.current = false;
-    openOrderModal();
-  }, [tradeAccess?.can_create_orders, openOrderModal]);
+    if (settings.modules.quotation) openOrderModal();
+    else setConfirmedOrderOpen(true);
+  }, [tradeAccess?.can_create_orders, openOrderModal, settings.modules]);
 
   const openAIImport = async () => {
     setAIImportOpen(true);
@@ -2533,6 +2609,70 @@ export default function TradeWorkspacePage() {
     }
   };
 
+  const saveModules = async (next: TradeModules) => {
+    const previous = modules;
+    setSavingModules(true);
+    setError("");
+    setSettings((current) => ({ ...current, modules: next }));
+    try {
+      const response = await api.put<TradeSettings>("/trade/modules", next);
+      if (response.code !== 0 || !response.data)
+        throw new Error(response.message || "保存功能模块失败");
+      setSettings((current) => ({
+        ...current,
+        modules: response.data?.modules || next,
+      }));
+      setNotice("功能模块已更新，订单流程会自动跳过关闭的环节。");
+      await loadData(true);
+      if (detailOrderIDRef.current)
+        await loadOrderDetail(detailOrderIDRef.current, false, true);
+    } catch (saveError) {
+      setSettings((current) => ({ ...current, modules: previous }));
+      setError(
+        saveError instanceof Error ? saveError.message : "保存功能模块失败",
+      );
+    } finally {
+      setSavingModules(false);
+    }
+  };
+
+  const handleConfirmedOrderCreated = async (order: TradeOrder) => {
+    setConfirmedOrderOpen(false);
+    setNotice(
+      `成交订单 ${order.order_no} 已录入，当前阶段：${stageDefinition(order.stage)?.label || order.stage}。`,
+    );
+    setDetailOrder(order);
+    setDetailViewStage(order.stage as Exclude<TradeStage, "cancelled">);
+    detailOrderIDRef.current = order.id;
+    await loadData(true);
+  };
+
+  const handlePricingSaved = async (order: TradeOrder, convert: boolean) => {
+    setPricingOrder(null);
+    let current = order;
+    if (convert && order.next_stage) {
+      const response = await api.post<TradeOrder>(
+        `/trade/orders/${order.id}/advance`,
+        { to_stage: order.next_stage, note: "报价单转为成交订单" },
+      );
+      if (response.code !== 0 || !response.data) {
+        setDetailOrder(order);
+        setError(response.message || "售价与成本已保存，但转为成交订单失败");
+        await loadData(true);
+        return;
+      }
+      current = response.data;
+    }
+    setDetailOrder(current);
+    setDetailViewStage(current.stage as Exclude<TradeStage, "cancelled">);
+    setNotice(
+      convert
+        ? `${current.order_no} 已转为成交订单，当前阶段：${stageDefinition(current.stage)?.label || current.stage}。`
+        : "售价与成本已保存，利润已重新计算。",
+    );
+    await loadData(true);
+  };
+
   const completeAIImport = async () => {
     if (!detailOrder || completingAIImport) return;
     setCompletingAIImport(true);
@@ -3266,30 +3406,35 @@ export default function TradeWorkspacePage() {
       value: dashboard?.pending_quote_count || 0,
       icon: Clock3,
       color: "text-amber-700",
+      enabled: modules.quotation,
     },
     {
       label: "采购中",
       value: dashboard?.purchase_count || 0,
       icon: ShoppingCart,
       color: "text-violet-700",
+      enabled: modules.purchase,
     },
     {
       label: "仓库环节",
       value: dashboard?.warehouse_count || 0,
       icon: Warehouse,
       color: "text-cyan-700",
+      enabled: modules.receiving || modules.inspection || modules.packing,
     },
     {
       label: "运输中",
       value: dashboard?.shipping_count || 0,
       icon: Ship,
       color: "text-blue-700",
+      enabled: modules.shipment,
     },
     {
       label: "报价逾期",
       value: dashboard?.overdue_quote_count || 0,
       icon: CalendarDays,
       color: "text-rose-700",
+      enabled: modules.quotation,
     },
     {
       label: "本月完成",
@@ -3297,7 +3442,23 @@ export default function TradeWorkspacePage() {
       icon: PackageCheck,
       color: "text-emerald-700",
     },
-  ];
+  ].filter((metric) => metric.enabled !== false);
+  const visibleStages = STAGES.filter(
+    (stage) =>
+      tradeStageEnabled(stage.key, modules) ||
+      (dashboard?.stage_counts?.[stage.key] || 0) > 0,
+  );
+  const detailStages = STAGES.filter(
+    (stage) =>
+      tradeStageEnabled(stage.key, modules) ||
+      stage.key === detailOrder?.stage ||
+      stage.key === detailViewStage,
+  );
+  const workflowSummary = STAGES.filter((stage) =>
+    tradeStageEnabled(stage.key, modules),
+  )
+    .filter((stage) => stage.key !== "completed")
+    .map((stage) => stage.shortLabel);
 
   const paymentOptions = settings.payment_methods.length
     ? settings.payment_methods
@@ -3330,7 +3491,13 @@ export default function TradeWorkspacePage() {
                 <h1 className="truncate text-base font-semibold sm:text-lg">外贸业务中心</h1>
                 <p className="truncate text-xs text-slate-500">
                   {tradeAccess?.scope_label ||
-                    "客户询价 · 供应商比价 · 报价 · 采购 · 仓库 · 质检 · 装箱 · 发货"}
+                    [
+                      modules.quotation ? "" : "成交订单",
+                      ...workflowSummary,
+                      "利润核算",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
                 </p>
               </div>
             </div>
@@ -3384,14 +3551,24 @@ export default function TradeWorkspacePage() {
                   <span className="hidden sm:inline">AI 智能建单</span>
                 </button>
               )}
-              {tradeAccess?.can_create_orders && (
+              {tradeAccess?.can_create_orders && modules.quotation && (
                 <button
                   type="button"
                   onClick={() => openOrderModal()}
-                  className="hidden h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white hover:bg-slate-700 sm:inline-flex"
+                  className="hidden h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 sm:inline-flex"
                 >
                   <Plus className="h-4 w-4" />
                   新建询价
+                </button>
+              )}
+              {tradeAccess?.can_create_orders && (
+                <button
+                  type="button"
+                  onClick={() => setConfirmedOrderOpen(true)}
+                  className="hidden h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white hover:bg-slate-700 sm:inline-flex"
+                >
+                  <Plus className="h-4 w-4" />
+                  录入成交订单
                 </button>
               )}
             </div>
@@ -3401,11 +3578,11 @@ export default function TradeWorkspacePage() {
         {tradeAccess?.can_create_orders && !detailOrder && (
           <button
             type="button"
-            onClick={() => openOrderModal()}
+            onClick={() => setConfirmedOrderOpen(true)}
             className="fixed inset-x-0 bottom-[calc(var(--mobile-tabbar-offset)+16px)] z-40 mx-auto flex h-12 w-fit items-center gap-2 rounded-full bg-slate-900 px-5 text-sm font-semibold text-white shadow-xl active:scale-95 sm:hidden"
           >
             <Plus className="h-5 w-5" />
-            新建询价
+            录入成交订单
           </button>
         )}
 
@@ -3428,13 +3605,13 @@ export default function TradeWorkspacePage() {
             </div>
           )}
 
-          <section className="flex overflow-x-auto rounded-lg border border-slate-200 bg-white [scrollbar-width:none] md:grid md:grid-cols-4 md:overflow-hidden xl:grid-cols-8">
-            {metrics.map((metric, index) => {
+          <section className="flex overflow-x-auto rounded-lg border border-slate-200 bg-white [scrollbar-width:none] md:overflow-hidden">
+            {metrics.map((metric) => {
               const Icon = metric.icon;
               return (
                 <div
                   key={metric.label}
-                  className="flex min-h-16 min-w-[128px] shrink-0 items-center gap-3 border-r border-slate-100 px-4 py-3 last:border-r-0 md:min-h-20 md:min-w-0"
+                  className="flex min-h-16 min-w-[128px] shrink-0 items-center gap-3 border-r border-slate-100 px-4 py-3 last:border-r-0 md:min-h-20 md:min-w-0 md:flex-1"
                 >
                   <Icon className={`h-5 w-5 shrink-0 ${metric.color}`} />
                   <div>
@@ -3458,14 +3635,16 @@ export default function TradeWorkspacePage() {
                 >
                   业务单
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveView("products")}
-                  className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm font-medium ${activeView === "products" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
-                >
-                  <History className="h-3.5 w-3.5" />
-                  产品报价库
-                </button>
+                {modules.quotation && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveView("products")}
+                    className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm font-medium ${activeView === "products" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+                  >
+                    <History className="h-3.5 w-3.5" />
+                    产品报价库
+                  </button>
+                )}
                 {tradeAccess?.can_view_customers && (
                   <button
                     type="button"
@@ -3625,7 +3804,7 @@ export default function TradeWorkspacePage() {
                     >
                       全部 {orders.length}
                     </button>
-                    {STAGES.map((stage) => {
+                    {visibleStages.map((stage) => {
                       const Icon = stage.icon;
                       const count = dashboard?.stage_counts?.[stage.key] || 0;
                       return (
@@ -6269,6 +6448,31 @@ export default function TradeWorkspacePage() {
           </div>
         )}
 
+        {confirmedOrderOpen && (
+          <ConfirmedOrderModal
+            customers={customers}
+            suppliers={suppliers}
+            showCost={Boolean(tradeAccess?.can_view_all_orders)}
+            onClose={() => setConfirmedOrderOpen(false)}
+            onCreated={handleConfirmedOrderCreated}
+            onCreateCustomer={
+              tradeAccess?.can_create_customers
+                ? () => openCustomerModal("manual")
+                : undefined
+            }
+          />
+        )}
+
+        {pricingOrder && (
+          <OrderPricingModal
+            order={pricingOrder.order}
+            suppliers={suppliers}
+            convert={pricingOrder.convert}
+            onClose={() => setPricingOrder(null)}
+            onSaved={handlePricingSaved}
+          />
+        )}
+
         {settingsOpen && (
           <div className="fixed inset-0 z-[70] flex items-end justify-center bg-slate-950/45 sm:items-center sm:p-4">
             <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
@@ -6288,6 +6492,13 @@ export default function TradeWorkspacePage() {
                 </button>
               </div>
               <div className="flex overflow-x-auto border-b border-slate-200 px-4">
+                <button
+                  type="button"
+                  onClick={() => setSettingsTab("modules")}
+                  className={`whitespace-nowrap border-b-2 px-3 py-3 text-sm font-medium ${settingsTab === "modules" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+                >
+                  功能模块
+                </button>
                 <button
                   type="button"
                   onClick={() => setSettingsTab("positions")}
@@ -6318,7 +6529,45 @@ export default function TradeWorkspacePage() {
                 </button>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto p-4">
-                {settingsTab === "positions" ? (
+                {settingsTab === "modules" ? (
+                  <div className="space-y-2">
+                    <p className="text-xs text-slate-500">
+                      关闭的模块会从界面和流程中隐藏，订单推进时自动跳过对应环节；已录入的数据不会删除，重新打开即可看到。
+                    </p>
+                    {MODULE_OPTIONS.map((option) => {
+                      const enabled = modules[option.key];
+                      return (
+                        <label
+                          key={option.key}
+                          className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-slate-200 px-4 py-3 hover:bg-slate-50"
+                        >
+                          <span className="min-w-0">
+                            <span className="block text-sm font-semibold text-slate-800">
+                              {option.label}
+                            </span>
+                            <span className="mt-0.5 block text-xs text-slate-500">
+                              {option.description}
+                            </span>
+                          </span>
+                          <input
+                            type="checkbox"
+                            role="switch"
+                            aria-label={option.label}
+                            checked={enabled}
+                            disabled={savingModules}
+                            onChange={() =>
+                              void saveModules({
+                                ...modules,
+                                [option.key]: !enabled,
+                              })
+                            }
+                            className="mt-1 h-5 w-5 shrink-0 accent-slate-900"
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+                ) : settingsTab === "positions" ? (
                   <>
                     <label className="mb-3 flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500">
                       <Search className="h-4 w-4" />
@@ -6704,7 +6953,7 @@ export default function TradeWorkspacePage() {
                 >
                   关闭
                 </button>
-                <button
+                {settingsTab !== "modules" && <button
                   type="button"
                   onClick={() =>
                     void (settingsTab === "positions"
@@ -6720,7 +6969,7 @@ export default function TradeWorkspacePage() {
                     <Save className="h-4 w-4" />
                   )}
                   保存设置
-                </button>
+                </button>}
               </div>
             </div>
           </div>
@@ -6766,14 +7015,17 @@ export default function TradeWorkspacePage() {
                 ) : (
                   <>
                     <div className="overflow-x-auto border-b border-slate-200 px-4 py-4">
-                      <div className="flex min-w-[900px] items-start">
-                        {STAGES.map((stage, index) => {
+                      <div className="flex min-w-[640px] items-start">
+                        {detailStages.map((stage, index) => {
                           const currentIndex = STAGES.findIndex(
                             (item) => item.key === detailOrder.stage,
                           );
+                          const stageIndex = STAGES.findIndex(
+                            (item) => item.key === stage.key,
+                          );
                           const done =
                             detailOrder.stage === "completed" ||
-                            (currentIndex >= 0 && index < currentIndex);
+                            (currentIndex >= 0 && stageIndex < currentIndex);
                           const active = stage.key === detailOrder.stage;
                           const Icon = stage.icon;
                           return (
@@ -6792,7 +7044,7 @@ export default function TradeWorkspacePage() {
                               }}
                             >
                               <div
-                                className={`absolute left-0 right-0 top-4 h-0.5 ${index === 0 ? "left-1/2" : ""} ${index === STAGES.length - 1 ? "right-1/2" : ""} ${done || active ? "bg-emerald-400" : "bg-slate-200"}`}
+                                className={`absolute left-0 right-0 top-4 h-0.5 ${index === 0 ? "left-1/2" : ""} ${index === detailStages.length - 1 ? "right-1/2" : ""} ${done || active ? "bg-emerald-400" : "bg-slate-200"}`}
                               />
                               <div
                                 className={`relative z-10 flex h-8 w-8 items-center justify-center rounded-full border-2 ${done ? "border-emerald-500 bg-emerald-500 text-white" : active ? "border-slate-900 bg-white text-slate-900" : "border-slate-200 bg-white text-slate-300"}`}
@@ -6931,7 +7183,40 @@ export default function TradeWorkspacePage() {
                             客户频道
                           </button>
                         )}
-                        {detailOrder.access?.can_generate_pi && (
+                        {detailOrder.access?.can_view_profit &&
+                          !modules.quotation &&
+                          QUOTE_STAGES.includes(detailOrder.stage) && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPricingOrder({
+                                  order: detailOrder,
+                                  convert: true,
+                                })
+                              }
+                              className="inline-flex h-9 items-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-semibold text-white hover:bg-slate-700"
+                            >
+                              <Check className="h-4 w-4" />
+                              转为成交订单
+                            </button>
+                          )}
+                        {detailOrder.access?.can_view_profit &&
+                          detailOrder.stage !== "cancelled" && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPricingOrder({
+                                  order: detailOrder,
+                                  convert: false,
+                                })
+                              }
+                              className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 px-3 text-sm font-semibold text-emerald-700 hover:bg-emerald-50"
+                            >
+                              <Pencil className="h-4 w-4" />
+                              编辑售价与成本
+                            </button>
+                          )}
+                        {detailOrder.access?.can_generate_pi && modules.quotation && (
                           <button
                             type="button"
                             onClick={openPIModal}
@@ -6941,7 +7226,7 @@ export default function TradeWorkspacePage() {
                             生成 PI
                           </button>
                         )}
-                        {detailOrder.access?.can_view_packing && (
+                        {detailOrder.access?.can_view_packing && modules.packing && (
                           <button
                             type="button"
                             onClick={() =>
@@ -7249,7 +7534,9 @@ export default function TradeWorkspacePage() {
                               <th className="px-3 py-2">图片</th>
                               <th className="px-3 py-2">SKU</th>
                               <th className="px-3 py-2">规格</th>
-                              <th className="px-3 py-2 text-right">询价数量</th>
+                              <th className="px-3 py-2 text-right">
+                                {modules.quotation ? "询价数量" : "数量"}
+                              </th>
                               <th className="px-3 py-2">当前环节状态</th>
                               {detailViewStage === "quotation" &&
                                 detailOrder.access
@@ -8294,7 +8581,7 @@ export default function TradeWorkspacePage() {
                       {detailViewStage === detailOrder.stage &&
                         detailOrder.can_operate_stage &&
                         (detailOrder.can_return ||
-                          nextStage(detailOrder.stage)) && (
+                          nextStage(detailOrder)) && (
                           <StageFlowActions
                             positionName={
                               detailOrder.required_position_name ||
@@ -8304,15 +8591,15 @@ export default function TradeWorkspacePage() {
                             note={advanceNote}
                             flowing={flowing}
                             returnLabel={
-                              previousStage(detailOrder.stage)
+                              previousStage(detailOrder)
                                 ? stageDefinition(
-                                    previousStage(detailOrder.stage)!,
+                                    previousStage(detailOrder)!,
                                   )?.label
                                 : undefined
                             }
                             advanceLabel={
-                              nextStage(detailOrder.stage)
-                                ? stageDefinition(nextStage(detailOrder.stage)!)
+                              nextStage(detailOrder)
+                                ? stageDefinition(nextStage(detailOrder)!)
                                     ?.label
                                 : undefined
                             }
@@ -8326,17 +8613,17 @@ export default function TradeWorkspacePage() {
                             onNoteChange={setAdvanceNote}
                             onReturn={
                               detailOrder.can_return &&
-                              previousStage(detailOrder.stage)
+                              previousStage(detailOrder)
                                 ? () =>
                                     void flowOrder(
-                                      previousStage(detailOrder.stage)!,
+                                      previousStage(detailOrder)!,
                                     )
                                 : undefined
                             }
                             onAdvance={
-                              nextStage(detailOrder.stage)
+                              nextStage(detailOrder)
                                 ? () =>
-                                    void flowOrder(nextStage(detailOrder.stage)!)
+                                    void flowOrder(nextStage(detailOrder)!)
                                 : undefined
                             }
                             onRework={() => {

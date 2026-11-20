@@ -396,6 +396,50 @@ type TradeSettings struct {
 	PaymentMethods           []string                       `json:"payment_methods"`
 	PaymentRecordPermissions []TradePaymentRecordPermission `json:"payment_record_permissions"`
 	PIProfile                TradePIProfile                 `json:"pi_profile"`
+	Modules                  TradeModules                   `json:"modules"`
+}
+
+// TradeModules switches optional parts of the order workflow on or off. A
+// switched-off stage is skipped when orders move forward or back; its data is
+// kept and shows again once the module is switched back on.
+type TradeModules struct {
+	// Inquiry, supplier quotes, customer quote rounds, PI and the quote library.
+	Quotation  bool `json:"quotation"`
+	Purchase   bool `json:"purchase"`
+	Receiving  bool `json:"receiving"`
+	Inspection bool `json:"inspection"`
+	Packing    bool `json:"packing"`
+	Shipment   bool `json:"shipment"`
+}
+
+func DefaultTradeModules() TradeModules {
+	return TradeModules{Purchase: true, Receiving: true, Inspection: true, Packing: true, Shipment: true}
+}
+
+func AllTradeModules() TradeModules {
+	modules := DefaultTradeModules()
+	modules.Quotation = true
+	return modules
+}
+
+// StageEnabled reports whether orders stop at the stage under these modules.
+func (m TradeModules) StageEnabled(stage string) bool {
+	switch stage {
+	case TradeStageInquiry, TradeStageSupplierQuote, TradeStageQuotation:
+		return m.Quotation
+	case TradeStagePurchase:
+		return m.Purchase
+	case TradeStageReceiving:
+		return m.Receiving
+	case TradeStageInspection:
+		return m.Inspection
+	case TradeStagePacking:
+		return m.Packing
+	case TradeStageShipment:
+		return m.Shipment
+	default:
+		return true
+	}
 }
 
 type TradePaymentRecordPermission struct {
@@ -539,6 +583,8 @@ type TradeOrder struct {
 	CanOperateStage              bool                      `json:"can_operate_stage"`
 	CanAdvance                   bool                      `json:"can_advance"`
 	CanReturn                    bool                      `json:"can_return"`
+	NextStage                    string                    `json:"next_stage"`
+	PrevStage                    string                    `json:"prev_stage"`
 	AdvanceBlockers              []string                  `json:"advance_blockers"`
 	Access                       *TradeOrderAccess         `json:"access,omitempty"`
 	StageUpdatedAt               time.Time                 `json:"stage_updated_at"`
@@ -743,6 +789,12 @@ type CreateTradeOrderItemRequest struct {
 	TargetPrice   float64 `json:"target_price"`
 	// Attachments uploaded beforehand through /upload by the same user.
 	ImageAttachmentIDs []int64 `json:"image_attachment_ids"`
+	// Used by confirmed orders, which skip quoting: the agreed selling price
+	// and, for users who may see cost, what the goods cost.
+	SalesPrice       float64 `json:"sales_price"`
+	SupplierName     string  `json:"supplier_name"`
+	PurchaseCurrency string  `json:"purchase_currency"`
+	PurchasePrice    float64 `json:"purchase_price"`
 }
 
 type AddTradeOrderItemsRequest struct {
@@ -797,6 +849,27 @@ type TradeItemCostRateInput struct {
 	Rate        float64 `json:"rate" binding:"gte=0"`
 }
 
+type TradeOrderPricingItem struct {
+	// Zero adds a new line.
+	OrderItemID      int64   `json:"order_item_id"`
+	SKU              string  `json:"sku"`
+	ProductName      string  `json:"product_name"`
+	Specification    string  `json:"specification"`
+	Quantity         float64 `json:"quantity"`
+	Unit             string  `json:"unit"`
+	SalesPrice       float64 `json:"sales_price"`
+	SupplierName     string  `json:"supplier_name"`
+	PurchaseCurrency string  `json:"purchase_currency"`
+	PurchasePrice    float64 `json:"purchase_price"`
+}
+
+type UpdateTradeOrderPricingRequest struct {
+	Currency        string                  `json:"currency"`
+	ExchangeRateCNY float64                 `json:"exchange_rate_cny"`
+	Items           []TradeOrderPricingItem `json:"items"`
+	RemovedItemIDs  []int64                 `json:"removed_item_ids"`
+}
+
 type UpdateTradeProfitSettingsRequest struct {
 	AdditionalCostAmount float64                  `json:"additional_cost_amount" binding:"gte=0"`
 	AdditionalCostNotes  string                   `json:"additional_cost_notes"`
@@ -805,7 +878,7 @@ type UpdateTradeProfitSettingsRequest struct {
 
 type CreateTradeOrderRequest struct {
 	CustomerID         int64                         `json:"customer_id" binding:"required"`
-	Title              string                        `json:"title" binding:"required"`
+	Title              string                        `json:"title"`
 	Priority           string                        `json:"priority"`
 	QuoteDeadline      string                        `json:"quote_deadline"`
 	ExpectedShipDate   string                        `json:"expected_ship_date"`
@@ -817,6 +890,10 @@ type CreateTradeOrderRequest struct {
 	PaymentMethod      string                        `json:"payment_method"`
 	Notes              string                        `json:"notes"`
 	Items              []CreateTradeOrderItemRequest `json:"items" binding:"required,min=1,dive"`
+	// A confirmed order is one the customer already accepted and paid: it
+	// skips quoting and starts at the first enabled stage after it.
+	Confirmed       bool    `json:"confirmed"`
+	ExchangeRateCNY float64 `json:"exchange_rate_cny"`
 	// AI import metadata is service-internal and cannot be supplied through the
 	// public create-order API.
 	AIImportID      string   `json:"-"`

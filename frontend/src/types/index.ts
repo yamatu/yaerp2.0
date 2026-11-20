@@ -1593,6 +1593,16 @@ export interface TradeSettings {
   payment_methods: string[];
   payment_record_permissions: TradePaymentRecordPermission[];
   pi_profile: TradePIProfile;
+  modules?: TradeModules;
+}
+
+export interface TradeModules {
+  quotation: boolean;
+  purchase: boolean;
+  receiving: boolean;
+  inspection: boolean;
+  packing: boolean;
+  shipment: boolean;
 }
 
 export type TradePaymentRecordAccess = "none" | "own" | "all";
@@ -1849,6 +1859,8 @@ export interface TradeOrder {
   can_operate_stage: boolean;
   can_advance: boolean;
   can_return: boolean;
+  next_stage?: TradeStage | "";
+  prev_stage?: TradeStage | "";
   advance_blockers: string[];
   access?: TradeOrderAccess;
   stage_updated_at: string;

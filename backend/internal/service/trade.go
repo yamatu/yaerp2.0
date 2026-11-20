@@ -53,6 +53,7 @@ type TradeService struct {
 	automationRepo   *repo.AutomationRepo
 	notificationHook func([]int64)
 	orderUpdatedHook func(orderID int64)
+	modulesCache     tradeModulesCache
 }
 
 func NewTradeService(
@@ -806,15 +807,23 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	if request == nil || request.CustomerID <= 0 {
 		return nil, fmt.Errorf("请选择客户")
 	}
-	if strings.TrimSpace(request.Title) == "" {
+	if strings.TrimSpace(request.Title) == "" && !request.Confirmed {
 		return nil, fmt.Errorf("请输入询价主题")
 	}
 	if len(request.Items) == 0 {
-		return nil, fmt.Errorf("至少添加一个询价产品")
+		return nil, fmt.Errorf("至少添加一个产品")
 	}
 	customer, err := s.getCustomer(userID, request.CustomerID)
 	if err != nil {
 		return nil, fmt.Errorf("客户不存在或无权访问")
+	}
+	if request.Confirmed {
+		if err := validateConfirmedTradeOrder(request); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(request.Title) == "" {
+			request.Title = fmt.Sprintf("%s %s 成交订单", firstNonEmptyTrade(customer.Name, customer.CompanyName), time.Now().Format("2006-01-02"))
+		}
 	}
 	quoteDeadline, err := parseTradeDate(request.QuoteDeadline)
 	if err != nil {
@@ -866,6 +875,9 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	}
 	if err := s.attachRequestedItemImages(userID, order.ID, items, request.Items); err != nil {
 		return nil, err
+	}
+	if request.Confirmed && !isAIImport {
+		return s.finishConfirmedOrder(userID, order, request, access.profile.CanViewAllOrders)
 	}
 	if order.ChannelID != nil && !isAIImport {
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{
@@ -1365,8 +1377,14 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 	if !validTradeStage(targetStage) {
 		return nil, fmt.Errorf("无效的目标阶段")
 	}
+	modules := s.Modules()
+	nextStage := ""
+	if order.Stage != model.TradeStageCancelled {
+		nextStage = nextEnabledTradeStage(order.Stage, modules)
+	}
+	prevStage := prevEnabledTradeStage(order.Stage, modules)
 	if order.Stage == model.TradeStageCompleted || order.Stage == model.TradeStageCancelled {
-		if targetStage != prevTradeStage(order.Stage) {
+		if targetStage != prevStage {
 			return nil, fmt.Errorf("当前业务单已经结束，只能退回上一阶段")
 		}
 	}
@@ -1391,8 +1409,8 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 			return nil, fmt.Errorf("只有业务单负责人、业务负责人或管理员可以取消业务单")
 		}
 	}
-	isForward := targetStage == nextTradeStage(order.Stage)
-	isBackward := targetStage == prevTradeStage(order.Stage)
+	isForward := targetStage != "" && targetStage == nextStage
+	isBackward := targetStage != "" && targetStage == prevStage
 	if !isCancelled && !isForward && !isBackward {
 		return nil, fmt.Errorf("当前处于%s阶段，只能进入相邻的上一步或下一步", tradeStageLabel(order.Stage))
 	}
@@ -2828,12 +2846,18 @@ func (s *TradeService) enrichOrderPermissionsWith(lookup *tradeStageLookup, user
 			order.RequiredPositionName = position.Name
 		}
 	}
+	modules := lookup.tradeModules()
+	order.NextStage = ""
+	if order.Stage != model.TradeStageCancelled {
+		order.NextStage = nextEnabledTradeStage(order.Stage, modules)
+	}
+	order.PrevStage = prevEnabledTradeStage(order.Stage, modules)
 	order.AdvanceBlockers = nil
 	if order.Items != nil {
-		order.AdvanceBlockers = tradeOrderAdvanceBlockers(order)
+		order.AdvanceBlockers = tradeOrderAdvanceBlockersWith(order, modules)
 	}
-	order.CanAdvance = allowed && order.Stage != model.TradeStageCancelled && nextTradeStage(order.Stage) != "" && len(order.AdvanceBlockers) == 0
-	order.CanReturn = allowed && prevTradeStage(order.Stage) != ""
+	order.CanAdvance = allowed && order.NextStage != "" && len(order.AdvanceBlockers) == 0
+	order.CanReturn = allowed && order.PrevStage != ""
 }
 
 func (s *TradeService) loadTradeOrderAdvanceBlockers(order *model.TradeOrder) ([]string, error) {
@@ -2899,10 +2923,16 @@ func (s *TradeService) loadTradeOrderAdvanceBlockers(order *model.TradeOrder) ([
 			order.CustomerQuotes = quotes
 		}
 	}
-	return tradeOrderAdvanceBlockers(order), nil
+	return tradeOrderAdvanceBlockersWith(order, s.Modules()), nil
 }
 
 func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
+	return tradeOrderAdvanceBlockersWith(order, model.AllTradeModules())
+}
+
+// tradeOrderAdvanceBlockersWith skips the checks of a switched-off stage, so an
+// order left there (e.g. an old quote) can move on to the next enabled stage.
+func tradeOrderAdvanceBlockersWith(order *model.TradeOrder, modules model.TradeModules) []string {
 	if order == nil {
 		return []string{"业务单数据不完整"}
 	}
@@ -2923,6 +2953,9 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 	}
 	if order.Stage != model.TradeStageInquiry && order.Stage != model.TradeStageCancelled && len(tradeActiveItems(items)) == 0 {
 		blockers = append(blockers, "没有需要继续处理的产品（全部无法报价或客户未采购），请恢复至少一项产品或取消订单")
+	}
+	if !modules.StageEnabled(order.Stage) {
+		return blockers
 	}
 	switch order.Stage {
 	case model.TradeStageInquiry:
@@ -3009,7 +3042,9 @@ func tradeOrderAdvanceBlockers(order *model.TradeOrder) []string {
 				break
 			}
 		}
-		if !paymentProofFound {
+		// Payment proofs hang off accepted quotes; without the quotation module
+		// orders are entered already paid.
+		if !paymentProofFound && modules.Quotation {
 			blockers = append(blockers, "完成订单前必须上传客户付款凭证")
 		}
 		if order.FreightMode == "quoted" {
@@ -3075,6 +3110,15 @@ type tradeStageLookup struct {
 	positions   map[string]tradeLookupPosition
 	memberships map[[2]int64]tradeLookupBool
 	members     map[int64]tradeLookupUserIDs
+	modules     *model.TradeModules
+}
+
+func (l *tradeStageLookup) tradeModules() model.TradeModules {
+	if l.modules == nil {
+		modules := l.svc.Modules()
+		l.modules = &modules
+	}
+	return *l.modules
 }
 
 type tradeLookupBool struct {
