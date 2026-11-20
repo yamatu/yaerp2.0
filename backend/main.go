@@ -367,7 +367,7 @@ func main() {
 		api.POST("/mail/forward/run", mailHandler.RunForwarding)
 		api.GET("/trade/access", tradeHandler.AccessProfile)
 		api.GET("/trade/dashboard", tradeHandler.Dashboard)
-		api.GET("/trade/boss-dashboard", tradeHandler.BossDashboard)
+		api.GET("/trade/boss-report", tradeHandler.BossReport)
 		api.GET("/trade/customers", tradeHandler.ListCustomers)
 		api.POST("/trade/customers", tradeHandler.CreateCustomer)
 		api.PUT("/trade/customers/:id", tradeHandler.UpdateCustomer)
