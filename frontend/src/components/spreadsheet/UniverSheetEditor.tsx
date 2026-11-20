@@ -6251,7 +6251,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {optionPickerTarget && (
-        <div className="fixed inset-0 z-[1100] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) { setOptionPickerTarget(null); setOptionPickerSearch('') } }}>
+        <div data-movable-dialog className="fixed inset-0 z-[1100] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) { setOptionPickerTarget(null); setOptionPickerSearch('') } }}>
           <div className="flex max-h-[82vh] w-full flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:max-w-md sm:rounded-lg">
             <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div className="min-w-0"><div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><Building2 className="h-4 w-4 text-emerald-600" />选择{optionPickerTarget.columnName}</div><div className="mt-1 truncate text-xs text-slate-400">第 {optionPickerTarget.row + 1} 行 · 支持输入关键词筛选</div></div>
@@ -6277,7 +6277,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {showFieldControlPanel && (
-        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !fieldControlApplying) setShowFieldControlPanel(false) }}>
+        <div data-movable-dialog className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !fieldControlApplying) setShowFieldControlPanel(false) }}>
           <div className="flex max-h-[90vh] w-[min(620px,96vw)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div className="min-w-0">
@@ -6352,7 +6352,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {showApprovalPanel && (
-        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !approvalAction) setShowApprovalPanel(false) }}>
+        <div data-movable-dialog className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !approvalAction) setShowApprovalPanel(false) }}>
           <div className="flex max-h-[92vh] w-[min(860px,97vw)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div className="min-w-0">
@@ -6417,7 +6417,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {showNumberFormatPanel && (
-        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !applyingNumberFormat) setShowNumberFormatPanel(false) }}>
+        <div data-movable-dialog className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-3 py-5" onMouseDown={(event) => { if (event.target === event.currentTarget && !applyingNumberFormat) setShowNumberFormatPanel(false) }}>
           <div className="flex max-h-[90vh] w-[min(680px,96vw)] flex-col overflow-hidden rounded-lg bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div className="min-w-0">
@@ -6476,7 +6476,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {showPdfExportPanel && (
-        <div className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-4 py-6">
+        <div data-movable-dialog className="fixed inset-0 z-[88] flex items-center justify-center bg-slate-950/45 px-4 py-6">
           <div className="w-[min(560px,96vw)] overflow-hidden rounded-xl bg-white shadow-2xl">
             <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-slate-900">
@@ -6602,7 +6602,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
       )}
 
       {pdfPreview && (
-        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/50 px-4 py-6">
+        <div data-movable-dialog className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/50 px-4 py-6">
           <div className="flex h-[min(900px,92vh)] w-[min(1120px,96vw)] flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
             <div className="flex min-h-16 items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
               <div className="min-w-0">

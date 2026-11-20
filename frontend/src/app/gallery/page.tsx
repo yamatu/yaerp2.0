@@ -836,7 +836,7 @@ export default function GalleryPage() {
         </div>
 
         {accessDirectory && (
-          <div className="fixed inset-0 z-[95] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setAccessDirectory(null) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[95] flex items-end justify-center bg-slate-950/40 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setAccessDirectory(null) }}>
             <div className="flex max-h-[92dvh] sm:max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl sm:rounded-lg bg-white shadow-2xl pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
                 <div className="min-w-0">
@@ -949,7 +949,7 @@ export default function GalleryPage() {
         )}
 
         {renaming && (
-          <div className="fixed inset-0 z-[120] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setRenaming(null) }}>
+          <div data-movable-dialog className="fixed inset-0 z-[120] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setRenaming(null) }}>
             <div className="w-full max-w-md rounded-t-2xl sm:rounded-lg bg-white shadow-2xl max-h-[92dvh] overflow-y-auto sm:max-h-none sm:overflow-visible pb-[env(safe-area-inset-bottom)] sm:pb-0">
               <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                 <div>

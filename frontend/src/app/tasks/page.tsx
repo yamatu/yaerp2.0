@@ -818,7 +818,7 @@ function TaskCenterContent() {
 
         {decisionTarget && (
           <div
-            className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4"
             onMouseDown={(event) => {
               if (event.target === event.currentTarget && !submitting)
                 setDecisionTarget(null);
@@ -907,7 +907,7 @@ function TaskCenterContent() {
 
         {createOpen && (
           <div
-            className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/40 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/40 sm:items-center sm:p-4"
             onClick={() => setCreateOpen(false)}
           >
             <div
@@ -1010,7 +1010,7 @@ function TaskCenterContent() {
 
         {filterOpen && (
           <div
-            className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/40 sm:items-center sm:p-4"
+            data-movable-dialog className="fixed inset-0 z-[100] flex items-end justify-center bg-slate-950/40 sm:items-center sm:p-4"
             onClick={() => setFilterOpen(false)}
           >
             <div
@@ -1264,7 +1264,7 @@ function RunDetailDialog({
 }) {
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4"
+      data-movable-dialog className="fixed inset-0 z-[110] flex items-end justify-center bg-slate-950/35 p-0 sm:items-center sm:p-4"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}

@@ -112,6 +112,11 @@ export function hasComposeImages(editorHTML: string) {
   return /data-mail-img="/.test(editorHTML);
 }
 
+/** Whether the editor content uses toolbar formatting and must go out as HTML. */
+export function hasComposeFormatting(editorHTML: string) {
+  return /<(b|strong|i|em|u|s|strike|font|ol|ul|li|a|hr|blockquote|h[1-6])[\s>]|\sstyle="/i.test(editorHTML);
+}
+
 /** Drops every registered image, e.g. when the compose window closes. */
 export function clearComposeImages() {
   images.forEach((image) => URL.revokeObjectURL(image.url));

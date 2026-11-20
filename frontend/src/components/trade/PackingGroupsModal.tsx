@@ -166,7 +166,7 @@ export function PackingGroupsModal({
 
   return (
     <div
-      className="fixed inset-0 z-[96] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
+      data-movable-dialog className="fixed inset-0 z-[96] flex items-end justify-center bg-slate-950/55 p-0 sm:items-center sm:p-4"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget && !saving) onClose();
       }}

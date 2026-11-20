@@ -178,6 +178,9 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	if !full && canViewCustomerPricing {
 		canViewSupplierPricing = false
 	}
+	// The salesperson follows their order through the warehouse as configured
+	// in the trade settings (receiving, inspection photos, packing).
+	visibility := s.OwnerVisibility()
 	canViewPayments, canViewAllPayments, canUploadPaymentProofs, canManagePaymentStatus := tradePaymentRecordScope(
 		full, owner, access.stageAccess[order.Stage], access.profile.PaymentRecordAccess,
 	)
@@ -187,9 +190,9 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 		CanViewCustomerPricing:   canViewCustomerPricing,
 		CanViewSupplier:          canViewSupplier,
 		CanViewSupplierPricing:   canViewSupplierPricing,
-		CanViewReceiving:         full || codes["purchasing"] || codes["warehouse"] || codes["quality"],
-		CanViewInspection:        full || codes["quality"] || codes["packing"],
-		CanViewPacking:           full || codes["packing"] || codes["logistics"],
+		CanViewReceiving:         full || codes["purchasing"] || codes["warehouse"] || codes["quality"] || (owner && visibility.Receiving),
+		CanViewInspection:        full || codes["quality"] || codes["packing"] || (owner && visibility.Inspection),
+		CanViewPacking:           full || codes["packing"] || codes["logistics"] || (owner && visibility.Packing),
 		CanViewShipment:          full || owner || codes["sales"] || codes["logistics"],
 		CanViewProfit:            full,
 		CanViewTimeline:          full || owner || access.profile.CanViewOrderProgress,
@@ -226,9 +229,21 @@ func (s *TradeService) orderAccessForUser(userID int64, order *model.TradeOrder,
 	earlyStage := order.Stage == model.TradeStageInquiry || order.Stage == model.TradeStageSupplierQuote || order.Stage == model.TradeStageQuotation
 	activeStage := order.Stage != model.TradeStageCompleted && order.Stage != model.TradeStageCancelled
 	result.CanAddItems = activeStage && (full || (earlyStage && (owner || canOperate)))
-	// Inquiry images are what the customer sent; real goods photos are taken
-	// at inspection through the inspection-photo flow.
-	result.CanManageItemImages = activeStage && (full || (earlyStage && (owner || canOperate)))
+	// Product pictures can be fixed at any point of an open order by the
+	// salesperson, the current stage's position or a full user.
+	result.CanManageItemImages = activeStage && (full || owner || canOperate)
+	result.CanManageInspectionPhotos = full
+	if !full && result.CanViewInspection {
+		lookup := access.stageLookup
+		if lookup == nil {
+			lookup = newTradeStageLookup(s)
+		}
+		canInspect, _, err := lookup.canOperateStage(userID, order, model.TradeStageInspection)
+		if err != nil {
+			return nil, err
+		}
+		result.CanManageInspectionPhotos = canInspect
+	}
 	return result, nil
 }
 
@@ -352,6 +367,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		order.QuotedGoodsAmount = 0
 		order.QuoteExchangeRateCNY = 0
 		order.QuotedFreightAmount = 0
+		order.PaymentFeeAmount = 0
 		order.QuoteDeadline = nil
 		order.PaymentMethod = ""
 		order.PaymentTerms = ""
@@ -402,6 +418,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 		if !orderAccess.CanViewCustomerPricing {
 			item.TargetPrice = 0
 			item.QuotedPrice = 0
+			item.FreightAmount = 0
 		}
 		if !orderAccess.CanViewSupplier {
 			item.SupplierName = ""

@@ -1125,14 +1125,31 @@ func applyTradeStageItemUpdate(stage string, item *model.TradeOrderItem, input *
 		item.PurchaseCurrency = strings.ToUpper(strings.TrimSpace(input.PurchaseCurrency))
 		item.PurchasePrice = nonNegativeTradeValue(input.PurchasePrice)
 		copyTradeWorkflowFields(item.WorkflowData, input.WorkflowData, "purchase_status", "cost_exchange_rate")
-		item.Status = firstNonEmptyTrade(tradeWorkflowString(item, "purchase_status"), item.Status)
+		status := normalizeTradePurchaseStatus(tradeWorkflowString(item, "purchase_status"))
+		setTradeWorkflowValue(item, "purchase_status", status)
+		item.Status = status
+		setTradeItemNotBought(item, status == tradePurchaseNotBought)
 	case model.TradeStageReceiving:
 		item.ReceivedQuantity = nonNegativeTradeValue(input.ReceivedQuantity)
 		copyTradeWorkflowFields(item.WorkflowData, input.WorkflowData, "warehouse_location", "received_date", "receipt_status")
+		// The status and the quantity follow each other, so either one is enough.
+		switch status := tradeWorkflowString(item, "receipt_status"); {
+		case status == "全部到货" && item.ReceivedQuantity < item.Quantity:
+			item.ReceivedQuantity = item.Quantity
+		case item.ReceivedQuantity >= item.Quantity && item.Quantity > 0 && (status == "" || status == "待到货" || status == "部分到货"):
+			setTradeWorkflowValue(item, "receipt_status", "全部到货")
+		case item.ReceivedQuantity > 0 && item.ReceivedQuantity < item.Quantity && (status == "" || status == "待到货"):
+			setTradeWorkflowValue(item, "receipt_status", "部分到货")
+		}
 		item.Status = firstNonEmptyTrade(tradeWorkflowString(item, "receipt_status"), item.Status)
 	case model.TradeStageInspection:
 		item.AcceptedQuantity = nonNegativeTradeValue(input.AcceptedQuantity)
 		copyTradeWorkflowFields(item.WorkflowData, input.WorkflowData, "sample_qty", "inspection_result", "inspection_issue", "inspector", "inspection_date")
+		if tradeWorkflowString(item, "inspection_result") == "合格" {
+			if expected := firstNonZeroTrade(item.ReceivedQuantity, item.Quantity); item.AcceptedQuantity < expected {
+				item.AcceptedQuantity = expected
+			}
+		}
 		item.Status = firstNonEmptyTrade(tradeWorkflowString(item, "inspection_result"), item.Status)
 	case model.TradeStagePacking:
 		item.PackedQuantity = nonNegativeTradeValue(input.PackedQuantity)
@@ -1201,10 +1218,12 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		summary.CostComplete = false
 		addWarning("订单没有产品明细")
 	}
+	lineFreight := 0.0
 	for _, item := range items {
 		if tradeItemExcluded(&item) {
 			continue
 		}
+		lineFreight += nonNegativeTradeValue(item.FreightAmount)
 		lineComplete := true
 		quantity := nonNegativeTradeValue(item.Quantity)
 		revenue := quantity * nonNegativeTradeValue(item.QuotedPrice)
@@ -1248,6 +1267,7 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 		summary.Lines = append(summary.Lines, model.TradeProfitLine{
 			OrderItemID: item.ID, LineNo: item.LineNo, SKU: item.SKU, ProductName: item.ProductName,
 			Quantity: quantity, SalesUnitPrice: item.QuotedPrice, Revenue: revenue,
+			FreightAmount: nonNegativeTradeValue(item.FreightAmount),
 			PurchaseCurrency: purchaseCurrency, PurchaseUnitPrice: item.PurchasePrice,
 			CostExchangeRate: rate, PurchaseCost: purchaseCost, ProfitAmount: lineProfit,
 			ProfitMargin: lineMargin, CostComplete: lineComplete,
@@ -1259,12 +1279,16 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 	freightMode := strings.ToLower(firstNonEmptyTrade(order.FreightMode, "customer_forwarder"))
 	if freightMode == "quoted" {
 		summary.FreightRevenue = nonNegativeTradeValue(order.QuotedFreightAmount)
-		if summary.FreightRevenue <= 0 {
+		if summary.FreightRevenue <= 0 && lineFreight <= 0 {
 			summary.CostComplete = false
 			addWarning("已选择我方报价运费，但尚未填写报价运费")
 		}
 	}
-	summary.Revenue = summary.GoodsRevenue + summary.FreightRevenue
+	// Freight charged per line and the payment fee are part of what the
+	// customer pays.
+	summary.FreightRevenue += lineFreight
+	summary.FeeRevenue = nonNegativeTradeValue(order.PaymentFeeAmount)
+	summary.Revenue = summary.GoodsRevenue + summary.FreightRevenue + summary.FeeRevenue
 	if order.TotalAmount > 0 {
 		summary.Revenue = order.TotalAmount
 	}
@@ -2991,10 +3015,20 @@ func tradeOrderAdvanceBlockersWith(order *model.TradeOrder, modules model.TradeM
 			blockers = append(blockers, "尚未有客户接受的对客报价；如客户砍价，请记录反馈并创建下一轮报价")
 		}
 	case model.TradeStagePurchase:
+		if modules.Quotation {
+			if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
+				return strings.TrimSpace(item.SupplierName) == "" || item.PurchasePrice <= 0 || !tradePurchaseStatusReady(item.Status)
+			}); labels != "" {
+				blockers = append(blockers, "尚未确认采购下单："+labels)
+			}
+			break
+		}
+		// Without quoting only the purchase status matters; "没买到" lines
+		// are already left out of the order.
 		if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
-			return strings.TrimSpace(item.SupplierName) == "" || item.PurchasePrice <= 0 || !tradePurchaseStatusReady(item.Status)
+			return !tradePurchaseStatusReady(item.Status)
 		}); labels != "" {
-			blockers = append(blockers, "尚未确认采购下单："+labels)
+			blockers = append(blockers, "还有产品是待采购："+labels)
 		}
 	case model.TradeStageReceiving:
 		if labels := tradeMissingItemLabels(items, func(item model.TradeOrderItem) bool {
@@ -3058,12 +3092,44 @@ func tradeOrderAdvanceBlockersWith(order *model.TradeOrder, modules model.TradeM
 	return blockers
 }
 
-func tradePurchaseStatusReady(status string) bool {
+const (
+	tradePurchasePending   = "待采购"
+	tradePurchaseBought    = "已采购"
+	tradePurchaseNotBought = "没买到"
+)
+
+// normalizeTradePurchaseStatus maps every purchase status, including the
+// older 已下单/生产中/已完成, onto 待采购 / 已采购 / 没买到.
+func normalizeTradePurchaseStatus(status string) string {
 	switch strings.TrimSpace(status) {
-	case "已下单", "生产中", "已完成":
-		return true
+	case tradePurchaseBought, "已下单", "生产中", "已完成":
+		return tradePurchaseBought
+	case tradePurchaseNotBought:
+		return tradePurchaseNotBought
 	default:
-		return false
+		return tradePurchasePending
+	}
+}
+
+func tradePurchaseStatusReady(status string) bool {
+	return normalizeTradePurchaseStatus(status) == tradePurchaseBought
+}
+
+// setTradeItemNotBought leaves a line the purchaser could not buy out of the
+// order (the customer is refunded for it); undoing it brings the line back.
+// Lines excluded for other reasons, such as supplier quoting, are untouched.
+func setTradeItemNotBought(item *model.TradeOrderItem, notBought bool) {
+	reason := tradeWorkflowString(item, tradeItemUnavailableReasonKey)
+	if notBought {
+		setTradeWorkflowValue(item, tradeItemUnavailableKey, true)
+		setTradeWorkflowValue(item, tradeItemUnavailableReasonKey, tradePurchaseNotBought)
+		setTradeWorkflowValue(item, tradeItemUnavailableAtKey, time.Now().Format(time.RFC3339))
+		return
+	}
+	if reason == tradePurchaseNotBought {
+		delete(item.WorkflowData, tradeItemUnavailableKey)
+		delete(item.WorkflowData, tradeItemUnavailableReasonKey)
+		delete(item.WorkflowData, tradeItemUnavailableAtKey)
 	}
 }
 

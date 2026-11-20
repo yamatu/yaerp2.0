@@ -87,32 +87,34 @@ type TradeCustomerDeleteRequest struct {
 }
 
 type TradeOrderItem struct {
-	ID               int64            `json:"id"`
-	OrderID          int64            `json:"order_id"`
-	LineNo           int              `json:"line_no"`
-	SKU              string           `json:"sku"`
-	ProductName      string           `json:"product_name"`
-	Description      string           `json:"description"`
-	Specification    string           `json:"specification"`
-	Quantity         float64          `json:"quantity"`
-	Unit             string           `json:"unit"`
-	TargetPrice      float64          `json:"target_price"`
-	QuotedPrice      float64          `json:"quoted_price"`
-	SupplierName     string           `json:"supplier_name"`
-	PurchaseCurrency string           `json:"purchase_currency"`
-	PurchasePrice    float64          `json:"purchase_price"`
-	ReceivedQuantity float64          `json:"received_quantity"`
-	AcceptedQuantity float64          `json:"accepted_quantity"`
-	PackedQuantity   float64          `json:"packed_quantity"`
-	CartonCount      int              `json:"carton_count"`
-	HSCode           string           `json:"hs_code"`
-	GrossWeight      float64          `json:"gross_weight"`
-	NetWeight        float64          `json:"net_weight"`
-	Status           string           `json:"status"`
-	WorkflowData     map[string]any   `json:"workflow_data,omitempty"`
-	Images           []TradeItemImage `json:"images,omitempty"`
-	CreatedAt        time.Time        `json:"created_at"`
-	UpdatedAt        time.Time        `json:"updated_at"`
+	ID               int64          `json:"id"`
+	OrderID          int64          `json:"order_id"`
+	LineNo           int            `json:"line_no"`
+	SKU              string         `json:"sku"`
+	ProductName      string         `json:"product_name"`
+	Description      string         `json:"description"`
+	Specification    string         `json:"specification"`
+	Quantity         float64        `json:"quantity"`
+	Unit             string         `json:"unit"`
+	TargetPrice      float64        `json:"target_price"`
+	QuotedPrice      float64        `json:"quoted_price"`
+	SupplierName     string         `json:"supplier_name"`
+	PurchaseCurrency string         `json:"purchase_currency"`
+	PurchasePrice    float64        `json:"purchase_price"`
+	ReceivedQuantity float64        `json:"received_quantity"`
+	AcceptedQuantity float64        `json:"accepted_quantity"`
+	PackedQuantity   float64        `json:"packed_quantity"`
+	CartonCount      int            `json:"carton_count"`
+	HSCode           string         `json:"hs_code"`
+	GrossWeight      float64        `json:"gross_weight"`
+	NetWeight        float64        `json:"net_weight"`
+	Status           string         `json:"status"`
+	WorkflowData     map[string]any `json:"workflow_data,omitempty"`
+	// Freight charged to the customer for this line, in the order currency.
+	FreightAmount float64          `json:"freight_amount"`
+	Images        []TradeItemImage `json:"images,omitempty"`
+	CreatedAt     time.Time        `json:"created_at"`
+	UpdatedAt     time.Time        `json:"updated_at"`
 }
 
 type TradeItemImage struct {
@@ -397,6 +399,19 @@ type TradeSettings struct {
 	PaymentRecordPermissions []TradePaymentRecordPermission `json:"payment_record_permissions"`
 	PIProfile                TradePIProfile                 `json:"pi_profile"`
 	Modules                  TradeModules                   `json:"modules"`
+	OwnerVisibility          TradeOwnerVisibility           `json:"owner_visibility"`
+}
+
+// TradeOwnerVisibility lets the salesperson who owns an order see the data
+// later stages record, even without the warehouse/quality/packing position.
+type TradeOwnerVisibility struct {
+	Receiving  bool `json:"receiving"`
+	Inspection bool `json:"inspection"`
+	Packing    bool `json:"packing"`
+}
+
+func DefaultTradeOwnerVisibility() TradeOwnerVisibility {
+	return TradeOwnerVisibility{Receiving: true, Inspection: true, Packing: true}
 }
 
 // TradeModules switches optional parts of the order workflow on or off. A
@@ -513,40 +528,44 @@ type TradeOrderAccess struct {
 	CanViewPI                bool   `json:"can_view_pi"`
 	CanGeneratePI            bool   `json:"can_generate_pi"`
 	CanManageItemImages      bool   `json:"can_manage_item_images"`
+	// Delete, rotate or flip inspection photos (their uploader may as well).
+	CanManageInspectionPhotos bool `json:"can_manage_inspection_photos"`
 }
 
 type TradeOrder struct {
-	ID                           int64                     `json:"id"`
-	OrderNo                      string                    `json:"order_no"`
-	CustomerID                   int64                     `json:"customer_id"`
-	CustomerName                 string                    `json:"customer_name"`
-	CustomerCompany              string                    `json:"customer_company"`
-	CustomerAvatarURL            string                    `json:"customer_avatar_url"`
-	OwnerID                      int64                     `json:"owner_id"`
-	OwnerName                    string                    `json:"owner_name"`
-	Title                        string                    `json:"title"`
-	Stage                        string                    `json:"stage"`
-	Priority                     string                    `json:"priority"`
-	InquiryDate                  time.Time                 `json:"inquiry_date"`
-	QuoteDeadline                *time.Time                `json:"quote_deadline,omitempty"`
-	ExpectedShipDate             *time.Time                `json:"expected_ship_date,omitempty"`
-	Currency                     string                    `json:"currency"`
-	Incoterm                     string                    `json:"incoterm"`
-	DestinationCountry           string                    `json:"destination_country"`
-	DestinationPort              string                    `json:"destination_port"`
-	PaymentTerms                 string                    `json:"payment_terms"`
-	PaymentMethod                string                    `json:"payment_method"`
-	TotalAmount                  float64                   `json:"total_amount"`
-	QuotedGoodsAmount            float64                   `json:"quoted_goods_amount"`
-	QuoteExchangeRateCNY         float64                   `json:"quote_exchange_rate_cny"`
-	FreightMode                  string                    `json:"freight_mode"`
-	QuotedFreightAmount          float64                   `json:"quoted_freight_amount"`
-	ActualFreightCurrency        string                    `json:"actual_freight_currency"`
-	ActualFreightAmount          float64                   `json:"actual_freight_amount"`
-	ActualFreightToCNYRate       float64                   `json:"actual_freight_to_cny_rate"`
-	ActualFreightNotes           string                    `json:"actual_freight_notes"`
-	AdditionalCostAmount         float64                   `json:"additional_cost_amount"`
-	AdditionalCostNotes          string                    `json:"additional_cost_notes"`
+	ID                     int64      `json:"id"`
+	OrderNo                string     `json:"order_no"`
+	CustomerID             int64      `json:"customer_id"`
+	CustomerName           string     `json:"customer_name"`
+	CustomerCompany        string     `json:"customer_company"`
+	CustomerAvatarURL      string     `json:"customer_avatar_url"`
+	OwnerID                int64      `json:"owner_id"`
+	OwnerName              string     `json:"owner_name"`
+	Title                  string     `json:"title"`
+	Stage                  string     `json:"stage"`
+	Priority               string     `json:"priority"`
+	InquiryDate            time.Time  `json:"inquiry_date"`
+	QuoteDeadline          *time.Time `json:"quote_deadline,omitempty"`
+	ExpectedShipDate       *time.Time `json:"expected_ship_date,omitempty"`
+	Currency               string     `json:"currency"`
+	Incoterm               string     `json:"incoterm"`
+	DestinationCountry     string     `json:"destination_country"`
+	DestinationPort        string     `json:"destination_port"`
+	PaymentTerms           string     `json:"payment_terms"`
+	PaymentMethod          string     `json:"payment_method"`
+	TotalAmount            float64    `json:"total_amount"`
+	QuotedGoodsAmount      float64    `json:"quoted_goods_amount"`
+	QuoteExchangeRateCNY   float64    `json:"quote_exchange_rate_cny"`
+	FreightMode            string     `json:"freight_mode"`
+	QuotedFreightAmount    float64    `json:"quoted_freight_amount"`
+	ActualFreightCurrency  string     `json:"actual_freight_currency"`
+	ActualFreightAmount    float64    `json:"actual_freight_amount"`
+	ActualFreightToCNYRate float64    `json:"actual_freight_to_cny_rate"`
+	ActualFreightNotes     string     `json:"actual_freight_notes"`
+	AdditionalCostAmount   float64    `json:"additional_cost_amount"`
+	AdditionalCostNotes    string     `json:"additional_cost_notes"`
+	// Fee charged to the customer for paying by PayPal or similar.
+	PaymentFeeAmount             float64                   `json:"payment_fee_amount"`
 	ChannelID                    *int64                    `json:"channel_id,omitempty"`
 	Notes                        string                    `json:"notes"`
 	Source                       string                    `json:"source"`
@@ -609,6 +628,7 @@ type TradeProfitLine struct {
 	Quantity          float64 `json:"quantity"`
 	SalesUnitPrice    float64 `json:"sales_unit_price"`
 	Revenue           float64 `json:"revenue"`
+	FreightAmount     float64 `json:"freight_amount"`
 	PurchaseCurrency  string  `json:"purchase_currency"`
 	PurchaseUnitPrice float64 `json:"purchase_unit_price"`
 	CostExchangeRate  float64 `json:"cost_exchange_rate"`
@@ -623,6 +643,7 @@ type TradeProfitSummary struct {
 	Revenue             float64           `json:"revenue"`
 	GoodsRevenue        float64           `json:"goods_revenue"`
 	FreightRevenue      float64           `json:"freight_revenue"`
+	FeeRevenue          float64           `json:"fee_revenue"`
 	ProductCost         float64           `json:"product_cost"`
 	ActualFreightCost   float64           `json:"actual_freight_cost"`
 	AdditionalCost      float64           `json:"additional_cost"`
@@ -792,6 +813,7 @@ type CreateTradeOrderItemRequest struct {
 	// Used by confirmed orders, which skip quoting: the agreed selling price
 	// and, for users who may see cost, what the goods cost.
 	SalesPrice       float64 `json:"sales_price"`
+	FreightAmount    float64 `json:"freight_amount"`
 	SupplierName     string  `json:"supplier_name"`
 	PurchaseCurrency string  `json:"purchase_currency"`
 	PurchasePrice    float64 `json:"purchase_price"`
@@ -858,16 +880,21 @@ type TradeOrderPricingItem struct {
 	Quantity         float64 `json:"quantity"`
 	Unit             string  `json:"unit"`
 	SalesPrice       float64 `json:"sales_price"`
+	FreightAmount    float64 `json:"freight_amount"`
 	SupplierName     string  `json:"supplier_name"`
 	PurchaseCurrency string  `json:"purchase_currency"`
 	PurchasePrice    float64 `json:"purchase_price"`
 }
 
+// UpdateTradeOrderPricingRequest edits only the lines it lists; order-level
+// values left nil keep their current value.
 type UpdateTradeOrderPricingRequest struct {
-	Currency        string                  `json:"currency"`
-	ExchangeRateCNY float64                 `json:"exchange_rate_cny"`
-	Items           []TradeOrderPricingItem `json:"items"`
-	RemovedItemIDs  []int64                 `json:"removed_item_ids"`
+	Currency         string                  `json:"currency"`
+	ExchangeRateCNY  *float64                `json:"exchange_rate_cny"`
+	PaymentFeeAmount *float64                `json:"payment_fee_amount"`
+	PaymentMethod    *string                 `json:"payment_method"`
+	Items            []TradeOrderPricingItem `json:"items"`
+	RemovedItemIDs   []int64                 `json:"removed_item_ids"`
 }
 
 type UpdateTradeProfitSettingsRequest struct {
@@ -892,8 +919,9 @@ type CreateTradeOrderRequest struct {
 	Items              []CreateTradeOrderItemRequest `json:"items" binding:"required,min=1,dive"`
 	// A confirmed order is one the customer already accepted and paid: it
 	// skips quoting and starts at the first enabled stage after it.
-	Confirmed       bool    `json:"confirmed"`
-	ExchangeRateCNY float64 `json:"exchange_rate_cny"`
+	Confirmed        bool    `json:"confirmed"`
+	ExchangeRateCNY  float64 `json:"exchange_rate_cny"`
+	PaymentFeeAmount float64 `json:"payment_fee_amount"`
 	// AI import metadata is service-internal and cannot be supplied through the
 	// public create-order API.
 	AIImportID      string   `json:"-"`

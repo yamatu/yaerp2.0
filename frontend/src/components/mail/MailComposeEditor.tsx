@@ -6,6 +6,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -15,6 +16,7 @@ import {
   composeImagesBytes,
   composeImagesMaxBytes,
 } from "@/lib/mailComposeImages";
+import MailFormatToolbar, { type MailFormatActions } from "@/components/mail/MailFormatToolbar";
 
 export interface MailComposeEditorHandle {
   focusStart: () => void;
@@ -33,9 +35,10 @@ interface MailComposeEditorProps {
 }
 
 /**
- * The body of a mail being written: plain text plus images placed anywhere in
- * it (pasted screenshots, dropped or picked photos). Pasted rich text is kept
- * as plain text, like the text box this replaces.
+ * The body of a mail being written: text formatted from the toolbar (fonts,
+ * sizes, bold, colours, lists, links) plus images placed anywhere in it
+ * (pasted screenshots, dropped or picked photos). Pasted rich text is kept as
+ * plain text, so foreign styles never leak into a mail.
  */
 const MailComposeEditor = forwardRef<MailComposeEditorHandle, MailComposeEditorProps>(
   function MailComposeEditor({ html, onChange, onAttach, onNotice, placeholder, className = "" }, ref) {
@@ -130,6 +133,44 @@ const MailComposeEditor = forwardRef<MailComposeEditorHandle, MailComposeEditorP
       if (attach.length) onAttach(attach);
     };
 
+    // Stable, so the toolbar subscribes to selection changes once.
+    const emitRef = useRef(emit);
+    emitRef.current = emit;
+    const restoreRef = useRef(restoreCaret);
+    restoreRef.current = restoreCaret;
+    const formatActions = useMemo<MailFormatActions>(
+      () => ({
+        exec: (command, value) => {
+          restoreRef.current();
+          document.execCommand("styleWithCSS", false, "true");
+          document.execCommand(command, false, value);
+          emitRef.current();
+        },
+        fontSize: (px) => {
+          const editor = editorRef.current;
+          if (!editor) return;
+          restoreRef.current();
+          // execCommand only knows sizes 1-7; mark with 7 and swap in pixels.
+          document.execCommand("styleWithCSS", false, "false");
+          document.execCommand("fontSize", false, "7");
+          document.execCommand("styleWithCSS", false, "true");
+          editor.querySelectorAll('font[size="7"]').forEach((font) => {
+            const span = document.createElement("span");
+            span.style.fontSize = `${px}px`;
+            span.append(...Array.from(font.childNodes));
+            font.replaceWith(span);
+          });
+          emitRef.current();
+        },
+        hasFocus: () => {
+          const editor = editorRef.current;
+          const selection = window.getSelection();
+          return Boolean(editor && selection?.rangeCount && editor.contains(selection.getRangeAt(0).commonAncestorContainer));
+        },
+      }),
+      [],
+    );
+
     useImperativeHandle(ref, () => ({
       focusStart: () => {
         const editor = editorRef.current;
@@ -176,7 +217,9 @@ const MailComposeEditor = forwardRef<MailComposeEditorHandle, MailComposeEditorP
     };
 
     return (
-      <div className="relative">
+      <div className="mt-3 overflow-hidden rounded-lg border border-slate-200 focus-within:border-sky-400">
+        <MailFormatToolbar actions={formatActions} />
+        <div className="relative">
         <div
           ref={editorRef}
           contentEditable
@@ -188,7 +231,7 @@ const MailComposeEditor = forwardRef<MailComposeEditorHandle, MailComposeEditorP
           onPaste={handlePaste}
           onDrop={handleDrop}
           onDragOver={(event) => event.preventDefault()}
-          className={`overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-slate-200 p-3 text-sm leading-7 outline-none focus:border-sky-400 [&_img]:my-1 [&_img]:inline-block [&_img]:h-auto [&_img]:max-h-[360px] [&_img]:max-w-full [&_img]:rounded ${className}`}
+          className={`block overflow-y-auto whitespace-pre-wrap break-words p-3 text-sm leading-7 outline-none [&_a]:text-sky-700 [&_a]:underline [&_hr]:my-2 [&_hr]:border-slate-300 [&_img]:my-1 [&_img]:inline-block [&_img]:h-auto [&_img]:max-h-[360px] [&_img]:max-w-full [&_img]:rounded [&_ol]:list-decimal [&_ol]:pl-7 [&_ul]:list-disc [&_ul]:pl-7 ${className}`}
         />
         {empty && (
           <div className="pointer-events-none absolute left-3 top-3 text-sm leading-7 text-slate-400">
@@ -201,6 +244,7 @@ const MailComposeEditor = forwardRef<MailComposeEditorHandle, MailComposeEditorP
             正在插入图片…
           </div>
         )}
+        </div>
       </div>
     );
   },

@@ -858,6 +858,7 @@ export function Modal({ open, onClose, title, description, icon: Icon, iconTone 
   const drawer = variant === 'drawer'
   return createPortal(
     <div
+      data-movable-dialog={drawer ? undefined : true}
       className={cx('fixed inset-0 z-[80] flex items-end justify-center bg-slate-950/45', drawer ? 'sm:items-stretch sm:justify-end' : 'sm:items-center sm:p-4')}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget && !busy) onClose()

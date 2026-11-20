@@ -5,6 +5,7 @@ import AIChatWrapper from '@/components/ai/AIChatWrapper'
 import GlobalQuickNav from '@/components/nav/GlobalQuickNav'
 import MobileTabBar from '@/components/nav/MobileTabBar'
 import ViewportMetrics from '@/components/nav/ViewportMetrics'
+import DialogMover from '@/components/ui/DialogMover'
 
 export const metadata: Metadata = {
   title: 'YaERP 2.0',
@@ -38,6 +39,7 @@ export default function RootLayout({
       <body className="h-full bg-gray-50 text-gray-900 antialiased">
         {children}
         <ViewportMetrics />
+        <DialogMover />
         <GlobalQuickNav />
         <MobileTabBar />
         <AIChatWrapper />

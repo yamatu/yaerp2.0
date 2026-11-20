@@ -1344,6 +1344,7 @@ export interface TradeOrderItem {
   net_weight: number;
   status: string;
   workflow_data?: Record<string, unknown>;
+  freight_amount?: number;
   images?: TradeItemImage[];
   created_at: string;
   updated_at: string;
@@ -1594,6 +1595,14 @@ export interface TradeSettings {
   payment_record_permissions: TradePaymentRecordPermission[];
   pi_profile: TradePIProfile;
   modules?: TradeModules;
+  owner_visibility?: TradeOwnerVisibility;
+}
+
+/** What the salesperson who owns an order may see of later stages. */
+export interface TradeOwnerVisibility {
+  receiving: boolean;
+  inspection: boolean;
+  packing: boolean;
 }
 
 export interface TradeModules {
@@ -1669,6 +1678,7 @@ export interface TradeOrderAccess {
   can_view_pi: boolean;
   can_generate_pi: boolean;
   can_manage_item_images: boolean;
+  can_manage_inspection_photos?: boolean;
 }
 
 export interface TradeProfitLine {
@@ -1693,6 +1703,7 @@ export interface TradeProfitSummary {
   revenue: number;
   goods_revenue: number;
   freight_revenue: number;
+  fee_revenue?: number;
   product_cost: number;
   actual_freight_cost: number;
   additional_cost: number;
@@ -1823,6 +1834,7 @@ export interface TradeOrder {
   actual_freight_notes: string;
   additional_cost_amount: number;
   additional_cost_notes: string;
+  payment_fee_amount?: number;
   channel_id?: number;
   notes: string;
   source: "manual" | "ai_import";

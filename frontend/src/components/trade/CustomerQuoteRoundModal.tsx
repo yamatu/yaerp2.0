@@ -350,7 +350,7 @@ export function CustomerQuoteRoundModal({ order, source, editing, canUsePurchase
   );
 
   return (
-    <div className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4" data-customer-quote-modal>
+    <div data-movable-dialog className="fixed inset-0 z-[90] flex items-end justify-center bg-slate-950/50 sm:items-center sm:p-4" data-customer-quote-modal>
       <div className="flex max-h-[94vh] w-full max-w-6xl flex-col overflow-hidden rounded-t-lg bg-white shadow-2xl sm:rounded-lg">
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
           <div>

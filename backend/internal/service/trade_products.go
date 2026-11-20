@@ -105,7 +105,7 @@ func (s *TradeService) itemImageOrderAccess(userID, orderID, itemID int64) error
 		return err
 	}
 	if !orderAccess.CanManageItemImages {
-		return fmt.Errorf("客户询价图片只能在询价、供应商询价和报价阶段由业务单负责人或当前岗位维护；到货实拍请在质检环节上传")
+		return fmt.Errorf("只有订单负责人、当前环节负责人或业务负责人可以维护产品图片")
 	}
 	belongs, err := s.repo.OrderItemBelongsToOrder(orderID, itemID)
 	if err != nil {
@@ -132,7 +132,7 @@ func (s *TradeService) UploadItemImage(userID, orderID, itemID int64, file multi
 		}
 	}
 	if inquiryImages >= maxTradeItemImages {
-		return nil, fmt.Errorf("每个产品最多保存 %d 张客户询价图片", maxTradeItemImages)
+		return nil, fmt.Errorf("每个产品最多保存 %d 张产品图片", maxTradeItemImages)
 	}
 	attachment, err := s.uploadSvc.Upload(file, header, userID)
 	if err != nil {
@@ -140,7 +140,7 @@ func (s *TradeService) UploadItemImage(userID, orderID, itemID int64, file multi
 	}
 	if !strings.HasPrefix(strings.ToLower(attachment.MimeType), "image/") {
 		_ = s.uploadSvc.DeleteFile(attachment.ID)
-		return nil, fmt.Errorf("客户询价图片必须是图片文件")
+		return nil, fmt.Errorf("产品图片必须是图片文件")
 	}
 	if err := s.repo.AddItemImage(orderID, itemID, attachment.ID, userID); err != nil {
 		_ = s.uploadSvc.DeleteFile(attachment.ID)
@@ -159,7 +159,7 @@ func (s *TradeService) DeleteItemImage(userID, orderID, itemID, imageID int64) (
 		return nil, err
 	}
 	if !deleted {
-		return nil, fmt.Errorf("客户询价图片不存在")
+		return nil, fmt.Errorf("产品图片不存在")
 	}
 	s.notifyOrderUpdated(orderID)
 	return s.GetOrder(userID, orderID)
