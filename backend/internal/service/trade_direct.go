@@ -84,8 +84,17 @@ func (s *TradeService) finishConfirmedOrder(userID int64, order *model.TradeOrde
 	}
 	start := confirmedOrderStartStage(s.Modules())
 	note := "录入成交订单：客户已确认并付款"
+	imported := request.ImportKey != ""
+	if imported {
+		start = firstNonEmptyTrade(request.ImportStage, start)
+		note = "从月度订单表导入"
+	}
 	if err := s.repo.AdvanceOrder(order.ID, userID, true, model.TradeStageInquiry, start, note); err != nil {
 		return nil, err
+	}
+	if imported {
+		s.notifyOrderUpdated(order.ID)
+		return s.GetOrder(userID, order.ID)
 	}
 	if order.ChannelID != nil {
 		_, _ = s.channelSvc.CreateMessage(userID, *order.ChannelID, ChannelMessageInput{

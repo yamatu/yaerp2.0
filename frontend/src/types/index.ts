@@ -1635,6 +1635,7 @@ export interface TradeModules {
   packing: boolean;
   shipment: boolean;
   show_legacy_stages?: boolean;
+  settlement_start_day?: number;
 }
 
 export type TradePaymentRecordAccess = "none" | "own" | "all";
@@ -1791,9 +1792,13 @@ export interface TradeBossOrderSummary {
   warnings: string[];
   completed_at: string;
   updated_at: string;
+  trend_key?: string;
 }
 
 export interface TradeBossPeriodSummary {
+  sales_orders?: number;
+  sales_revenue_cny?: number;
+  sales_missing_rate_orders?: number;
   completed_orders: number;
   finalized_orders: number;
   incomplete_orders: number;
@@ -1815,6 +1820,8 @@ export interface TradeBossPeriodSummary {
 export interface TradeBossTrendPoint {
   key: string;
   label: string;
+  sales_orders?: number;
+  sales_revenue_cny?: number;
   completed_orders: number;
   finalized_orders: number;
   revenue_cny: number;
@@ -1871,6 +1878,9 @@ export interface TradeOrder {
   stage: TradeStage;
   priority: "low" | "normal" | "high" | "urgent";
   inquiry_date: string;
+  deal_date?: string;
+  settlement_month?: string;
+  shipping_address?: string;
   quote_deadline?: string;
   expected_ship_date?: string;
   currency: string;
@@ -2027,4 +2037,64 @@ export interface ProxyNodeResult {
   name: string
   delay: number
   error?: string
+}
+
+export interface TradeSettlementMonth {
+  month: string;
+  orders: number;
+}
+
+export interface TradeOrderSheetImage {
+  name: string;
+  size: number;
+}
+
+export interface TradeOrderSheetRow {
+  row_number: number;
+  customer_label: string;
+  customer_name: string;
+  country: string;
+  deal_date: string;
+  goods_amount: number;
+  payment_fee: number;
+  freight_amount: number;
+  actual_freight_cny: number;
+  actual_freight_note: string;
+  shipping_address: string;
+  tracking_numbers: string[];
+  notes: string;
+  pi_no: string;
+  images: TradeOrderSheetImage[];
+  matched_customer_id?: number;
+  matched_customer_name?: string;
+  import_key: string;
+  existing_order_no?: string;
+  skip: boolean;
+  skip_reason?: string;
+  problems: string[];
+}
+
+export interface TradeOrderSheetPreview {
+  file_name: string;
+  sheet: string;
+  sheets: string[];
+  settlement_month: string;
+  settlement_month_source: "filename" | "dates" | "today";
+  currency: string;
+  exchange_rate: number;
+  rows: TradeOrderSheetRow[];
+  warnings: string[];
+}
+
+export interface TradeOrderSheetImportResult {
+  created: number;
+  skipped: number;
+  failed: number;
+  rows: {
+    row_number: number;
+    status: "created" | "skipped" | "failed";
+    order_id?: number;
+    order_no?: string;
+    message?: string;
+  }[];
 }

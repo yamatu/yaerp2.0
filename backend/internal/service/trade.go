@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"yaerp/internal/model"
 	"yaerp/internal/repo"
@@ -174,6 +175,9 @@ func (s *TradeService) CreateCustomer(userID int64, request *model.CreateTradeCu
 	if customer.ContactName == "" && source == "whatsapp" {
 		customer.ContactName = customer.Name
 	}
+	if err := validateTradeCustomerLengths(customer); err != nil {
+		return nil, err
+	}
 	if err := s.repo.CreateCustomer(customer); err != nil {
 		return nil, err
 	}
@@ -249,7 +253,7 @@ func normalizeTradeCustomerUpdate(request *model.UpdateTradeCustomerRequest) (*m
 	if companyName == "" {
 		companyName = name
 	}
-	return &model.TradeCustomer{
+	customer := &model.TradeCustomer{
 		Name: name, CompanyName: companyName, Country: strings.TrimSpace(request.Country),
 		Region: strings.TrimSpace(request.Region), ContactName: strings.TrimSpace(request.ContactName),
 		Email: strings.TrimSpace(request.Email), Phone: strings.TrimSpace(request.Phone), Source: source,
@@ -258,7 +262,34 @@ func normalizeTradeCustomerUpdate(request *model.UpdateTradeCustomerRequest) (*m
 		WhatsAppChatName: strings.TrimSpace(request.WhatsAppChatName),
 		AvatarURL:        strings.TrimSpace(request.AvatarURL), Tags: normalizeTradeTags(request.Tags),
 		Notes: strings.TrimSpace(request.Notes),
-	}, nil
+	}
+	if err := validateTradeCustomerLengths(customer); err != nil {
+		return nil, err
+	}
+	return customer, nil
+}
+
+// Limits mirror the VARCHAR sizes of trade_customers.
+func validateTradeCustomerLengths(customer *model.TradeCustomer) error {
+	fields := []struct {
+		label string
+		value string
+		limit int
+	}{
+		{"客户简称", customer.Name, 200},
+		{"公司全称", customer.CompanyName, 240},
+		{"联系人", customer.ContactName, 160},
+		{"邮箱", customer.Email, 200},
+		{"电话 / WhatsApp", customer.Phone, 80},
+		{"WhatsApp 会话 ID", customer.WhatsAppChatID, 200},
+		{"WhatsApp 会话名称", customer.WhatsAppChatName, 240},
+	}
+	for _, field := range fields {
+		if count := utf8.RuneCountInString(field.value); count > field.limit {
+			return fmt.Errorf("%s最多 %d 个字符，当前 %d 个", field.label, field.limit, count)
+		}
+	}
+	return nil
 }
 
 func (s *TradeService) ListCustomerDeleteRequests(userID int64, status string) ([]model.TradeCustomerDeleteRequest, error) {
@@ -415,6 +446,11 @@ func (s *TradeService) ListOrders(userID int64, filter model.TradeOrderFilter) (
 	if filter.Stage != "" && !validTradeStage(filter.Stage) {
 		return nil, fmt.Errorf("无效的业务阶段")
 	}
+	month, err := normalizeSettlementMonth(filter.SettlementMonth)
+	if err != nil {
+		return nil, err
+	}
+	filter.SettlementMonth = month
 	access, err := s.loadTradeUserAccess(userID)
 	if err != nil {
 		return nil, err
@@ -648,12 +684,26 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 	if err != nil {
 		return nil, fmt.Errorf("客户不存在或无权访问")
 	}
+	isAIImport := strings.TrimSpace(request.AIImportID) != ""
+	dealt := request.Confirmed || isAIImport
+	dealDate, err := parseTradeDate(request.DealDate)
+	if err != nil {
+		return nil, fmt.Errorf("成交日期格式无效")
+	}
+	if dealDate == nil && dealt {
+		today := time.Now()
+		dealDate = &today
+	}
+	settlementMonth, err := s.resolveSettlementMonth(request.SettlementMonth, dealDate, time.Now())
+	if err != nil {
+		return nil, err
+	}
 	if request.Confirmed {
 		if err := validateConfirmedTradeOrder(request); err != nil {
 			return nil, err
 		}
 		if strings.TrimSpace(request.Title) == "" {
-			request.Title = fmt.Sprintf("%s %s 成交订单", firstNonEmptyTrade(customer.Name, customer.CompanyName), time.Now().Format("2006-01-02"))
+			request.Title = fmt.Sprintf("%s %s 成交订单", firstNonEmptyTrade(customer.Name, customer.CompanyName), dealDate.Format("2006-01-02"))
 		}
 	}
 	quoteDeadline, err := parseTradeDate(request.QuoteDeadline)
@@ -691,8 +741,13 @@ func (s *TradeService) CreateOrder(userID int64, request *model.CreateTradeOrder
 		DestinationPort: "", PaymentTerms: paymentMethod, PaymentMethod: paymentMethod,
 		ChannelID: customer.ChannelID, Notes: strings.TrimSpace(request.Notes),
 		Source: "manual", DataStatus: "ready",
+		DealDate: dealDate, SettlementMonth: settlementMonth,
+		ShippingAddress: strings.TrimSpace(request.ShippingAddress),
 	}
-	isAIImport := strings.TrimSpace(request.AIImportID) != ""
+	if key := strings.TrimSpace(request.ImportKey); key != "" {
+		order.Source = "excel_import"
+		order.ImportKey = key
+	}
 	if isAIImport {
 		order.Source = "ai_import"
 		order.DataStatus = "importing"
@@ -1293,6 +1348,12 @@ func (s *TradeService) AdvanceOrder(userID, orderID int64, request *model.Advanc
 	}
 	if order.Stage == model.TradeStagePurchase && targetStage == model.TradeStageReceiving && order.ReworkRequired {
 		if err := s.repo.ClearOrderRework(orderID); err != nil {
+			return nil, err
+		}
+	}
+	if isForward && order.DealDate == nil && tradeStageAtOrAfter(targetStage, model.TradeStagePurchase) {
+		today := time.Now()
+		if err := s.repo.MarkOrderDealt(orderID, today, s.Modules().SettlementMonthFor(today)); err != nil {
 			return nil, err
 		}
 	}

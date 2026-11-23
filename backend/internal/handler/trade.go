@@ -2,7 +2,9 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -217,8 +219,107 @@ func (h *TradeHandler) DeleteCustomer(c *gin.Context) {
 	response.OK(c, result)
 }
 
+func (h *TradeHandler) UpdateOrderDeal(c *gin.Context) {
+	orderID, err := parseIDParam(c, "id")
+	if err != nil {
+		response.BadRequest(c, "无效的业务单编号")
+		return
+	}
+	var request model.UpdateTradeOrderDealRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	order, err := h.service.UpdateOrderDeal(c.GetInt64("user_id"), orderID, &request)
+	if errors.Is(err, sql.ErrNoRows) {
+		response.NotFound(c, "业务单不存在或无权访问")
+		return
+	}
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *TradeHandler) SettlementMonths(c *gin.Context) {
+	months, err := h.service.SettlementMonths(c.GetInt64("user_id"))
+	if err != nil {
+		response.ServerError(c, err.Error())
+		return
+	}
+	response.OK(c, months)
+}
+
+func (h *TradeHandler) SetMonthExchangeRate(c *gin.Context) {
+	var request model.SetMonthExchangeRateRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	changed, err := h.service.SetMonthExchangeRate(c.GetInt64("user_id"), c.Param("month"), &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, gin.H{"updated": changed})
+}
+
+func readTradeSheetUpload(c *gin.Context) (string, []byte, bool) {
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "请选择要导入的 Excel 文件")
+		return "", nil, false
+	}
+	defer file.Close()
+	if header.Size > service.TradeOrderSheetMaxBytes {
+		response.BadRequest(c, "文件太大，请不要超过 60MB")
+		return "", nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(file, service.TradeOrderSheetMaxBytes+1))
+	if err != nil {
+		response.BadRequest(c, "读取文件失败")
+		return "", nil, false
+	}
+	return header.Filename, data, true
+}
+
+func (h *TradeHandler) PreviewOrderSheetImport(c *gin.Context) {
+	name, data, ok := readTradeSheetUpload(c)
+	if !ok {
+		return
+	}
+	preview, err := h.service.PreviewOrderSheet(c.GetInt64("user_id"), name, data, c.PostForm("sheet"))
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, preview)
+}
+
+func (h *TradeHandler) ApplyOrderSheetImport(c *gin.Context) {
+	name, data, ok := readTradeSheetUpload(c)
+	if !ok {
+		return
+	}
+	var request model.TradeOrderSheetApplyRequest
+	if err := json.Unmarshal([]byte(c.PostForm("payload")), &request); err != nil {
+		response.BadRequest(c, "导入参数格式无效")
+		return
+	}
+	result, err := h.service.ApplyOrderSheet(c.GetInt64("user_id"), name, data, &request)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *TradeHandler) ListOrders(c *gin.Context) {
-	filter := model.TradeOrderFilter{Search: c.Query("search"), Stage: strings.TrimSpace(c.Query("stage"))}
+	filter := model.TradeOrderFilter{
+		Search: c.Query("search"), Stage: strings.TrimSpace(c.Query("stage")),
+		SettlementMonth: strings.TrimSpace(c.Query("month")),
+	}
 	if value := strings.TrimSpace(c.Query("customer_id")); value != "" {
 		customerID, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || customerID <= 0 {

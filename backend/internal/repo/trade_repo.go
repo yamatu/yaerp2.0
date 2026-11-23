@@ -22,6 +22,7 @@ type TradeRepo struct {
 var (
 	ErrLastTradeOrderItem = errors.New("trade order must keep at least one item")
 	ErrAIImportInProgress = errors.New("AI trade order import is already in progress")
+	ErrTradeOrderAlreadyImported = errors.New("trade order row was already imported")
 )
 
 func NewTradeRepo(db *sql.DB) *TradeRepo {
@@ -464,8 +465,9 @@ func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrde
 			expected_ship_date, currency, incoterm, destination_country, destination_port,
 			payment_terms, payment_method, total_amount, channel_id, notes,
 			source, data_status, ai_import_id, ai_source_text, ai_missing_fields, ai_import_model,
-			stage_updated_at, created_at, updated_at
-		 ) VALUES ($1,$2,$3,$4,'inquiry',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$24,$24)
+			stage_updated_at, created_at, updated_at,
+			deal_date, settlement_month, shipping_address, import_key
+		 ) VALUES ($1,$2,$3,$4,'inquiry',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$24,$24,$25,$26,$27,$28)
 		 RETURNING id`,
 		order.OrderNo, order.CustomerID, order.OwnerID, order.Title, order.Priority, order.InquiryDate,
 		order.QuoteDeadline, order.ExpectedShipDate, order.Currency, order.Incoterm,
@@ -473,8 +475,12 @@ func (r *TradeRepo) CreateOrder(order *model.TradeOrder, items []model.TradeOrde
 		order.TotalAmount, order.ChannelID, order.Notes,
 		source, dataStatus, strings.TrimSpace(order.AIImportID), strings.TrimSpace(order.AISourceText),
 		missingRaw, strings.TrimSpace(order.AIImportModel), now,
+		order.DealDate, order.SettlementMonth, order.ShippingAddress, strings.TrimSpace(order.ImportKey),
 	).Scan(&order.ID)
 	if err != nil {
+		if strings.Contains(err.Error(), "uq_trade_orders_import_key") {
+			return ErrTradeOrderAlreadyImported
+		}
 		return fmt.Errorf("create trade order: %w", err)
 	}
 
@@ -709,14 +715,15 @@ const tradeOrderSelect = `
 	           SELECT COALESCE(NULLIF(TRIM(item.sku), ''), item.product_name) AS code
 	           FROM trade_order_items item WHERE item.order_id = o.id ORDER BY item.line_no, item.id LIMIT 4
 	       ) preview), ''),
-	       o.stage_updated_at, o.created_at, o.updated_at
+	       o.stage_updated_at, o.created_at, o.updated_at,
+	       o.deal_date, o.settlement_month, o.shipping_address, o.import_key
 	FROM (SELECT * FROM trade_orders WHERE deleted_at IS NULL) o
 	JOIN trade_customers c ON c.id = o.customer_id
 	LEFT JOIN users u ON u.id = o.owner_id`
 
 func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 	var order model.TradeOrder
-	var quoteDeadline, expectedShipDate sql.NullTime
+	var quoteDeadline, expectedShipDate, dealDate sql.NullTime
 	var channelID sql.NullInt64
 	var inspectionGalleryDirectoryID, paymentGalleryDirectoryID sql.NullInt64
 	var aiMissingFieldsRaw []byte
@@ -738,8 +745,12 @@ func scanTradeOrder(scanner tradeRowScanner) (*model.TradeOrder, error) {
 		&inspectionGalleryDirectoryID, &paymentGalleryDirectoryID, &order.ReworkRequired,
 		&order.ReworkReason, &order.ReworkCount, &order.ItemCount, &order.SKUPreview,
 		&order.StageUpdatedAt, &order.CreatedAt, &order.UpdatedAt,
+		&dealDate, &order.SettlementMonth, &order.ShippingAddress, &order.ImportKey,
 	); err != nil {
 		return nil, err
+	}
+	if dealDate.Valid {
+		order.DealDate = &dealDate.Time
 	}
 	if quoteDeadline.Valid {
 		order.QuoteDeadline = &quoteDeadline.Time
@@ -839,19 +850,24 @@ func (r *TradeRepo) ListOrdersScoped(userID int64, canViewAll bool, stages []str
 		WHERE ($1 OR o.owner_id = $2 OR o.stage = ANY($3))
 		  AND ($4 = '' OR o.stage = $4)
 		  AND ($5 = 0 OR o.customer_id = $5)
-		  AND ($6 = '' OR CONCAT_WS(' ', o.order_no, o.title, c.name, c.company_name, o.destination_country, o.destination_port) ILIKE '%' || $6 || '%'
+		  AND ($6 = '' OR CONCAT_WS(' ', o.order_no, o.title, c.name, c.company_name, o.destination_country, o.destination_port, o.shipping_address) ILIKE '%' || $6 || '%'
 		       OR EXISTS (
 		           SELECT 1
 		           FROM trade_order_items search_item
 		           WHERE search_item.order_id = o.id
 		             AND CONCAT_WS(' ', search_item.sku, search_item.product_name, search_item.description, search_item.specification) ILIKE '%' || $6 || '%'
+		       )
+		       OR EXISTS (
+		           SELECT 1 FROM trade_order_parcels search_parcel
+		           WHERE search_parcel.order_id = o.id AND search_parcel.tracking_no ILIKE '%' || $6 || '%'
 		       ))
+		  AND ($7 = '' OR o.settlement_month = $7)
 		ORDER BY CASE WHEN o.stage IN ('completed', 'cancelled') THEN 1 ELSE 0 END,
 		         o.updated_at DESC, o.id DESC
-		LIMIT 500`
+		LIMIT 2000`
 	rows, err := r.db.Query(
 		query, canViewAll, userID, pq.Array(stages), strings.TrimSpace(filter.Stage),
-		filter.CustomerID, strings.TrimSpace(filter.Search),
+		filter.CustomerID, strings.TrimSpace(filter.Search), strings.TrimSpace(filter.SettlementMonth),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list trade orders: %w", err)
@@ -2103,6 +2119,99 @@ func (r *TradeRepo) saveSetting(userID int64, key string, setting any) error {
 		key, value, userID,
 	)
 	return err
+}
+
+// UpdateOrderDeal sets the deal date, settlement month and, when given, the
+// shipping address.
+func (r *TradeRepo) UpdateOrderDeal(orderID int64, dealDate *time.Time, settlementMonth string, shippingAddress *string) error {
+	result, err := r.db.Exec(
+		`UPDATE trade_orders SET deal_date=$2,settlement_month=$3,
+		 shipping_address=COALESCE($4,shipping_address),updated_at=NOW()
+		 WHERE id=$1 AND deleted_at IS NULL`,
+		orderID, dealDate, settlementMonth, shippingAddress,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkOrderDealt records the deal date of an order that had none yet, e.g.
+// a quote that the customer has just accepted.
+func (r *TradeRepo) MarkOrderDealt(orderID int64, dealDate time.Time, settlementMonth string) error {
+	_, err := r.db.Exec(
+		`UPDATE trade_orders SET deal_date=$2,settlement_month=$3
+		 WHERE id=$1 AND deal_date IS NULL AND deleted_at IS NULL`,
+		orderID, dealDate, settlementMonth,
+	)
+	return err
+}
+
+// SetMonthExchangeRate applies a CNY rate to the orders of a settlement month
+// sold in currency and returns how many orders changed.
+func (r *TradeRepo) SetMonthExchangeRate(settlementMonth, currency string, rate float64, onlyMissing bool) (int64, error) {
+	result, err := r.db.Exec(
+		`UPDATE trade_orders SET quote_exchange_rate_cny=$3,updated_at=NOW()
+		 WHERE deleted_at IS NULL AND settlement_month=$1 AND UPPER(currency)=$2
+		   AND stage <> 'cancelled' AND (NOT $4 OR quote_exchange_rate_cny <= 0)`,
+		settlementMonth, strings.ToUpper(currency), rate, onlyMissing,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// ImportedOrderNumbers maps the given import keys to the order numbers that
+// already hold them.
+func (r *TradeRepo) ImportedOrderNumbers(keys []string) (map[string]string, error) {
+	found := make(map[string]string)
+	if len(keys) == 0 {
+		return found, nil
+	}
+	rows, err := r.db.Query(
+		`SELECT import_key, order_no FROM trade_orders
+		 WHERE deleted_at IS NULL AND import_key = ANY($1)`, pq.Array(keys),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, orderNo string
+		if err := rows.Scan(&key, &orderNo); err != nil {
+			return nil, err
+		}
+		found[key] = orderNo
+	}
+	return found, rows.Err()
+}
+
+// SettlementMonths lists the months that hold orders, newest first.
+func (r *TradeRepo) SettlementMonths(userID int64, canViewAll bool, stages []string) ([]model.TradeSettlementMonth, error) {
+	rows, err := r.db.Query(
+		`SELECT settlement_month, COUNT(*) FROM trade_orders o
+		 WHERE deleted_at IS NULL AND settlement_month <> ''
+		   AND ($1 OR o.owner_id = $2 OR o.stage = ANY($3))
+		 GROUP BY settlement_month ORDER BY settlement_month DESC`,
+		canViewAll, userID, pq.Array(stages),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	months := make([]model.TradeSettlementMonth, 0)
+	for rows.Next() {
+		var month model.TradeSettlementMonth
+		if err := rows.Scan(&month.Month, &month.Orders); err != nil {
+			return nil, err
+		}
+		months = append(months, month)
+	}
+	return months, rows.Err()
 }
 
 // UpdateOrderPricingHeader sets the selling currency, its CNY rate, the

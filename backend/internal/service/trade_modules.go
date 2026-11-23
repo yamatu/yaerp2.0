@@ -67,6 +67,9 @@ func (s *TradeService) UpdateModules(userID int64, modules model.TradeModules) (
 	if err := s.requireTradeAdmin(userID, "只有管理员可以开关外贸业务功能模块"); err != nil {
 		return nil, err
 	}
+	if modules.SettlementStartDay < 1 || modules.SettlementStartDay > 28 {
+		modules.SettlementStartDay = 1
+	}
 	if err := s.repo.UpdateModules(userID, modules); err != nil {
 		return nil, err
 	}
