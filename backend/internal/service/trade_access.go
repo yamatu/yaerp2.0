@@ -397,6 +397,7 @@ func (s *TradeService) redactTradeOrder(userID int64, order *model.TradeOrder, a
 	if !orderAccess.CanViewCustomer && !orderAccess.CanViewShipment {
 		order.DestinationCountry = ""
 		order.DestinationPort = ""
+		order.ShippingAddress = ""
 	}
 	if !orderAccess.CanViewInspection {
 		order.InspectionPhotos = nil

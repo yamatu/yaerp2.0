@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,16 +48,22 @@ func (s *TradeService) BossReport(userID int64, period string, year, month int) 
 			orders[index].Parcels = []model.TradeParcel{{ParcelNo: 1}}
 		}
 	}
-	return buildTradeBossReport(orders, items, period, year, month, time.Now())
+	return buildTradeBossReport(orders, items, period, year, month, time.Now(), s.Modules())
 }
 
-// tradeBossRange is the period being reported, as [start, end).
+// tradeBossRange is the period being reported: deal dates in [start, end)
+// and settlement months starting with monthPrefix ("2026-11" or "2026-").
 type tradeBossRange struct {
-	start, end time.Time
-	label      string
+	start, end  time.Time
+	label       string
+	monthPrefix string
 }
 
-func tradeBossRanges(period string, year, month int, now time.Time) (string, tradeBossRange, tradeBossRange, error) {
+func (r tradeBossRange) holds(settlementMonth string) bool {
+	return settlementMonth != "" && strings.HasPrefix(settlementMonth, r.monthPrefix)
+}
+
+func tradeBossRanges(period string, year, month int, now time.Time, modules model.TradeModules) (string, tradeBossRange, tradeBossRange, error) {
 	location := now.Location()
 	if period == "" {
 		period = tradeBossPeriodMonth
@@ -75,17 +82,19 @@ func tradeBossRanges(period string, year, month int, now time.Time) (string, tra
 		if month < 1 || month > 12 {
 			return "", tradeBossRange{}, tradeBossRange{}, fmt.Errorf("月份无效")
 		}
-		start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, location)
-		previous := start.AddDate(0, -1, 0)
-		return period,
-			tradeBossRange{start: start, end: start.AddDate(0, 1, 0), label: start.Format("2006年1月")},
-			tradeBossRange{start: previous, end: start, label: previous.Format("2006年1月")}, nil
+		monthRange := func(first time.Time) tradeBossRange {
+			start, end := modules.SettlementRange(first.Year(), first.Month(), location)
+			return tradeBossRange{start: start, end: end, label: first.Format("2006年1月"), monthPrefix: first.Format("2006-01")}
+		}
+		first := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, location)
+		return period, monthRange(first), monthRange(first.AddDate(0, -1, 0)), nil
 	case tradeBossPeriodYear:
-		start := time.Date(year, time.January, 1, 0, 0, 0, 0, location)
-		previous := start.AddDate(-1, 0, 0)
-		return period,
-			tradeBossRange{start: start, end: start.AddDate(1, 0, 0), label: start.Format("2006年")},
-			tradeBossRange{start: previous, end: start, label: previous.Format("2006年")}, nil
+		yearRange := func(year int) tradeBossRange {
+			start, _ := modules.SettlementRange(year, time.January, location)
+			end, _ := modules.SettlementRange(year+1, time.January, location)
+			return tradeBossRange{start: start, end: end, label: fmt.Sprintf("%d年", year), monthPrefix: fmt.Sprintf("%04d-", year)}
+		}
+		return period, yearRange(year), yearRange(year - 1), nil
 	default:
 		return "", tradeBossRange{}, tradeBossRange{}, fmt.Errorf("报表周期只能是 month 或 year")
 	}
@@ -98,14 +107,31 @@ func tradeOrderCompletedAt(order *model.TradeOrder) time.Time {
 	return order.UpdatedAt
 }
 
+// tradeOrderPeriodDate is the day an order counts on: its deal date, or for
+// older orders without one, when it was completed.
+func tradeOrderPeriodDate(order *model.TradeOrder) time.Time {
+	if order.DealDate != nil {
+		return *order.DealDate
+	}
+	return tradeOrderCompletedAt(order)
+}
+
+func tradeOrderSettlementMonth(order *model.TradeOrder, modules model.TradeModules, location *time.Location) string {
+	if order.SettlementMonth != "" {
+		return order.SettlementMonth
+	}
+	return modules.SettlementMonthFor(tradeOrderPeriodDate(order).In(location))
+}
+
 func buildTradeBossReport(
 	orders []model.TradeOrder,
 	items []model.TradeOrderItem,
 	period string,
 	year, month int,
 	now time.Time,
+	modules model.TradeModules,
 ) (*model.TradeBossReport, error) {
-	period, current, previous, err := tradeBossRanges(period, year, month, now)
+	period, current, previous, err := tradeBossRanges(period, year, month, now, modules)
 	if err != nil {
 		return nil, err
 	}
@@ -138,30 +164,51 @@ func buildTradeBossReport(
 
 	for index := range orders {
 		order := &orders[index]
-		profit := buildTradeProfitSummary(order, itemsByOrder[order.ID])
-		if order.Stage != model.TradeStageCompleted {
-			if order.Stage != model.TradeStageCancelled {
-				report.ActiveOrders++
-				report.ActiveRevenueCNY += profit.RevenueCNY
-			}
+		if order.Stage == model.TradeStageCancelled {
 			continue
 		}
-		completedAt := tradeOrderCompletedAt(order).In(location)
-		years[completedAt.Year()] = true
-		inCurrent := !completedAt.Before(current.start) && completedAt.Before(current.end)
-		inPrevious := !completedAt.Before(previous.start) && completedAt.Before(previous.end)
-		if inPrevious {
-			addTradeBossOrder(&report.Previous, profit)
+		profit := buildTradeProfitSummary(order, itemsByOrder[order.ID])
+		completed := order.Stage == model.TradeStageCompleted
+		if !completed {
+			report.ActiveOrders++
+			report.ActiveRevenueCNY += profit.RevenueCNY
+		}
+		if !completed && order.DealDate == nil {
+			continue
+		}
+		periodDate := tradeOrderPeriodDate(order).In(location)
+		settlementMonth := tradeOrderSettlementMonth(order, modules, location)
+		if len(settlementMonth) >= 4 {
+			if year, err := strconv.Atoi(settlementMonth[:4]); err == nil {
+				years[year] = true
+			}
+		}
+		inCurrent := current.holds(settlementMonth)
+		if previous.holds(settlementMonth) {
+			addTradeBossSale(&report.Previous, profit)
+			if completed {
+				addTradeBossOrder(&report.Previous, profit)
+			}
 		}
 		if !inCurrent {
 			continue
 		}
+		bucket := &report.Trend[tradeBossTrendIndex(period, current, settlementMonth, periodDate, len(report.Trend))]
+		addTradeBossSale(&report.Summary, profit)
+		bucket.SalesOrders++
+		if profit.ExchangeRateCNY > 0 {
+			bucket.SalesRevenueCNY += profit.RevenueCNY
+		}
+		if !completed {
+			continue
+		}
 		addTradeBossOrder(&report.Summary, profit)
-		bucket := &report.Trend[tradeBossTrendIndex(period, completedAt)]
 		bucket.CompletedOrders++
 		currency := strings.ToUpper(firstNonEmptyTrade(profit.Currency, "未设置"))
 		if len(report.Orders) < tradeBossOrderLimit {
-			report.Orders = append(report.Orders, tradeBossOrderSummary(order, profit, currency, completedAt))
+			summary := tradeBossOrderSummary(order, profit, currency, periodDate)
+			summary.TrendKey = bucket.Key
+			report.Orders = append(report.Orders, summary)
 		}
 		if !profit.Finalized {
 			continue
@@ -239,20 +286,40 @@ func tradeBossTrendBuckets(period string, current tradeBossRange) []model.TradeB
 		}
 		return points
 	}
-	days := current.end.AddDate(0, 0, -1).Day()
-	points := make([]model.TradeBossTrendPoint, days)
-	for index := range points {
-		day := current.start.AddDate(0, 0, index)
-		points[index] = model.TradeBossTrendPoint{Key: day.Format("2006-01-02"), Label: fmt.Sprintf("%d日", index+1)}
+	points := make([]model.TradeBossTrendPoint, 0, 31)
+	for day := current.start; day.Before(current.end); day = day.AddDate(0, 0, 1) {
+		label := fmt.Sprintf("%d日", day.Day())
+		if current.start.Day() != 1 {
+			label = fmt.Sprintf("%d/%d", int(day.Month()), day.Day())
+		}
+		points = append(points, model.TradeBossTrendPoint{Key: day.Format("2006-01-02"), Label: label})
 	}
 	return points
 }
 
-func tradeBossTrendIndex(period string, completedAt time.Time) int {
+// tradeBossTrendIndex picks the month of a yearly report or the day of a
+// monthly one; a deal moved into another cycle by hand lands on its edge.
+func tradeBossTrendIndex(period string, current tradeBossRange, settlementMonth string, date time.Time, buckets int) int {
+	index := 0
 	if period == tradeBossPeriodYear {
-		return int(completedAt.Month()) - 1
+		if len(settlementMonth) >= 7 {
+			month, _ := strconv.Atoi(settlementMonth[5:7])
+			index = month - 1
+		}
+	} else {
+		day := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, current.start.Location())
+		index = int(day.Sub(current.start).Hours() / 24)
 	}
-	return completedAt.Day() - 1
+	return min(max(index, 0), buckets-1)
+}
+
+func addTradeBossSale(summary *model.TradeBossPeriodSummary, profit *model.TradeProfitSummary) {
+	summary.SalesOrders++
+	if profit.ExchangeRateCNY > 0 {
+		summary.SalesRevenueCNY += profit.RevenueCNY
+	} else {
+		summary.SalesMissingRateOrders++
+	}
 }
 
 func addTradeBossOrder(summary *model.TradeBossPeriodSummary, profit *model.TradeProfitSummary) {

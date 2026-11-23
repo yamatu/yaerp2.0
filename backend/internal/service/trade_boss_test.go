@@ -44,7 +44,7 @@ func closeTo(a, b float64) bool { return math.Abs(a-b) < 0.0001 }
 func TestTradeBossMonthReport(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.Local)
 	orders, items := tradeBossFixture(now)
-	report, err := buildTradeBossReport(orders, items, "month", 2026, 7, now)
+	report, err := buildTradeBossReport(orders, items, "month", 2026, 7, now, model.DefaultTradeModules())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestTradeBossMonthReport(t *testing.T) {
 func TestTradeBossYearReport(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.Local)
 	orders, items := tradeBossFixture(now)
-	report, err := buildTradeBossReport(orders, items, "year", 2026, 0, now)
+	report, err := buildTradeBossReport(orders, items, "year", 2026, 0, now, model.DefaultTradeModules())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,13 +95,85 @@ func TestTradeBossYearReport(t *testing.T) {
 	}
 }
 
+func TestTradeBossSettlementCycle(t *testing.T) {
+	now := time.Date(2026, time.November, 23, 12, 0, 0, 0, time.Local)
+	modules := model.DefaultTradeModules()
+	modules.SettlementStartDay = 26
+	day := func(month time.Month, d int) *time.Time {
+		value := time.Date(2026, month, d, 0, 0, 0, 0, time.Local)
+		return &value
+	}
+	orders := []model.TradeOrder{
+		// Oct 27 is past the 26th, so it belongs to November.
+		{ID: 1, Stage: model.TradeStageCompleted, DealDate: day(time.October, 27), StageUpdatedAt: now,
+			Currency: "USD", TotalAmount: 100, QuoteExchangeRateCNY: 6.6, FreightMode: "customer_forwarder"},
+		// Moved into November by hand although the deal is from September.
+		{ID: 2, Stage: model.TradeStageCompleted, DealDate: day(time.September, 13), SettlementMonth: "2026-11",
+			StageUpdatedAt: now, Currency: "USD", TotalAmount: 40, QuoteExchangeRateCNY: 6.6, FreightMode: "customer_forwarder"},
+		// A deal still being purchased, without a rate yet.
+		{ID: 3, Stage: model.TradeStagePurchase, DealDate: day(time.November, 3), StageUpdatedAt: now,
+			Currency: "USD", TotalAmount: 500, FreightMode: "customer_forwarder"},
+		// Oct 25 is still October.
+		{ID: 4, Stage: model.TradeStageCompleted, DealDate: day(time.October, 25), StageUpdatedAt: now,
+			Currency: "USD", TotalAmount: 70, QuoteExchangeRateCNY: 7, FreightMode: "customer_forwarder"},
+	}
+	items := []model.TradeOrderItem{
+		{OrderID: 1, ID: 11, LineNo: 1, SKU: "A", Quantity: 1, QuotedPrice: 100},
+		{OrderID: 2, ID: 21, LineNo: 1, SKU: "B", Quantity: 1, QuotedPrice: 40},
+		{OrderID: 3, ID: 31, LineNo: 1, SKU: "C", Quantity: 1, QuotedPrice: 500},
+		{OrderID: 4, ID: 41, LineNo: 1, SKU: "D", Quantity: 1, QuotedPrice: 70},
+	}
+	report, err := buildTradeBossReport(orders, items, "month", 2026, 11, now, modules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.StartDate != "2026-10-26" || report.EndDate != "2026-11-25" || report.Trend[0].Label != "10/26" {
+		t.Fatalf("November cycle should run Oct 26 - Nov 25: %s %s %s", report.StartDate, report.EndDate, report.Trend[0].Label)
+	}
+	summary := report.Summary
+	if summary.SalesOrders != 3 || summary.SalesMissingRateOrders != 1 || !closeTo(summary.SalesRevenueCNY, 924) {
+		t.Fatalf("sales should count every November deal: %#v", summary)
+	}
+	if summary.CompletedOrders != 2 || summary.FinalizedOrders != 0 {
+		t.Fatalf("orders without purchase cost are completed but not finalized: %#v", summary)
+	}
+	if report.Trend[1].SalesOrders != 1 || report.Trend[0].SalesOrders != 1 {
+		t.Fatalf("Oct 27 lands on the second day, the moved order on the first: %#v", report.Trend[:2])
+	}
+	if report.Previous.SalesOrders != 1 || !closeTo(report.Previous.SalesRevenueCNY, 490) {
+		t.Fatalf("October keeps the Oct 25 deal: %#v", report.Previous)
+	}
+}
+
+func TestSettlementMonthFor(t *testing.T) {
+	modules := model.TradeModules{SettlementStartDay: 26}
+	cases := map[string]string{"2026-10-25": "2026-10", "2026-10-26": "2026-11", "2026-12-31": "2027-01"}
+	for date, want := range cases {
+		parsed, _ := time.Parse("2006-01-02", date)
+		if got := modules.SettlementMonthFor(parsed); got != want {
+			t.Fatalf("%s: got %s want %s", date, got, want)
+		}
+	}
+	if got := (model.TradeModules{}).SettlementMonthFor(time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)); got != "2026-10" {
+		t.Fatalf("calendar months by default, got %s", got)
+	}
+	for input, want := range map[string]string{"2026-11": "2026-11", "2026/1": "2026-01", "202611": "2026-11", "": ""} {
+		if got, err := normalizeSettlementMonth(input); err != nil || got != want {
+			t.Fatalf("%q: got %q %v", input, got, err)
+		}
+	}
+	if _, err := normalizeSettlementMonth("2026-13"); err == nil {
+		t.Fatal("month 13 must be rejected")
+	}
+}
+
 func TestTradeBossReportRejectsBadPeriod(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.Local)
 	for _, args := range []struct {
 		period      string
 		year, month int
 	}{{"month", 2026, 13}, {"week", 2026, 1}, {"year", 1990, 0}} {
-		if _, err := buildTradeBossReport(nil, nil, args.period, args.year, args.month, now); err == nil {
+		if _, err := buildTradeBossReport(nil, nil, args.period, args.year, args.month, now, model.DefaultTradeModules()); err == nil {
 			t.Fatalf("expected error for %#v", args)
 		}
 	}

@@ -160,6 +160,9 @@ export function TradeBossPanel({ onOpenOrder }: { onOpenOrder: (orderID: number)
     const workbook = XLSX.utils.book_new();
     const overview = [
       ["报表期间", `${report.label}（${report.start_date} 至 ${report.end_date}）`],
+      ["成交订单（全部）", s.sales_orders || 0],
+      ["销售额（全部成交） CNY", s.sales_revenue_cny || 0],
+      ["缺汇率未计入订单", s.sales_missing_rate_orders || 0],
       ["已完成订单", s.completed_orders],
       ["已核算订单", s.finalized_orders],
       ["待核算订单", s.incomplete_orders],
@@ -198,7 +201,7 @@ export function TradeBossPanel({ onOpenOrder }: { onOpenOrder: (orderID: number)
       workbook,
       XLSX.utils.json_to_sheet(
         report.orders.map((order) => ({
-          完成日期: formatDate(order.completed_at),
+          成交日期: formatDate(order.completed_at),
           订单号: order.order_no,
           标题: order.title,
           客户: order.customer_name,
@@ -417,10 +420,12 @@ function KpiCards({ report }: { report: TradeBossReport }) {
       tone: profitTone(s.profit_amount_cny),
     },
     {
-      label: "销售额",
-      value: cny(s.revenue_cny),
-      sub: `${report.previous_label}：${cny(p.revenue_cny)}`,
-      delta: relativeDelta(s.revenue_cny, p.revenue_cny),
+      label: "销售额（全部成交）",
+      value: cny(s.sales_revenue_cny || 0),
+      sub: s.sales_missing_rate_orders
+        ? `成交 ${s.sales_orders || 0} 单 · ${s.sales_missing_rate_orders} 单缺汇率未计入`
+        : `成交 ${s.sales_orders || 0} 单 · ${report.previous_label}：${cny(p.sales_revenue_cny || 0)}`,
+      delta: relativeDelta(s.sales_revenue_cny || 0, p.sales_revenue_cny || 0),
     },
     {
       label: "总成本",
@@ -535,7 +540,7 @@ function TrendSection({
             {report.label} {report.period === "year" ? "月度" : "每日"}经营趋势
           </h3>
           <p className="mt-0.5 text-xs text-slate-400">
-            {report.start_date} 至 {report.end_date}，按订单完成日期归属；金额只含成本、汇率完整的订单。
+            {report.start_date} 至 {report.end_date}，按成交日期计入账期；利润金额只含已完成且成本、汇率完整的订单。
             {report.period === "year" ? "点击柱子查看该月月报。" : "点击某天可筛选下方订单。"}
           </p>
         </div>
@@ -1157,7 +1162,10 @@ function OrdersSection({
   const [filter, setFilter] = useState<OrderFilter>("all");
   const [sort, setSort] = useState<OrderSort>("date");
   const inScope = useMemo(
-    () => report.orders.filter((order) => !selectedKey || formatDate(order.completed_at) === selectedKey),
+    () =>
+      report.orders.filter(
+        (order) => !selectedKey || (order.trend_key || formatDate(order.completed_at)) === selectedKey,
+      ),
     [report.orders, selectedKey],
   );
   const rows = useMemo(
@@ -1219,7 +1227,7 @@ function OrdersSection({
           <table className="w-full min-w-[1080px] text-sm">
             <thead className="sticky top-0 z-[1] bg-slate-50 text-left text-xs text-slate-500">
               <tr>
-                <th className="px-4 py-2.5">完成日期</th>
+                <th className="px-4 py-2.5">成交日期</th>
                 <th className="px-4 py-2.5">订单</th>
                 <th className="px-4 py-2.5">客户 / 业务员</th>
                 <th className="px-4 py-2.5 text-right">销售额</th>

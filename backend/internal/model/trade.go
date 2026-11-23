@@ -470,6 +470,27 @@ type TradeModules struct {
 	Shipment   bool `json:"shipment"`
 	// Keep switched-off stages that still hold old orders in the stage filter.
 	ShowLegacyStages bool `json:"show_legacy_stages"`
+	// Day of month a settlement cycle starts on. 1 (or 0) is the calendar
+	// month; 26 puts deals from Oct 26 to Nov 25 into November.
+	SettlementStartDay int `json:"settlement_start_day"`
+}
+
+// SettlementMonthFor returns the YYYY-MM settlement cycle a deal date falls in.
+func (m TradeModules) SettlementMonthFor(date time.Time) string {
+	start := m.SettlementStartDay
+	if start > 1 && start <= 28 && date.Day() >= start {
+		date = time.Date(date.Year(), date.Month(), 1, 0, 0, 0, 0, date.Location()).AddDate(0, 1, 0)
+	}
+	return date.Format("2006-01")
+}
+
+// SettlementRange is the [start, end) of deal dates in a settlement month.
+func (m TradeModules) SettlementRange(year int, month time.Month, location *time.Location) (time.Time, time.Time) {
+	start := time.Date(year, month, 1, 0, 0, 0, 0, location)
+	if day := m.SettlementStartDay; day > 1 && day <= 28 {
+		start = time.Date(year, month-1, day, 0, 0, 0, 0, location)
+	}
+	return start, start.AddDate(0, 1, 0)
 }
 
 func DefaultTradeModules() TradeModules {
@@ -590,6 +611,10 @@ type TradeOrder struct {
 	Stage                  string     `json:"stage"`
 	Priority               string     `json:"priority"`
 	InquiryDate            time.Time  `json:"inquiry_date"`
+	DealDate               *time.Time `json:"deal_date,omitempty"`
+	SettlementMonth        string     `json:"settlement_month"`
+	ShippingAddress        string     `json:"shipping_address"`
+	ImportKey              string     `json:"import_key,omitempty"`
 	QuoteDeadline          *time.Time `json:"quote_deadline,omitempty"`
 	ExpectedShipDate       *time.Time `json:"expected_ship_date,omitempty"`
 	Currency               string     `json:"currency"`
@@ -754,13 +779,21 @@ type TradeBossOrderSummary struct {
 	Warnings          []string  `json:"warnings"`
 	CompletedAt       time.Time `json:"completed_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+	// Trend slot the order is counted in; differs from its date when the
+	// order was moved into this cycle by hand.
+	TrendKey string `json:"trend_key"`
 }
 
 // TradeBossPeriodSummary adds up the completed orders of a period in CNY.
 // Only orders whose cost and exchange rate are complete count as finalized
 // and enter the amounts.
 type TradeBossPeriodSummary struct {
-	CompletedOrders   int64   `json:"completed_orders"`
+	// Every deal of the period whatever its stage or cost (销售额), in CNY at
+	// the order rate; orders still missing that rate are only counted.
+	SalesOrders            int64   `json:"sales_orders"`
+	SalesRevenueCNY        float64 `json:"sales_revenue_cny"`
+	SalesMissingRateOrders int64   `json:"sales_missing_rate_orders"`
+	CompletedOrders        int64   `json:"completed_orders"`
 	FinalizedOrders   int64   `json:"finalized_orders"`
 	IncompleteOrders  int64   `json:"incomplete_orders"`
 	ProfitableOrders  int64   `json:"profitable_orders"`
@@ -782,6 +815,8 @@ type TradeBossPeriodSummary struct {
 type TradeBossTrendPoint struct {
 	Key             string  `json:"key"`
 	Label           string  `json:"label"`
+	SalesOrders     int64   `json:"sales_orders"`
+	SalesRevenueCNY float64 `json:"sales_revenue_cny"`
 	CompletedOrders int64   `json:"completed_orders"`
 	FinalizedOrders int64   `json:"finalized_orders"`
 	RevenueCNY      float64 `json:"revenue_cny"`
@@ -1005,12 +1040,21 @@ type CreateTradeOrderRequest struct {
 	Confirmed        bool    `json:"confirmed"`
 	ExchangeRateCNY  float64 `json:"exchange_rate_cny"`
 	PaymentFeeAmount float64 `json:"payment_fee_amount"`
+	// YYYY-MM-DD; confirmed orders default to today.
+	DealDate string `json:"deal_date"`
+	// YYYY-MM; empty derives it from the deal date and the cycle start day.
+	SettlementMonth string `json:"settlement_month"`
+	ShippingAddress string `json:"shipping_address"`
 	// AI import metadata is service-internal and cannot be supplied through the
 	// public create-order API.
 	AIImportID      string   `json:"-"`
 	AISourceText    string   `json:"-"`
 	AIMissingFields []string `json:"-"`
 	AIImportModel   string   `json:"-"`
+	// Set by the monthly workbook import: the row's identity and the stage the
+	// order lands in. Imported orders notify nobody.
+	ImportKey   string `json:"-"`
+	ImportStage string `json:"-"`
 }
 
 type AdvanceTradeOrderRequest struct {
@@ -1200,4 +1244,26 @@ type TradeOrderFilter struct {
 	Search     string
 	Stage      string
 	CustomerID int64
+	// YYYY-MM settlement month; empty lists every month.
+	SettlementMonth string
+}
+
+// UpdateTradeOrderDealRequest edits when an order was closed and where it ships.
+type UpdateTradeOrderDealRequest struct {
+	DealDate        string  `json:"deal_date"`
+	SettlementMonth string  `json:"settlement_month"`
+	ShippingAddress *string `json:"shipping_address"`
+}
+
+type TradeSettlementMonth struct {
+	Month  string `json:"month"`
+	Orders int64  `json:"orders"`
+}
+
+// SetMonthExchangeRateRequest applies one settlement rate (结汇汇率) to the
+// orders of a settlement month that are sold in Currency.
+type SetMonthExchangeRateRequest struct {
+	Currency     string  `json:"currency"`
+	Rate         float64 `json:"rate"`
+	OnlyMissing  bool    `json:"only_missing"`
 }

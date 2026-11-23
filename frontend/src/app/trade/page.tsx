@@ -24,6 +24,7 @@ import {
   Copy,
   Download,
   Eye,
+  FileSpreadsheet,
   FileText,
   History,
   ImagePlus,
@@ -82,6 +83,17 @@ import { EditableCell } from "@/components/trade/EditableCell";
 import { TradeParcelsPanel } from "@/components/trade/TradeParcelsPanel";
 import { TradeBossPanel } from "@/components/trade/TradeBossPanel";
 import {
+  MonthExchangeRateModal,
+  OrderSheetImportModal,
+} from "@/components/trade/OrderSheetImportModal";
+import { OrderDealInfo, formatDealDay } from "@/components/trade/OrderDealInfo";
+import {
+  currentSettlementMonth,
+  formatSettlementMonth,
+  settlementRangeLabel,
+  shiftSettlementMonth,
+} from "@/lib/tradeSettlement";
+import {
   TradeImageViewer,
   type TradeImageTarget,
 } from "@/components/trade/TradeImageViewer";
@@ -131,6 +143,7 @@ import type {
   TradePISellerProfile,
   TradePosition,
   TradeSettings,
+  TradeSettlementMonth,
   TradeStage,
   TradeSupplier,
   User,
@@ -233,7 +246,7 @@ type SettingsTab =
   | "pi";
 
 const MODULE_OPTIONS: Array<{
-  key: Exclude<keyof TradeModules, "show_legacy_stages">;
+  key: Exclude<keyof TradeModules, "show_legacy_stages" | "settlement_start_day">;
   label: string;
   description: string;
 }> = [
@@ -859,12 +872,25 @@ function readTradeWorkspaceState() {
       showOnlyMine?: boolean;
       ownerFilter?: number | "all";
       customerFilter?: number | "all";
+      monthChoice?: string | null;
+      monthChosenIn?: string;
       detailOrderId?: number;
       scrollY?: number;
     } | null;
   } catch {
     return null;
   }
+}
+
+function tradeOrdersPath(month: string) {
+  return month === "all" ? "/trade/orders" : `/trade/orders?month=${encodeURIComponent(month)}`;
+}
+
+// A month picked in the list is kept while the calendar month lasts; a new
+// month opens on the current settlement cycle again.
+function calendarMonthKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 }
 
 export default function TradeWorkspacePage() {
@@ -895,6 +921,15 @@ export default function TradeWorkspacePage() {
   });
   const modules = settings.modules || DEFAULT_TRADE_MODULES;
   const ownerVisibility = settings.owner_visibility || DEFAULT_OWNER_VISIBILITY;
+  const settlementStartDay = modules.settlement_start_day || 1;
+  const currentMonth = currentSettlementMonth(settlementStartDay);
+  // null follows the current settlement cycle; "all" lists every month.
+  const [monthChoice, setMonthChoice] = useState<string | null>(null);
+  const orderMonth = monthChoice ?? currentMonth;
+  const orderMonthRef = useRef(orderMonth);
+  const [settlementMonths, setSettlementMonths] = useState<TradeSettlementMonth[]>([]);
+  const [sheetImportOpen, setSheetImportOpen] = useState(false);
+  const [monthRateOpen, setMonthRateOpen] = useState(false);
   const [confirmedOrderOpen, setConfirmedOrderOpen] = useState(false);
   const [pricingOrder, setPricingOrder] = useState<{
     order: TradeOrder;
@@ -1080,14 +1115,16 @@ export default function TradeWorkspacePage() {
           api.get<TradeAccessProfile>("/trade/access"),
           api.get<TradeDashboard>("/trade/dashboard"),
           api.get<TradeCustomer[]>("/trade/customers"),
-          api.get<TradeOrder[]>("/trade/orders"),
+          api.get<TradeOrder[]>(tradeOrdersPath(orderMonthRef.current)),
           api.get<TradeSupplier[]>("/trade/suppliers"),
           api.get<TradePosition[]>("/trade/positions"),
           api.get<TradeSettings>("/trade/settings"),
           api.get<TradeCustomerDeleteRequest[]>(
             "/trade/customer-delete-requests?status=pending",
           ),
+          api.get<TradeSettlementMonth[]>("/trade/settlement-months"),
         ] as const;
+        const requestedMonth = orderMonthRef.current;
         const [
           accessResponse,
           dashboardResponse,
@@ -1097,6 +1134,7 @@ export default function TradeWorkspacePage() {
           positionResponse,
           settingsResponse,
           customerDeleteResponse,
+          monthsResponse,
         ] = await Promise.all(requests);
         const responses = [
           accessResponse,
@@ -1107,13 +1145,17 @@ export default function TradeWorkspacePage() {
           positionResponse,
           settingsResponse,
           customerDeleteResponse,
+          monthsResponse,
         ];
         const failed = responses.find((response) => response.code !== 0);
         if (failed) throw new Error(failed.message || "加载外贸业务数据失败");
         setTradeAccess(accessResponse.data || null);
         setDashboard(dashboardResponse.data || null);
         setCustomers(customerResponse.data || []);
-        setOrders(orderResponse.data || []);
+        // The month may have changed while loading; that switch loads its own list.
+        if (orderMonthRef.current === requestedMonth)
+          setOrders(orderResponse.data || []);
+        setSettlementMonths(monthsResponse.data || []);
         setSuppliers(supplierResponse.data || []);
         setPositions(positionResponse.data || []);
         setCustomerDeleteRequests(customerDeleteResponse.data || []);
@@ -1229,6 +1271,10 @@ export default function TradeWorkspacePage() {
       setShowOnlyMine(saved.showOnlyMine);
     if (saved?.ownerFilter) setOwnerFilter(saved.ownerFilter);
     if (saved?.customerFilter) setCustomerFilter(saved.customerFilter);
+    if (saved?.monthChoice && saved.monthChosenIn === calendarMonthKey()) {
+      setMonthChoice(saved.monthChoice);
+      orderMonthRef.current = saved.monthChoice;
+    }
     const queryOrderID = Number(
       new URLSearchParams(window.location.search).get("order"),
     );
@@ -1244,6 +1290,29 @@ export default function TradeWorkspacePage() {
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    if (orderMonthRef.current === orderMonth) return;
+    orderMonthRef.current = orderMonth;
+    let cancelled = false;
+    setRefreshing(true);
+    void api
+      .get<TradeOrder[]>(tradeOrdersPath(orderMonth))
+      .then((response) => {
+        if (cancelled || orderMonthRef.current !== orderMonth) return;
+        if (response.code !== 0) {
+          setError(response.message || "加载业务单失败");
+          return;
+        }
+        setOrders(response.data || []);
+      })
+      .finally(() => {
+        if (!cancelled) setRefreshing(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [orderMonth]);
 
   // Quick action from the global command palette: open the new-inquiry modal.
   // The request may arrive before this page mounts, so it is also persisted.
@@ -1316,6 +1385,8 @@ export default function TradeWorkspacePage() {
         showOnlyMine,
         ownerFilter,
         customerFilter,
+        monthChoice,
+        monthChosenIn: calendarMonthKey(),
         detailOrderId: detailOrderIDRef.current || undefined,
         scrollY: window.scrollY,
       }),
@@ -1323,6 +1394,7 @@ export default function TradeWorkspacePage() {
   }, [
     activeView,
     customerFilter,
+    monthChoice,
     ownerFilter,
     search,
     showOnlyMine,
@@ -1404,6 +1476,7 @@ export default function TradeWorkspacePage() {
         order.destination_port,
         order.owner_name,
         order.sku_preview,
+        order.shipping_address,
       ].some((value) => value?.toLowerCase().includes(keyword));
     });
   }, [
@@ -1415,6 +1488,51 @@ export default function TradeWorkspacePage() {
     showOnlyMine,
     stageFilter,
   ]);
+
+  const orderStageCounts = useMemo(() => {
+    const counts: Partial<Record<TradeStage, number>> = {};
+    orders.forEach((order) => {
+      counts[order.stage] = (counts[order.stage] || 0) + 1;
+    });
+    return counts;
+  }, [orders]);
+
+  // Deals of the listed month as filtered on screen: goods and amounts per
+  // currency, the CNY total at each order's rate, and orders still lacking one.
+  const monthSummary = useMemo(() => {
+    const goods = new Map<string, number>();
+    const totals = new Map<string, number>();
+    let deals = 0;
+    let cny = 0;
+    let missingRate = 0;
+    filteredOrders.forEach((order) => {
+      if (order.stage === "cancelled" || !order.deal_date) return;
+      deals += 1;
+      const currency = order.currency || "USD";
+      goods.set(currency, (goods.get(currency) || 0) + (order.quoted_goods_amount || 0));
+      totals.set(currency, (totals.get(currency) || 0) + (order.total_amount || 0));
+      if (currency === "CNY") cny += order.total_amount || 0;
+      else if (order.quote_exchange_rate_cny > 0)
+        cny += (order.total_amount || 0) * order.quote_exchange_rate_cny;
+      else missingRate += 1;
+    });
+    return { deals, goods, totals, cny, missingRate };
+  }, [filteredOrders]);
+
+  const monthOptions = useMemo(() => {
+    const counts = new Map(settlementMonths.map((item) => [item.month, item.orders]));
+    [currentMonth, orderMonth].forEach((month) => {
+      if (month !== "all" && !counts.has(month)) counts.set(month, 0);
+    });
+    return Array.from(counts, ([month, count]) => ({ month, count })).sort((left, right) =>
+      right.month.localeCompare(left.month),
+    );
+  }, [currentMonth, orderMonth, settlementMonths]);
+
+  const chooseMonth = useCallback(
+    (month: string) => setMonthChoice(month === currentMonth ? null : month),
+    [currentMonth],
+  );
 
   const orderOwners = useMemo(() => {
     const byID = new Map<number, string>();
@@ -3589,6 +3707,18 @@ export default function TradeWorkspacePage() {
                   <span className="hidden sm:inline">AI 智能建单</span>
                 </button>
               )}
+              {tradeAccess?.can_create_orders && (
+                <button
+                  type="button"
+                  onClick={() => setSheetImportOpen(true)}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-sm font-semibold text-emerald-700 hover:bg-emerald-100"
+                  title="导入业务员的月度外贸工作表"
+                  aria-label="导入订单表"
+                >
+                  <FileSpreadsheet className="h-4 w-4" />
+                  <span className="hidden sm:inline">导入订单表</span>
+                </button>
+              )}
               {tradeAccess?.can_create_orders && modules.quotation && (
                 <button
                   type="button"
@@ -3713,6 +3843,58 @@ export default function TradeWorkspacePage() {
                 )}
               </div>
               <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
+                {activeView === "orders" && (
+                  <div
+                    className="flex h-9 shrink-0 items-center rounded-lg border border-slate-200 bg-white"
+                    title="按账期月份查看订单"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => chooseMonth(shiftSettlementMonth(orderMonth === "all" ? currentMonth : orderMonth, -1))}
+                      className="inline-flex h-full w-8 items-center justify-center rounded-l-lg text-slate-500 hover:bg-slate-50"
+                      aria-label="上个月"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </button>
+                    <CalendarDays className="h-4 w-4 text-slate-400" />
+                    <select
+                      value={orderMonth}
+                      onChange={(event) =>
+                        event.target.value === "all"
+                          ? setMonthChoice("all")
+                          : chooseMonth(event.target.value)
+                      }
+                      className="h-full max-w-60 bg-transparent px-1.5 text-sm font-medium text-slate-700 outline-none"
+                      aria-label="账期月份"
+                    >
+                      {monthOptions.map((option) => (
+                        <option key={option.month} value={option.month}>
+                          {formatSettlementMonth(option.month)}
+                          {option.month === currentMonth ? "（本月）" : ""}
+                          {option.count > 0 ? ` · ${option.count} 单` : ""}
+                        </option>
+                      ))}
+                      <option value="all">全部月份</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => chooseMonth(shiftSettlementMonth(orderMonth === "all" ? currentMonth : orderMonth, 1))}
+                      className="inline-flex h-full w-8 items-center justify-center rounded-r-lg text-slate-500 hover:bg-slate-50"
+                      aria-label="下个月"
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+                {activeView === "orders" && orderMonth !== currentMonth && (
+                  <button
+                    type="button"
+                    onClick={() => setMonthChoice(null)}
+                    className="h-9 shrink-0 rounded-lg border border-slate-200 px-3 text-sm text-slate-600 hover:bg-slate-50"
+                  >
+                    回到本月
+                  </button>
+                )}
                 {activeView !== "boss" && activeView !== "products" && (
                   <label className="flex h-9 min-w-[180px] flex-1 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm text-slate-500 lg:max-w-sm">
                     <Search className="h-4 w-4 shrink-0" />
@@ -3844,7 +4026,7 @@ export default function TradeWorkspacePage() {
                     </button>
                     {visibleStages.map((stage) => {
                       const Icon = stage.icon;
-                      const count = dashboard?.stage_counts?.[stage.key] || 0;
+                      const count = orderStageCounts[stage.key] || 0;
                       return (
                         <button
                           key={stage.key}
@@ -3860,6 +4042,48 @@ export default function TradeWorkspacePage() {
                     })}
                   </div>
                 </div>
+                {orderMonth !== "all" && (
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                    <span className="font-semibold text-slate-800">
+                      {formatSettlementMonth(orderMonth)}账期
+                      {settlementRangeLabel(orderMonth, settlementStartDay) && (
+                        <span className="ml-1 font-normal text-slate-400">
+                          （{settlementRangeLabel(orderMonth, settlementStartDay)}）
+                        </span>
+                      )}
+                    </span>
+                    <span>成交 {monthSummary.deals} 单</span>
+                    {Array.from(monthSummary.goods).map(([currency, value]) =>
+                      value > 0 ? (
+                        <span key={currency}>
+                          货款 {formatFinancialMoney(currency, value)}
+                          <span className="text-slate-400">
+                            {" "}
+                            · 客户实付 {formatFinancialMoney(currency, monthSummary.totals.get(currency) || 0)}
+                          </span>
+                        </span>
+                      ) : null,
+                    )}
+                    {monthSummary.cny > 0 && (
+                      <span>折合 {formatFinancialMoney("¥", monthSummary.cny)}</span>
+                    )}
+                    {tradeAccess?.can_view_all_orders && monthSummary.missingRate > 0 && (
+                      <span className="font-medium text-amber-700">
+                        {monthSummary.missingRate} 单还没有结汇汇率
+                      </span>
+                    )}
+                    {tradeAccess?.can_view_all_orders && monthSummary.deals > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setMonthRateOpen(true)}
+                        className="inline-flex h-7 items-center gap-1 rounded-md border border-slate-200 bg-white px-2 font-medium text-slate-700 hover:bg-slate-100"
+                      >
+                        <CircleDollarSign className="h-3.5 w-3.5" />
+                        设置本月结汇汇率
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div className="divide-y divide-slate-100 md:hidden">
                   {loading ? (
                     <div className="flex h-48 items-center justify-center text-sm text-slate-400">
@@ -3898,6 +4122,15 @@ export default function TradeWorkspacePage() {
                                 {order.customer_name}
                                 {order.owner_name ? ` · ${order.owner_name}` : ""}
                               </div>
+                              {(order.deal_date || order.total_amount > 0) && (
+                                <div className="truncate text-xs tabular-nums text-slate-400">
+                                  {formatDealDay(order.deal_date)}
+                                  {order.deal_date && order.total_amount > 0 ? " · " : ""}
+                                  {order.total_amount > 0
+                                    ? formatFinancialMoney(order.currency, order.total_amount)
+                                    : ""}
+                                </div>
+                              )}
                             </div>
                             <span
                               className={`inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold ${stage?.background || "bg-slate-100"} ${stage?.color || "text-slate-600"}`}
@@ -3936,7 +4169,7 @@ export default function TradeWorkspacePage() {
                         <th className="px-4 py-3">负责职位</th>
                         <th className="px-4 py-3">产品</th>
                         <th className="px-4 py-3">目的地</th>
-                        <th className="px-4 py-3">报价截止</th>
+                        <th className="px-4 py-3">成交日期 / 金额</th>
                         <th className="px-4 py-3">业务员</th>
                         <th className="px-4 py-3 text-right">操作</th>
                       </tr>
@@ -4052,7 +4285,23 @@ export default function TradeWorkspacePage() {
                                 ) || "未设置"}
                               </td>
                               <td className="px-4 py-3">
-                                {formatDate(order.quote_deadline)}
+                                {order.deal_date ? (
+                                  <div className="tabular-nums">{formatDealDay(order.deal_date)}</div>
+                                ) : (
+                                  <div className="text-xs text-slate-400">
+                                    报价截止 {formatDate(order.quote_deadline)}
+                                  </div>
+                                )}
+                                {order.total_amount > 0 && (
+                                  <div className="mt-0.5 text-xs tabular-nums text-slate-500">
+                                    {formatFinancialMoney(order.currency, order.total_amount)}
+                                  </div>
+                                )}
+                                {orderMonth === "all" && order.settlement_month && (
+                                  <div className="mt-0.5 text-[11px] text-slate-400">
+                                    {formatSettlementMonth(order.settlement_month)}账期
+                                  </div>
+                                )}
                               </td>
                               <td className="px-4 py-3">{order.owner_name}</td>
                               <td className="px-4 py-3">
@@ -5968,6 +6217,37 @@ export default function TradeWorkspacePage() {
           />
         )}
 
+        {sheetImportOpen && (
+          <OrderSheetImportModal
+            customers={customers}
+            users={users}
+            canAssignOwner={Boolean(tradeAccess?.can_view_all_orders)}
+            currentUserId={profile?.id}
+            onClose={() => setSheetImportOpen(false)}
+            onImported={async (month) => {
+              chooseMonth(month);
+              setStageFilter("all");
+              await loadData(true);
+            }}
+          />
+        )}
+
+        {monthRateOpen && orderMonth !== "all" && (
+          <MonthExchangeRateModal
+            month={orderMonth}
+            currencies={Array.from(monthSummary.goods.keys()).filter(
+              (currency) => currency !== "CNY",
+            )}
+            missingCount={monthSummary.missingRate}
+            onClose={() => setMonthRateOpen(false)}
+            onSaved={async (updated) => {
+              setMonthRateOpen(false);
+              setNotice(`已更新 ${updated} 单的结汇汇率。`);
+              await loadData(true);
+            }}
+          />
+        )}
+
         {pricingOrder && (
           <OrderPricingModal
             order={pricingOrder.order}
@@ -6095,6 +6375,34 @@ export default function TradeWorkspacePage() {
                         }
                         className="mt-1 h-5 w-5 shrink-0 accent-slate-900"
                       />
+                    </label>
+                    <label className="flex items-start justify-between gap-4 rounded-lg border border-slate-200 px-4 py-3">
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-slate-800">
+                          月度账期从每月几号开始
+                        </span>
+                        <span className="mt-0.5 block text-xs text-slate-500">
+                          订单按成交日期计入账期月份。选 1 号即自然月；选 26 号则 10/26–11/25 的成交算 11 月。只影响之后录入的订单，已有订单可在订单详情里单独调整账期。
+                        </span>
+                      </span>
+                      <select
+                        value={settlementStartDay}
+                        disabled={savingModules}
+                        onChange={(event) =>
+                          void saveModules({
+                            ...modules,
+                            settlement_start_day: Number(event.target.value),
+                          })
+                        }
+                        className="h-9 shrink-0 rounded-lg border border-slate-200 bg-white px-2 text-sm outline-none"
+                        aria-label="月度账期起始日"
+                      >
+                        {Array.from({ length: 28 }, (_, index) => index + 1).map((day) => (
+                          <option key={day} value={day}>
+                            {day === 1 ? "1 号（自然月）" : `${day} 号`}
+                          </option>
+                        ))}
+                      </select>
                     </label>
                     <div className="pt-4">
                       <h3 className="text-sm font-semibold text-slate-800">
@@ -6741,6 +7049,24 @@ export default function TradeWorkspacePage() {
                         </div>
                       </div>
                     </div>
+                    <OrderDealInfo
+                      order={detailOrder}
+                      canEdit={Boolean(
+                        detailOrder.stage !== "cancelled" &&
+                          (tradeAccess?.can_view_all_orders ||
+                            detailOrder.owner_id === profile?.id),
+                      )}
+                      canSeeAddress={Boolean(
+                        detailOrder.access?.can_view_customer ||
+                          detailOrder.access?.can_view_shipment,
+                      )}
+                      startDay={settlementStartDay}
+                      onSaved={(saved) => {
+                        setDetailOrder(saved);
+                        setNotice(`${saved.order_no} 的成交日期与账期已保存。`);
+                        void loadData(true);
+                      }}
+                    />
                     <div className="p-4">
                       <div className="flex flex-wrap gap-2">
                         {detailOrder.channel_id && (

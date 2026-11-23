@@ -8,15 +8,17 @@ ALTER TABLE trade_orders
     ADD COLUMN IF NOT EXISTS ai_missing_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS ai_import_model VARCHAR(256) NOT NULL DEFAULT '';
 
+-- Migrations re-run on every startup, so these checks must already allow the
+-- values later migrations add, or existing rows would fail them on restart.
 ALTER TABLE trade_orders DROP CONSTRAINT IF EXISTS trade_orders_source_check;
 ALTER TABLE trade_orders
     ADD CONSTRAINT trade_orders_source_check
-    CHECK (source IN ('manual', 'ai_import'));
+    CHECK (source IN ('manual', 'ai_import', 'excel_import'));
 
 ALTER TABLE trade_orders DROP CONSTRAINT IF EXISTS trade_orders_data_status_check;
 ALTER TABLE trade_orders
     ADD CONSTRAINT trade_orders_data_status_check
-    CHECK (data_status IN ('ready', 'incomplete'));
+    CHECK (data_status IN ('ready', 'incomplete', 'importing'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_orders_ai_import_id
     ON trade_orders(ai_import_id)

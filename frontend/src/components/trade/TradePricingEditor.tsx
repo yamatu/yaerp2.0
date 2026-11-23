@@ -7,6 +7,7 @@ import { CustomerCombobox } from "@/components/trade/CustomerCombobox";
 import { CurrencyCombobox } from "@/components/trade/CurrencyCombobox";
 import { amountValue, parseAmountText, sanitizeTypedNumber } from "@/lib/tradeNumbers";
 import { tradeActiveItems } from "@/lib/tradeItems";
+import { todayInputDate } from "@/lib/tradeSettlement";
 import type { TradeCustomer, TradeOrder, TradeSupplier } from "@/types";
 
 type ColumnKey = "sku" | "quantity" | "sales_price" | "freight_amount" | "purchase_price" | "supplier_name";
@@ -712,6 +713,8 @@ export function ConfirmedOrderModal({
   const [fee, setFee] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("");
   const [notes, setNotes] = useState("");
+  const [dealDate, setDealDate] = useState(() => todayInputDate());
+  const [shippingAddress, setShippingAddress] = useState("");
   const [lines, setLines] = useState<PricingLine[]>(() => [newPricingLine(), newPricingLine(), newPricingLine()]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -722,6 +725,10 @@ export function ConfirmedOrderModal({
   const submit = async () => {
     if (!customerID) {
       setError("请选择客户");
+      return;
+    }
+    if (!dealDate) {
+      setError("请填写成交日期");
       return;
     }
     const message = validateLines(lines);
@@ -740,6 +747,8 @@ export function ConfirmedOrderModal({
         payment_fee_amount: feeAmount(fee, base),
         payment_method: paymentMethod.trim(),
         notes: notes.trim(),
+        deal_date: dealDate,
+        shipping_address: shippingAddress.trim(),
         confirmed: true,
         items: lines.filter(lineUsed).map((line) => {
           const payload = linePayload(line);
@@ -812,15 +821,32 @@ export function ConfirmedOrderModal({
       </div>
       <PricingGrid lines={lines} onChange={setLines} currency={currency} showCost={showCost} />
       <ProfitSummary lines={lines} currency={currency} rate={amountValue(rate)} fee={feeAmount(fee, base)} showCost={showCost} />
-      <label className="block text-sm">
-        <span className="mb-1 block text-xs font-medium text-slate-500">备注（选填）</span>
-        <textarea
-          value={notes}
-          onChange={(event) => setNotes(event.target.value)}
-          rows={2}
-          className="w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm outline-none focus:border-slate-400"
-        />
-      </label>
+      <div className="grid gap-3 sm:grid-cols-[180px_1fr_1fr]">
+        <label className="block text-sm">
+          <span className="mb-1 block text-xs font-medium text-slate-500">成交日期（合同日期）</span>
+          <input type="date" value={dealDate} onChange={(event) => setDealDate(event.target.value)} className={fieldClass} />
+          <span className="mt-0.5 block text-[11px] text-slate-400">按这个日期计入月度账期</span>
+        </label>
+        <label className="block text-sm">
+          <span className="mb-1 block text-xs font-medium text-slate-500">收货地址（选填）</span>
+          <textarea
+            value={shippingAddress}
+            onChange={(event) => setShippingAddress(event.target.value)}
+            rows={2}
+            placeholder="收件人、街道、城市、邮编、国家"
+            className="w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm outline-none focus:border-slate-400"
+          />
+        </label>
+        <label className="block text-sm">
+          <span className="mb-1 block text-xs font-medium text-slate-500">备注（选填）</span>
+          <textarea
+            value={notes}
+            onChange={(event) => setNotes(event.target.value)}
+            rows={2}
+            className="w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm outline-none focus:border-slate-400"
+          />
+        </label>
+      </div>
       <ErrorBox message={error} />
     </DialogFrame>
   );
