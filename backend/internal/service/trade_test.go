@@ -98,10 +98,16 @@ func TestBuildTradeProfitSummaryInfersCNYCostRateFromQuoteRate(t *testing.T) {
 	if !profit.CostComplete || !profit.Finalized || math.Abs(profit.ProductCost-(600.0/7.0)) > 0.0001 {
 		t.Fatalf("CNY purchase cost should use the inverse quote rate: %#v", profit)
 	}
+	// The cost was paid in CNY: a manual rate must not change what it cost.
 	item.WorkflowData = map[string]any{"cost_exchange_rate": 0.14}
 	profit = buildTradeProfitSummary(order, []model.TradeOrderItem{item})
-	if !profit.CostComplete || math.Abs(profit.ProductCost-84) > 0.0001 || math.Abs(profit.ProfitAmount-916) > 0.0001 {
-		t.Fatalf("exchange rate was not applied: %#v", profit)
+	if !profit.CostComplete || math.Abs(profit.TotalCostCNY-600) > 0.0001 || math.Abs(profit.ProfitAmountCNY-6400) > 0.0001 {
+		t.Fatalf("a CNY cost must stay CNY 600: %#v", profit)
+	}
+	item.PurchaseCurrency, item.WorkflowData = "EUR", map[string]any{"cost_exchange_rate": 1.1}
+	profit = buildTradeProfitSummary(order, []model.TradeOrderItem{item})
+	if !profit.CostComplete || math.Abs(profit.ProductCost-660) > 0.0001 {
+		t.Fatalf("other currencies still use the manual rate: %#v", profit)
 	}
 }
 

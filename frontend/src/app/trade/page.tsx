@@ -7176,7 +7176,7 @@ export default function TradeWorkspacePage() {
                                   </span>
                                 </div>
                                 <p className="mt-0.5 text-xs text-slate-400">
-                                  客户付款（产品 + 运费 + 手续费）按汇率折合人民币，减去采购成本即为利润。
+                                  客户付款 = 卖价 + 运费 + 手续费（PayPal 付款才有手续费），按汇率折合人民币；减去人民币采购成本和实际快递费即为利润。客户付的运费是收入，不是成本。
                                 </p>
                               </div>
                               <button
@@ -7194,18 +7194,25 @@ export default function TradeWorkspacePage() {
                               const cny = (value: number) =>
                                 rate > 0 ? formatFinancialMoney("CNY", value * rate) : "汇率待补";
                               const cells: Array<{ label: string; value: string; sub?: string; tone?: string }> = [
-                                { label: "产品金额", value: formatFinancialMoney(currency, summary.goods_revenue) },
-                                { label: "运费", value: formatFinancialMoney(currency, summary.freight_revenue) },
-                                { label: "手续费", value: formatFinancialMoney(currency, summary.fee_revenue || 0) },
+                                { label: "卖价（产品金额）", value: formatFinancialMoney(currency, summary.goods_revenue) },
+                                { label: "运费（客户付）", value: formatFinancialMoney(currency, summary.freight_revenue) },
+                                {
+                                  label: "手续费（客户付）",
+                                  value: formatFinancialMoney(currency, summary.fee_revenue || 0),
+                                  sub: (summary.fee_revenue || 0) > 0 ? undefined : "银行转账无手续费",
+                                },
                                 {
                                   label: "客户付款合计",
                                   value: formatFinancialMoney(currency, summary.revenue),
                                   sub: currency === "CNY" ? undefined : `≈ ${cny(summary.revenue)}`,
+                                  tone: "text-sky-800",
                                 },
                                 { label: "采购成本（人民币）", value: cny(summary.product_cost) },
                               ];
                               if (summary.actual_freight_cost > 0)
-                                cells.push({ label: "实际运费（人民币）", value: formatFinancialMoney("CNY", summary.freight_cost_cny) });
+                                cells.push({ label: "实际快递费（人民币）", value: formatFinancialMoney("CNY", summary.freight_cost_cny) });
+                              else if (summary.freight_revenue > 0)
+                                cells.push({ label: "实际快递费（人民币）", value: "待发货录入", sub: "录入前不扣运费", tone: "text-slate-400" });
                               if (summary.additional_cost > 0)
                                 cells.push({ label: "附加成本（人民币）", value: cny(summary.additional_cost) });
                               cells.push(
@@ -9406,11 +9413,18 @@ export default function TradeWorkspacePage() {
                   </div>
                   <div className="divide-y divide-slate-100">
                     {(detailOrder.items || []).map((item) => {
-                      const purchaseCurrency =
-                        item.purchase_currency || detailOrder.currency;
+                      // Costs are paid in CNY unless another currency was chosen;
+                      // CNY follows the order rate automatically.
+                      const purchaseCurrency = (
+                        item.purchase_currency || "CNY"
+                      ).toUpperCase();
+                      const orderRate = detailOrder.quote_exchange_rate_cny;
+                      const followsOrderRate =
+                        purchaseCurrency === "CNY" &&
+                        detailOrder.currency.toUpperCase() !== "CNY";
                       const sameCurrency =
-                        purchaseCurrency.toUpperCase() ===
-                        detailOrder.currency.toUpperCase();
+                        purchaseCurrency ===
+                          detailOrder.currency.toUpperCase() || followsOrderRate;
                       return (
                         <div
                           key={item.id}
@@ -9433,17 +9447,22 @@ export default function TradeWorkspacePage() {
                           <label className="block">
                             <span className="mb-1 block text-[11px] text-slate-500">
                               {purchaseCurrency} → {detailOrder.currency}
+                              {followsOrderRate && "（按订单汇率自动换算）"}
                             </span>
                             <input
-                              type="number"
+                              type={followsOrderRate ? "text" : "number"}
                               min={0}
                               step="any"
                               disabled={sameCurrency}
                               value={
-                                sameCurrency
-                                  ? "1"
-                                  : profitSettingsDraft.item_rates[item.id] ||
-                                    ""
+                                followsOrderRate
+                                  ? orderRate > 0
+                                    ? `1 ${detailOrder.currency} = ${orderRate} CNY`
+                                    : "先填写订单汇率"
+                                  : sameCurrency
+                                    ? "1"
+                                    : profitSettingsDraft.item_rates[item.id] ||
+                                      ""
                               }
                               onChange={(event) =>
                                 setProfitSettingsDraft((current) =>
