@@ -145,6 +145,29 @@ func TestTradeBossSettlementCycle(t *testing.T) {
 	}
 }
 
+// A USD order sold at 120 + 115 freight, bought for CNY 390: the cost must
+// stay CNY 390 whether the currency was left empty or a manual cost rate of
+// 6.5 was typed in, never 390 × 6.5.
+func TestTradeProfitKeepsCNYCostInCNY(t *testing.T) {
+	order := &model.TradeOrder{Currency: "USD", QuoteExchangeRateCNY: 6.5, Stage: model.TradeStageShipment,
+		QuotedGoodsAmount: 120, TotalAmount: 235, FreightMode: "customer_forwarder"}
+	for name, item := range map[string]model.TradeOrderItem{
+		"no currency":          {LineNo: 1, Quantity: 1, QuotedPrice: 120, FreightAmount: 115, PurchasePrice: 390},
+		"CNY with manual rate": {LineNo: 1, Quantity: 1, QuotedPrice: 120, FreightAmount: 115, PurchasePrice: 390, PurchaseCurrency: "CNY", WorkflowData: map[string]any{"cost_exchange_rate": 6.5}},
+	} {
+		profit := buildTradeProfitSummary(order, []model.TradeOrderItem{item})
+		if !closeTo(profit.RevenueCNY, 1527.5) || !closeTo(profit.ProductCost*profit.ExchangeRateCNY, 390) ||
+			!closeTo(profit.ProfitAmountCNY, 1137.5) || profit.Lines[0].PurchaseCurrency != "CNY" {
+			t.Fatalf("%s: revenue %.2f cost %.2f profit %.2f currency %s", name, profit.RevenueCNY,
+				profit.ProductCost*profit.ExchangeRateCNY, profit.ProfitAmountCNY, profit.Lines[0].PurchaseCurrency)
+		}
+	}
+	usd := model.TradeOrderItem{LineNo: 1, Quantity: 1, QuotedPrice: 120, PurchasePrice: 50, PurchaseCurrency: "USD"}
+	if profit := buildTradeProfitSummary(order, []model.TradeOrderItem{usd}); !closeTo(profit.ProductCost, 50) {
+		t.Fatalf("an explicit USD cost stays in USD: %.2f", profit.ProductCost)
+	}
+}
+
 func TestSettlementMonthFor(t *testing.T) {
 	modules := model.TradeModules{SettlementStartDay: 26}
 	cases := map[string]string{"2026-10-25": "2026-10", "2026-10-26": "2026-11", "2026-12-31": "2027-01"}

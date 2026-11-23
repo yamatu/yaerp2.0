@@ -132,11 +132,25 @@ function headerKey(cell: string): ColumnKey | null {
   return null;
 }
 
+const PAYPAL_FEE_PERCENT = 5;
+
 /** Payment fee: a plain amount, or a percentage of goods + freight. */
 function feeAmount(text: string, base: number) {
   const trimmed = text.trim();
-  if (trimmed.endsWith("%")) return (base * amountValue(trimmed.slice(0, -1))) / 100;
+  if (trimmed.endsWith("%")) return Math.round(base * amountValue(trimmed.slice(0, -1))) / 100;
   return amountValue(trimmed);
+}
+
+// A saved fee that is a round percentage of goods + freight (PayPal's 5%)
+// opens as that percentage, so it follows later price or freight changes.
+function initialFeeText(fee: number, base: number) {
+  if (!(fee > 0)) return "";
+  if (base > 0) {
+    const percent = Math.round(((fee / base) * 100) * 10) / 10;
+    if (percent > 0 && percent <= 20 && Math.abs(Math.round(base * percent) / 100 - fee) < 0.006)
+      return `${percent}%`;
+  }
+  return String(fee);
 }
 
 // Esc closes the dialog unless focus sits in another dialog opened on top, a
@@ -591,15 +605,39 @@ function OrderMoneyFields({
       </label>
       <div>
         <NumberField
-          label={`手续费（${currency}，可填 4.4%）`}
+          label={`手续费（${currency}，可填 5%）`}
           value={fee}
           onChange={onFeeChange}
           placeholder="PayPal 等收的手续费"
           allowPercent
         />
-        {fee.trim().endsWith("%") && (
-          <div className="mt-0.5 text-[11px] text-slate-400">= {money(feeAmount(fee, feeBase), currency)}</div>
-        )}
+        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
+          <button
+            type="button"
+            onClick={() => {
+              onFeeChange(`${PAYPAL_FEE_PERCENT}%`);
+              if (!paymentMethod.trim() || /bank|t\/t|电汇|银行/i.test(paymentMethod)) onPaymentMethodChange("PayPal");
+            }}
+            className={`rounded-md border px-1.5 py-0.5 ${fee.trim() === `${PAYPAL_FEE_PERCENT}%` ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+          >
+            PayPal {PAYPAL_FEE_PERCENT}%
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onFeeChange("");
+              if (!paymentMethod.trim() || /paypal/i.test(paymentMethod)) onPaymentMethodChange("T/T 电汇");
+            }}
+            className={`rounded-md border px-1.5 py-0.5 ${!fee.trim() ? "border-sky-300 bg-sky-50 text-sky-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+          >
+            银行转账（无手续费）
+          </button>
+          {fee.trim().endsWith("%") && (
+            <span className="text-slate-400">
+              =（卖价 + 运费）× {fee.trim()} = {money(feeAmount(fee, feeBase), currency)}
+            </span>
+          )}
+        </div>
       </div>
     </>
   );
@@ -872,7 +910,15 @@ export function OrderPricingModal({
   const [rate, setRate] = useState(() =>
     order.quote_exchange_rate_cny > 0 ? String(order.quote_exchange_rate_cny) : rememberedRate(initialCurrency),
   );
-  const [fee, setFee] = useState(() => ((order.payment_fee_amount || 0) > 0 ? String(order.payment_fee_amount) : ""));
+  const [fee, setFee] = useState(() =>
+    initialFeeText(
+      order.payment_fee_amount || 0,
+      tradeActiveItems(order.items || []).reduce(
+        (sum, item) => sum + (item.quantity || 0) * (item.quoted_price || 0) + (item.freight_amount || 0),
+        0,
+      ),
+    ),
+  );
   const [paymentMethod, setPaymentMethod] = useState(order.payment_method || "");
   const [lines, setLines] = useState<PricingLine[]>(() => {
     const items = tradeActiveItems(order.items || []);

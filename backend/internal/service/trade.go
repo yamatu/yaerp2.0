@@ -1008,7 +1008,7 @@ func applyTradeStageItemUpdate(stage string, item *model.TradeOrderItem, input *
 		item.Status = inquiryStatus
 	case model.TradeStagePurchase:
 		item.SupplierName = strings.TrimSpace(input.SupplierName)
-		item.PurchaseCurrency = strings.ToUpper(strings.TrimSpace(input.PurchaseCurrency))
+		item.PurchaseCurrency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(input.PurchaseCurrency), "CNY"))
 		item.PurchasePrice = nonNegativeTradeValue(input.PurchasePrice)
 		copyTradeWorkflowFields(item.WorkflowData, input.WorkflowData, "purchase_status", "cost_exchange_rate")
 		status := normalizeTradePurchaseStatus(tradeWorkflowString(item, "purchase_status"))
@@ -1121,13 +1121,9 @@ func buildTradeProfitSummary(order *model.TradeOrder, items []model.TradeOrderIt
 			lineComplete = false
 			addWarning(fmt.Sprintf("第 %d 行尚未录入对客报价", item.LineNo))
 		}
-		purchaseCurrency := strings.ToUpper(strings.TrimSpace(item.PurchaseCurrency))
+		purchaseCurrency := tradePurchaseCurrency(&item)
 		if purchaseCurrency == "" {
-			if isAIImportedTradeItem(&item) {
-				purchaseCurrency = "待补"
-			} else {
-				purchaseCurrency = currency
-			}
+			purchaseCurrency = "待补"
 		}
 		rate := tradeProfitExchangeRate(currency, quoteRateCNY, &item)
 		if rate <= 0 {
@@ -1239,25 +1235,37 @@ func tradeStageAtOrAfter(stage, target string) bool {
 	return stageIndex >= 0 && targetIndex >= 0 && stageIndex >= targetIndex
 }
 
+// tradePurchaseCurrency: purchase costs are paid in CNY, so a cost entered
+// without a currency is CNY. AI imports leave it empty when unknown.
+func tradePurchaseCurrency(item *model.TradeOrderItem) string {
+	currency := strings.ToUpper(strings.TrimSpace(item.PurchaseCurrency))
+	if currency == "" && !isAIImportedTradeItem(item) {
+		return "CNY"
+	}
+	return currency
+}
+
+// tradeProfitExchangeRate converts one unit of purchase currency into the
+// order currency. A CNY cost always follows the order's CNY rate, so a stray
+// manual rate cannot inflate it; other currencies need the manual rate.
 func tradeProfitExchangeRate(orderCurrency string, quoteRateCNY float64, item *model.TradeOrderItem) float64 {
 	if item == nil {
 		return 1
 	}
-	if strings.TrimSpace(item.PurchaseCurrency) == "" && isAIImportedTradeItem(item) {
+	purchaseCurrency := tradePurchaseCurrency(item)
+	if purchaseCurrency == "" {
 		return 0
 	}
-	purchaseCurrency := strings.ToUpper(firstNonEmptyTrade(item.PurchaseCurrency, orderCurrency))
 	if strings.EqualFold(purchaseCurrency, orderCurrency) {
 		return 1
 	}
-	rate := tradeWorkflowFloat(item, "cost_exchange_rate")
-	if rate > 0 {
-		return rate
+	if purchaseCurrency == "CNY" {
+		if quoteRateCNY > 0 {
+			return 1 / quoteRateCNY
+		}
+		return 0
 	}
-	if purchaseCurrency == "CNY" && quoteRateCNY > 0 {
-		return 1 / quoteRateCNY
-	}
-	return 0
+	return tradeWorkflowFloat(item, "cost_exchange_rate")
 }
 
 func isAIImportedTradeItem(item *model.TradeOrderItem) bool {
