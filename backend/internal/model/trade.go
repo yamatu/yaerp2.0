@@ -987,6 +987,8 @@ type UpdateTradeStageDataRequest struct {
 type TradeItemCostRateInput struct {
 	OrderItemID int64   `json:"order_item_id" binding:"required"`
 	Rate        float64 `json:"rate" binding:"gte=0"`
+	// Currency of the purchase price; empty keeps the stored one.
+	Currency string `json:"currency"`
 }
 
 type TradeOrderPricingItem struct {

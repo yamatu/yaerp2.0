@@ -17,7 +17,10 @@ import (
 	"yaerp/internal/repo"
 )
 
-var tradePhoneDigitsPattern = regexp.MustCompile(`[^0-9+]`)
+var (
+	tradePhoneDigitsPattern  = regexp.MustCompile(`[^0-9+]`)
+	tradeCurrencyCodePattern = regexp.MustCompile(`^[A-Z]{3}$`)
+)
 
 var tradeStageOrder = []string{
 	model.TradeStageInquiry,
@@ -626,6 +629,13 @@ func (s *TradeService) UpdateProfitSettings(userID, orderID int64, request *mode
 		if input.Rate < 0 {
 			return nil, fmt.Errorf("成本换算率不能小于零")
 		}
+		if strings.TrimSpace(input.Currency) != "" {
+			currency, err := normalizeTradePurchaseCurrency(input.Currency)
+			if err != nil {
+				return nil, fmt.Errorf("第 %d 行%w", item.LineNo, err)
+			}
+			item.PurchaseCurrency = currency
+		}
 		if item.WorkflowData == nil {
 			item.WorkflowData = map[string]any{}
 		}
@@ -1008,7 +1018,11 @@ func applyTradeStageItemUpdate(stage string, item *model.TradeOrderItem, input *
 		item.Status = inquiryStatus
 	case model.TradeStagePurchase:
 		item.SupplierName = strings.TrimSpace(input.SupplierName)
-		item.PurchaseCurrency = strings.ToUpper(firstNonEmptyTrade(strings.TrimSpace(input.PurchaseCurrency), "CNY"))
+		currency, err := normalizeTradePurchaseCurrency(input.PurchaseCurrency)
+		if err != nil {
+			return err
+		}
+		item.PurchaseCurrency = currency
 		item.PurchasePrice = nonNegativeTradeValue(input.PurchasePrice)
 		copyTradeWorkflowFields(item.WorkflowData, input.WorkflowData, "purchase_status", "cost_exchange_rate")
 		status := normalizeTradePurchaseStatus(tradeWorkflowString(item, "purchase_status"))
@@ -1233,6 +1247,28 @@ func tradeStageAtOrAfter(stage, target string) bool {
 		}
 	}
 	return stageIndex >= 0 && targetIndex >= 0 && stageIndex >= targetIndex
+}
+
+// normalizeTradePurchaseCurrency turns what people type into a currency code;
+// purchases are paid in CNY, so an empty or RMB-like value is CNY.
+func normalizeTradePurchaseCurrency(value string) (string, error) {
+	cleaned := strings.ToUpper(strings.TrimSpace(value))
+	switch cleaned {
+	case "", "RMB", "CNY", "CNH", "人民币", "元", "¥", "￥", "RMB¥":
+		return "CNY", nil
+	case "美元", "美金", "$", "US$", "USD$":
+		return "USD", nil
+	case "欧元", "€":
+		return "EUR", nil
+	case "港币", "港元", "HK$":
+		return "HKD", nil
+	case "日元", "円":
+		return "JPY", nil
+	}
+	if !tradeCurrencyCodePattern.MatchString(cleaned) {
+		return "", fmt.Errorf("采购币种无效：%s（人民币请填 CNY）", strings.TrimSpace(value))
+	}
+	return cleaned, nil
 }
 
 // tradePurchaseCurrency: purchase costs are paid in CNY, so a cost entered

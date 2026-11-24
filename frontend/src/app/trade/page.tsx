@@ -207,6 +207,7 @@ interface ProfitSettingsDraft {
   additional_cost_amount: string;
   additional_cost_notes: string;
   item_rates: Record<number, string>;
+  item_currencies: Record<number, string>;
 }
 
 interface TradePIDraft {
@@ -585,7 +586,13 @@ const STAGE_DATA_FIELDS: Partial<Record<TradeStage, StageDataField[]>> = {
   ],
   purchase: [
     { key: "supplier_name", label: "供应商", source: "item" },
-    { key: "purchase_currency", label: "采购币种", source: "item" },
+    {
+      key: "purchase_currency",
+      label: "采购币种",
+      source: "item",
+      type: "select",
+      options: ["CNY", "USD", "EUR", "HKD", "GBP", "JPY"],
+    },
     { key: "purchase_price", label: "采购单价", source: "item", type: "number" },
     {
       key: "cost_exchange_rate",
@@ -707,6 +714,9 @@ function stageAtOrAfter(stage: TradeStage, target: TradeStage) {
 }
 
 function stageItemValue(item: TradeOrderItem, field: StageDataField) {
+  // Purchases are paid in CNY unless another currency was recorded.
+  if (field.key === "purchase_currency")
+    return (item.purchase_currency || "CNY").toUpperCase();
   const value =
     field.source === "workflow"
       ? item.workflow_data?.[field.key]
@@ -2028,8 +2038,10 @@ export default function TradeWorkspacePage() {
         ) {
           value = stageItemStatus(stage, item);
         }
+        // A rarer purchase currency is kept as recorded, not reset to CNY.
         if (
           field.type === "select" &&
+          field.key !== "purchase_currency" &&
           field.options?.length &&
           !field.options.includes(value)
         ) {
@@ -2638,6 +2650,12 @@ export default function TradeWorkspacePage() {
       additional_cost_amount: String(detailOrder.additional_cost_amount || 0),
       additional_cost_notes: detailOrder.additional_cost_notes || "",
       item_rates: itemRates,
+      item_currencies: Object.fromEntries(
+        (detailOrder.items || []).map((item) => [
+          item.id,
+          (item.purchase_currency || "CNY").toUpperCase(),
+        ]),
+      ),
     });
     setProfitSettingsOpen(true);
     setError("");
@@ -2659,6 +2677,7 @@ export default function TradeWorkspacePage() {
           item_rates: (detailOrder.items || []).map((item) => ({
             order_item_id: item.id,
             rate: Number(profitSettingsDraft.item_rates[item.id] || 0),
+            currency: profitSettingsDraft.item_currencies[item.id] || "CNY",
           })),
         },
       );
@@ -9416,9 +9435,29 @@ export default function TradeWorkspacePage() {
                       // Costs are paid in CNY unless another currency was chosen;
                       // CNY follows the order rate automatically.
                       const purchaseCurrency = (
-                        item.purchase_currency || "CNY"
+                        profitSettingsDraft.item_currencies[item.id] ||
+                        item.purchase_currency ||
+                        "CNY"
                       ).toUpperCase();
+                      const orderCurrency = detailOrder.currency.toUpperCase();
+                      const currencyChoices = Array.from(
+                        new Set([
+                          "CNY",
+                          orderCurrency,
+                          (item.purchase_currency || "CNY").toUpperCase(),
+                        ]),
+                      );
                       const orderRate = detailOrder.quote_exchange_rate_cny;
+                      // What this line's cost comes to in CNY with the choices on screen.
+                      const lineCost = item.purchase_price * item.quantity;
+                      const lineCostCNY =
+                        purchaseCurrency === "CNY"
+                          ? lineCost
+                          : purchaseCurrency === orderCurrency
+                            ? lineCost * orderRate
+                            : lineCost *
+                              Number(profitSettingsDraft.item_rates[item.id] || 0) *
+                              orderRate;
                       const followsOrderRate =
                         purchaseCurrency === "CNY" &&
                         detailOrder.currency.toUpperCase() !== "CNY";
@@ -9428,7 +9467,7 @@ export default function TradeWorkspacePage() {
                       return (
                         <div
                           key={item.id}
-                          className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_180px] sm:items-center"
+                          className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_120px_180px] sm:items-center"
                         >
                           <div className="min-w-0">
                             <div className="truncate text-sm font-medium text-slate-800">
@@ -9442,8 +9481,48 @@ export default function TradeWorkspacePage() {
                                 item.purchase_price,
                               )}{" "}
                               × {item.quantity} {item.unit}
+                              {purchaseCurrency !== "CNY" && lineCostCNY > 0 && (
+                                <span className="ml-1 text-slate-500">
+                                  ≈ {formatFinancialMoney("CNY", lineCostCNY)}
+                                </span>
+                              )}
                             </div>
+                            {purchaseCurrency !== "CNY" &&
+                              purchaseCurrency === orderCurrency && (
+                                <div className="mt-1 text-xs text-amber-700">
+                                  采购价按 {purchaseCurrency} 计算，会乘以汇率 {orderRate || "?"}；如果这个价格其实是人民币，请把币种改成 CNY。
+                                </div>
+                              )}
                           </div>
+                          <label className="block">
+                            <span className="mb-1 block text-[11px] text-slate-500">
+                              采购币种
+                            </span>
+                            <select
+                              value={purchaseCurrency}
+                              aria-label={`第 ${item.line_no} 行采购币种`}
+                              onChange={(event) =>
+                                setProfitSettingsDraft((current) =>
+                                  current
+                                    ? {
+                                        ...current,
+                                        item_currencies: {
+                                          ...current.item_currencies,
+                                          [item.id]: event.target.value,
+                                        },
+                                      }
+                                    : current,
+                                )
+                              }
+                              className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2 text-sm outline-none focus:border-violet-300"
+                            >
+                              {currencyChoices.map((choice) => (
+                                <option key={choice} value={choice}>
+                                  {choice === "CNY" ? "CNY 人民币" : choice}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
                           <label className="block">
                             <span className="mb-1 block text-[11px] text-slate-500">
                               {purchaseCurrency} → {detailOrder.currency}
