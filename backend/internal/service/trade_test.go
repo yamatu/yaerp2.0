@@ -470,3 +470,35 @@ func TestDefaultTradeSupplierQuoteCurrencyUsesCNYForDomesticSuppliers(t *testing
 		t.Fatalf("foreign supplier currency = %q, want EUR", actual)
 	}
 }
+
+func TestNormalizeTradePurchaseCurrency(t *testing.T) {
+	for input, want := range map[string]string{
+		"": "CNY", "rmb": "CNY", "人民币": "CNY", "元": "CNY", "¥": "CNY", " cny ": "CNY",
+		"usd": "USD", "美金": "USD", "$": "USD", "eur": "EUR", "港币": "HKD",
+	} {
+		if got, err := normalizeTradePurchaseCurrency(input); err != nil || got != want {
+			t.Fatalf("%q: got %q %v, want %q", input, got, err, want)
+		}
+	}
+	for _, bad := range []string{"dollar", "US", "12"} {
+		if _, err := normalizeTradePurchaseCurrency(bad); err == nil {
+			t.Fatalf("%q should be rejected", bad)
+		}
+	}
+}
+
+// A CNY 2,000 cost on a USD order at 6.5 is CNY 2,000, never 2,000 x 6.5.
+func TestTradeProfitKeepsCNYCostWhateverTheRate(t *testing.T) {
+	order := &model.TradeOrder{Stage: model.TradeStagePurchase, Currency: "USD", QuoteExchangeRateCNY: 6.5, FreightMode: "customer_forwarder"}
+	item := model.TradeOrderItem{ID: 1, LineNo: 1, Quantity: 1, QuotedPrice: 500, PurchaseCurrency: "CNY", PurchasePrice: 2000,
+		WorkflowData: map[string]any{"cost_exchange_rate": 1.0}}
+	profit := buildTradeProfitSummary(order, []model.TradeOrderItem{item})
+	if math.Abs(profit.TotalCostCNY-2000) > 0.001 || math.Abs(profit.ProfitAmountCNY-(3250-2000)) > 0.001 {
+		t.Fatalf("CNY cost must stay 2000: cost %v profit %v", profit.TotalCostCNY, profit.ProfitAmountCNY)
+	}
+	item.PurchaseCurrency = "USD"
+	profit = buildTradeProfitSummary(order, []model.TradeOrderItem{item})
+	if math.Abs(profit.TotalCostCNY-13000) > 0.001 {
+		t.Fatalf("a real USD cost converts at the order rate: %v", profit.TotalCostCNY)
+	}
+}

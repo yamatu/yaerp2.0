@@ -21,6 +21,9 @@ func validateConfirmedTradeOrder(request *model.CreateTradeOrderRequest) error {
 		if item.SalesPrice < 0 || item.PurchasePrice < 0 || item.FreightAmount < 0 {
 			return fmt.Errorf("第 %d 行金额不能小于零", index+1)
 		}
+		if _, err := normalizeTradePurchaseCurrency(item.PurchaseCurrency); err != nil {
+			return fmt.Errorf("第 %d 行%w", index+1, err)
+		}
 	}
 	return nil
 }
@@ -43,7 +46,8 @@ func applyTradeItemPricing(item *model.TradeOrderItem, input model.TradeOrderPri
 	}
 	item.SupplierName = strings.TrimSpace(input.SupplierName)
 	item.PurchasePrice = nonNegativeTradeValue(input.PurchasePrice)
-	item.PurchaseCurrency = strings.ToUpper(strings.TrimSpace(input.PurchaseCurrency))
+	// Validated by the callers; a bad value cannot reach this point.
+	item.PurchaseCurrency, _ = normalizeTradePurchaseCurrency(input.PurchaseCurrency)
 	if item.PurchaseCurrency == "" {
 		item.PurchaseCurrency = "CNY"
 	}
@@ -197,6 +201,9 @@ func (s *TradeService) UpdateOrderPricing(userID, orderID int64, request *model.
 		}
 		if input.SalesPrice < 0 || input.PurchasePrice < 0 || input.FreightAmount < 0 {
 			return nil, fmt.Errorf("第 %d 行金额不能小于零", index+1)
+		}
+		if _, err := normalizeTradePurchaseCurrency(input.PurchaseCurrency); err != nil {
+			return nil, fmt.Errorf("第 %d 行%w", index+1, err)
 		}
 		if _, _, err := normalizeTradeItemIdentity(input.SKU, input.ProductName); err != nil {
 			return nil, fmt.Errorf("第 %d 行：%w", index+1, err)

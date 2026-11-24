@@ -933,12 +933,20 @@ export function OrderPricingModal({
         sales_price: item.quoted_price ? String(item.quoted_price) : "",
         freight_amount: item.freight_amount ? String(item.freight_amount) : "",
         supplier_name: item.supplier_name || "",
-        purchase_currency: (item.purchase_currency || "CNY").toUpperCase(),
+        // The cost column is in CNY, so what is shown is what gets saved.
+        purchase_currency: "CNY",
         purchase_price: item.purchase_price ? String(item.purchase_price) : "",
       }),
     );
     return [...loaded, newPricingLine()];
   });
+  // Costs stored in another currency (old entries, AI imports): say that they
+  // will be saved as CNY rather than silently keeping the foreign currency.
+  const foreignCosts = showCost
+    ? tradeActiveItems(order.items || []).filter(
+        (item) => item.purchase_price > 0 && (item.purchase_currency || "CNY").toUpperCase() !== "CNY",
+      )
+    : [];
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const close = useCallback(() => onClose(), [onClose]);
@@ -1010,6 +1018,18 @@ export function OrderPricingModal({
           onPaymentMethodChange={setPaymentMethod}
         />
       </div>
+      {foreignCosts.length > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800" data-foreign-cost-notice>
+          {foreignCosts.map((item) => (
+            <div key={item.id}>
+              第 {item.line_no} 行采购价原来记为 {money(item.purchase_price, (item.purchase_currency || "").toUpperCase())}。
+            </div>
+          ))}
+          <div className="mt-0.5 text-xs text-amber-700">
+            这里的采购单价按人民币计算，保存后会按人民币保存；如果确实是外币价格，请换算成人民币后再填写。
+          </div>
+        </div>
+      )}
       <PricingGrid lines={lines} onChange={setLines} currency={currency} showCost={showCost} />
       <ProfitSummary lines={lines} currency={currency} rate={amountValue(rate)} fee={feeAmount(fee, base)} showCost={showCost} />
       <ErrorBox message={error} />
