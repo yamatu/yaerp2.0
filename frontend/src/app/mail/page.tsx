@@ -708,6 +708,9 @@ export default function MailPage() {
   const previousInboxUnreadRef = useRef<number | null>(null);
   const mailStatusPollingRef = useRef(false);
   const mailAudioContextRef = useRef<AudioContext | null>(null);
+  // Newest active account id. Requests that were issued for an earlier account
+  // compare against it so their late answer cannot repopulate the view.
+  const activeAccountIDRef = useRef<number | null>(null);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const adminMode = isAdmin(currentUser);
   const [account, setAccount] = useState<MailAccount | null | undefined>(
@@ -719,6 +722,11 @@ export default function MailPage() {
     useState<MailAccountInput>(emptyAccountInput);
   const [summary, setSummary] = useState<MailSummary | null>(null);
   const [folders, setFolders] = useState<MailFolder[]>([]);
+  // Account the folder list was loaded for. A folder name only means something
+  // for the account that listed it (AliMail names its folders with numeric ids
+  // such as "2", an IMAP account has no such folder), so messages are only
+  // requested when the list belongs to the account being shown.
+  const [foldersAccountID, setFoldersAccountID] = useState<number | null>(null);
   const [selectedFolder, setSelectedFolder] = useState("");
   const [pageData, setPageData] = useState<MailMessagePage>({
     folder: "",
@@ -1033,6 +1041,7 @@ export default function MailPage() {
         throw new Error(accountRes.message || "无法读取邮箱账号");
       const values = accountRes.data || [];
       const value = values.find((item) => item.is_default) || values[0] || null;
+      activeAccountIDRef.current = value?.id ?? null;
       setAccounts(values);
       setAccount(value);
       setSummary(
@@ -1052,6 +1061,7 @@ export default function MailPage() {
       );
       setEditingAccountID(value?.id || null);
     } catch (loadError) {
+      activeAccountIDRef.current = null;
       setAccount(null);
       setAccounts([]);
       setError(
@@ -1078,13 +1088,18 @@ export default function MailPage() {
 
   const loadFolders = useCallback(async () => {
     if (!account) return;
+    const requestedAccountID = account.id;
     setLoadingFolders(true);
     try {
       const res = await api.get<MailFolder[]>("/mail/folders");
       if (res.code !== 0 || !res.data)
         throw new Error(res.message || "无法读取邮件文件夹");
+      // The account was switched while this request was in flight: its folder
+      // names belong to the previous mailbox and would be sent to the new one.
+      if (activeAccountIDRef.current !== requestedAccountID) return;
       const values = res.data;
       setFolders(values);
+      setFoldersAccountID(requestedAccountID);
       const inbox = values.find((folder) => folder.role === "inbox");
       if (inbox) {
         setSummary((current) =>
@@ -1110,11 +1125,14 @@ export default function MailPage() {
         );
       });
     } catch (loadError) {
+      if (activeAccountIDRef.current !== requestedAccountID) return;
       setError(
         loadError instanceof Error ? loadError.message : "无法读取邮件文件夹",
       );
     } finally {
-      setLoadingFolders(false);
+      if (activeAccountIDRef.current === requestedAccountID) {
+        setLoadingFolders(false);
+      }
     }
   }, [account]);
 
@@ -1153,6 +1171,10 @@ export default function MailPage() {
 
   const loadMessages = useCallback(async (silent = false) => {
     if (!account || !selectedFolder) return;
+    // The folder list still describes the previous account (fast switch), so
+    // `selectedFolder` is a name the current mailbox may not have at all.
+    if (foldersAccountID !== account.id) return;
+    const requestedAccountID = account.id;
     if (!silent) setLoadingMessages(true);
     setError("");
     try {
@@ -1184,9 +1206,11 @@ export default function MailPage() {
       const res = await api.get<MailMessagePage>(endpoint);
       if (res.code !== 0 || !res.data)
         throw new Error(res.message || "无法读取邮件");
+      if (activeAccountIDRef.current !== requestedAccountID) return;
       setPageData(res.data);
       setSelectedKeys(new Set());
     } catch (loadError) {
+      if (activeAccountIDRef.current !== requestedAccountID) return;
       setError(loadError instanceof Error ? loadError.message : "无法读取邮件");
       setPageData((current) => ({
         ...current,
@@ -1195,13 +1219,16 @@ export default function MailPage() {
         has_more: false,
       }));
     } finally {
-      if (!silent) setLoadingMessages(false);
+      if (activeAccountIDRef.current === requestedAccountID) {
+        setLoadingMessages(false);
+      }
     }
   }, [
     account,
     correspondenceContact,
     endDate,
     filterMode,
+    foldersAccountID,
     page,
     searchQuery,
     searchScope,
@@ -1828,6 +1855,10 @@ export default function MailPage() {
     }
     setSelected(null);
     setSelectedFolder("");
+    // The folder list belongs to the account that is being left; dropping it
+    // here keeps its names from being sent to the new account.
+    setFolders([]);
+    setFoldersAccountID(null);
     setPage(1);
     setSearchDraft("");
     setSearchQuery("");
