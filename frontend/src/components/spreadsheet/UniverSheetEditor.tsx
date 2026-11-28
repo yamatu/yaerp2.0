@@ -57,6 +57,7 @@ import {
   registerSharedFormulaEditorInterceptor,
   type SharedFormulaResolver,
 } from '@/lib/univer-shared-formula'
+import { registerInsertFunctionRefPicking } from '@/lib/univer-insert-function-ref'
 import { wsClient } from '@/lib/ws'
 import { createMarkLayer, watchMarkShapeWipes, type MarkLayer, type MarkShape } from '@/lib/univer-mark-layer'
 import {
@@ -4276,6 +4277,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
         registerEditorComposedStyleInterceptor(univerResult.univer)
         installCellEditorAlignmentRecalculation(univerResult.univer)
         registerSharedFormulaEditorInterceptor(univerResult.univer)
+        const insertFunctionRefPicking = registerInsertFunctionRefPicking(univerResult.univer)
         const editorCaretCollapse = registerEditorCaretCollapse(univerResult.univer)
         const formatPainterRowHeightGuard = registerFormatPainterRowHeightGuard(univerResult.univer)
         const resolveSharedFormula = createSharedFormulaResolver(univerResult.univer)
@@ -4946,6 +4948,7 @@ export default function UniverSheetEditor({ workbookId, workbookName, workbookSh
           persistSheetViewMemory()
           disposable.dispose()
           cellShiftRepair?.dispose()
+          insertFunctionRefPicking?.dispose()
           formulaErrorHintDisposable?.dispose()
           plainTextPaste?.dispose()
           pastePlainRef.current = null
